@@ -29,6 +29,10 @@
   needed — GitHub issues are read with `gh issue view <id>` when full thread context helps.
 
 ## 2. Branch-target rules
+- **Target checkout:** the Wyrd repo at `/home/eddie/wyrd/wyrd` (the sibling `../wyrd`).
+  The Plan/Do leaves implement and cite against *that* checkout (`git -C ../wyrd …`), and
+  the `C4-ci` gate runs `cargo xtask ci` there via `engine/xtask.sh`. The builder leaves
+  its edits in that working tree so the gate tests them; run from a clean feature branch.
 - **Per-area branch map:** everything targets **`main`**. Wyrd is early and has **no
   maintenance branches** today (no `maintenance/*`, no master-vs-maintenance split) — say
   so rather than invent one; add a map here if/when a release branch is cut.
