@@ -45,11 +45,10 @@ failing gate. Address it; do **not** re-submit the rejected approach unchanged.
 
 Cite `path:line` on the target branch for every claim and change.
 
-Write the patch against the brief's **target branch** in the Wyrd checkout
-(`../wyrd`). Wyrd is its own repo, not a fork: branch from `main` (INTEGRATION.md §2),
-ship the test where Wyrd's suite lives (e.g. `crates/<crate>/tests/`), and make the
-patch commit-ready for Wyrd's own gate — `cargo fmt` + `clippy -D warnings`, run by
-`cargo xtask ci`.
+Write the patch against the brief's **target branch** (targeting resolved at Plan per
+`docs/INTEGRATION.md` §2). Ship the test in the location the target uses, and make the
+patch commit-ready for the target's own commit hooks (formatter / linters).
+
 
 **When you reject an alternative on cost, show the cost** — a diff sketch or a concrete
 line count someone can check, never an adjective ("heavier", "larger", "touches every
@@ -60,29 +59,36 @@ restore**, cost-vs-minimalism is not even the deciding axis — the target is th
 change that restores the invariant, not the smallest diff (`docs/principles.md` §1.2,
 §2).
 
-## Running the test — use Wyrd's runner
+## Running the test — use the project's runner, never a hand-rolled invocation
 
-To confirm the test goes red→green, run it through Wyrd's own gate, not a
-hand-rolled command: `cargo test -p <crate>` for the targeted test, and
-`./engine/xtask.sh ci` (which delegates `cargo xtask ci`) for the whole gate
-(INTEGRATION.md §4). Your edits land in `../wyrd`'s working tree, which is exactly
-what the `C4-ci` gate tests.
+To confirm the test goes red→green, run it through **the project's own test
+runner** (the wrapper `pdca.toml` and `docs/INTEGRATION.md` name — e.g. a
+`scripts/run-tests` entry point, `make test`, or the configured gate `cmd`).
+Do **NOT** assemble your own runner command (a bare container invocation, an
+ad-hoc test command, or similar): it has **no timeout**, so a hung test blocks
+the whole Do beat forever.
 
-Keep the test **deterministic** — Wyrd's correctness tier is DST under madsim
-(ADR-0009): no wall-clock, no real network/disk in a unit/DST test; drive time and
-faults through `wyrd_testkit` so a seed reproduces the run. A test that depends on
-real timing or ordering is not acceptable evidence. This pre-fix/post-fix check is a
-fast sanity pass (Check's gates re-run the full `cargo xtask ci`), so one quick run
-is enough.
+Do **not** assume the runner gives you a display, GUI, or other rich runtime —
+many are **headless**. If your test pulls in a heavy dependency (a GUI toolkit, a
+display/IO-bound library, …) **at load time**, a headless runner can crash on
+load — and it recurs on every iterate-do until the test stops pulling it in.
+Keep the unit under test load-light: extract the logic into a unit free of those
+heavy dependencies and test *that*. Check what the runner actually provides
+(`pdca.toml`, `docs/INTEGRATION.md`) rather than assuming — an inaccurate belief
+about the environment is what makes a test crash silently.
+This pre-fix/post-fix check is a fast sanity pass (Check's gates re-run the real
+suite), so a single quick run through the wrapper is enough.
 
-## Commit-ready for Wyrd
+## Commit-ready for the target repo
 
-The patch must be **committable to Wyrd**, not just gate-green. Run `cargo fmt` over
-every file you touch (`clippy -D warnings` and `fmt --check` are part of
-`cargo xtask ci`, so an unformatted patch fails the gate). Wyrd commits also require a
-**DCO sign-off** (`git commit -s`, ADR-0003 §1) and the PR a **linked issue**
-(`require-issue`); the sign-off/issue mechanics belong to the publish step, but don't
-write a patch the gate or those host checks would reject.
+The patch must be **committable to the target repo**, not just gate-green. When the
+fix is published, the commit runs the *target's own* pre-commit hooks
+(formatter/linters — e.g. the project's configured formatter), which no PDCA gate
+models — so "all gates green" does **not** mean "committable". Run the project's
+configured formatter / commit hooks (the ones its repo sets up; check `pdca.toml` /
+`docs/INTEGRATION.md`) over every file you touch before declaring done. A patch the
+target's commit hook would reject is not done — it would otherwise fail mid-publish,
+after the branch is already pushed.
 
 ## STOP discipline — enforced, not asked
 

@@ -58,12 +58,11 @@ not push, branch, or open a PR yourself.**
   `cd <checkout> && …` (`git -C` is the safe idiom).
 - Resolve the branch target per INTEGRATION §2. One logical fix per PR; do not invent
   scope the brief didn't accept.
-- Targeting (INTEGRATION.md §2): Wyrd is its own repo, not a fork — the contribution
-  branches from `main` (no `upstream` remote, no maintenance branch). The PR is
-  **draft-only** and the human marks it ready; the deterministic `pdca publish`
-  performs the push. The commit carries a **DCO sign-off** (ADR-0003) and the PR a
-  **linked issue** (`require-issue`). Write the commit-msg/PR prose to match `main`;
-  do not push or open the PR yourself.
+- The contribution branches from the brief's **target branch** (per INTEGRATION §2),
+  the PR is **draft-only** and the human marks it ready, and the deterministic `pdca
+  publish` performs the push. Write the commit-msg/PR prose to match the target; do not
+  push or open the PR yourself.
+
 
 ## Boundaries
 
