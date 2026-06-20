@@ -142,6 +142,19 @@ class PublishSlice(unittest.TestCase):
         self.assertIn("add --all", out)        # stages new files (the regression test)
         self.assertNotIn("commit -aF", out)    # never the modified-only commit
 
+    def test_commit_is_signed_off_both_paths(self) -> None:
+        # DCO (#81): both the new-PR and stack-mode commits carry `-s`, so the
+        # Signed-off-by trailer is present and a DCO-gated host accepts the PR.
+        _bundle(self.cfg, "DCO", brief_body=_FIX_BRIEF, accepted=True)
+        _bundle(self.cfg, "DCOSTK", brief_body=_STACK_BRIEF, accepted=True)
+        for iid in ("DCO", "DCOSTK"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                publish.publish(self.cfg, iid, dry_run=True)
+            out = buf.getvalue()
+            self.assertIn("commit -s -F", out, f"{iid}: commit not signed off")
+            self.assertNotIn("commit -F", out)  # the unsigned form is gone
+
     def test_pr_head_is_fork_owner_qualified(self) -> None:
         """Regression (#23b): a fork-based PR's --head must be OWNER:BRANCH, else gh
         resolves the branch against the base repo and fails 'Head ref must be a
@@ -353,6 +366,22 @@ class PublishSlice(unittest.TestCase):
         self.cfg.gates_checks = echo_gate
         row2 = next(r for r in gates.run_gates(d2, self.cfg)["rows"] if r["element"] == "C4")
         self.assertEqual(row2["path_line"].strip(), "BASE=")
+
+
+class ContributionTemplates(unittest.TestCase):
+    """Both publisher templates must scaffold the tracker reference as a first-class
+    line (issue #79) — the contribution gate lints commit-msg and PR body
+    independently, so a slot missing from one reliably drops the id there."""
+
+    def test_pr_description_has_tracker_reference_slot(self) -> None:
+        commit_tpl = (TEMPLATES / "commit-msg.txt.tpl").read_text(encoding="utf-8")
+        pr_tpl = (TEMPLATES / "pr-description.md.tpl").read_text(encoding="utf-8")
+        # The commit template has always had the reference line; the PR body now mirrors it.
+        self.assertIn("Fixes #<id>", commit_tpl)
+        self.assertIn("Fixes #<id>", pr_tpl)
+        # It sits after the Test section, with guidance on the ticketless case.
+        self.assertLess(pr_tpl.index("## Test"), pr_tpl.index("Fixes #<id>"))
+        self.assertIn("declared-ticketless", pr_tpl)
 
 
 if __name__ == "__main__":
