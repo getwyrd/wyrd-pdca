@@ -32,8 +32,11 @@ physically cannot patch what you judge.
 
 - Re-run the asserted evidence: stash the fix → confirm red; unstash → confirm
   green. Re-run the validator/scanners yourself. Trust re-runs, not claims.
-- Re-check that every cited `path:line` grounds on the target branch; drop
-  findings that do not ground.
+- Re-check that every cited `path:line` grounds on the **target source at
+  `$PDCA_TARGET`** (read-only; the driver resolves it from the brief's target and adds
+  it for you). Ground only there — do **not** wander into other checkouts on the
+  machine; if `$PDCA_TARGET` is unset, ground against `patch.diff` alone. Drop findings
+  that do not ground.
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + one-line rationale + path:line.
 
 ## Always emit the complete 5/5/1 verdict table
@@ -64,34 +67,26 @@ never sees.
 
 ## Emit NEEDS-HUMAN by design on
 
-Validation fitness-to-purpose; contested symptom-vs-root-cause; scope-creep /
-Plan re-entry; visual / manual-repro outcomes; and the project's enumerated
-human-only items (INTEGRATION.md §4). Each becomes a `- [ ]` row in `SUMMARY.md`
-§6 the human must clear.
+Validation fitness-to-purpose; contested symptom-vs-root-cause; semantic
+upstream-isn't-ahead; scope-creep / Plan re-entry; visual / manual-repro
+outcomes; and the project's enumerated human-only items (INTEGRATION.md §4).
+Each becomes a `- [ ]` row in `SUMMARY.md` §6 the human must clear.
 
-Ground the review in **Wyrd's own normative sources** — Wyrd is its own repo,
-**not a fork**: everything targets `main`, with no upstream/maintenance branches and
-no cherry-picks (INTEGRATION.md §2), so fork/cherry-pick discipline does not apply.
-Verify every cited `path:line` against the Wyrd checkout at `../wyrd` (read-only).
-Each tier's criteria come from **INTEGRATION.md §4**, which maps the slots onto
-Wyrd's sources — C4 → `cargo xtask ci`; T1 → the chunk-format spec + conformance
-vectors (ADR-0002); T2 → rustfmt + `clippy -D warnings`; T3 → DST under madsim and
-the architecture testing strategy (§13, ADR-0009); T4 → DCO + `require-issue` +
-cargo-deny (ADR-0003); T5 → any ADR/spec/proposal change is the architecture board's
-call (GOVERNANCE), never a model's. Where a judgment can't be mechanically settled,
-raise it NEEDS-HUMAN.
+Confirm the prior-art check ran by **affected file path** (merged history + closed/
+rejected work); where it can't be mechanically settled, raise it NEEDS-HUMAN.
+
 
 ### C5 symptom-guard smell-test
 
 The "contested symptom-vs-root-cause" trigger above has a concrete detection rule —
-apply it to `patch.diff` every cycle. If the fix papers over a defect with a
-**runtime guard or fallback** rather than removing its cause — a defensive branch
-that swallows an error the seam should not produce, an `unwrap_or` / `.ok()` that
-hides a `Result`/`Option` the design says is always present, or a `#[cfg]` / feature
-gate / lazy re-init guarding a path that by design runs with that invariant already
-held — flag C5 **NEEDS-HUMAN** and ask in the basis: can the cause be removed instead
-(fix the seam, the initialization order, or the invariant) so the guard is
-unnecessary? A guard papering over a broken invariant is the canonical case. This is
-the downstream backstop for the planner's Plan-exit gate (`docs/principles.md` §3) —
-it catches a guard Do introduces even when the brief was clean. It does **not** fire
-on a fix that *removes / transforms* the cause rather than guarding it.
+apply it to `patch.diff` every cycle. If the fix adds a **capability probe** (a
+feature/attribute check, or a try-it-and-fall-back around an optional capability —
+e.g. in Python `hasattr` / `try: import …`) or a **runtime guard** *inside code that
+is meant to run with that capability present* — the guard protects a path that, by
+design, only executes when the capability exists — flag C5 **NEEDS-HUMAN** and ask in
+the basis: can the eager / load-time cause be removed instead (e.g. compute lazily on
+first real use) so the probe is unnecessary? A probe papering over a load-time side
+effect is the canonical case. This is the downstream backstop for the planner's
+Plan-exit gate (`docs/principles.md` §3) — it catches a guard Do introduces even
+when the brief was clean. It does **not** fire on a fix that *removes / transforms* the
+cause rather than guarding a present capability.
