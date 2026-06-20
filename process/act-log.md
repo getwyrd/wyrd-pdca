@@ -1,0 +1,32 @@
+# Act log — Wyrd PDCA
+
+> Append-only, cross-cycle (docs 02 §ACT). Each entry records which frozen
+> bundles an Act review considered, what their records exposed, the concrete
+> process deltas applied (each located by a path / rule ID / template field), and
+> how the next review will judge whether the delta worked. Act never re-decides a
+> contribution's disposition. Newest entries on top.
+
+<!-- Template for a new entry:
+
+# Act review — <date> — cycles considered: <issue_ids>
+
+## What the cycles' records exposed
+- <pattern across one or more cycles, citing SUMMARY §6/§7/§10>
+
+## Process deltas
+- Spec template: <field added/clarified/removed>            (path)
+- Ruleset: <rule added/retired/relaxed/tightened>           (path:line)
+- Gates: <check added/promoted/moved>                       (path:line)
+- Agent skills: <SKILL.md / AGENTS.md adjustment>           (path:line)
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+- Another bug (project/component): filed <tracker> #NNNN    (link)
+- Design issue: <name> → dedicated design phase, owner <who>
+- Harness/driver issue: this repo's tracker | template feedback upstream  (link)
+- Other open Act item: <item> → owner <who>, next step <…>
+
+## How effectiveness will be judged
+- The next Do phases should not recreate <specific issue>. Watch the next K cycles.
+-->
+
+(no Act reviews yet)

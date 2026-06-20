@@ -1,0 +1,49 @@
+# engine/ — the verification engine for Wyrd PDCA
+
+This directory holds the **project-specific verification engine**: the runners,
+helpers, and tooling the PDCA cycle invokes to *reproduce* a defect and *verify* a
+fix. It is the home that `pdca.toml` `[[gates.checks]]` `cmd`s and the
+`docs/INTEGRATION.md` §3 / §9 runners point at.
+
+The harness machinery — the driver, the state machine, the gate *runner* — is
+generic and lives in `src/pdca_harness/`. **What's in here is yours**: different
+projects verify differently (a Docker test suite, a native build, a headless GUI
+driver), so the template ships the convention and the wiring, not the engine.
+
+## Convention
+
+```
+engine/
+  scripts/        the runners gates invoke (run-verify.sh, run-suite.sh, …)
+  scripts/lib/    shared shell/python helpers (optional)
+  tests/          tests for the engine itself, so your runners don't rot
+```
+
+Gate `cmd`s in `pdca.toml` reference these by path, e.g.
+`cmd = "./engine/scripts/run-verify.sh"`. The **same** command runs locally (the
+driver) and in CI (`pdca gates --working-tree`) — single-sourced, no drift.
+
+## The two gate shapes that matter
+
+- **Per-fix correctness gate (C4)** — `scope = "bundle"`, `gating = true`. Applies
+  the bundle's `patch.diff` and runs ONLY its test, asserting **red without the
+  fix, green with it**. The driver exports `$PDCA_BUNDLE` (the bundle dir) to the
+  command. `scripts/run-verify.sh` is a skeleton for this — fill it in. This is the
+  gate that makes a cycle mean something: it validates *this* change.
+- **Everything else is advisory by default** — `gating = false`. Runtime
+  (whole-suite T3), conformance (T1/T2/T4), and interface/E2E tiers all audit code
+  the *current* fix did not introduce, so gating them on pre-existing/legacy
+  non-conformance is wrong: a whole-suite run on the unmodified tree is red the
+  moment anything is broken, regardless of the patch. Ship these advisory and
+  **promote a tier to `gating = true` once its targeted artifacts are clean**.
+  - **Interface / E2E**: gate a **smoke test** ("does the app start"), not the
+    full suite — the full suite mixes green tests with reproductions of known
+    (often unmerged-upstream) bugs, so it's a characterization, not a pass/fail
+    signal. Run the full suite manually.
+
+Cite each tier's rules back to your project's **normative ruleset** (name it in
+`docs/INTEGRATION.md` §4) — a gate you can trace to a written source is auditable;
+one you can't is folklore.
+
+Replace the skeleton(s) here with your real runners, add their tests under
+`engine/tests/`, then wire them in `pdca.toml` `[[gates.checks]]`.
