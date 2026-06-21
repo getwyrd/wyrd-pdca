@@ -10,7 +10,10 @@
 - **Success criterion:** <the observable condition that means it is fixed — must be
   demonstrable by C4-verify (the patch applied in isolation at Check). Do NOT scope this
   to a T3 whole-suite pass or a fork-CI green: those only clear after the fix is merged,
-  not at Check. Use them as supplementary evidence only.>
+  not at Check. Use them as supplementary evidence only. State the BINDING observable
+  condition; if you name a specific mechanism/component/API/file ("composing X over Y",
+  "README only"), mark it BINDING or merely ILLUSTRATIVE — so Do diverging on mechanism,
+  while the binding condition still holds, is a Do call and NOT a scope NEEDS-HUMAN.>
 - **Invariant to restore:** <the property the fix must make true, stated over the
   defect CATEGORY, not the repro file. NOT a mechanism. Cite its source (language spec /
   framework docs / internal rule) per `docs/principles.md` §3–§6. SELF-TEST: could Do
@@ -29,6 +32,17 @@
   (principles.md §3.1, §3.3).> / out of scope: <what is explicitly excluded>
 - **Repro instruction:** <fixture + exact steps on the target branch>
 - **Test file:** <path where the regression test ships — must fail pre-fix, pass post-fix>
+- **Verification posture:** <how Check can actually demonstrate this. DEFAULT (omit the
+  field): a flippable regression test — red pre-fix, green post-fix at Check (the `Test
+  file` above). Declare a posture HERE when that default does NOT hold, so C2/C4 land as a
+  pre-declared sign-off item rather than a surprise NEEDS-HUMAN: (a) NET-NEW coverage /
+  infrastructure where "red" is criterion-ABSENCE (a new file / born-at-tier — no prior
+  failing assertion to flip); or (b) a test INERT at Check because its green is observable
+  only off-Check (a Docker host, an env var like `WYRD_DSERVER_ENDPOINTS`, a live CI / fork
+  PR run, real hardware). When you declare a deferred posture: NAME where/who confirms the
+  deferred green, and ask Do to capture a *demonstrated* red where feasible (a temporary
+  negation/stub proving the new seam is load-bearing) rather than resting red on
+  non-existence.>
 - **Citations expected:** Do must cite path:line on the target branch for every change.
 - **Prior-art check (triage cycles):** <searched by file path — merged history / open PRs / closed PRs — result>
 - **Disposition hint:** <one triage flag — drives the driver's Do path. FIX (full
