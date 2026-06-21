@@ -1,0 +1,488 @@
+diff --git a/README.md b/README.md
+index 1b2206d..e92c691 100644
+--- a/README.md
++++ b/README.md
+@@ -81,6 +81,62 @@ cargo build
+ cargo test
+ ```
+ 
++## Run a local cluster
++
++You can stand up a small **distributed** Wyrd cluster on one machine and drive it
++with the `wyrd` gateway client mode — several networked D servers in containers,
++with the binary fanning each object's erasure-coded fragments across them over
++gRPC. This is the milestone-2 networked path exercised end to end by hand; it is
++not yet a production deployment (no durability or stability promise).
++
++Bring up four D servers on fixed ports, each with its own persistent volume:
++
++```sh
++docker compose up --build -d        # uses ./docker-compose.yml
++```
++
++Four, not three: the default durability is `rs(6,3)` — 9 fragments per chunk,
++any **k = 6** of which reconstruct the data. Three servers hold 3 fragments each,
++so losing one drops to exactly 6 (no headroom); a fourth server keeps a
++single-server loss above k. The loopback round-trip test uses the same four.
++
++Point the gateway at the cluster's published endpoints. `--endpoints` switches
++`put`/`get` from the local-disk path to the **static-endpoints gateway client
++mode**: fragments fan out over gRPC to the listed D servers, while the object
++metadata is held locally under `--data-dir`.
++
++```sh
++ENDPOINTS=http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053,http://127.0.0.1:50054
++
++# PUT: erasure-code the object and fan its fragments across the D servers.
++cargo run --bin wyrd -- put ./somefile --key obj/one \
++  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
++
++# GET: reconstruct it from fragments read back over gRPC, byte-identical.
++cargo run --bin wyrd -- get obj/one --out ./out.bin \
++  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
++
++diff ./somefile ./out.bin && echo "round-trip ok"
++```
++
++Tear the cluster down (and drop its volumes) when finished:
++
++```sh
++docker compose down -v
++```
++
++Notes and current limits:
++
++- The endpoint list is **static** — the gateway dials exactly the D servers you
++  name. Dynamic discovery (etcd or a non-static coordination backend), stable
++  placement records, and rebalance are milestone-3 work (ADR-0006).
++- Metadata is held locally under `--data-dir`, so the `put` and `get` above must
++  share it. This is a single-gateway shape; a shared-metadata gateway daemon is a
++  later topology choice.
++- The CI integration fixture (`crates/chunkstore-grpc/tests/docker-compose.yml`,
++  driven by `cargo xtask integration`) is separate — it uses ephemeral ports and
++  is not meant to be driven by hand.
++
+ ## Security
+ 
+ Wyrd is pre-release software and carries no security promise yet, but we still
+diff --git a/crates/server/src/cli.rs b/crates/server/src/cli.rs
+index 502d806..5b7be1f 100644
+--- a/crates/server/src/cli.rs
++++ b/crates/server/src/cli.rs
+@@ -18,6 +18,7 @@ use std::time::Duration;
+ 
+ use pollster::block_on;
+ use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
+ use wyrd_coordination_mem::MemCoordination;
+ use wyrd_core::metadata::EcScheme;
+ use wyrd_core::{read, write};
+@@ -25,7 +26,7 @@ use wyrd_metadata_redb::RedbMetadataStore;
+ use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, WriteBatch};
+ 
+ use crate::dserver::{self, DServer};
+-use crate::{Gateway, DEFAULT_DURABILITY};
++use crate::{Gateway, GatewayError, DEFAULT_DURABILITY};
+ 
+ /// Default endpoint the `d-server` role binds and advertises.
+ const DEFAULT_DSERVER_BIND: &str = "127.0.0.1:50051";
+@@ -36,6 +37,79 @@ const DEFAULT_DSERVER_RENEW_SECS: u64 = 10;
+ 
+ type BoxError = Box<dyn std::error::Error + Send + Sync>;
+ 
++/// The chunk plane of the static-endpoints gateway client mode (M2.8, proposal
++/// 0004): the M2 fan-out placement store over one gRPC `ChunkStore` client per
++/// configured D-server endpoint. Fragment index `i` lands on D server `i % n`
++/// (`fanout.rs`), so a chunk's fragments prefer distinct, real, networked D
++/// servers.
++pub type GrpcFanout = FanoutChunkStore<GrpcChunkStore>;
++
++/// The static-endpoints gateway client mode: a [`Gateway`] whose chunk plane
++/// fans out over gRPC clients to a *configured* list of D-server endpoints, with
++/// metadata and coordination held locally under a data dir. This is the
++/// user-facing composition the brief calls for — the `wyrd` binary itself is the
++/// gateway, dialing the cluster's published ports (no separate discovery
++/// backend; etcd / dynamic discovery is M3 work, ADR-0006).
++pub type ClusterGateway = Gateway<RedbMetadataStore, GrpcFanout, MemCoordination>;
++
++/// Split a comma-separated `--endpoints` value (e.g.
++/// `http://127.0.0.1:50051,http://127.0.0.1:50052`) into dialable endpoint
++/// strings, rejecting an empty list — a fan-out with no backend can place no
++/// fragment.
++pub fn parse_endpoints(raw: &str) -> Result<Vec<String>, BoxError> {
++    let endpoints: Vec<String> = raw
++        .split(',')
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .collect();
++    if endpoints.is_empty() {
++        return Err(
++            "--endpoints needs at least one D-server URL (e.g. http://127.0.0.1:50051)".into(),
++        );
++    }
++    Ok(endpoints)
++}
++
++/// Dial each endpoint as a gRPC `ChunkStore` client and compose them into the M2
++/// fan-out placement store. Connecting up front surfaces an unreachable D server
++/// as a clear startup error rather than a mid-write failure.
++pub async fn connect_fanout(endpoints: &[String]) -> Result<GrpcFanout, BoxError> {
++    if endpoints.is_empty() {
++        return Err("connect_fanout: at least one endpoint is required".into());
++    }
++    let mut clients = Vec::with_capacity(endpoints.len());
++    for endpoint in endpoints {
++        let client = GrpcChunkStore::connect(endpoint.clone())
++            .await
++            .map_err(|e| format!("gateway: cannot connect to D server `{endpoint}`: {e}"))?;
++        clients.push(client);
++    }
++    Ok(FanoutChunkStore::new(clients))
++}
++
++/// Compose the static-endpoints gateway client mode over `endpoints`, holding
++/// the metadata store (redb) and coordination locally under `data_dir`. The
++/// returned [`ClusterGateway`] runs the same S3 PUT/GET paths as the in-process
++/// gateway, but every fragment crosses the wire to a configured D server.
++pub async fn connect_gateway(
++    data_dir: &str,
++    endpoints: &[String],
++) -> Result<ClusterGateway, BoxError> {
++    let dir = Path::new(data_dir);
++    std::fs::create_dir_all(dir)?;
++    let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
++    let fanout = connect_fanout(endpoints).await?;
++    Ok(Gateway::new(meta, fanout, MemCoordination::new()))
++}
++
++/// Build the multi-threaded tokio runtime the cluster client mode needs: the
++/// gRPC clients are async (tonic), unlike the sync local-disk paths (pollster).
++fn cluster_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
++    Ok(tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()?)
++}
++
+ /// Every object key binds under the root inode (a flat namespace at M0).
+ const ROOT: u64 = 0;
+ /// The persisted, monotonic inode-id allocator, so `put` and `get` (separate
+@@ -78,10 +152,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
+ 
+ fn usage() {
+     eprintln!("usage:");
+-    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none]");
+-    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR]");
++    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…]");
++    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…]");
+     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
+     eprintln!("  wyrd demo");
++    eprintln!();
++    eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
++    eprintln!(
++        "  to the listed D servers (metadata held locally). See README \"Run a local cluster\"."
++    );
+ }
+ 
+ /// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.
+@@ -138,6 +217,14 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
+ 
+     let data =
+         std::fs::read(file).map_err(|e| format!("put: cannot read input file `{file}`: {e}"))?;
++
++    // Cluster client mode: fan the object's fragments out over gRPC to the
++    // configured D servers, holding metadata locally under `data_dir`.
++    if let Some(raw) = parsed.flag("endpoints") {
++        let endpoints = parse_endpoints(raw)?;
++        return cluster_put(data_dir, &endpoints, key, &data, chunk_size, durability);
++    }
++
+     let (meta, chunks) = open_backends(data_dir)?;
+ 
+     block_on(async {
+@@ -185,6 +272,13 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
+     let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
+     let out = parsed.flag("out");
+ 
++    // Cluster client mode: reconstruct the object from fragments read back over
++    // gRPC from the configured D servers (any-k arrive-first).
++    if let Some(raw) = parsed.flag("endpoints") {
++        let endpoints = parse_endpoints(raw)?;
++        return cluster_get(data_dir, &endpoints, key, out);
++    }
++
+     let (meta, chunks) = open_backends(data_dir)?;
+ 
+     block_on(async {
+@@ -205,6 +299,74 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
+     })
+ }
+ 
++/// `wyrd put … --endpoints <list>`: store the object through the static-endpoints
++/// gateway client mode — fragments fan out over gRPC to the configured D servers,
++/// metadata held locally under `data_dir`.
++fn cluster_put(
++    data_dir: &str,
++    endpoints: &[String],
++    key: &str,
++    data: &[u8],
++    chunk_size: usize,
++    durability: EcScheme,
++) -> Result<ExitCode, BoxError> {
++    let runtime = cluster_runtime()?;
++    runtime.block_on(async {
++        let gateway = connect_gateway(data_dir, endpoints)
++            .await?
++            .with_chunk_size(chunk_size)
++            .with_durability(durability);
++        match gateway.put_object(key, data).await {
++            Ok(()) => {
++                let chunks = data.len().div_ceil(chunk_size.max(1));
++                println!(
++                    "put ok (cluster): key={key} servers={} chunks={chunks} bytes={} durability={}",
++                    endpoints.len(),
++                    data.len(),
++                    durability_label(durability),
++                );
++                Ok(ExitCode::SUCCESS)
++            }
++            // A lost commit race is the only application-level failure; everything
++            // else (an unreachable D server) surfaces as a transport error below.
++            Err(e) if e.downcast_ref::<GatewayError>() == Some(&GatewayError::Conflict) => {
++                eprintln!("wyrd: {e}");
++                Ok(ExitCode::FAILURE)
++            }
++            Err(e) => Err(e),
++        }
++    })
++}
++
++/// `wyrd get … --endpoints <list>`: read the object back through the
++/// static-endpoints gateway client mode, reconstructing it from fragments read
++/// over gRPC from the configured D servers.
++fn cluster_get(
++    data_dir: &str,
++    endpoints: &[String],
++    key: &str,
++    out: Option<&str>,
++) -> Result<ExitCode, BoxError> {
++    let runtime = cluster_runtime()?;
++    runtime.block_on(async {
++        let gateway = connect_gateway(data_dir, endpoints).await?;
++        match gateway.get_object(key).await? {
++            Some(bytes) => {
++                match out {
++                    Some(path) => std::fs::write(path, &bytes)
++                        .map_err(|e| format!("get: cannot write output file `{path}`: {e}"))?,
++                    None => std::io::stdout().write_all(&bytes)?,
++                }
++                Ok(ExitCode::SUCCESS)
++            }
++            None => {
++                eprintln!("wyrd: key `{key}` not found");
++                Ok(ExitCode::FAILURE)
++            }
++        }
++    })
++}
++
+ /// `wyrd d-server`: host the local filesystem `ChunkStore` over the gRPC
+ /// `ChunkStore` service, registering the endpoint for discovery through the
+ /// `Coordination` seam, until Ctrl-C.
+diff --git a/crates/server/tests/gateway_cluster.rs b/crates/server/tests/gateway_cluster.rs
+new file mode 100644
+index 0000000..0aca72a
+--- /dev/null
++++ b/crates/server/tests/gateway_cluster.rs
+@@ -0,0 +1,109 @@
++//! M2.8 definition of done (issue #155): the **static-endpoints gateway client
++//! mode** — `wyrd put`/`get --endpoints …` — composes a [`Gateway`] over a
++//! `FanoutChunkStore<GrpcChunkStore>` built from a configured endpoint list, and
++//! round-trips an object byte-identically across a real, networked cluster.
++//!
++//! This is the in-process loopback proof of that composition (the C4-verify
++//! criterion in the brief; the containerized `docker compose up` + `wyrd
++//! put/get` flow is the supplementary manual / nightly tier). Like
++//! `chunkstore-grpc/tests/round_trip.rs` and the Tier-2 test, it stands up real
++//! gRPC D servers over loopback — real tonic transport, real HTTP/2 framing —
++//! rather than an in-memory fake, then drives the *same* `connect_gateway`
++//! composition the CLI's `--endpoints` path uses, so the test exercises the
++//! shipping client mode, not a stand-in.
++
++use tokio_stream::wrappers::TcpListenerStream;
++use tonic::transport::Server;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
++use wyrd_server::cli::connect_gateway;
++
++/// Stand up one D-server service over a fresh `FsChunkStore`, bound to an
++/// ephemeral loopback port, and return its dialable endpoint. The listener is
++/// bound (accepting into the OS backlog) before we hand back the endpoint, so a
++/// client can dial with no startup race. The temp dir and serve task are kept
++/// alive for the test's duration.
++async fn spawn_dserver() -> (String, tempfile::TempDir, tokio::task::JoinHandle<()>) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let store = FsChunkStore::open(dir.path()).expect("open store");
++    let service = ChunkStoreService::new(store);
++
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind loopback");
++    let addr = listener.local_addr().expect("local addr");
++
++    let server = tokio::spawn(async move {
++        Server::builder()
++            .add_service(ChunkStoreServer::new(service))
++            .serve_with_incoming(TcpListenerStream::new(listener))
++            .await
++            .expect("serve");
++    });
++
++    (format!("http://{addr}"), dir, server)
++}
++
++/// A deterministic payload that spans several chunks at the test's chunk size,
++/// so each chunk fans its own fragments out across the cluster.
++fn payload(len: usize) -> Vec<u8> {
++    (0..len)
++        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
++        .collect()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn gateway_put_get_byte_identical_across_grpc_cluster() {
++    // A four-server cluster of real, networked gRPC D servers over loopback.
++    let mut endpoints = Vec::new();
++    let mut dirs = Vec::new();
++    let mut servers = Vec::new();
++    for _ in 0..4 {
++        let (endpoint, dir, server) = spawn_dserver().await;
++        endpoints.push(endpoint);
++        dirs.push(dir);
++        servers.push(server);
++    }
++
++    // The exact composition the CLI's `--endpoints` path builds: a `Gateway`
++    // over a `FanoutChunkStore<GrpcChunkStore>` of the configured endpoints, with
++    // metadata held locally under a data dir.
++    let data_dir = tempfile::tempdir().expect("data dir");
++    let gateway = connect_gateway(data_dir.path().to_str().unwrap(), &endpoints)
++        .await
++        .expect("compose the static-endpoints gateway client mode")
++        // A small chunk size so the object spans several chunks under the default
++        // rs(6,3): every chunk's 9 fragments fan out across the four D servers.
++        .with_chunk_size(8 * 1024);
++
++    // S3 PUT → GET across the networked cluster, byte-identical (the criterion).
++    let key = "cluster/object";
++    let data = payload(40 * 1024 + 777);
++    gateway
++        .put_object(key, &data)
++        .await
++        .expect("PUT fans fragments out over gRPC to the cluster");
++    let got = gateway
++        .get_object(key)
++        .await
++        .expect("GET reconstructs the object from gRPC fragments");
++    assert_eq!(
++        got.as_deref(),
++        Some(&data[..]),
++        "object read back over the networked gRPC cluster must be byte-identical",
++    );
++
++    // A missing key reports not-found, not an error, through the same path.
++    assert!(
++        gateway
++            .get_object("cluster/absent")
++            .await
++            .expect("a miss is Ok(None), not a transport error")
++            .is_none(),
++        "an unknown key returns None",
++    );
++
++    for server in servers {
++        server.abort();
++    }
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..ddde210
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,77 @@
++# Run a local Wyrd cluster (Milestone 2.8, issue #155).
++#
++# A user-facing, hand-driven cluster — distinct from the CI fixture at
++# `crates/chunkstore-grpc/tests/docker-compose.yml` (that one is scaled by
++# `cargo xtask integration` onto ephemeral host ports and torn down). This one
++# stands up a fixed, named set of D servers on **fixed published ports** with a
++# **persistent volume each**, so a human can dial them from the host with the
++# `wyrd` gateway client mode:
++#
++#   docker compose up --build -d
++#   wyrd put ./file --key obj/one \
++#     --endpoints http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053,http://127.0.0.1:50054 \
++#     --data-dir ./cluster-meta
++#   wyrd get obj/one --out ./out.bin \
++#     --endpoints http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053,http://127.0.0.1:50054 \
++#     --data-dir ./cluster-meta
++#
++# Four D servers, not three: the default durability is rs(6,3) — 9 fragments per
++# chunk, needing any k=6 to reconstruct. With three servers each holds 3 fragments,
++# so losing one drops to exactly 6 = no redundancy headroom. A fourth server keeps
++# a single-server loss above k, matching the four-server loopback round-trip test.
++#
++# See the README "Run a local cluster" walk-through for the full flow. Each
++# service is the `d-server` role of the single `wyrd` binary (ADR-0014/ADR-0016),
++# built from the same image the CI fixture uses.
++services:
++  dserver1:
++    build:
++      context: .
++      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
++    image: wyrd-dserver:local
++    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data"]
++    # Fixed host port so the gateway can be pointed at a stable endpoint list.
++    ports:
++      - "50051:50051"
++    volumes:
++      - dserver1-data:/data
++
++  dserver2:
++    image: wyrd-dserver:local
++    build:
++      context: .
++      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
++    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data"]
++    ports:
++      - "50052:50051"
++    volumes:
++      - dserver2-data:/data
++
++  dserver3:
++    image: wyrd-dserver:local
++    build:
++      context: .
++      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
++    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data"]
++    ports:
++      - "50053:50051"
++    volumes:
++      - dserver3-data:/data
++
++  dserver4:
++    image: wyrd-dserver:local
++    build:
++      context: .
++      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
++    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data"]
++    ports:
++      - "50054:50051"
++    volumes:
++      - dserver4-data:/data
++
++# A persistent chunk store per D server, so fragments survive a restart.
++volumes:
++  dserver1-data:
++  dserver2-data:
++  dserver3-data:
++  dserver4-data:

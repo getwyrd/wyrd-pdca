@@ -1,0 +1,91 @@
+# Result — issue 151 / ci-enforce-rust-gate-and-dco-required
+
+## 1. Spec (from brief.md)              ← Check verifies against THIS
+- Defect / goal: 
+- Success criterion: `ci.yml` gains a small always-runs "gate" job (no paths filter)
+- Repo + branch target: getwyrd/wyrd @ main
+- Scope (one logical fix) / out of scope: add the always-runs gate-aggregation job to `.github/workflows/ci.yml` (keep
+
+## 2. Disposition claimed               ← sign-off confirms or overrides
+- Outcome: likely-fix
+- Confidence: medium
+- Recommendation: (set by Do)
+
+## 3. Correctness (Check — chain)
+- C1 Spec: none — brief.md
+- C2 Reproduction (red pre-fix): none — (no gate configured)
+- C3 Change: none — patch.diff
+- C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance): pass — xtask ci: all checks passed
+- C5 Causal adequacy: none — reviewer + human sign-off
+
+## 4. Conformance (Check — stack)
+- T1 Structure: none — (no gate configured)
+- T2 Shape: none — (no gate configured)
+- T3 Runtime: none — (no gate configured)
+- T4 Contribution: none — (no gate configured)
+- T5 Judgment: none — reviewer + human sign-off
+- T5 judgment: → see §5.
+
+## 5. Advisory review (artifact-only, decorrelated)
+Reviewer ran without build-notes.md. Summary:
+
+# Check review — issue 151 / ci-enforce-rust-gate-and-dco-required
+
+> Advisory, artifact-only, decorrelated from the builder. Inputs: `patch.diff`, `brief.md`,
+> `check-gates.json` (build-notes.md withheld). Citations re-derived against the target source
+> at `$PDCA_TARGET=/home/eddie/wyrd/wyrd` (read-only; ci.yml/dco.yml there carry the patch).
+
+## Verdict table
+
+| Item | Verdict | Basis |
+| --- | --- | --- |
+| C1 — C1 Spec | PASS | brief.md:18-30 fixes a deterministic-inspection oracle (gate job present with `needs:[rust]` + skip-or-pass `if:`; `cargo xtask ci` green) and scopes out the admin flip — spec is unambiguous and artifact-checkable. |
+| C2 — C2 Reproduction (red pre-fix) | N/A | A required-check/provenance config defect has no in-repo failing test: pre-fix workflow-level `paths-ignore` is evident from diff context (patch.diff:34-45) and the "unrequired / mergeable-without-DCO" fact is a `gh api` branch-protection observation (brief.md:8-17), not a reproducible runtime red. Behavioral repro folded into the NEEDS-HUMAN items below. check-gates C2 = "(no gate configured)". |
+| C3 — C3 Change | PASS | Patch adds the `changes` classifier (ci.yml:43-83) and the always-runs `gate` aggregator (ci.yml:120-145), removes the workflow-level `paths-ignore` while preserving the #125 docs skip at job level (ci.yml:85-87), and documents `dco` as required-ready (dco.yml:8-14). Matches brief scope; nothing out-of-scope (no path-skip removal, no `enforce_admins`/review change, no `xtask ci` change). |
+| C4 — C4 Verification (red→green) | PASS | Configured gating check `cargo xtask ci` = pass (check-gates C4-ci) → confirms **no Rust regression**, the only thing xtask ci can verify since it never reads `.github/workflows/`. Gate-logic correctness (`if: always()`, `needs:[changes,rust]`, success iff changes=success AND rust∈{success,skipped}, ci.yml:127-145) is sound on re-derivation: rust=skipped→pass (docs-only), rust=failure/cancelled→fail, changes≠success→fail. No literal red→green exists for a YAML config change; the behavioral red→green is supplementary/NEEDS-HUMAN (see T3, V). |
+| C5 — C5 Causal adequacy | NEEDS-HUMAN | In-repo cause (no always-on aggregator job; `dco` not documented/added as required) is addressed by the artifact, but the stated invariant — "enforced, not merely reported" (brief.md:31-34) — is restored only when a maintainer adds `gate`+`dco` to the branch-protection required-checks set. That admin action is outside the artifact (brief.md:28-30, 49-52); contested/human. |
+| T1 — T1 Structure | N/A | Deliverable is workflow YAML with no in-repo test harness (repo has no actionlint, brief.md:22-23); there is no test artifact whose structure could be assessed — correctness is established by deterministic inspection. check-gates T1 = "(no gate configured)". |
+| T2 — T2 Shape | N/A | Same: no test artifact exists whose assertion shape could be evaluated. The `gate` job is self-checking CI infra verified by inspection, not a test with an assertion shape. check-gates T2 = "(no gate configured)". |
+| T3 — T3 Runtime | NEEDS-HUMAN | The `gate` job actually reporting success on a real docs-only PR (rust skipped) vs. failure on a failing code PR is observable only by running GitHub Actions on a live/fork PR (brief.md:25-28) — not artifact-checkable here. check-gates T3 = "(no gate configured)". |
+| T4 — T4 Contribution | PASS | Net-new, in-scope contribution: the previously-absent always-runs `gate` job — the exact context to mark required (ci.yml:120-126) — plus the `dco` required-readiness note (dco.yml:9-14). Prior-art check (brief.md:44-46) confirms the gate-job pattern is net-new, no duplication. |
+| T5 — T5 Judgment | NEEDS-HUMAN | Design judgment is reasonable on inspection — `gh api`-based `changes` job reusing the repo's existing idiom over an external paths-filter action (ci.yml:39-40), fail-safe-to-`code=true` when the changed-file list is indeterminate (ci.yml:66-69), conservative gate semantics — but it is a reviewer + human sign-off call. check-gates T5 oracle = "reviewer + human sign-off". |
+| V — Validation — fitness-to-purpose | NEEDS-HUMAN | Whether this truly serves the maintainer's purpose — every code-affecting PR gated and every commit DCO-signed, *enforced before merge* — depends on the branch-protection required-checks flip and the deferred posture choices (review count, `enforce_admins`), which are the maintainer's call at sign-off (brief.md:29-30, 49-52). Always-human. |
+
+## §6 — Items the human must clear (each NEEDS-HUMAN row above)
+
+1. **C5 Causal adequacy / contested root-cause.** The YAML alone does not restore the invariant. At §9 the maintainer must add the `gate` job context and the `dco` context to `repos/getwyrd/wyrd/branches/main/protection` required status checks; otherwise both still "run without gating" — the exact mismatch this cycle targets (brief.md:16-17, 28-30).
+2. **T3 Runtime / behavioral demonstration.** Confirm on a live or fork-CI run that (a) a docs-only PR yields `changes=success`, `rust=skipped`, `gate=success` (no "pending" wedge), and (b) a code PR that fails `cargo xtask ci` yields `gate=failure`. Not observable artifact-only.
+3. **T5 Judgment.** Sign off on the design choices: the `gh api` `changes` classifier vs. a maintained paths-filter action, the fail-safe-to-code default, and whether mirroring the #125 docs path set at job level (ci.yml:74-77: `docs/*`, `*.md`, `LICENSE|NOTICE`) is the intended set going forward.
+4. **V Validation / fitness-to-purpose.** Confirm the change meets the stated goal and decide the out-of-scope posture items flagged for the human only: required-review count and `enforce_admins` (brief.md:39-41, 50-51) — note-only, not implemented this cycle.
+
+## Reviewer notes (advisory, non-gating)
+
+- **xtask ci scope, restated:** check-gates marks `overall: pass` on the strength of C4 (`cargo xtask ci`). That green proves only *no Rust regression* — it never exercises the workflow YAML. The gating Check criterion per brief.md:22-25 is the deterministic inspection performed here (gate job present, `needs:[rust]`, skip-or-pass `if:`), which I independently confirm at ci.yml:120-145.
+- **`dco` change is documentary.** The patch's dco.yml hunk (dco.yml:8-14) adds only comments; the no-paths-filter "always reports" property that makes it gating-ready pre-existed. This matches "make `dco` gating-ready" — it was ready; the artifact documents it and the human requires it. No functional dco change to verify.
+- **Minor, non-blocking:** the PR branch of `changes` (ci.yml:61-62) lacks the `|| files=""` fallback the push branch has (ci.yml:64); with `set -uo pipefail` but no `-e`, a `gh api` failure still falls through to the empty-`files` fail-safe (ci.yml:66-69), so behavior is safe — worth a human glance but not a defect.
+
+## 6. NEEDS-HUMAN — items the human must clear before sign-off
+- [x] C2 — C2 Reproduction (red pre-fix)
+- [x] C4 — C4 Verification (red→green)
+- [x] C5 — C5 Causal adequacy — In-repo cause (no always-on aggregator job; `dco` not documented/added as required) is addressed by the artifact, but the stated invariant — "enforced, not merely reported" (brief.md:31-34) — is restored only when a maintainer adds `gate`+`dco` to the branch-protection required-checks set. That admin action is outside the artifact (brief.md:28-30, 49-52); contested/human.
+- [x] T3 — T3 Runtime — The `gate` job actually reporting success on a real docs-only PR (rust skipped) vs. failure on a failing code PR is observable only by running GitHub Actions on a live/fork PR (brief.md:25-28) — not artifact-checkable here. check-gates T3 = "(no gate configured)".
+- [x] T5 — T5 Judgment — Design judgment is reasonable on inspection — `gh api`-based `changes` job reusing the repo's existing idiom over an external paths-filter action (ci.yml:39-40), fail-safe-to-`code=true` when the changed-file list is indeterminate (ci.yml:66-69), conservative gate semantics — but it is a reviewer + human sign-off call. check-gates T5 oracle = "reviewer + human sign-off".
+- [x] V — Validation — fitness-to-purpose — Whether this truly serves the maintainer's purpose — every code-affecting PR gated and every commit DCO-signed, *enforced before merge* — depends on the branch-protection required-checks flip and the deferred posture choices (review count, `enforce_admins`), which are the maintainer's call at sign-off (brief.md:29-30, 49-52). Always-human.
+
+## 7. Proven / not proven
+- Proven by which oracle: gates overall = pass (stub oracles).
+- Unproven / needs manual run: anything flagged in §6.
+
+## 8. Ready-to-ship attachments
+- patch.diff
+- tracker-comment.md     (ALWAYS, every tracker item)
+- build-notes.md         (builder rationale — for the human, not the reviewer)
+
+## 9. Check sign-off                     ← human completes Check here
+- Disposition confirmed / overridden:
+- Outcome: merged-wider
+- Iteration delta (if iterating):
+- By / date: Eduard Ralph / 2026-06-21
+
+## 10. Act candidates (hints for the next Act review)
+- (empty is the common case)
