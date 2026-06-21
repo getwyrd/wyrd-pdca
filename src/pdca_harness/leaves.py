@@ -45,6 +45,7 @@ from . import act as act_mod
 from . import brief
 from . import gates
 from . import progress
+from . import worktree
 from .config import Config, LeafConfig
 
 # build-notes.md is DELIBERATELY ABSENT from this list (independence contract).
@@ -275,6 +276,12 @@ def _stub_plan_batch(cfg: Config, ids: list[str] | None = None) -> None:
 # ----------------------------------------------------------------------------
 def do_build(d: Path, cfg: Config) -> None:
     if cfg.builder.mode == "command":
+        # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
+        # primary checkout is never mutated; expose it as $PDCA_WORKTREE + grant the
+        # claude builder read/write there. Best-effort: None ⇒ edit in place, as before.
+        wt = worktree.ensure(d, cfg)
+        env = {"PDCA_WORKTREE": str(wt)} if wt else None
+        extra = ["--add-dir", str(wt)] if wt and cfg.builder.family == "claude" else None
         # The builder runs from cfg.root but writes into the bundle d — watch d so the
         # heartbeat shows patch.diff / build-notes.md appearing as it works.
         _invoke(
@@ -282,6 +289,7 @@ def do_build(d: Path, cfg: Config) -> None:
             label=f"Do {d.name}",
             status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
             stream_json=True,  # Tier 3: show the builder's live tool-use
+            env=env, extra_argv=extra,
         )
         return
     _stub_build(d, cfg)
@@ -289,7 +297,10 @@ def do_build(d: Path, cfg: Config) -> None:
 
 def _build_prompt(d: Path) -> str:
     return (
-        f"You are the Do builder. Read {d}/brief.md. Build to satisfy its **Success "
+        f"You are the Do builder. Read {d}/brief.md. If $PDCA_WORKTREE is set, make ALL "
+        "target-source edits there — it is an isolated git worktree off the target's base "
+        "(the host's primary checkout is NOT touched); cite path:line against it. Build to "
+        "satisfy the brief's **Success "
         "criterion** (the real end result), not a narrower proxy — an item is done only "
         "when that end result holds, proven red→green; a green mechanical check on "
         "something adjacent is not done. If brief.md names a **Planning artifact** (an "
@@ -485,6 +496,104 @@ def _stub_review(d: Path, cfg: Config) -> None:
         "decides at sign-off.\n",
         encoding="utf-8",
     )
+
+
+# ----------------------------------------------------------------------------
+# Optional advisory reviewer leaves (issue #64) — an OPEN, role-distinct set of extra
+# advisory reviewers (e.g. a correctness-bug + reuse/cleanup code-review lens), each a
+# reviewer-shaped leaf. Always advisory: they write check-advisory-<id>.md and their
+# NEEDS-HUMAN findings route into SUMMARY §6; they never gate. Conditioned per-bundle by
+# an optional ``when`` ({field, substring}) brief match — empty ⇒ always run.
+# ----------------------------------------------------------------------------
+def advisory_artifact(d: Path, leaf_id: str) -> Path:
+    """The artifact path an advisory leaf writes (parallel to check-review.md)."""
+    return d / f"check-advisory-{leaf_id}.md"
+
+
+def _advisory_applies(spec: dict, d: Path) -> bool:
+    """True iff this advisory leaf should run for bundle ``d``. ``when`` ({field,
+    substring}) matches a brief field case-insensitively (like a gate target flag);
+    absent ⇒ always run."""
+    when = spec.get("when") or {}
+    needle = (when.get("substring") or "").lower()
+    if not needle:
+        return True
+    return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
+
+
+def _advisory_prompt(spec: dict, leaf_id: str) -> str:
+    role = spec.get("role") or "review the patch for correctness bugs and reuse / " \
+        "simplification / efficiency cleanups"
+    return (
+        f"You are an ADVISORY code reviewer — lens: {role}. You have ONLY patch.diff, "
+        "brief.md and check-gates.json here (build-notes.md is withheld); ground every "
+        "cited path:line on the target source at $PDCA_TARGET, never other checkouts. "
+        f"Write check-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
+        "bullet with a path:line. For any finding a human must adjudicate, prefix the "
+        "bullet '- NEEDS-HUMAN — ' (it becomes a SUMMARY §6 item). You are ADVISORY — you "
+        "never gate; the human decides at sign-off. If you find nothing, say so explicitly."
+    )
+
+
+def run_advisory_leaves(d: Path, cfg: Config) -> None:
+    """Run each configured advisory reviewer that applies (issue #64). Each writes
+    check-advisory-<id>.md; failures degrade to a §6 NEEDS-HUMAN placeholder, never crash
+    the cycle (advisory, like the main reviewer)."""
+    for spec in cfg.advisory_leaves:
+        leaf_id = spec.get("id") or "advisory"
+        if not _advisory_applies(spec, d):
+            continue
+        leaf = LeafConfig(mode=spec.get("mode", "stub"), family=spec.get("family", ""),
+                          argv=list(spec.get("argv", [])))
+        if leaf.mode == "command":
+            _run_advisory_sandboxed(d, cfg, leaf, spec, leaf_id)
+        else:
+            _stub_advisory(d, spec, leaf_id)
+
+
+def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, leaf_id: str) -> None:
+    """Run one advisory leaf in a temp dir holding ONLY the reviewer inputs (the same
+    independence sandbox as the main reviewer), grounding on $PDCA_TARGET (#75)."""
+    with tempfile.TemporaryDirectory(prefix="pdca-advisory-") as tmp:
+        sandbox = Path(tmp)
+        for name in REVIEWER_INPUTS:
+            if (d / name).exists():
+                shutil.copy2(d / name, sandbox / name)
+        target = _reviewer_target(d, cfg)
+        env = {"PDCA_TARGET": str(target)} if target else None
+        extra = ["--add-dir", str(target)] if target and leaf.family == "claude" else None
+        out = sandbox / f"check-advisory-{leaf_id}.md"
+        try:
+            _invoke(leaf, sandbox, _advisory_prompt(spec, leaf_id),
+                    label=f"Advisory {leaf_id} {d.name}",
+                    status=lambda: progress.bundle_activity(sandbox, (out.name,)),
+                    stream_json=True, env=env, extra_argv=extra)
+        except Exception as exc:  # noqa: BLE001 — advisory must never crash the cycle
+            _advisory_unavailable(d, leaf_id, f"leaf failed: {exc}")
+            return
+        if out.exists():
+            shutil.copy2(out, advisory_artifact(d, leaf_id))
+        else:
+            _advisory_unavailable(d, leaf_id, "produced no artifact")
+
+
+def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
+    role = spec.get("role") or "correctness bugs + reuse/simplification cleanups"
+    advisory_artifact(d, leaf_id).write_text(
+        f"# Advisory review — {leaf_id} (stub)\n\nLens: {role}.\n\n"
+        "- NEEDS-HUMAN — advisory code-review lens is a stub here; a real "
+        f"`{leaf_id}` leaf (family/argv in [[leaves.advisory]]) reviews the patch and "
+        "lists findings. The human adjudicates at sign-off.\n",
+        encoding="utf-8")
+
+
+def _advisory_unavailable(d: Path, leaf_id: str, reason: str) -> None:
+    print(f"leaves: {d.name} — advisory '{leaf_id}' unavailable ({reason})", file=sys.stderr)
+    advisory_artifact(d, leaf_id).write_text(
+        f"# Advisory review — {leaf_id} — NOT COMPLETED\n\n"
+        f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
+        "re-run it or adjudicate by hand.\n",
+        encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------

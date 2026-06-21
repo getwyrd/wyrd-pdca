@@ -9,7 +9,7 @@
 > **Host repo:** Wyrd, the Rust workspace monorepo at the sibling checkout `../wyrd`
 > (`https://github.com/getwyrd/wyrd`). This PDCA project is **out-of-tree** — it wraps
 > Wyrd's existing Plan/Do/Check machinery and adds the Act beat; it never modifies
-> Wyrd's tree. Wyrd's process is recorded in its ADRs (`../wyrd-cycle/docs/design/adr/`),
+> Wyrd's tree. Wyrd's process is recorded in its ADRs (`../wyrd/docs/design/adr/`),
 > `GOVERNANCE.md`, and `specs/`; those are the normative sources cited below.
 > Maintained by Act (append changes; don't silently rewrite).
 
@@ -29,15 +29,15 @@
   needed — GitHub issues are read with `gh issue view <id>` when full thread context helps.
 
 ## 2. Branch-target rules
-- **Target checkout:** a **dedicated git worktree** of the Wyrd repo at `../wyrd-cycle`
-  (branch `pdca-cycle`, off `main`) — **not** the live `../wyrd` checkout a human works in,
-  so a cycle's Do/Check never mutates someone's working tree. `engine/cycle-worktree.sh`
-  creates it and `--reset`s it clean to `origin/main` before a cycle; the
-  `[publisher.checkouts]` map (`"getwyrd/wyrd" = "../wyrd-cycle"`) points the
-  driver-resolved target — the reviewer's grounding and the publisher's branch/commit — at
-  it, and `engine/xtask.sh` runs `cargo xtask ci` there so the gate tests the builder's
-  edits. (Render-level stopgap for the harness's in-place-edit default,
-  eduralph/pdca-harness#94; `$WYRD_REPO` / `$WYRD_CYCLE` override the paths.)
+- **Target checkout:** the sibling **`../wyrd`** checkout — but a cycle's Do/Check never
+  mutate it directly. With `[driver].worktree` on (the default; native since
+  eduralph/pdca-harness#94, v0.30.0) the driver runs Do/Check in a **per-cycle git
+  worktree** off the target's base (`origin/main`), reset clean before each Do and exposed
+  to the builder and gate commands as **`$PDCA_WORKTREE`** — so the human's working tree is
+  never touched and concurrent lanes get private worktrees. `engine/xtask.sh` runs
+  `cargo xtask ci` in `$PDCA_WORKTREE` (falling back to `../wyrd` if isolation is off), so
+  the gate tests the SAME tree the builder edited; the per-fix `C4-verify` gate uses its
+  own dedicated `../wyrd-verify` worktree off `origin/main` (`$WYRD_REPO` overrides).
 - **Per-area branch map:** everything targets **`main`**. Wyrd is early and has **no
   maintenance branches** today (no `maintenance/*`, no master-vs-maintenance split) — say
   so rather than invent one; add a map here if/when a release branch is cut.
@@ -47,12 +47,12 @@
   cherry-pick is a **correctness** check — "applies cleanly" ≠ "remains correct"; verify
   against the target branch's related code, including files the patch doesn't touch.
 - **Immutability rule (host-enforced):** Wyrd's `adr-immutability` gate forbids editing an
-  Accepted ADR (`../wyrd-cycle/docs/design/adr/`, ADR-0001). A Plan that needs to change an
+  Accepted ADR (`../wyrd/docs/design/adr/`, ADR-0001). A Plan that needs to change an
   accepted decision authors a **new** superseding ADR — never edits the old one.
 
 ## 3. Reproduction fixtures and runners
 - **Canonical fixture path:** the on-disk-format **conformance vectors** at
-  `../wyrd-cycle/docs/design/specs/conformance/vectors/v1/` (valid) and `.../invalid/v1/`
+  `../wyrd/docs/design/specs/conformance/vectors/v1/` (valid) and `.../invalid/v1/`
   (malformed), each a `.fragment` + its `.expected.json` / `.reason.txt` oracle (ADR-0002).
 - **Verification runner (the whole gate):** **`cargo xtask ci`**, delegated via
   `./engine/xtask.sh` (§9). It runs identically on a laptop and in CI (ADR-0016): fmt
@@ -77,8 +77,8 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 
 | Tier | Written ruleset (normative source) | Home | Single-sourced command | Status |
 |---|---|---|---|---|
-| C4 correctness | the change + Wyrd's whole gate | `cargo xtask` (`../wyrd-cycle/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
-| T1 format-conformance | chunk-format spec v1, RFC-2119 (`../wyrd-cycle/docs/design/specs/chunk-format/v1.md`); conformance spec `specs/conformance/v1.md` (ADR-0002) | `cargo xtask conformance` (vectors in `specs/conformance/`) | `./engine/xtask.sh conformance` | [built — runs inside `ci`; advisory row optional] |
+| C4 correctness | the change + Wyrd's whole gate | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
+| T1 format-conformance | chunk-format spec v1, RFC-2119 (`../wyrd/docs/design/specs/chunk-format/v1.md`); conformance spec `specs/conformance/v1.md` (ADR-0002) | `cargo xtask conformance` (vectors in `specs/conformance/`) | `./engine/xtask.sh conformance` | [built — runs inside `ci`; advisory row optional] |
 | T2 shape | `rustfmt` + `clippy -D warnings` (no project style doc; the linters are the rule) | inside `cargo xtask ci` | (subsumed by `ci`) | [built — part of `ci`] |
 | T3 runtime / DST | testing strategy, ADR-0009 (madsim DST is the spine; from M0) | `cargo xtask dst` + `test` | `./engine/xtask.sh dst` | [built — runs inside `ci`; advisory row optional] |
 | T4 contribution | ADR-0003 §1 (DCO), `require-issue`, `adr-immutability`; commit/PR conventions (§8) | `cargo xtask` gates + GitHub CI | `./engine/xtask.sh ci` (re-gate) + host CI | [built — host-enforced] |
@@ -102,8 +102,8 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 ## 6. Brief and design-proposal templates
 - **Brief template:** `templates/brief.md.tpl`.
 - **Plan reference (the Plan beat's artifact):** Wyrd's Plan is **a set of existing
-  artifacts**, not a new document — the issue's linked **ADR** (`../wyrd-cycle/docs/design/adr/`),
-  **proposal** (`../wyrd-cycle/docs/design/proposals/`), or **spec** (`../wyrd-cycle/docs/design/specs/`).
+  artifacts**, not a new document — the issue's linked **ADR** (`../wyrd/docs/design/adr/`),
+  **proposal** (`../wyrd/docs/design/proposals/`), or **spec** (`../wyrd/docs/design/specs/`).
   PDCA's Plan step *points at* the relevant one (`templates/plan-pointer.md.tpl`); it does
   not impose its own format.
 - **Design-proposal template:** `templates/design-proposal.md.tpl` — reserved for the
@@ -131,17 +131,18 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 ## 9. Repo-specific scripts and tooling
 | Role | Path | Invocation | Status |
 |---|---|---|---|
-| **Gate runner (delegated)** | `engine/xtask.sh` → `../wyrd-cycle` `cargo xtask` | `./engine/xtask.sh <ci\|conformance\|dst>` (cd's to the cycle worktree, execs `cargo xtask`) | [built — wholesale delegation; **Wyrd owns the gate defs**, ADR-0016] |
+| **Gate runner (delegated)** | `engine/xtask.sh` → `$PDCA_WORKTREE` `cargo xtask` | `./engine/xtask.sh <ci\|conformance\|dst>` (cd's to the per-cycle worktree, execs `cargo xtask`) | [built — wholesale delegation; **Wyrd owns the gate defs**, ADR-0016] |
+| Per-fix verify | `engine/scripts/run-verify.sh` | `C4-verify` gate (red→green in a `../wyrd-verify` worktree) | [built — bundle-scoped, advisory] |
 | Gates (single-sourced) | `pdca.toml` `[gates] runner` + `checks` | `pdca gates [<id>] [--working-tree]` | [built — `C4-ci` gating; T1/T3 rows optional/advisory] |
 | Tracker read | `gh` CLI | `gh issue view <id>` (ad hoc; no scraper needed) | [host tool] |
 | Driver | `src/pdca_harness/` | `pdca run <id>` / `pdca flow <id>` | [built — stub leaves; wire `command` for real runs] |
-| Act tooling (L4) | `src/pdca_harness/act.py` | `pdca act-index`, `pdca act-log --date <d>` | [built] |
+| Act tooling (L4) | `src/pdca_harness/act.py` | `pdca act index`, `pdca act log --date <d>` | [built] |
 | Reviewer config | `AGENTS.md` + `.claude/agents/reviewer.md` | (model leaf) | [built — contract; wire command mode] |
 | Builder subagent | `.claude/agents/builder.md` + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
 
 ## 10. Maintainer and governance
 - **Who reviews:** Eduard Ralph (founding maintainer during bootstrap, per
-  `../wyrd-cycle/docs/governance/GOVERNANCE.md`). ADR/spec/proposal acceptance is the
+  `../wyrd/docs/governance/GOVERNANCE.md`). ADR/spec/proposal acceptance is the
   architecture board's (provisional founding-maintainer authority until the board reaches
   three members).
 - **Ready-mark gate:** PRs open as **draft**; the human re-reads and marks ready. The
@@ -149,7 +150,7 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
   `builder_guard.py`).
 - **External-contribution flow:** standard GitHub PR against `main`, gated by
   `require-issue` / `dco` / `cargo xtask ci`.
-- **MAINTAINERS file:** `../wyrd-cycle/docs/governance/GOVERNANCE.md` is the authority (roles +
+- **MAINTAINERS file:** `../wyrd/docs/governance/GOVERNANCE.md` is the authority (roles +
   ladder); no separate MAINTAINERS file.
 
 ### Composing with the host's CI / PR governance (issue #67)
