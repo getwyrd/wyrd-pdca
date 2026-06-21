@@ -1,0 +1,661 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5a1215c..411945e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2224,11 +2224,21 @@ dependencies = [
+  "wyrd-chunk-format",
+  "wyrd-chunkstore-fs",
+  "wyrd-chunkstore-grpc",
+- "wyrd-proto",
+  "wyrd-testkit",
+  "wyrd-traits",
+ ]
+ 
++[[package]]
++name = "wyrd-custodian"
++version = "0.0.0"
++dependencies = [
++ "pollster",
++ "tracing",
++ "wyrd-coordination-mem",
++ "wyrd-core",
++ "wyrd-traits",
++]
++
+ [[package]]
+ name = "wyrd-dst"
+ version = "0.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index d534524..65c1745 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,6 +16,7 @@ members = [
+     "crates/chunkstore-fs",
+     "crates/chunkstore-grpc",
+     "crates/coordination-mem",
++    "crates/custodian",
+     "crates/server",
+     "crates/dst",
+     "xtask",
+@@ -40,6 +41,7 @@ wyrd-metadata-redb = { path = "crates/metadata-redb" }
+ wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
+ wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
+ wyrd-coordination-mem = { path = "crates/coordination-mem" }
++wyrd-custodian = { path = "crates/custodian" }
+ 
+ # Shared third-party dependencies, version-pinned once here.
+ async-trait = "0.1"
+@@ -102,6 +104,14 @@ tonic = "0.14"
+ # service stubs reference `tonic_prost::ProstCodec`.
+ tonic-prost = "0.14"
+ tonic-prost-build = "0.14"
++# Structured instrumentation for the custodian's durability plane (M3, proposal
++# 0005 §"The durability plane", ADR-0012). The base `tracing` facade only —
++# `default-features = false` drops the `attributes` proc-macro we do not use,
++# keeping the dependency surface (and license audit, ADR-0003) minimal. The
++# backend-agnostic OTel layer (`tracing-opentelemetry` + Prometheus/OTLP exporters)
++# is a separate, audited dependency added when the custodian loops need it
++# (NEEDS-HUMAN, proposal 0005 Impact).
++tracing = { version = "0.1", default-features = false, features = ["std"] }
+ 
+ # Lint policy — the SINGLE SOURCE OF TRUTH for the lint gate (ADR-0016: the rule
+ # lives in one place, not duplicated across CI YAML and a clippy CLI flag). Each
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index cea857c..a449d0b 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -10,5 +10,6 @@
+ 
+ pub mod erasure;
+ pub mod metadata;
++pub mod placement;
+ pub mod read;
+ pub mod write;
+diff --git a/crates/core/src/placement.rs b/crates/core/src/placement.rs
+new file mode 100644
+index 0000000..35c9f36
+--- /dev/null
++++ b/crates/core/src/placement.rs
+@@ -0,0 +1,134 @@
++//! Failure-domain-aware placement selector (proposal 0005 §"Failure-domain-aware
++//! placement", §7.3) — the zone-local primitive **shared by the write fan-out and
++//! by custodian re-placement**, so a chunk's `n` fragments occupy `n` distinct
++//! failure domains wherever the topology offers `>= n` of them.
++//!
++//! It lives in `core` on purpose: the write fan-out itself lives here
++//! ([`crate::write::write_fragments`]), and the L4 `custodian` crate re-exports
++//! this module (`wyrd_custodian::selector`) — one definition, two consumers, no
++//! cross-crate cycle (proposal 0005 Open questions: "where it lives — core vs.
++//! custodian, re-exported"). The boundary with L2 / M6 is deliberate: M3 owns
++//! enforcement on write and repair with zone-local labels; the placement *policy*
++//! service is M6 and layers on top.
++//!
++//! The model is kept deliberately thin (proposal 0005): each D server carries an
++//! **opaque** failure-domain id ([`DomainId`]) — the selector uses only its
++//! identity (equality), never parsing rack/power/switch structure — plus the
++//! **distinctness invariant** enforced by [`select_distinct_domains`]. The
++//! selection *algorithm* below is illustrative (greedy first-fit by domain); the
++//! load-bearing contract is the distinctness invariant on its output.
++
++use std::collections::HashSet;
++use std::fmt;
++
++/// A stable D-server identity (proposal 0005 §"Stable D-server identity"): a
++/// server is referenced by a stable id, not its endpoint URL, so a placement
++/// record survives a rebind. Opaque to the selector.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub struct ServerId(pub u64);
++
++/// An **opaque** failure-domain label (rack / power / switch, §7.3). The selector
++/// compares it only by identity; it never interprets the contents, so M6's
++/// placement policy can refine the labelling without changing this primitive.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub struct DomainId(String);
++
++impl DomainId {
++    /// Wrap an opaque domain label (the value surfaced through D-server
++    /// registration). The selector treats it purely as an identity.
++    pub fn new(label: impl Into<String>) -> Self {
++        Self(label.into())
++    }
++}
++
++/// A candidate D server for placement: its stable id and the failure domain it
++/// sits in.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Candidate {
++    /// The stable D-server id.
++    pub server: ServerId,
++    /// The opaque failure domain the server occupies.
++    pub domain: DomainId,
++}
++
++impl Candidate {
++    /// A candidate `server` sitting in failure `domain`.
++    pub fn new(server: ServerId, domain: DomainId) -> Self {
++        Self { server, domain }
++    }
++}
++
++/// One chosen placement: a fragment is placed on `server`, which sits in `domain`.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Placement {
++    /// The stable id of the server a fragment is placed on.
++    pub server: ServerId,
++    /// The failure domain that server occupies.
++    pub domain: DomainId,
++}
++
++/// Why a domain-distinct placement could not be produced.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum PlacementError {
++    /// The topology offers fewer than `needed` distinct failure domains, so the
++    /// `n`-distinct invariant cannot be met — the caller must not place anyway
++    /// (durability is gate-zero, proposal 0005 §"Failure-domain-aware placement").
++    InsufficientDomains {
++        /// The number of distinct domains required (`n`).
++        needed: usize,
++        /// The number of distinct domains the topology actually offers.
++        found: usize,
++    },
++}
++
++impl fmt::Display for PlacementError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            PlacementError::InsufficientDomains { needed, found } => write!(
++                f,
++                "cannot place across {needed} distinct failure domains: topology offers only {found}"
++            ),
++        }
++    }
++}
++
++impl std::error::Error for PlacementError {}
++
++/// Select `n` placements across `n` **distinct** failure domains from
++/// `candidates`.
++///
++/// Returns exactly `n` placements, each in a distinct failure domain, when the
++/// candidate set spans `>= n` domains. When it spans fewer, returns
++/// [`PlacementError::InsufficientDomains`] rather than collapsing two fragments
++/// into one domain — the distinctness invariant is the durability guarantee, not
++/// a best-effort hint.
++///
++/// The algorithm (greedy first-fit by domain) is illustrative; the contract is
++/// the post-condition: the returned servers occupy `n` distinct domains.
++pub fn select_distinct_domains(
++    candidates: &[Candidate],
++    n: usize,
++) -> Result<Vec<Placement>, PlacementError> {
++    let mut chosen: Vec<Placement> = Vec::with_capacity(n);
++    let mut used: HashSet<&DomainId> = HashSet::new();
++    for candidate in candidates {
++        if chosen.len() == n {
++            break;
++        }
++        // First server seen in a not-yet-used domain wins the slot; subsequent
++        // servers in that domain are skipped, which is what enforces distinctness.
++        if used.insert(&candidate.domain) {
++            chosen.push(Placement {
++                server: candidate.server,
++                domain: candidate.domain.clone(),
++            });
++        }
++    }
++    if chosen.len() < n {
++        return Err(PlacementError::InsufficientDomains {
++            needed: n,
++            found: used.len(),
++        });
++    }
++    Ok(chosen)
++}
+diff --git a/crates/custodian/Cargo.toml b/crates/custodian/Cargo.toml
+new file mode 100644
+index 0000000..3706650
+--- /dev/null
++++ b/crates/custodian/Cargo.toml
+@@ -0,0 +1,30 @@
++[package]
++name = "wyrd-custodian"
++description = "The custodian (L4): the zone's background durability-maintenance plane — single active leader-elected loop, failure-domain placement, and the OpenTelemetry seam (proposal 0005, M3). Skeleton at M3.3."
++version.workspace = true
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++repository.workspace = true
++publish.workspace = true
++
++[dependencies]
++# The dependency rule (ADR-0010): the custodian depends only on the trait seams
++# (`traits`), the shared client/protocol crate (`core`, home of the shared
++# placement selector + write fan-out), and `tracing` — NEVER a concrete backend.
++wyrd-traits.workspace = true
++wyrd-core.workspace = true
++tracing.workspace = true
++
++[dev-dependencies]
++# The skeleton test drives leadership through a concrete `Coordination` — the
++# in-memory backend, named only here (standing in for `server`'s composition,
++# ADR-0010) to exercise the real `elect_leader`/`Leadership` token seam.
++wyrd-coordination-mem.workspace = true
++# Drives the async `elect_leader` without a runtime tie-in (as `core`'s tests do).
++pollster.workspace = true
++
++# Inherit the workspace lint policy (single source of truth in the root
++# Cargo.toml [workspace.lints.*]).
++[lints]
++workspace = true
+diff --git a/crates/custodian/src/leadership.rs b/crates/custodian/src/leadership.rs
+new file mode 100644
+index 0000000..5121e14
+--- /dev/null
++++ b/crates/custodian/src/leadership.rs
+@@ -0,0 +1,101 @@
++//! Single active custodian leadership, fenced (proposal 0005 §"Single active
++//! custodian, fenced").
++//!
++//! One active leader per zone, elected via the **existing**
++//! [`Coordination::elect_leader`], which returns a fenced [`Leadership`] token.
++//! Two guards make a deposed-but-still-running custodian safe (proposal 0005):
++//! the **fencing token** rejects its coordination actions, and — for the later
++//! mutating slices — its location-update commit is version-conditional. This
++//! skeleton implements the first guard: a [`LeadershipFence`] tracks the zone's
++//! current term, and a custodian whose token is stale against it is refused.
++//!
++//! A real coordination backend (etcd) enforces the fence server-side; the
++//! in-memory backend always grants leadership (a lone process is always the
++//! leader) but hands out a strictly-rising token per term, so the fence here is
++//! the faithful zone-local model of "stale token ⇒ rejected".
++
++use wyrd_traits::{Coordination, FencingToken, Leadership, Result};
++
++use crate::reconcile::TickReport;
++
++/// A single active custodian for a zone, holding the [`Leadership`] token its
++/// election term was granted.
++pub struct Custodian {
++    zone: String,
++    leadership: Leadership,
++}
++
++impl Custodian {
++    /// Campaign to become the single active custodian for `zone`, via the existing
++    /// [`Coordination::elect_leader`], taking the fenced [`Leadership`] token of
++    /// the granted term.
++    pub async fn elect(coord: &dyn Coordination, zone: &str) -> Result<Self> {
++        let leadership = coord.elect_leader(&leader_key(zone)).await?;
++        Ok(Self {
++            zone: zone.to_owned(),
++            leadership,
++        })
++    }
++
++    /// The zone this custodian was elected for.
++    pub fn zone(&self) -> &str {
++        &self.zone
++    }
++
++    /// The fenced leadership token of this custodian's term.
++    pub fn leadership(&self) -> Leadership {
++        self.leadership
++    }
++
++    /// Run one reconciliation tick, **refused if this custodian has been deposed**
++    /// — i.e. its leadership token is stale against the zone's current term
++    /// (`fence`). This is the fencing guard that makes a deposed-but-running
++    /// custodian safe (proposal 0005 §"Single active custodian, fenced"): only the
++    /// holder of the current term may act.
++    pub fn reconcile_tick(&self, fence: &LeadershipFence) -> Result<TickReport> {
++        crate::reconcile::reconcile_once(self, fence)
++    }
++}
++
++/// The coordination key the zone's custodian leadership is campaigned under.
++fn leader_key(zone: &str) -> String {
++    format!("custodian/{zone}/leader")
++}
++
++/// The zone's view of the **current** leadership term: the highest fencing token
++/// granted so far. It is what a deposed custodian's action is checked against.
++#[derive(Debug, Default, Clone, Copy)]
++pub struct LeadershipFence {
++    current: FencingToken,
++}
++
++impl LeadershipFence {
++    /// A fence with no term installed yet (no leader has acted).
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Install a newly granted leadership term. Monotonic: a later term fences an
++    /// earlier one, and re-installing an older term never lowers the fence.
++    pub fn install(&mut self, leadership: Leadership) {
++        self.current = self.current.max(leadership.token);
++    }
++
++    /// The current term's fencing token.
++    pub fn current_term(&self) -> FencingToken {
++        self.current
++    }
++
++    /// Check that `leadership` is the current term; reject a deposed leader whose
++    /// token is stale (strictly less than the current term).
++    pub fn guard(&self, leadership: Leadership) -> Result<()> {
++        if leadership.token < self.current {
++            return Err(format!(
++                "deposed custodian: stale fencing token {} < current term {}",
++                leadership.token, self.current
++            )
++            .into());
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/custodian/src/lib.rs b/crates/custodian/src/lib.rs
+new file mode 100644
+index 0000000..3e1f90f
+--- /dev/null
++++ b/crates/custodian/src/lib.rs
+@@ -0,0 +1,33 @@
++//! The **custodian** crate (L4) — the zone's background durability-maintenance
++//! plane (proposal 0005, Milestone 3). A storage system written by M2 can store
++//! erasure-coded data but cannot yet *keep* it: a D server that dies after a clean
++//! commit silently lowers a chunk's redundancy and nothing notices. The custodian
++//! is the plane that garbage-collects, scrubs, reconstructs, rebalances, and emits
++//! the durability telemetry that makes the guarantee observable.
++//!
++//! This crate is the **foundation skeleton** (M3.3, proposal 0005 PR-sequence step
++//! 3): the scaffold the four maintenance loops (GC, scrub, reconstruction,
++//! rebalance — slices 4–7) layer on rather than re-invent. It stands up:
++//!
++//! - [`leadership`] — a **single active custodian per zone**, leader-elected and
++//!   **fenced** via the existing [`wyrd_traits::Coordination::elect_leader`]; a
++//!   deposed-but-running custodian's action is rejected by its stale fencing token.
++//! - [`selector`] — the zone-local **failure-domain-aware placement selector**
++//!   (re-exported from [`wyrd_core::placement`], the shared home so the write
++//!   fan-out and custodian re-placement use one primitive).
++//! - [`reconcile`] — the **reconciliation control-loop skeleton** (a fenced tick).
++//! - [`telemetry`] — the **backend-agnostic OpenTelemetry seam** (ADR-0012): a
++//!   first custodian metric is emitted through an exporter that names no concrete
++//!   backend, so every later loop emits from its first commit (ADR-0011).
++//!
++//! Dependency rule (ADR-0010): this crate depends only on `traits`, `core`, and
++//! `tracing` — **never** a concrete backend. The four loops' *behaviour*, the
++//! version-conditional repair location-update, and the full DST campaign are out
++//! of scope for this slice (proposal 0005 slices 4–8).
++
++#![forbid(unsafe_code)]
++
++pub mod leadership;
++pub mod reconcile;
++pub mod selector;
++pub mod telemetry;
+diff --git a/crates/custodian/src/reconcile.rs b/crates/custodian/src/reconcile.rs
+new file mode 100644
+index 0000000..0194f5e
+--- /dev/null
++++ b/crates/custodian/src/reconcile.rs
+@@ -0,0 +1,35 @@
++//! The reconciliation control-loop skeleton (proposal 0005 §"The four custodian
++//! loops", §"Declarative management hook").
++//!
++//! The custodian runs continuous reconciliation loops on the single active leader,
++//! reading authoritative state and converging reality toward the recorded intent.
++//! This slice (M3.3) stands up only the **scaffold**: a single fenced tick that
++//! the four loops' *behaviour* (GC, scrub, reconstruction, rebalance — proposal
++//! 0005 slices 4–7) will fill in. Each tick is gated by the leadership fence so a
++//! deposed custodian converges nothing.
++
++use wyrd_traits::{FencingToken, Result};
++
++use crate::leadership::{Custodian, LeadershipFence};
++
++/// The outcome of one reconciliation tick.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct TickReport {
++    /// The leadership term the tick ran under (proof it ran as the current leader).
++    pub term: FencingToken,
++}
++
++/// Run one reconciliation tick for `custodian`, gated by the zone's leadership
++/// `fence`. Returns the [`TickReport`] when the custodian still holds the current
++/// term; an error when it has been deposed (its token is stale).
++///
++/// The tick body is a no-op skeleton: the convergence work of each loop is slices
++/// 4–7 of proposal 0005. What is load-bearing here is the fence gate.
++pub fn reconcile_once(custodian: &Custodian, fence: &LeadershipFence) -> Result<TickReport> {
++    fence.guard(custodian.leadership())?;
++    // Skeleton: no loop behaviour runs yet (proposal 0005 slices 4–7). The tick
++    // simply reports the term it ran under, proving the gate let the leader act.
++    Ok(TickReport {
++        term: custodian.leadership().token,
++    })
++}
+diff --git a/crates/custodian/src/selector.rs b/crates/custodian/src/selector.rs
+new file mode 100644
+index 0000000..50b7911
+--- /dev/null
++++ b/crates/custodian/src/selector.rs
+@@ -0,0 +1,13 @@
++//! The zone-local failure-domain-aware placement selector.
++//!
++//! Re-exported from [`wyrd_core::placement`], its shared home: the **write
++//! fan-out** (which lives in `core`) and custodian **re-placement** use one
++//! primitive, so a chunk's `n` fragments occupy `n` distinct failure domains on
++//! both write and repair (proposal 0005 §"Failure-domain-aware placement"). The
++//! model is thin on purpose — an opaque [`DomainId`] per D server plus the
++//! distinctness invariant of [`select_distinct_domains`] — so M6's placement
++//! *policy* service layers on rather than replaces it.
++
++pub use wyrd_core::placement::{
++    select_distinct_domains, Candidate, DomainId, Placement, PlacementError, ServerId,
++};
+diff --git a/crates/custodian/src/telemetry.rs b/crates/custodian/src/telemetry.rs
+new file mode 100644
+index 0000000..d4140cb
+--- /dev/null
++++ b/crates/custodian/src/telemetry.rs
+@@ -0,0 +1,80 @@
++//! The backend-agnostic OpenTelemetry seam (proposal 0005 §"The durability
++//! plane", ADR-0012).
++//!
++//! Durability metrics are emitted through the [`MetricExporter`] trait, which
++//! names **no** concrete backend (ADR-0010). Production wires a
++//! `tracing-opentelemetry` layer exposing **both** a Prometheus-scrapeable
++//! endpoint and an OTLP push behind this trait; the
++//! `tracing-opentelemetry`/`opentelemetry-otlp`/Prometheus-exporter dependency +
++//! `deny.toml` audit is a sign-off NEEDS-HUMAN item (proposal 0005 Impact, ADR-0003).
++//! Tests wire [`InMemoryExporter`] to assert emission **in-process**. Either way
++//! the custodian emits a **first metric from its first commit** (ADR-0011) and
++//! hardcodes no backend. Each metric is also surfaced as a `tracing` event — the
++//! ingestion point the OTel layer subscribes to.
++
++use std::sync::Mutex;
++
++/// The first custodian metric: a gauge that is `1` while a custodian is up. Its
++/// emission from the first commit is what proves the durability plane is wired
++/// (ADR-0011), so every later loop emits from its own first commit.
++pub const CUSTODIAN_UP: &str = "custodian_up";
++
++/// One emitted metric sample.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Metric {
++    /// The metric name (e.g. [`CUSTODIAN_UP`]).
++    pub name: &'static str,
++    /// The metric value.
++    pub value: u64,
++}
++
++/// The backend-agnostic exporter seam. Concrete exporters — a Prometheus-scrapeable
++/// endpoint, an OTLP pusher, or the in-process [`InMemoryExporter`] — implement
++/// this; the custodian never names one (ADR-0010, ADR-0012).
++pub trait MetricExporter: Send + Sync {
++    /// Record one emitted metric sample.
++    fn record(&self, metric: Metric);
++}
++
++/// Emit the custodian's first metric(s) through `exporter` (ADR-0011: telemetry
++/// from the custodian's first commit). The sample is also raised as a `tracing`
++/// event — the seam the production OTel layer (Prometheus + OTLP) subscribes to.
++pub fn emit_startup_metrics(exporter: &dyn MetricExporter) {
++    let metric = Metric {
++        name: CUSTODIAN_UP,
++        value: 1,
++    };
++    tracing::info!(
++        metric = metric.name,
++        value = metric.value,
++        "custodian telemetry seam online"
++    );
++    exporter.record(metric);
++}
++
++/// An in-process exporter that records samples into a buffer, so emission is
++/// assertable in-process at C4-verify. Production wires the OTel (Prometheus +
++/// OTLP) exporter behind the same [`MetricExporter`] trait.
++#[derive(Default)]
++pub struct InMemoryExporter {
++    samples: Mutex<Vec<Metric>>,
++}
++
++impl InMemoryExporter {
++    /// A snapshot of the samples recorded so far.
++    pub fn samples(&self) -> Vec<Metric> {
++        self.samples
++            .lock()
++            .expect("exporter mutex poisoned")
++            .clone()
++    }
++}
++
++impl MetricExporter for InMemoryExporter {
++    fn record(&self, metric: Metric) {
++        self.samples
++            .lock()
++            .expect("exporter mutex poisoned")
++            .push(metric);
++    }
++}
+diff --git a/crates/custodian/tests/skeleton.rs b/crates/custodian/tests/skeleton.rs
+new file mode 100644
+index 0000000..6aaf5be
+--- /dev/null
++++ b/crates/custodian/tests/skeleton.rs
+@@ -0,0 +1,114 @@
++//! M3.3 custodian-skeleton acceptance (proposal 0005 PR-sequence step 3).
++//!
++//! Demonstrates the three load-bearing seams of the slice:
++//!   1. a single active custodian is **elected and fenced** — a deposed leader's
++//!      reconciliation action is **rejected** (stale fencing token);
++//!   2. the **failure-domain selector** places `n` fragments across `n` distinct
++//!      domains where the topology offers `>= n`, and refuses otherwise;
++//!   3. the **exporter emits a first custodian metric** through a backend-agnostic
++//!      seam, observable in-process.
++
++use std::collections::HashSet;
++
++use pollster::block_on;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_custodian::leadership::{Custodian, LeadershipFence};
++use wyrd_custodian::selector::{select_distinct_domains, Candidate, DomainId, ServerId};
++use wyrd_custodian::telemetry::{emit_startup_metrics, InMemoryExporter, CUSTODIAN_UP};
++
++/// (1) A single active custodian is elected via the existing
++/// `Coordination::elect_leader`, fenced by its `Leadership` token; a deposed
++/// custodian's coordination action is rejected.
++#[test]
++fn elected_custodian_is_fenced_and_a_deposed_leader_is_rejected() {
++    let coord = MemCoordination::new();
++    let mut fence = LeadershipFence::new();
++
++    // The first custodian wins leadership and, as the current term, reconciles.
++    let leader = block_on(Custodian::elect(&coord, "zone-a")).expect("elect leader");
++    fence.install(leader.leadership());
++    assert!(
++        leader.reconcile_tick(&fence).is_ok(),
++        "the active leader holds the current term and may act"
++    );
++
++    // A new custodian wins a fresh, strictly-higher term; `leader` is now deposed.
++    let successor = block_on(Custodian::elect(&coord, "zone-a")).expect("elect successor");
++    fence.install(successor.leadership());
++    assert!(
++        successor.leadership().token > leader.leadership().token,
++        "each election term carries a strictly-rising fencing token"
++    );
++
++    // The new leader acts; the deposed one's action MUST be rejected.
++    assert!(
++        successor.reconcile_tick(&fence).is_ok(),
++        "the new leader holds the current term"
++    );
++    assert!(
++        leader.reconcile_tick(&fence).is_err(),
++        "a deposed custodian's action MUST be rejected by its stale fencing token"
++    );
++}
++
++/// (2) The selector places `n` fragments across `n` distinct failure domains when
++/// the topology offers `>= n` domains.
++#[test]
++fn selector_places_fragments_across_n_distinct_domains() {
++    // Five servers spanning four distinct domains (two share `rack-a`).
++    let candidates = vec![
++        Candidate::new(ServerId(0), DomainId::new("rack-a")),
++        Candidate::new(ServerId(1), DomainId::new("rack-a")),
++        Candidate::new(ServerId(2), DomainId::new("rack-b")),
++        Candidate::new(ServerId(3), DomainId::new("rack-c")),
++        Candidate::new(ServerId(4), DomainId::new("rack-d")),
++    ];
++    let n = 3;
++
++    let chosen = select_distinct_domains(&candidates, n).expect("topology has >= n domains");
++    assert_eq!(chosen.len(), n, "one placement per fragment");
++
++    let distinct_domains: HashSet<_> = chosen.iter().map(|p| p.domain.clone()).collect();
++    assert_eq!(
++        distinct_domains.len(),
++        n,
++        "the n fragments must occupy n DISTINCT failure domains"
++    );
++    let distinct_servers: HashSet<_> = chosen.iter().map(|p| p.server).collect();
++    assert_eq!(
++        distinct_servers.len(),
++        n,
++        "each fragment on a distinct server"
++    );
++}
++
++/// (2b) The selector refuses rather than collapse two fragments into one domain
++/// when the topology offers fewer than `n` distinct domains.
++#[test]
++fn selector_refuses_when_topology_has_too_few_domains() {
++    let candidates = vec![
++        Candidate::new(ServerId(0), DomainId::new("rack-a")),
++        Candidate::new(ServerId(1), DomainId::new("rack-a")),
++        Candidate::new(ServerId(2), DomainId::new("rack-b")),
++    ];
++    assert!(
++        select_distinct_domains(&candidates, 3).is_err(),
++        "only 2 distinct domains exist; placing 3 distinctly is impossible"
++    );
++}
++
++/// (3) The exporter emits a first custodian metric through a backend-agnostic
++/// seam, observable in-process — no concrete backend named.
++#[test]
++fn exporter_emits_first_custodian_metric_with_no_backend_hardcoded() {
++    let exporter = InMemoryExporter::default();
++    emit_startup_metrics(&exporter);
++
++    let samples = exporter.samples();
++    assert!(
++        samples
++            .iter()
++            .any(|m| m.name == CUSTODIAN_UP && m.value == 1),
++        "the custodian must emit its first metric ({CUSTODIAN_UP}) from startup"
++    );
++}
