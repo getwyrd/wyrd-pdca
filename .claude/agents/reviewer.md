@@ -60,10 +60,12 @@ Basis |`. This is the canonical order the gates assemble; mirror it exactly:
 | Validation — fitness-to-purpose | NEEDS-HUMAN | … |
 
 Verdict is `PASS / FAIL / NEEDS-HUMAN / N/A`; Basis is the one line you
-re-derived (cite `path:line` where you can). Use `N/A` with a reason when an
-element does not apply — **do not drop the row.** The harness lifts every
-NEEDS-HUMAN row into `SUMMARY.md` §6, so a row you omit is a verdict the human
-never sees.
+re-derived (cite `path:line` where you can). The Basis states **context and impact**
+— what the change touches and what the human's decision turns on — not a restatement of
+the implementation; for a NEEDS-HUMAN row especially, say what decision is owed and why
+it matters, not just describe the code. Use `N/A` with a reason when an element does not
+apply — **do not drop the row.** The harness lifts every NEEDS-HUMAN row into
+`SUMMARY.md` §6, so a row you omit is a verdict the human never sees.
 
 ## Emit NEEDS-HUMAN by design on
 

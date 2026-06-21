@@ -22,7 +22,11 @@ driver enforces this by not passing the file; do not ask for it.
   do **not** search other checkouts on the machine; if `$PDCA_TARGET` is unset, ground
   against `patch.diff` alone. Drop any finding that does not ground.
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + a one-line rationale + a path:line.
-  No free-form prose verdict.
+  No free-form prose verdict. The rationale states **context and impact** — what the
+  change touches and what the human's decision turns on — not a restatement of the
+  implementation. For a NEEDS-HUMAN row especially: say what decision is owed and why it
+  matters, not just describe the code. (The `path:line` is *where*; the rationale is *what
+  is at stake* — re-deriving the diff is not a verdict.)
 - You have **execute** access (run tests/validator, git stash/unstash) and **no
   write access to the fix** — you cannot patch what you judge.
 
