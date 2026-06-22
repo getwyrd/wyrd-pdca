@@ -1,0 +1,1209 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3c2d18f..bd54fcb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2488,6 +2488,7 @@ dependencies = [
+  "tracing",
+  "tracing-opentelemetry",
+  "tracing-subscriber",
++ "wyrd-chunk-format",
+  "wyrd-coordination-mem",
+  "wyrd-core",
+  "wyrd-testkit",
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index a449d0b..fe572be 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -12,4 +12,5 @@ pub mod erasure;
+ pub mod metadata;
+ pub mod placement;
+ pub mod read;
++pub mod repair;
+ pub mod write;
+diff --git a/crates/core/src/read.rs b/crates/core/src/read.rs
+index aabd710..4299ec9 100644
+--- a/crates/core/src/read.rs
++++ b/crates/core/src/read.rs
+@@ -21,6 +21,7 @@ use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, PlacementChunkS
+ 
+ use crate::erasure;
+ use crate::metadata::{self, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState};
++use crate::repair;
+ 
+ /// Resolve `name` under `parent` to its inode id, or `None` if the name is
+ /// unbound.
+@@ -56,10 +57,28 @@ pub async fn read_inode(
+ pub async fn read_object_from(
+     chunks: &impl PlacementChunkStore,
+     inode: &InodeRecord,
++) -> Result<Vec<u8>> {
++    // No metadata store at this entry, so a corruption finding cannot be recorded
++    // on the repair queue; the placement-aware entries ([`read_object`] /
++    // [`read_path`]) thread the store and feed the queue. Findings are still
++    // computed (and dropped) here so this path's behaviour is otherwise unchanged.
++    let mut corrupt = Vec::new();
++    read_object_collecting(chunks, inode, &mut corrupt).await
++}
++
++/// Reassemble an object's bytes, **collecting** the ids of chunks whose read had to
++/// exclude a checksum-failing fragment, so the caller can enqueue them for repair on
++/// the shared queue (`0005:174-176`). `corrupt` is appended to as the read proceeds —
++/// it carries the findings even when the read ultimately fails (a chunk below `k`
++/// survivors is still a durable repair obligation).
++async fn read_object_collecting(
++    chunks: &impl PlacementChunkStore,
++    inode: &InodeRecord,
++    corrupt: &mut Vec<ChunkId>,
+ ) -> Result<Vec<u8>> {
+     let mut bytes = Vec::with_capacity(inode.size as usize);
+     for chunk in &inode.chunk_map {
+-        bytes.extend_from_slice(&read_chunk(chunks, chunk).await?);
++        bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt).await?);
+     }
+     if bytes.len() as u64 != inode.size {
+         return Err(ReadError::SizeMismatch {
+@@ -98,7 +117,11 @@ fn fragment_dserver(chunk: &ChunkRef, index: u16) -> DServerId {
+ /// Each fragment is fetched from the D server the **placement record** names
+ /// ([`fragment_dserver`]), not from `index % n` — the location authority is the
+ /// committed chunk map, not the fan-out.
+-async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
++async fn read_chunk(
++    chunks: &impl PlacementChunkStore,
++    chunk: &ChunkRef,
++    corrupt: &mut Vec<ChunkId>,
++) -> Result<Vec<u8>> {
+     match chunk.scheme {
+         EcScheme::None => {
+             // A single fragment at index 0; there is nothing to reconstruct around.
+@@ -112,7 +135,16 @@ async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Resu
+                 )
+                 .await?
+                 .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
+-            Ok(decode(&fragment)?.payload)
++            match decode(&fragment) {
++                Ok(decoded) => Ok(decoded.payload),
++                Err(e) => {
++                    // A present-but-corrupt single fragment: never return its bytes,
++                    // and record the chunk as a durable repair obligation before
++                    // surfacing the error (there is nothing to reconstruct around).
++                    corrupt.push(chunk.id);
++                    Err(e.into())
++                }
++            }
+         }
+         EcScheme::ReedSolomon { k, m } => {
+             let (k, m) = (k as usize, m as usize);
+@@ -141,12 +173,21 @@ async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Resu
+             let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
+             while let Some((index, fetched)) = inflight.next().await {
+                 if let Ok(Some(fragment)) = fetched {
+-                    if let Ok(decoded) = decode(&fragment) {
+-                        shards.push((index as usize, decoded.payload));
+-                        if shards.len() == k {
+-                            // `k` verified: drop the outstanding fetches, which
+-                            // abandons (cancels) them.
+-                            break;
++                    match decode(&fragment) {
++                        Ok(decoded) => {
++                            shards.push((index as usize, decoded.payload));
++                            if shards.len() == k {
++                                // `k` verified: drop the outstanding fetches, which
++                                // abandons (cancels) them.
++                                break;
++                            }
++                        }
++                        Err(_) => {
++                            // A present fragment that fails its checksum is bit rot:
++                            // excluded from the decoder (read around) AND its chunk
++                            // recorded as a repair obligation, never silently absorbed
++                            // (`0005:174-176`, `0005:262-264`).
++                            corrupt.push(chunk.id);
+                         }
+                     }
+                 }
+@@ -177,7 +218,19 @@ pub async fn read_object(
+     if inode.state != InodeState::Committed {
+         return Ok(None);
+     }
+-    Ok(Some(read_object_from(chunks, &inode).await?))
++    // Read the object, collecting any chunk whose read excluded a checksum-failing
++    // fragment, then enqueue each onto the SAME repair queue scrub feeds
++    // (`0005:174-176`) — whether or not the read itself recovered. The enqueue runs
++    // before the read result is surfaced, so a read that fails below `k` survivors
++    // still leaves a durable repair obligation behind.
++    let mut corrupt = Vec::new();
++    let result = read_object_collecting(chunks, &inode, &mut corrupt).await;
++    corrupt.sort_unstable();
++    corrupt.dedup();
++    for chunk in corrupt {
++        repair::enqueue_repair(meta, chunk, "read").await?;
++    }
++    Ok(Some(result?))
+ }
+ 
+ /// Read a committed object by path. `None` if the name is unbound or its inode is
+diff --git a/crates/core/src/repair.rs b/crates/core/src/repair.rs
+new file mode 100644
+index 0000000..eede5ba
+--- /dev/null
++++ b/crates/core/src/repair.rs
+@@ -0,0 +1,83 @@
++//! The shared **reconstruction / repair queue** — the durable seam a corruption
++//! finding lands on, whether discovered **proactively by scrub** (the custodian's
++//! scrub loop) or **reactively on read** (the client read path's read-time checksum
++//! verification). Proposal 0005 §Scrub (`0005:262-267`) and the read-time-failure
++//! feed (`0005:174-176`) require **one shared queue** that both producers enqueue
++//! onto and the reconstruction loop (slice 6, `0005:531-536`) later drains.
++//!
++//! The queue lives in `core` rather than `custodian` because the read path is in
++//! `core` and `core` must not depend on `custodian` (the dependency rule runs
++//! `custodian → core`, ADR-0010 `0005:421-422`). Placing the key + the enqueue +
++//! the verify here makes "the same queue" true **by construction**: scrub
++//! (`custodian`, which depends on `core`) and the read path call the *same*
++//! [`enqueue_repair`] against the *same* [`repair_key`].
++//!
++//! This slice only **produces** repair obligations; dequeuing and rebuilding is the
++//! reconstruction custodian (slice 6, out of scope here). The concrete ledger
++//! representation (key/encoding) is ILLUSTRATIVE; the shared-queue feed is BINDING.
++
++use wyrd_traits::{ChunkId, MetadataStore, Result, WriteBatch};
++
++/// Key prefix for the **repair queue** ledger — the chunks a corruption finding has
++/// flagged for reconstruction. Mirrors the `pending:` / `orphan:` ledger pattern
++/// (architecture §5).
++pub const REPAIR_PREFIX: &[u8] = b"repair:";
++
++/// Key for a repair-queue entry: `repair:<chunk_id>`. Keyed by chunk so a repair
++/// obligation is a **set** — enqueuing the same chunk twice (scrub and a read both
++/// catching it) collapses to one obligation, never a duplicate rebuild.
++pub fn repair_key(chunk: ChunkId) -> Vec<u8> {
++    format!("repair:{chunk}").into_bytes()
++}
++
++/// Parse a repair-queue key back to the chunk id it enqueues.
++pub fn parse_repair_key(key: &[u8]) -> Option<ChunkId> {
++    std::str::from_utf8(key)
++        .ok()?
++        .strip_prefix("repair:")?
++        .parse()
++        .ok()
++}
++
++/// Verify a stored fragment's **self-describing checksum** and that it belongs to
++/// `chunk` (the committed chunk map's id). Returns `true` only when the bytes decode
++/// cleanly (header + payload crc32c verified by [`wyrd_chunk_format::decode`]) **and**
++/// the decoded header names `chunk`. A `false` is bit rot / a misplaced fragment: the
++/// fragment must be **excluded** from the decoder and its `chunk` enqueued for
++/// reconstruction ([`enqueue_repair`]) — the load-bearing invariant
++/// (`0005:262-267`, `0005:174-176`).
++///
++/// This is the one verify both producers share: the read path decodes for the same
++/// effect inline (`crates/core/src/read.rs`), and scrub calls this against each
++/// referenced fragment it walks.
++pub fn fragment_intact(bytes: &[u8], chunk: ChunkId) -> bool {
++    matches!(wyrd_chunk_format::decode(bytes), Ok(decoded) if decoded.header.chunk_id == chunk)
++}
++
++/// Enqueue `chunk` for reconstruction onto the shared, durable repair queue.
++/// **Idempotent** — a chunk already queued stays a single obligation (the key
++/// dedups). `detected_by` records the producer (`"scrub"` | `"read"`) for the
++/// durability-plane audit trail (`0005:336-340`); the reconstruction loop reads only
++/// the key set.
++pub async fn enqueue_repair(
++    meta: &dyn MetadataStore,
++    chunk: ChunkId,
++    detected_by: &str,
++) -> Result<()> {
++    meta.commit(WriteBatch::new().put(repair_key(chunk), detected_by.as_bytes().to_vec()))
++        .await?;
++    Ok(())
++}
++
++/// Every chunk currently enqueued on the repair queue. The reconstruction loop's
++/// future entry point; here it is the in-process read-back that proves both
++/// producers feed the **same** queue.
++pub async fn queued_repairs(meta: &dyn MetadataStore) -> Result<Vec<ChunkId>> {
++    let mut chunks = Vec::new();
++    for (key, _value) in meta.scan(REPAIR_PREFIX).await? {
++        if let Some(chunk) = parse_repair_key(&key) {
++            chunks.push(chunk);
++        }
++    }
++    Ok(chunks)
++}
+diff --git a/crates/core/tests/read_repair.rs b/crates/core/tests/read_repair.rs
+new file mode 100644
+index 0000000..b9a49c3
+--- /dev/null
++++ b/crates/core/tests/read_repair.rs
+@@ -0,0 +1,255 @@
++//! M3.5 (issue #143, proposal 0005 slice 5): the **read path feeds the shared repair
++//! queue** (`0005:174-176`). The scrub loop and the read path land repair obligations
++//! on **one** durable queue ([`wyrd_core::repair`]); this is the read-path producer's
++//! regression home (the enqueue seam lands in `core`, where the read path lives).
++//!
++//! BINDING leg 4 of the success criterion: a read that **excludes** a checksum-failing
++//! fragment also **enqueues** its chunk for repair onto the same queue scrub feeds — a
++//! corruption finding discovered reactively on read is never absorbed silently. Proven
++//! in-process over the trait stores. The enqueue is keyed by the very
++//! [`repair::repair_key`] the scrub loop also enqueues onto, so "the same queue" holds
++//! by construction.
++//!
++//! Flippable demonstration: drop the enqueue loop in [`read::read_object`] and the
++//! repair-queue assertions below fire while the bytes still read back — proving the
++//! enqueue, not the read, is what these tests pin.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_chunk_format::{encode, FragmentHeader, CORE_HEADER_LEN};
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeRecord, InodeState};
++use wyrd_core::{erasure, read, repair};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, FragmentId, Health, MetadataStore, PlacementChunkStore,
++    Result, WriteBatch,
++};
++
++// ---- in-memory trait stores (backend-agnostic; the path is proven over the seams) ----
++
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// A dumb in-memory chunk store holding the real stored fragment bytes; the default
++/// `PlacementChunkStore::get_fragment_at` routes straight through by `FragmentId`.
++#[derive(Default)]
++struct MemChunks {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemChunks {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++impl PlacementChunkStore for MemChunks {}
++
++// ---- helpers ----
++
++/// Wrap a shard's bytes in a valid, self-describing v1 fragment for `chunk`.
++fn fragment(chunk: ChunkId, payload: &[u8]) -> Bytes {
++    Bytes::from(encode(
++        &FragmentHeader::new_v1(chunk, payload.len() as u64),
++        payload,
++    ))
++}
++
++/// Commit a single-chunk inode into the metadata store, returning its id.
++async fn commit_inode(meta: &MemMeta, inode: u64, chunk: ChunkRef, size: u64) {
++    let record = InodeRecord {
++        size,
++        chunk_map: vec![chunk],
++        state: InodeState::Committed,
++        version: 1,
++    };
++    let outcome = meta
++        .commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
++        .await
++        .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++}
++
++// ---- leg 4: an EC read excludes a corrupt fragment AND enqueues its chunk ----
++
++#[tokio::test]
++async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
++    let meta = MemMeta::default();
++    let chunks = MemChunks::default();
++
++    // A real RS(2,1) chunk: 3 fragments, reconstructible from any k = 2.
++    let (k, m) = (2u8, 1u8);
++    let data = b"the read path catches bit rot too";
++    let chunk_id: ChunkId = 0xF00D;
++    let shards = erasure::encode(k as usize, m as usize, data).unwrap();
++    assert_eq!(shards.len(), 3);
++
++    // Store all three fragments; then inject a bit-flip into fragment index 0's
++    // payload so its checksum fails — the read must exclude it and reconstruct from
++    // the surviving two.
++    for (index, shard) in shards.iter().enumerate() {
++        chunks
++            .put_fragment(
++                FragmentId {
++                    chunk: chunk_id,
++                    index: index as u16,
++                },
++                fragment(chunk_id, shard),
++            )
++            .await
++            .unwrap();
++    }
++    let mut rotten = fragment(chunk_id, &shards[0]).to_vec();
++    rotten[CORE_HEADER_LEN as usize] ^= 0xff;
++    chunks
++        .put_fragment(
++            FragmentId {
++                chunk: chunk_id,
++                index: 0,
++            },
++            Bytes::from(rotten),
++        )
++        .await
++        .unwrap();
++
++    commit_inode(
++        &meta,
++        1,
++        ChunkRef {
++            id: chunk_id,
++            scheme: EcScheme::ReedSolomon { k, m },
++            len: data.len() as u64,
++            placement: vec![0, 1, 2],
++        },
++        data.len() as u64,
++    )
++    .await;
++
++    // The read reconstructs byte-identical from the two surviving fragments...
++    let got = read::read_object(&meta, &chunks, 1).await.unwrap();
++    assert_eq!(
++        got.as_deref(),
++        Some(data.as_slice()),
++        "the corrupt fragment is read around; the object reconstructs"
++    );
++
++    // ...AND the chunk it excluded is now a durable repair obligation on the SAME
++    // queue scrub feeds — keyed by the shared `repair::repair_key` (`0005:174-176`).
++    assert_eq!(
++        repair::queued_repairs(&meta).await.unwrap(),
++        vec![chunk_id],
++        "the read-time checksum failure enqueued its chunk for reconstruction"
++    );
++    assert_eq!(
++        meta.get(&repair::repair_key(chunk_id)).await.unwrap(),
++        Some(Bytes::from_static(b"read")),
++        "the obligation records the read-path producer"
++    );
++}
++
++// ---- leg 4 (unrecoverable case): a corrupt single fragment still enqueues ----
++
++#[tokio::test]
++async fn unrecoverable_read_still_enqueues_the_corrupt_chunk() {
++    let meta = MemMeta::default();
++    let chunks = MemChunks::default();
++
++    // A `none`-scheme chunk has a single fragment; a corrupt one cannot be read
++    // around, so the read fails — but the corruption is still a durable repair
++    // obligation, never silently absorbed.
++    let chunk_id: ChunkId = 0xBEEF;
++    let payload = b"lonely fragment";
++    let mut rotten = fragment(chunk_id, payload).to_vec();
++    rotten[CORE_HEADER_LEN as usize] ^= 0xff;
++    chunks
++        .put_fragment(
++            FragmentId {
++                chunk: chunk_id,
++                index: 0,
++            },
++            Bytes::from(rotten),
++        )
++        .await
++        .unwrap();
++
++    commit_inode(
++        &meta,
++        1,
++        ChunkRef {
++            id: chunk_id,
++            scheme: EcScheme::None,
++            len: payload.len() as u64,
++            placement: vec![0],
++        },
++        payload.len() as u64,
++    )
++    .await;
++
++    let result = read::read_object(&meta, &chunks, 1).await;
++    assert!(
++        result.is_err(),
++        "a corrupt single fragment cannot be read around: the read fails"
++    );
++    assert_eq!(
++        repair::queued_repairs(&meta).await.unwrap(),
++        vec![chunk_id],
++        "even a failed read leaves the corrupt chunk enqueued for reconstruction"
++    );
++}
+diff --git a/crates/custodian/Cargo.toml b/crates/custodian/Cargo.toml
+index 69ce470..2bae0f5 100644
+--- a/crates/custodian/Cargo.toml
++++ b/crates/custodian/Cargo.toml
+@@ -37,6 +37,11 @@ tokio.workspace = true
+ # the `MetadataStore`/`ChunkStore` seams, backend-agnostic).
+ async-trait.workspace = true
+ bytes.workspace = true
++# The scrub loop's test injects a bit-flip into a real v1 fragment to prove the
++# checksum verify is load-bearing; it builds the fragment with the on-disk-format
++# writer. Test-only — the scrub loop itself borrows `core`'s verify and gains no
++# chunk-format dependency (ADR-0010).
++wyrd-chunk-format.workspace = true
+ 
+ # Inherit the workspace lint policy (single source of truth).
+ [lints]
+diff --git a/crates/custodian/src/gc.rs b/crates/custodian/src/gc.rs
+index bc6affc..ab52baf 100644
+--- a/crates/custodian/src/gc.rs
++++ b/crates/custodian/src/gc.rs
+@@ -176,7 +176,7 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
+ /// Every `(dserver, fragment)` a **committed** chunk map references through its
+ /// placement record (`core::metadata::ChunkRef.placement`). A pending (uncommitted)
+ /// inode's provisional map is excluded — only a committed reference protects bytes.
+-async fn referenced_fragments(
++pub(crate) async fn referenced_fragments(
+     meta: &dyn MetadataStore,
+ ) -> Result<HashSet<(DServerId, FragmentId)>> {
+     let mut set = HashSet::new();
+diff --git a/crates/custodian/src/lib.rs b/crates/custodian/src/lib.rs
+index 547e65b..84569e8 100644
+--- a/crates/custodian/src/lib.rs
++++ b/crates/custodian/src/lib.rs
+@@ -23,11 +23,13 @@
+ pub mod gc;
+ pub mod leadership;
+ pub mod reconciliation;
++pub mod scrub;
+ pub mod telemetry;
+ 
+ pub use gc::{mark_orphaned, GcContext};
+ pub use leadership::{Custodian, FenceError, FencedZone};
+ pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
++pub use scrub::ScrubContext;
+ pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
+ 
+ /// The failure-domain-aware **selector** the custodian places against — it lives in
+diff --git a/crates/custodian/src/reconciliation.rs b/crates/custodian/src/reconciliation.rs
+index 7b7df21..3d5ed33 100644
+--- a/crates/custodian/src/reconciliation.rs
++++ b/crates/custodian/src/reconciliation.rs
+@@ -10,6 +10,7 @@
+ 
+ use crate::gc::{self, GcContext};
+ use crate::leadership::{Custodian, FenceError, FencedZone};
++use crate::scrub::{self, ScrubContext};
+ 
+ /// The observable outcome of a reconciliation step — "changed" vs "satisfied" are
+ /// distinct, observable moments (`0005:351-352`).
+@@ -50,22 +51,40 @@ impl std::error::Error for ReconcileError {}
+ /// zone's current leadership term, so a superseded custodian's reconciliation is
+ /// rejected (`0005:362-367`).
+ ///
+-/// When `gc` is supplied, the step dispatches to the **GC loop** ([`gc::reconcile`],
+-/// `0005:288-295`) over the given stores; a bare `None` exercises the fence alone
+-/// (no maintenance inputs wired). Scrub / reconstruction / rebalance (slices 5–7)
+-/// are not yet dispatched.
++/// The supplied maintenance inputs select which loops the step dispatches: `gc`
++/// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
++/// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), and both `None` exercises
++/// the fence alone (no maintenance inputs wired). When both are supplied the step
++/// runs each independent loop and reports [`Reconciled::Changed`] if **either**
++/// converged. Reconstruction / rebalance (slices 6–7) are not yet dispatched.
+ pub async fn reconcile_step(
+     zone: &FencedZone,
+     custodian: &Custodian,
+     gc: Option<&GcContext<'_>>,
++    scrub: Option<&ScrubContext<'_>>,
+     now_millis: u64,
+ ) -> Result<Reconciled, ReconcileError> {
+     zone.authorize(custodian.term())
+         .map_err(ReconcileError::Fenced)?;
+-    match gc {
+-        Some(ctx) => gc::reconcile(ctx, now_millis)
++
++    let mut outcome = Reconciled::Satisfied;
++    if let Some(ctx) = gc {
++        if gc::reconcile(ctx, now_millis)
+             .await
+-            .map_err(ReconcileError::Store),
+-        None => Ok(Reconciled::Satisfied),
++            .map_err(ReconcileError::Store)?
++            == Reconciled::Changed
++        {
++            outcome = Reconciled::Changed;
++        }
++    }
++    if let Some(ctx) = scrub {
++        if scrub::reconcile(ctx, now_millis)
++            .await
++            .map_err(ReconcileError::Store)?
++            == Reconciled::Changed
++        {
++            outcome = Reconciled::Changed;
++        }
+     }
++    Ok(outcome)
+ }
+diff --git a/crates/custodian/src/scrub.rs b/crates/custodian/src/scrub.rs
+new file mode 100644
+index 0000000..b600f55
+--- /dev/null
++++ b/crates/custodian/src/scrub.rs
+@@ -0,0 +1,124 @@
++//! The **scrub custodian loop** (proposal 0005 §"The four custodian loops" / Scrub,
++//! `0005:262-267`; §6.3 step 1 read-vs-scrub mirror `0005:264-266`; the durability
++//! metrics scrub coverage + scrub-detected corruption rate `0005:331-332`;
++//! PR-sequence slice 5 `0005:528-530`).
++//!
++//! Scrub catches **bit rot before the data is needed** — the proactive mirror of the
++//! read path's read-time checksum verification (`0005:262-266`, the read path in
++//! `crates/core/src/read.rs`). One pass walks each D server
++//! ([`ChunkStore::list_fragments`]) and, for each fragment a **committed** chunk map
++//! references, fetches its bytes and **verifies its self-describing checksum against
++//! the chunk map** ([`wyrd_core::repair::fragment_intact`]). On a mismatch the
++//! fragment is treated as lost — **excluded** (never fed to a decoder) — and its
++//! chunk is **enqueued for reconstruction** on the one shared, durable repair queue
++//! ([`wyrd_core::repair::enqueue_repair`]) that the read path also feeds
++//! (`0005:174-176`). The load-bearing invariant, whose violation is **silent
++//! corruption**: a checksum-failing fragment is **never absorbed silently** — it
++//! always becomes a durable repair obligation (`0005:262-267`).
++//!
++//! Scope: scrub only **produces** repair obligations. It never dequeues, rebuilds, or
++//! deletes — gathering any-`k`, recomputing, re-placing, and the version-conditional
++//! commit are the reconstruction custodian (slice 6, `0005:531-536`). Reclaiming the
++//! displaced bytes is GC's (slice 4). So scrub does **not** call `delete_fragment`.
++//!
++//! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
++//! `traits` / `core` seams plus `tracing` — the checksum verify is borrowed from
++//! `core` (which owns the on-disk-format reader), so `custodian` gains no
++//! chunk-format dependency and no new on-disk-format knowledge.
++
++use wyrd_core::repair;
++use wyrd_traits::{ChunkStore, DServerId, FragmentId, MetadataStore, Result};
++
++use crate::gc::referenced_fragments;
++use crate::reconciliation::Reconciled;
++
++/// What the scrub reconciler reads over: the authoritative metadata store (committed
++/// chunk maps + the shared repair queue) and the **fleet** of D servers, each a
++/// [`ChunkStore`] keyed by its stable [`DServerId`] — the same shape GC takes
++/// ([`crate::GcContext`]).
++///
++/// This is the input the running control point hands scrub; it is **not** a deployed
++/// custodian process (Option A, `0005:524-527`). The loop is correct over these
++/// abstractions and reachable through the real [`crate::reconcile_step`].
++pub struct ScrubContext<'a> {
++    /// The authoritative metadata store (chunk maps + the repair queue).
++    pub meta: &'a dyn MetadataStore,
++    /// The fleet of D servers to scrub, each addressed by its stable id.
++    pub fleet: &'a [(DServerId, &'a dyn ChunkStore)],
++}
++
++/// One scrub reconciliation pass over `ctx`. Dispatched only from
++/// [`crate::reconcile_step`] (the fenced control point) — never a parallel entry.
++/// Returns [`Reconciled::Changed`] if any chunk was enqueued for reconstruction,
++/// [`Reconciled::Satisfied`] otherwise.
++pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Result<Reconciled> {
++    // The reference set: every fragment a *committed* chunk map points at. Scrub
++    // verifies exactly these — an orphan / pending-garbage fragment is GC's concern,
++    // not a corruption finding (the same set GC uses as its safety gate).
++    let referenced = referenced_fragments(ctx.meta).await?;
++
++    let mut changed = false;
++    for &(dserver, store) in ctx.fleet {
++        for frag in store.list_fragments().await? {
++            // Only fragments a committed chunk map references are scrubbed.
++            if !referenced.contains(&(dserver, frag)) {
++                continue;
++            }
++            // Fetch the bytes named by the chunk map. A fragment that vanished between
++            // the walk and the fetch is a loss for GC/reconstruction to notice, not a
++            // checksum finding — skip it rather than raise a false positive.
++            let Some(bytes) = store.get_fragment(frag).await? else {
++                continue;
++            };
++
++            // COVERAGE: a referenced fragment scrub walked and verified.
++            emit_scrubbed(dserver, frag);
++
++            // VERIFY the self-describing checksum against the committed chunk map.
++            // `frag.chunk` is the id the chunk map references it under.
++            if !repair::fragment_intact(&bytes, frag.chunk) {
++                // CORRUPTION: exclude the failing fragment (never decode it) and
++                // enqueue its chunk on the shared repair queue the read path feeds.
++                emit_corruption(dserver, frag);
++                repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
++                changed = true;
++            }
++        }
++    }
++
++    Ok(if changed {
++        Reconciled::Changed
++    } else {
++        Reconciled::Satisfied
++    })
++}
++
++/// Emit **scrub coverage** on the durability-plane seam (ADR-0011 / ADR-0012,
++/// `0005:331`): one increment per referenced fragment scrub walked + verified, the
++/// metric the `DurabilityTelemetry` `tracing`→OTel bridge counts, plus an
++/// append-only audit event (`0005:336-340`).
++fn emit_scrubbed(dserver: DServerId, frag: FragmentId) {
++    tracing::info!(monotonic_counter.scrub_coverage = 1_u64);
++    tracing::info!(
++        target: "wyrd.custodian.scrub.audit",
++        action = "verify",
++        dserver,
++        chunk = %frag.chunk,
++        index = frag.index,
++        "scrub verified a referenced fragment's checksum against the chunk map",
++    );
++}
++
++/// Emit **scrub-detected corruption** on the same seam (`0005:332`): a referenced
++/// fragment that failed its checksum, now excluded and enqueued for reconstruction.
++fn emit_corruption(dserver: DServerId, frag: FragmentId) {
++    tracing::info!(monotonic_counter.scrub_corruption_detected = 1_u64);
++    tracing::info!(
++        target: "wyrd.custodian.scrub.audit",
++        action = "corruption",
++        dserver,
++        chunk = %frag.chunk,
++        index = frag.index,
++        "scrub detected bit rot: fragment excluded, chunk enqueued for reconstruction",
++    );
++}
+diff --git a/crates/custodian/tests/gc.rs b/crates/custodian/tests/gc.rs
+index c5a8974..e079f7e 100644
+--- a/crates/custodian/tests/gc.rs
++++ b/crates/custodian/tests/gc.rs
+@@ -207,7 +207,7 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
+     };
+ 
+     // now = 200: past the lease (100) and past the orphan window (0 + 50).
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), 200)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 200)
+         .await
+         .unwrap();
+     assert_eq!(outcome, Reconciled::Changed, "GC reclaimed fragment bytes");
+@@ -271,7 +271,7 @@ async fn never_reclaims_a_referenced_fragment() {
+         grace_window_millis: 0,
+     };
+ 
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), 1_000_000)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 1_000_000)
+         .await
+         .unwrap();
+ 
+@@ -306,7 +306,7 @@ async fn honours_the_reader_safe_grace_window() {
+ 
+     // WITHIN the window (now = 120 < 150): not reclaimed, and a reader holding the
+     // prior version still resolves the fragment.
+-    let early = reconcile_step(&zone, &custodian, Some(&ctx), 120)
++    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, 120)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -320,7 +320,7 @@ async fn honours_the_reader_safe_grace_window() {
+     );
+ 
+     // AFTER the window (now = 160 >= 150): reclaimed.
+-    let late = reconcile_step(&zone, &custodian, Some(&ctx), 160)
++    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, 160)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -366,7 +366,7 @@ async fn emits_gc_actions_on_the_durability_seam() {
+     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+ 
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), 100)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 100)
+         .with_subscriber(subscriber)
+         .await
+         .unwrap();
+diff --git a/crates/custodian/tests/scrub.rs b/crates/custodian/tests/scrub.rs
+new file mode 100644
+index 0000000..d560e46
+--- /dev/null
++++ b/crates/custodian/tests/scrub.rs
+@@ -0,0 +1,394 @@
++//! M3.5 (issue #143, proposal 0005 slice 5, `0005:528-530`): the **scrub custodian
++//! loop**, driven through the real [`reconcile_step`] fenced control point.
++//!
++//! The BINDING legs of the success criterion, proven in-process over the trait
++//! stores (Option A — no deployed custodian process exists yet, `0005:524-527`):
++//!
++//! 1. **Walk + verify** (`0005:262-263`): through `reconcile_step`, scrub walks each
++//!    store (`list_fragments`) and verifies each **referenced** fragment's
++//!    self-describing checksum against the committed chunk map; an unreferenced
++//!    fragment (an orphan, GC's concern) is not a scrub finding.
++//! 2. **Bit-flip detected, excluded, enqueued** (`0005:263-264`, the central DoD,
++//!    flippable): an injected bit-flip in a referenced fragment is detected, the
++//!    fragment is treated as lost, and its chunk is enqueued for reconstruction on
++//!    the shared repair queue ([`wyrd_core::repair`]) — the same queue the read path
++//!    feeds (`0005:174-176`). Scrub never deletes (that is GC / reconstruction).
++//!    Flippable: negate `repair::fragment_intact` in `scrub::reconcile` (treat every
++//!    fragment as intact) and the enqueue never happens — this assertion fires.
++//! 3. **Durability-plane emission** (`0005:331-332`, ADR-0011/0012): scrub coverage
++//!    and scrub-detected corruption are emitted on the `DurabilityTelemetry` seam as
++//!    metric + audit events and read back in-process via `gather_prometheus`.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_chunk_format::{encode, FragmentHeader, CORE_HEADER_LEN};
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
++use wyrd_core::repair;
++use wyrd_custodian::{
++    reconcile_step, Custodian, DurabilityTelemetry, ExporterConfig, FencedZone, Reconciled,
++    ScrubContext,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
++    WriteBatch,
++};
++
++// ---- in-memory trait stores (backend-agnostic; the loop is proven over the seams) ----
++
++/// A trivial in-memory metadata store.
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// One D server's fragment bytes — a deliberately dumb `ChunkStore` that holds the
++/// **real** stored fragment bytes (so their checksums can be verified).
++#[derive(Default)]
++struct MemDServer {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++// ---- helpers ----
++
++const ROOT: InodeId = 0;
++
++fn frag(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// A valid, self-describing v1 fragment for `chunk` (header + payload crc32c stamped
++/// by the on-disk-format writer). This is what `fragment_intact` must accept.
++fn valid_fragment(chunk: ChunkId) -> Bytes {
++    let payload = b"scrubbable bytes";
++    Bytes::from(encode(
++        &FragmentHeader::new_v1(chunk, payload.len() as u64),
++        payload,
++    ))
++}
++
++/// The same fragment with a single **bit flipped in the payload** — its trailing
++/// payload checksum no longer matches, so `decode` fails its crc32c gate: injected
++/// bit rot.
++fn corrupt_fragment(chunk: ChunkId) -> Bytes {
++    let mut bytes = valid_fragment(chunk).to_vec();
++    // Flip the first payload byte (just past the fixed core header).
++    bytes[CORE_HEADER_LEN as usize] ^= 0xff;
++    Bytes::from(bytes)
++}
++
++/// Commit an inode whose single `none`-scheme chunk's fragment at index 0 is placed
++/// on `dserver` — a committed reference scrub must verify.
++async fn commit_reference(
++    meta: &MemMeta,
++    inode: InodeId,
++    name: &str,
++    chunk: ChunkId,
++    dserver: DServerId,
++) {
++    let record = InodeRecord {
++        size: 16,
++        chunk_map: vec![ChunkRef {
++            id: chunk,
++            scheme: EcScheme::None,
++            len: 16,
++            placement: vec![dserver],
++        }],
++        state: InodeState::Committed,
++        version: 1,
++    };
++    let outcome = metadata::create(meta, ROOT, name, inode, &record)
++        .await
++        .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++}
++
++async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
++    let leader = Custodian::elect(coord, "zone-scrub").await.unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    (zone, leader)
++}
++
++// ---- criterion 1: walk + verify referenced fragments through the control point ----
++
++#[tokio::test]
++async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // A referenced, intact fragment scrub must verify and pass.
++    let chunk: ChunkId = 0xA1;
++    d0.put_fragment(frag(chunk, 0), valid_fragment(chunk))
++        .await
++        .unwrap();
++    commit_reference(&meta, 1, "intact", chunk, 0).await;
++
++    // An UNREFERENCED fragment (an orphan: present, referenced by no committed chunk
++    // map) — GC's concern, NOT a scrub finding even though it is also "valid" bytes
++    // here. Scrub must skip it: it verifies only what the chunk map references.
++    let orphan: ChunkId = 0xB2;
++    d0.put_fragment(frag(orphan, 0), corrupt_fragment(orphan))
++        .await
++        .unwrap();
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), 0)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Satisfied,
++        "all referenced fragments verified intact; the unreferenced orphan is not scrubbed"
++    );
++    assert!(
++        repair::queued_repairs(&meta).await.unwrap().is_empty(),
++        "no repair obligation: the referenced fragment is intact, the corrupt one is unreferenced"
++    );
++}
++
++// ---- criterion 2: bit-flip detected, excluded, enqueued (the central, flippable leg) ----
++
++#[tokio::test]
++async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // A committed chunk map references (chunk, 0) on d0, but its stored bytes carry
++    // an injected bit-flip — its payload checksum no longer verifies.
++    let chunk: ChunkId = 0xC3;
++    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
++        .await
++        .unwrap();
++    commit_reference(&meta, 1, "rotten", chunk, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), 0)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "the bit-flip is detected and a repair obligation is produced"
++    );
++
++    // The chunk is enqueued for reconstruction on the SHARED repair queue — keyed by
++    // the very `repair::repair_key` the read path also enqueues onto (`0005:174-176`).
++    assert!(
++        meta.get(&repair::repair_key(chunk))
++            .await
++            .unwrap()
++            .is_some(),
++        "the corrupt fragment's chunk is enqueued on the shared repair queue"
++    );
++    assert_eq!(
++        repair::queued_repairs(&meta).await.unwrap(),
++        vec![chunk],
++        "exactly the rotten chunk is queued for reconstruction"
++    );
++
++    // Scrub only PRODUCES the obligation — it never deletes the fragment (reclaiming
++    // displaced bytes is GC; rebuilding is reconstruction, slice 6, out of scope).
++    assert!(
++        d0.get_fragment(frag(chunk, 0)).await.unwrap().is_some(),
++        "scrub does not delete the corrupt fragment; it only enqueues its chunk"
++    );
++}
++
++// ---- criterion 2 (second half): an INTACT-but-misplaced fragment is also detected ----
++//
++// Verifying the checksum ALONE is not enough: scrub must verify each referenced
++// fragment's self-describing header AGAINST THE COMMITTED CHUNK MAP (`0005:264-266`).
++// A fragment whose payload checksum verifies cleanly but whose header names a
++// *different* chunk than the map stores it under is corruption all the same — feeding
++// its bytes to the referenced chunk's decoder would silently reconstruct another
++// chunk's data. This pins the `decoded.header.chunk_id == chunk` half of
++// `repair::fragment_intact` (the half the bit-flip case above does not reach).
++//
++// Flippable demonstration (recorded in build-notes): drop `&& header.chunk_id == chunk`
++// from `repair::fragment_intact` and this fragment is absorbed silently — the enqueue
++// never happens and the two assertions below fire.
++#[tokio::test]
++async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstruction() {
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // The committed chunk map references (chunk, 0) on d0, but the bytes physically
++    // stored there are a perfectly VALID v1 fragment for a DIFFERENT chunk: its
++    // payload checksum verifies, yet its header names `foreign`, not `chunk`.
++    let chunk: ChunkId = 0xC8;
++    let foreign: ChunkId = 0x9999;
++    d0.put_fragment(frag(chunk, 0), valid_fragment(foreign))
++        .await
++        .unwrap();
++    commit_reference(&meta, 1, "misplaced", chunk, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), 0)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "an intact-but-misplaced fragment is a corruption finding, not silently absorbed"
++    );
++
++    // The REFERENCED chunk is enqueued for reconstruction — never the foreign header's
++    // id, which the chunk map does not reference here.
++    assert_eq!(
++        repair::queued_repairs(&meta).await.unwrap(),
++        vec![chunk],
++        "exactly the referenced chunk is queued; the misplaced fragment is excluded"
++    );
++    assert!(
++        meta.get(&repair::repair_key(foreign))
++            .await
++            .unwrap()
++            .is_none(),
++        "the foreign chunk the stray header names is not the obligation produced"
++    );
++
++    // Scrub only PRODUCES the obligation; it never deletes the misplaced fragment.
++    assert!(
++        d0.get_fragment(frag(chunk, 0)).await.unwrap().is_some(),
++        "scrub does not delete the misplaced fragment; it only enqueues its chunk"
++    );
++}
++
++// ---- criterion 3: scrub coverage + corruption on the durability seam, read back ----
++
++#[tokio::test]
++async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // One intact and one corrupt referenced fragment, so both the coverage metric
++    // (two fragments walked + verified) and the corruption metric (one finding) emit.
++    let intact: ChunkId = 0xD4;
++    d0.put_fragment(frag(intact, 0), valid_fragment(intact))
++        .await
++        .unwrap();
++    commit_reference(&meta, 1, "intact", intact, 0).await;
++
++    let rotten: ChunkId = 0xE5;
++    d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten))
++        .await
++        .unwrap();
++    commit_reference(&meta, 2, "rotten", rotten, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    // Wire the backend-agnostic durability seam (ADR-0012) and run scrub under it.
++    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), 0)
++        .with_subscriber(subscriber)
++        .await
++        .unwrap();
++    assert_eq!(outcome, Reconciled::Changed);
++
++    telemetry.flush().unwrap();
++    let exposed = telemetry
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert!(
++        exposed.contains("scrub_coverage"),
++        "scrub coverage is exported on the durability seam; got:\n{exposed}"
++    );
++    assert!(
++        exposed.contains("scrub_corruption_detected"),
++        "the scrub-detected corruption rate is exported on the durability seam; got:\n{exposed}"
++    );
++}
+diff --git a/crates/custodian/tests/skeleton.rs b/crates/custodian/tests/skeleton.rs
+index 2503cf1..6cb7bc0 100644
+--- a/crates/custodian/tests/skeleton.rs
++++ b/crates/custodian/tests/skeleton.rs
+@@ -38,7 +38,7 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
+     // The active leader's reconciliation step is admitted (the bare fence path: no
+     // maintenance inputs wired, so the control point reports a satisfied zone).
+     assert_eq!(
+-        reconcile_step(&zone, &leader, None, 0).await.unwrap(),
++        reconcile_step(&zone, &leader, None, None, 0).await.unwrap(),
+         Reconciled::Satisfied,
+         "the active leader acts"
+     );
+@@ -53,10 +53,12 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
+ 
+     // The new leader acts; the DEPOSED leader is now fenced out.
+     assert_eq!(
+-        reconcile_step(&zone, &usurper, None, 0).await.unwrap(),
++        reconcile_step(&zone, &usurper, None, None, 0)
++            .await
++            .unwrap(),
+         Reconciled::Satisfied
+     );
+-    let rejected = reconcile_step(&zone, &leader, None, 0).await;
++    let rejected = reconcile_step(&zone, &leader, None, None, 0).await;
+     assert!(
+         rejected.is_err(),
+         "a deposed leader's coordination action must be rejected by its stale fencing token"
