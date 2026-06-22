@@ -254,47 +254,106 @@ def _check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
 
 
 # ----------------------------------------------------------------------------
-# The unattended band: advance every bundle through Do + Check (docs 09). Serial by
-# default; a worker pool of cfg.lanes lanes when configured (PDCA_LANES / [driver].lanes).
+# The unattended band: advance every bundle through Do + Check, BEAT-SYNCHRONISED.
+# Instead of driving each bundle end-to-end before the next, every round advances
+# all bundles by ONE beat (driver.advance), so the SAME beat runs across the whole
+# wave before the next: all Dos, then all gates+reviews, then all SUMMARY assembles
+# (the "all dos, then all checks" ordering, mirroring how Plan and sign-off already
+# batch). Serial by default; a worker pool of cfg.lanes lanes — with a BARRIER per
+# beat — when configured (PDCA_LANES / [driver].lanes).
 # ----------------------------------------------------------------------------
-def _build_all(cfg: Config, bundles: list[Path]) -> None:
-    """Drive each bundle through the unattended Do+Check band to AWAITING_SIGNOFF / COMPLETE.
+def _advance_one(cfg: Config, d: Path) -> bool:
+    """Advance bundle ``d`` by exactly ONE beat under isolation; return True iff it
+    progressed (its file-derived state changed).
 
-    ``cfg.lanes <= 1`` keeps the original strictly-serial loop (Plan-if-unplanned then
-    drive, per bundle). With ``cfg.lanes > 1`` the *drive* fans out across a worker pool:
-    a serial Plan pre-pass runs first (an ``iterate-plan`` may have re-opened a bundle to
-    UNPLANNED, and the Plan leaf is **interactive** — it must never enter the pool), then
-    ``min(lanes, len(bundles))`` worker threads, each pinned to a fixed lane slot for its
-    lifetime (so only ``lanes`` lane-scoped checkouts/runners are ever needed), pull
-    bundles off a shared queue and run the unattended ``driver.run_issue``.
+    A leaf that raises is contained by :func:`_isolate` and leaves the state unchanged,
+    so this returns False — the sweep then drops that bundle for the rest of the band
+    (a perpetually-stuck bundle can't spin the round loop), and a later
+    ``_drive_and_act`` pass re-drives anything left short of sign-off.
     """
-    if cfg.lanes <= 1 or len(bundles) <= 1:
-        for d in bundles:
-            if not _deps_met(cfg, d):
-                continue  # a declared prereq isn't COMPLETE yet — a later pass picks it up
-            def _build(d=d):
-                _plan_if_unplanned(cfg, d, None)  # iterate-plan may have re-opened it
-                driver.run_issue(d, cfg)
-            _isolate(d, "build/check", _build)
-        return
+    before = state.state(d)
+    _isolate(d, "build/check", lambda: driver.advance(d, cfg))
+    return state.state(d) != before
 
-    # Serial Plan pre-pass — the interactive Plan beat stays out of the pool. After it
-    # every bundle has a brief, so the declared-conflict map is complete.
+
+def _build_all(cfg: Config, bundles: list[Path]) -> None:
+    """Drive every bundle through the unattended Do+Check band to AWAITING_SIGNOFF /
+    COMPLETE, advancing the wave one beat at a time so all Dos precede all Checks.
+
+    A serial Plan pre-pass runs first (an ``iterate-plan`` may have re-opened a bundle to
+    UNPLANNED, and the Plan leaf is **interactive** — it must never enter the pool / a beat
+    round); after it every bundle has a brief, so the declared-conflict map is complete.
+    ``cfg.lanes <= 1`` runs the beat rounds serially; ``cfg.lanes > 1`` fans each round
+    across ``min(lanes, len(bundles))`` lane-pinned workers with a barrier between beats.
+    """
     for d in bundles:
         _isolate(d, "plan", lambda d=d: _plan_if_unplanned(cfg, d, None))
+
+    if cfg.lanes <= 1 or len(bundles) <= 1:
+        _beat_sweep_serial(cfg, bundles)
+        return
+    _beat_sweep_pooled(cfg, bundles)
+
+
+def _beat_sweep_serial(cfg: Config, bundles: list[Path]) -> None:
+    """Round-robin one beat per bundle until the wave stops progressing.
+
+    Each round advances every still-running, deps-met bundle by one beat, in the caller's
+    sort-by-name order. A bundle that doesn't move (HALTED, dep-blocked, or a leaf that
+    raised) drops out of the active set; when nothing moves the band is done.
+    """
+    active = list(bundles)
+    while active:
+        progressed: list[Path] = []
+        for d in active:
+            if state.state(d) in state.HALTED or not _deps_met(cfg, d):
+                continue  # halted, or a prereq isn't COMPLETE yet (a later pass picks it up)
+            if _advance_one(cfg, d):
+                progressed.append(d)
+        if not progressed:
+            break  # nobody moved — the rest are halted, dep-blocked, or stuck
+        active = progressed
+
+
+def _beat_sweep_pooled(cfg: Config, bundles: list[Path]) -> None:
+    """The beat-synchronised sweep across a ``cfg.lanes`` worker pool, BARRIER per beat.
+
+    Each round advances every still-running, deps-met, conflict-free bundle by one beat in
+    parallel, then joins before the next beat — so 'all Dos' (in parallel) finish before
+    'all gates+reviews' begin. Within a round each worker holds a fixed lane slot (gates
+    read it via :func:`lane.current`) and a bundle never shares a lane with one it declares
+    a conflict with. The per-bundle worktree (#94) follows the bundle, so a bundle running
+    on a different lane slot between beats is safe.
+    """
     conflicts = _conflict_map(cfg, bundles)
-    # Pooled drive — fixed lane slot per worker; gates read it via lane.current().
-    # A worker claims the first queued bundle whose declared deps are COMPLETE and which
-    # conflicts with nothing currently in flight; with no fields declared the first
-    # queued bundle is always eligible, so this is the same FIFO pool as before.
-    remaining = list(bundles)  # preserves the caller's sort-by-name order
+    nlanes = min(cfg.lanes, len(bundles))
+    active = list(bundles)
+    while active:
+        pending = [d for d in active
+                   if state.state(d) not in state.HALTED and _deps_met(cfg, d)]
+        if not pending:
+            break
+        progressed = _run_beat_round_pooled(cfg, pending, conflicts, nlanes)
+        if not progressed:
+            break  # nobody moved this beat — halted, dep-blocked, or stuck
+        active = progressed
+
+
+def _run_beat_round_pooled(
+    cfg: Config, pending: list[Path], conflicts: dict[str, set[str]], nlanes: int
+) -> list[Path]:
+    """Advance each ``pending`` bundle by ONE beat across ``nlanes`` lane-pinned workers,
+    conflict-aware; join (the per-beat barrier) and return the bundles that progressed."""
+    remaining = list(pending)  # preserves the caller's sort-by-name order
     inflight: set[str] = set()
+    progressed: list[Path] = []
     cond = threading.Condition()
 
     def _next_eligible() -> Path | None:
-        # caller holds `cond`. Pop+return the first eligible bundle, else None.
+        # caller holds `cond`. Pop+return the first bundle conflicting with nothing in
+        # flight, else None. Deps were already checked when `pending` was built.
         for i, d in enumerate(remaining):
-            if _deps_met(cfg, d) and conflicts[d.name].isdisjoint(inflight):
+            if conflicts[d.name].isdisjoint(inflight):
                 inflight.add(d.name)
                 return remaining.pop(i)
         return None
@@ -309,25 +368,26 @@ def _build_all(cfg: Config, bundles: list[Path]) -> None:
                     d = _next_eligible()
                     if d is not None:
                         break
-                    # Nothing eligible right now. If nothing is in flight to unblock the
-                    # rest, they are dep-blocked on prereqs that only go COMPLETE after a
-                    # later sign-off pass — leave them and exit. Otherwise wait for an
-                    # in-flight bundle to finish and re-check.
+                    # Nothing eligible now: everything left conflicts with an in-flight
+                    # bundle. If nothing is in flight to clear them, exit; else wait.
                     if not inflight:
                         cond.notify_all()
                         return
                     cond.wait()
-            _isolate(d, "build/check", lambda d=d: driver.run_issue(d, cfg))
+            moved = _advance_one(cfg, d)
             with cond:
                 inflight.discard(d.name)
+                if moved:
+                    progressed.append(d)
                 cond.notify_all()
 
     threads = [threading.Thread(target=worker, args=(k,), name=f"pdca-lane{k}")
-               for k in range(min(cfg.lanes, len(bundles)))]
+               for k in range(nlanes)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    return progressed
 
 
 # ----------------------------------------------------------------------------
@@ -357,6 +417,7 @@ def _drive_and_act(
     # build touches a bundle (issue #36). No `Depends on` fields ⇒ no-op.
     _check_dep_graph(cfg, bundles)
     for _ in range(max_passes):
+        before = [state.state(d) for d in bundles]  # to tell real progress from a stall below
         # Build-all (unattended): advance each bundle to AWAITING_SIGNOFF / COMPLETE.
         # Each bundle is isolated — one that raises (a leaf left it half-written) is
         # skipped this pass, never crashing the sweep and losing the others' progress.
@@ -369,7 +430,15 @@ def _drive_and_act(
         # build-all above applies all the iterations together.
         pending = [e.bundle for e in queue.awaiting_signoff(cfg) if e.bundle.name in names]
         if not pending:
-            break
+            # Nothing to sign off this pass. Break only if build-all made NO progress
+            # either (every bundle terminal, or an UNPLANNED one the planner declined to
+            # brief). An iterate-plan re-opens its bundle to UNPLANNED via the archive —
+            # that IS progress, so loop once more: the next pass's Plan pre-pass re-briefs
+            # it and the band rebuilds it. Without this the cycle stalls at UNPLANNED and
+            # the re-planned iteration is never produced. Bounded by max_passes.
+            if [state.state(d) for d in bundles] == before:
+                break
+            continue
         for chunk in _chunks(pending, SIGNOFF_BATCH_SIZE):
             # The session writes a decision per bundle as it goes; a dropped session
             # still leaves the finished ones, applied below. Isolate it so a crashed
