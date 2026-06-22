@@ -1,0 +1,1671 @@
+diff --git a/crates/core/src/placement.rs b/crates/core/src/placement.rs
+index 39dea5b..e9e19f0 100644
+--- a/crates/core/src/placement.rs
++++ b/crates/core/src/placement.rs
+@@ -25,7 +25,7 @@
+ //! later, custodian re-placement, so the invariant holds on both write and repair
+ //! (`0005:241-242`).
+ 
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ 
+ use wyrd_traits::DServerId;
+ 
+@@ -122,6 +122,44 @@ impl Topology {
+     fn util(&self, id: DServerId) -> u64 {
+         self.utilization.get(&id).copied().unwrap_or(0)
+     }
++
++    /// The **per-failure-domain utilization** — the capacity-plane signal the
++    /// custodian publishes (proposal 0005 §"The durability plane", `0005:341-343`;
++    /// architecture §8.3): each opaque failure domain mapped to the **sum** of its
++    /// member servers' recorded utilization (a server with no recorded utilization
++    /// contributes zero). It is the by-product of the thin domain model the durability
++    /// plane emits per domain; the selector keeps no policy of its own (`0005:251`).
++    pub fn domain_utilization(&self) -> BTreeMap<FailureDomain, u64> {
++        let mut by_domain: BTreeMap<FailureDomain, u64> = BTreeMap::new();
++        for server in &self.servers {
++            let entry = by_domain.entry(server.domain.clone()).or_insert(0);
++            *entry = entry.saturating_add(self.util(server.id));
++        }
++        by_domain
++    }
++
++    /// A view of this topology with the `exclude`d servers removed — the re-placement
++    /// pool a **drain / decommission** evacuation selects against, so an evacuated
++    /// fragment is never re-placed back onto a draining server (proposal 0005
++    /// §"Rebalance", `0005:297-303`: move fragments *off* draining servers). The
++    /// retained servers' utilization is carried over so least-loaded selection still
++    /// holds on the filtered view.
++    pub fn excluding(&self, exclude: &BTreeSet<DServerId>) -> Topology {
++        Topology {
++            servers: self
++                .servers
++                .iter()
++                .filter(|s| !exclude.contains(&s.id))
++                .cloned()
++                .collect(),
++            utilization: self
++                .utilization
++                .iter()
++                .filter(|(id, _)| !exclude.contains(id))
++                .map(|(id, used)| (*id, *used))
++                .collect(),
++        }
++    }
+ }
+ 
+ /// Why a distinct-domain placement could not be produced.
+@@ -328,6 +366,42 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn domain_utilization_sums_per_domain() {
++        // Two servers in domain A (10 + 5), one in B (7), one in C (no recorded util).
++        let mut t = Topology::default();
++        t.register(0, "A").register(1, "A").register(2, "B");
++        t.register(3, "C");
++        t.set_utilization(0, 10)
++            .set_utilization(1, 5)
++            .set_utilization(2, 7);
++        let util = t.domain_utilization();
++        assert_eq!(util.get(&FailureDomain::new("A")), Some(&15), "A sums 10+5");
++        assert_eq!(util.get(&FailureDomain::new("B")), Some(&7));
++        assert_eq!(
++            util.get(&FailureDomain::new("C")),
++            Some(&0),
++            "a domain with no recorded utilization maps to zero"
++        );
++    }
++
++    #[test]
++    fn excluding_drops_servers_and_their_utilization() {
++        let mut t = Topology::default();
++        t.register(0, "A").register(1, "B").register(2, "C");
++        t.set_utilization(1, 99);
++        // Exclude server 1 (the draining server): it must not be selectable.
++        let drained: std::collections::BTreeSet<DServerId> = [1].into_iter().collect();
++        let filtered = t.excluding(&drained);
++        assert_eq!(filtered.distinct_domains(), 2, "B is gone with server 1");
++        // A 2-wide distinct placement on the filtered view never lands on server 1.
++        let placement = select_distinct_domains(&filtered, 2).unwrap();
++        assert!(
++            !placement.contains(&1),
++            "an evacuation never re-places onto the draining server"
++        );
++    }
++
+     #[test]
+     fn replacement_refuses_when_no_free_domain_remains() {
+         // Two domains, both occupied by survivors: no free domain for a rebuild.
+diff --git a/crates/custodian/src/desired_state.rs b/crates/custodian/src/desired_state.rs
+new file mode 100644
+index 0000000..98d9c06
+--- /dev/null
++++ b/crates/custodian/src/desired_state.rs
+@@ -0,0 +1,150 @@
++//! The **declarative management hook** (proposal 0005 §"Declarative management hook",
++//! `0005:346-356`; ADR-0011 rule 2: declarative, self-reconciling management;
++//! architecture §8.4).
++//!
++//! Management is **declarative**: the operator writes **desired state** (drain /
++//! decommission a D server) and the custodian's rebalance loop reconciles reality
++//! toward it — the Kubernetes control-loop pattern on the substrate already present.
++//! M3 builds only the **hook** — the desired-state read/write + the
++//! reconciliation-status surface — single-zone: desired state **folds into the local
++//! metadata** (`0005:353-354`). The full API-first management surface and its CLI are
++//! ADR-0013, deferred (`0005:355-356`).
++//!
++//! The load-bearing contract is that **"policy changed"** (desired state recorded) and
++//! **"policy satisfied"** (reality matches — the drained server holds no referenced
++//! fragment) are **distinct, observable moments** (`0005:351-352`). The concrete
++//! desired-state encoding (a `desired:dserver:<id>` ledger entry) and the
++//! reconciliation-status shape ([`ReconciliationStatus`]) are ILLUSTRATIVE; the two
++//! observable moments are BINDING.
++//!
++//! Dependency boundary (ADR-0010, `0005:421-422`): this stays over the `traits` seam —
++//! the desired state is a plain metadata-ledger entry, mirroring the `pending:` /
++//! `orphan:` / `repair:` ledger pattern, so the hook gains no backend of its own.
++
++use std::collections::BTreeMap;
++
++use wyrd_traits::{DServerId, MetadataStore, Result, WriteBatch};
++
++use crate::gc::referenced_fragments;
++
++/// Key prefix for the **desired-state** ledger — a D server the operator has marked
++/// draining / decommissioning. Mirrors the `pending:` / `orphan:` / `repair:` ledger
++/// pattern (architecture §5); the value records which lifecycle was requested.
++const DESIRED_PREFIX: &[u8] = b"desired:dserver:";
++
++/// Key for one D server's desired-state record: `desired:dserver:<id>`.
++pub fn desired_key(dserver: DServerId) -> Vec<u8> {
++    format!("desired:dserver:{dserver}").into_bytes()
++}
++
++fn parse_desired_key(key: &[u8]) -> Option<DServerId> {
++    std::str::from_utf8(key)
++        .ok()?
++        .strip_prefix("desired:dserver:")?
++        .parse()
++        .ok()
++}
++
++/// The operator-requested lifecycle of a D server (`0005:349`). Both are evacuation
++/// targets for the rebalance loop — fragments are moved **off** the server; the
++/// distinction (drain = temporary, decommission = permanent removal) is recorded for
++/// the audit trail and a later policy, not the M3 evacuation mechanism.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DServerLifecycle {
++    /// Temporarily evacuate the server (e.g. maintenance); it may return to service.
++    Draining,
++    /// Permanently evacuate the server ahead of removal from the fleet.
++    Decommissioning,
++}
++
++impl DServerLifecycle {
++    /// The on-ledger label for this lifecycle.
++    pub fn label(self) -> &'static str {
++        match self {
++            DServerLifecycle::Draining => "draining",
++            DServerLifecycle::Decommissioning => "decommissioning",
++        }
++    }
++
++    fn parse(s: &str) -> Option<Self> {
++        match s {
++            "draining" => Some(DServerLifecycle::Draining),
++            "decommissioning" => Some(DServerLifecycle::Decommissioning),
++            _ => None,
++        }
++    }
++}
++
++/// The reconciliation status of a D server's drain/decommission desired state — the
++/// observable surface that makes **"policy changed"** and **"policy satisfied"**
++/// distinct moments (`0005:351-352`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ReconciliationStatus {
++    /// No drain/decommission desired state is recorded for this server.
++    NotRequested,
++    /// Desired state is recorded (**policy changed**) but reality has not yet
++    /// converged — the server still holds at least one **referenced** fragment.
++    Pending,
++    /// Desired state is recorded **and** reality matches (**policy satisfied**) — the
++    /// server holds no referenced fragment; its leftover bytes are GC-eligible orphans.
++    Satisfied,
++}
++
++/// **Operator write** — record that `dserver` should be drained / decommissioned. This
++/// is the **"policy changed"** moment (`0005:351`). Idempotent at the metadata layer (a
++/// plain put), single-zone (folds into the local metadata, `0005:353-354`).
++pub async fn set_lifecycle(
++    meta: &dyn MetadataStore,
++    dserver: DServerId,
++    lifecycle: DServerLifecycle,
++) -> Result<()> {
++    meta.commit(WriteBatch::new().put(desired_key(dserver), lifecycle.label().as_bytes().to_vec()))
++        .await?;
++    Ok(())
++}
++
++/// Clear `dserver`'s desired state — it returns to active service (a drain cancelled).
++pub async fn clear_lifecycle(meta: &dyn MetadataStore, dserver: DServerId) -> Result<()> {
++    meta.commit(WriteBatch::new().delete(desired_key(dserver)))
++        .await?;
++    Ok(())
++}
++
++/// Every D server the operator has marked draining / decommissioning, with its
++/// requested lifecycle — the desired state the rebalance loop reconciles against.
++pub async fn draining_servers(
++    meta: &dyn MetadataStore,
++) -> Result<BTreeMap<DServerId, DServerLifecycle>> {
++    let mut map = BTreeMap::new();
++    for (key, value) in meta.scan(DESIRED_PREFIX).await? {
++        if let Some(id) = parse_desired_key(&key) {
++            if let Some(lifecycle) = std::str::from_utf8(&value)
++                .ok()
++                .and_then(DServerLifecycle::parse)
++            {
++                map.insert(id, lifecycle);
++            }
++        }
++    }
++    Ok(map)
++}
++
++/// The [`ReconciliationStatus`] of `dserver`'s desired state — the observable
++/// "changed" vs "satisfied" surface (`0005:351-352`). "Satisfied" is computed from the
++/// **committed** placement records (the same reference set GC / scrub gate on): a drain
++/// is satisfied once no committed chunk map's placement record points at `dserver`.
++pub async fn reconciliation_status(
++    meta: &dyn MetadataStore,
++    dserver: DServerId,
++) -> Result<ReconciliationStatus> {
++    if meta.get(&desired_key(dserver)).await?.is_none() {
++        return Ok(ReconciliationStatus::NotRequested);
++    }
++    let referenced = referenced_fragments(meta).await?;
++    let still_holds = referenced.iter().any(|(server, _)| *server == dserver);
++    Ok(if still_holds {
++        ReconciliationStatus::Pending
++    } else {
++        ReconciliationStatus::Satisfied
++    })
++}
+diff --git a/crates/custodian/src/lib.rs b/crates/custodian/src/lib.rs
+index bbe8ebc..0ac5629 100644
+--- a/crates/custodian/src/lib.rs
++++ b/crates/custodian/src/lib.rs
+@@ -20,15 +20,22 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++pub mod desired_state;
+ pub mod gc;
+ pub mod leadership;
++pub mod rebalance;
+ pub mod reconciliation;
+ pub mod reconstruction;
+ pub mod scrub;
+ pub mod telemetry;
+ 
++pub use desired_state::{
++    clear_lifecycle, draining_servers, reconciliation_status, set_lifecycle, DServerLifecycle,
++    ReconciliationStatus,
++};
+ pub use gc::{mark_orphaned, GcContext};
+ pub use leadership::{Custodian, FenceError, FencedZone};
++pub use rebalance::RebalanceContext;
+ pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
+ pub use reconstruction::{repair_priority, ReconstructionContext};
+ pub use scrub::ScrubContext;
+diff --git a/crates/custodian/src/rebalance.rs b/crates/custodian/src/rebalance.rs
+new file mode 100644
+index 0000000..7e82bb6
+--- /dev/null
++++ b/crates/custodian/src/rebalance.rs
+@@ -0,0 +1,327 @@
++//! The **rebalance custodian loop** — drain / decommission evacuation (proposal 0005
++//! §"The four custodian loops" / Rebalance, `0005:297-303`; the shared
++//! commit-point-atomic re-place §"Repair-vs-serve" `0005:305-317` and the atomicity
++//! graduation line `0005:486`; §"Declarative management hook" `0005:346-356`;
++//! PR-sequence slice 7, `0005:537-540`).
++//!
++//! Rebalance proactively moves fragments **off** D servers the operator has marked
++//! draining / decommissioning (the [`crate::desired_state`] hook), **preserving the
++//! failure-domain distinctness invariant** (`0005:298`, architecture §6.3 step 3). One
++//! pass reads the desired state, finds every committed chunk with a fragment on a
++//! draining server, and evacuates it (`0005:297-303`):
++//!
++//! ```text
++//! desired: operator marks a D server draining/decommissioning (desired_state hook)
++//! detect:  a committed chunk whose placement record points at the draining server
++//! move:    pick a healthy NON-draining D server in a failure domain DISTINCT from the
++//!          chunk's surviving fragments ──► copy the intact fragment bytes there FIRST
++//!          ──[ONE version-conditional MetadataStore::commit: repoint the placement
++//!             record + orphan the displaced fragment on the draining server]──►
++//!             readers flip atomically to the new location
++//! gc:      the displaced fragment ──[after GC's reader-safe grace window]──► reclaimed
++//! ```
++//!
++//! Each move is **the same commit-point-atomic re-place as a reconstruction**
++//! (`0005:298-299`, `0005:486`): the fragment is written to its new home **before** the
++//! commit, so a crash mid-move leaves only **collectable garbage** (an orphaned
++//! fragment GC reclaims), never a torn / hybrid chunk; the repoint is CAS'd on the
++//! prior inode record, so a superseded custodian or racing writer loses the commit
++//! rather than corrupting the placement record. Unlike reconstruction it needs **no**
++//! erasure rebuild — the fragment is intact on the (alive, draining) server, so it is
++//! **copied**, not reconstructed; the shared piece is the failure-domain selector and
++//! the atomic repoint, not the decode.
++//!
++//! Two load-bearing invariants:
++//!
++//! - **Spread wins** (`0005:302-303`, durability is gate-zero): where a move cannot keep
++//!   the chunk on `n` distinct domains (no free distinct domain remains off the draining
++//!   servers), the selector **refuses** and the move is **aborted** — the fragment stays
++//!   put rather than collapse the chunk's spread.
++//! - **Never propagate corruption**: a fragment that is missing or checksum-failing on
++//!   the draining server is **not** moved (that is a loss for the reconstruction loop,
++//!   not a clean drain move) — only an intact fragment is copied.
++//!
++//! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
++//! `traits` / `core` seams plus `tracing` — the placement selector and the fragment
++//! verify are borrowed from `core`, so `custodian` gains no backend and no
++//! on-disk-format knowledge of its own.
++
++use std::collections::{BTreeSet, HashMap};
++
++use wyrd_core::metadata::{self, InodeId, InodeRecord, InodeState};
++use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
++use wyrd_core::repair;
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
++};
++
++use crate::desired_state;
++use crate::reconciliation::Reconciled;
++
++/// What the rebalance reconciler reads and re-places over: the authoritative metadata
++/// store (committed chunk maps + the desired-state ledger), the **fleet** of D servers
++/// — each a [`ChunkStore`] keyed by its stable [`DServerId`], the same shape GC / scrub
++/// / reconstruction take — and the zone-local failure-domain
++/// [`Topology`](wyrd_core::placement::Topology) the evacuated fragments are re-placed
++/// against.
++///
++/// This is the input the running control point hands rebalance; it is **not** a
++/// deployed custodian process (Option A, `0005:519-523`). The loop is correct over
++/// these abstractions and reachable through the real [`crate::reconcile_step`].
++pub struct RebalanceContext<'a> {
++    /// The authoritative metadata store (chunk maps + the desired-state ledger).
++    pub meta: &'a dyn MetadataStore,
++    /// The fleet of D servers, each addressed by its stable id.
++    pub fleet: &'a [(DServerId, &'a dyn ChunkStore)],
++    /// The zone-local failure-domain view the evacuated fragments are re-placed against
++    /// (the **same** selector the write fan-out uses, `0005:241-242`).
++    pub topology: &'a Topology,
++}
++
++/// One chunk's evacuation plan: which fragment(s) sit on a draining server, where the
++/// chunk lives (for the CAS), and the failure domains its surviving fragments occupy
++/// (to keep the move disjoint).
++struct EvacPlan {
++    inode_id: InodeId,
++    prior: InodeRecord,
++    chunk_index: usize,
++    chunk_id: ChunkId,
++    /// The chunk's current placement vector (length `n`).
++    placement: Vec<DServerId>,
++    /// Fragment indices on a draining server (to be evacuated).
++    evac: Vec<usize>,
++    /// The failure domains the fragments that **stay** occupy (excluded from the move).
++    survivor_domains: Vec<FailureDomain>,
++}
++
++/// One rebalance reconciliation pass over `ctx` at logical time `now_millis`.
++/// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
++/// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
++/// repointed, [`Reconciled::Satisfied`] otherwise.
++pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Result<Reconciled> {
++    let stores: HashMap<DServerId, &dyn ChunkStore> = ctx.fleet.iter().copied().collect();
++
++    // **Capacity plane**: emit per-failure-domain utilization every pass — the
++    // by-product of the domain model the durability plane publishes (`0005:341-343`).
++    emit_domain_utilization(ctx.topology);
++
++    // Read the operator's desired state: which D servers are draining/decommissioning.
++    let draining = desired_state::draining_servers(ctx.meta).await?;
++    if draining.is_empty() {
++        return Ok(Reconciled::Satisfied);
++    }
++    let draining_set: BTreeSet<DServerId> = draining.keys().copied().collect();
++
++    // Plan an evacuation for each committed chunk with a fragment on a draining server.
++    let plans = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
++
++    let mut changed = false;
++    for plan in &plans {
++        match evacuate_chunk(ctx, &stores, plan, &draining_set, now_millis).await? {
++            EvacOutcome::Committed => changed = true,
++            EvacOutcome::Conflict => emit_conflict(plan.chunk_id),
++            EvacOutcome::Aborted => {}
++        }
++    }
++
++    Ok(if changed {
++        Reconciled::Changed
++    } else {
++        Reconciled::Satisfied
++    })
++}
++
++/// Scan the committed chunk maps for fragments sitting on a draining server, building
++/// one [`EvacPlan`] per affected chunk.
++async fn plan_evacuations(
++    meta: &dyn MetadataStore,
++    topology: &Topology,
++    draining: &BTreeSet<DServerId>,
++) -> Result<Vec<EvacPlan>> {
++    let mut plans = Vec::new();
++    for (key, value) in meta.scan(b"inode:").await? {
++        let record: InodeRecord = metadata::decode(&value)?;
++        if record.state != InodeState::Committed {
++            continue;
++        }
++        let Some(inode_id) = parse_inode_key(&key) else {
++            continue;
++        };
++        for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
++            let evac: Vec<usize> = chunk
++                .placement
++                .iter()
++                .enumerate()
++                .filter(|(_, server)| draining.contains(server))
++                .map(|(index, _)| index)
++                .collect();
++            if evac.is_empty() {
++                continue;
++            }
++            // The domains the fragments that STAY occupy — the move must avoid them so
++            // the chunk keeps `n` distinct domains (`0005:298`, the invariant).
++            let survivor_domains: Vec<FailureDomain> = chunk
++                .placement
++                .iter()
++                .enumerate()
++                .filter(|(index, _)| !evac.contains(index))
++                .filter_map(|(_, server)| topology.domain_of(*server).cloned())
++                .collect();
++            plans.push(EvacPlan {
++                inode_id,
++                prior: record.clone(),
++                chunk_index,
++                chunk_id: chunk.id,
++                placement: chunk.placement.clone(),
++                evac,
++                survivor_domains,
++            });
++        }
++    }
++    Ok(plans)
++}
++
++/// The outcome of evacuating one chunk.
++enum EvacOutcome {
++    /// The version-conditional commit landed; the fragment(s) were re-placed.
++    Committed,
++    /// The commit lost the CAS race (the copied fragments are now collectable garbage).
++    Conflict,
++    /// The move could not proceed — spread could not be preserved (no free distinct
++    /// domain), or a fragment was missing / corrupt / off-fleet; nothing was committed.
++    Aborted,
++}
++
++/// Evacuate `plan`'s fragment(s) off the draining server(s): copy each to a healthy
++/// non-draining D server in a distinct failure domain, then repoint the chunk's
++/// placement record with **one version-conditional commit**.
++async fn evacuate_chunk(
++    ctx: &RebalanceContext<'_>,
++    stores: &HashMap<DServerId, &dyn ChunkStore>,
++    plan: &EvacPlan,
++    draining: &BTreeSet<DServerId>,
++    now_millis: u64,
++) -> Result<EvacOutcome> {
++    // Select re-placement servers from the NON-draining pool, in domains distinct from
++    // the survivors — so an evacuation never lands back on a draining server and never
++    // collapses the chunk's spread. **Spread wins**: if no free distinct domain remains,
++    // the selector refuses and the move is aborted (`0005:302-303`).
++    let pool = ctx.topology.excluding(draining);
++    let new_servers = match select_distinct_domains_excluding(
++        &pool,
++        plan.evac.len() as u16,
++        &plan.survivor_domains,
++    ) {
++        Ok(servers) => servers,
++        Err(_) => return Ok(EvacOutcome::Aborted),
++    };
++
++    // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
++    // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
++    let mut new_placement = plan.placement.clone();
++    let mut displaced = Vec::new();
++    for (slot, &index) in plan.evac.iter().enumerate() {
++        let source = plan.placement[index];
++        let target = new_servers[slot];
++        let frag = FragmentId {
++            chunk: plan.chunk_id,
++            index: index as u16,
++        };
++        let (Some(source_store), Some(target_store)) = (stores.get(&source), stores.get(&target))
++        else {
++            // The source or selector target is outside the fleet view — cannot move.
++            return Ok(EvacOutcome::Aborted);
++        };
++        // Only an INTACT fragment is moved. A missing / checksum-failing fragment is a
++        // loss for the reconstruction loop, not a clean drain move — never propagate it.
++        let Some(bytes) = source_store.get_fragment(frag).await? else {
++            return Ok(EvacOutcome::Aborted);
++        };
++        if !repair::fragment_intact(&bytes, plan.chunk_id) {
++            return Ok(EvacOutcome::Aborted);
++        }
++        target_store.put_fragment(frag, bytes).await?;
++        displaced.push((source, frag));
++        new_placement[index] = target;
++    }
++
++    // THE binding commit: ONE version-conditional mutation that atomically repoints the
++    // placement record and orphans the displaced fragments on the draining server. The
++    // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
++    // racing writer / superseded custodian loses here rather than corrupting the record.
++    let mut next_chunk_map = plan.prior.chunk_map.clone();
++    next_chunk_map[plan.chunk_index].placement = new_placement;
++    let next = InodeRecord {
++        size: plan.prior.size,
++        chunk_map: next_chunk_map,
++        state: InodeState::Committed,
++        version: plan.prior.version + 1,
++    };
++    let inode_key = metadata::inode_key(plan.inode_id);
++    let mut batch = WriteBatch::new()
++        .require(inode_key.clone(), metadata::encode(&plan.prior))
++        .put(inode_key, metadata::encode(&next));
++    for (dserver, frag) in &displaced {
++        batch = batch.put(
++            crate::gc::orphan_key(*dserver, *frag),
++            now_millis.to_string().into_bytes(),
++        );
++    }
++
++    match ctx.meta.commit(batch).await? {
++        CommitOutcome::Committed => {
++            emit_evacuated(plan.chunk_id, displaced.len());
++            Ok(EvacOutcome::Committed)
++        }
++        // Lost the CAS race: the placement moved under us. The copied fragments are now
++        // collectable garbage; the drain is re-assessed next pass.
++        CommitOutcome::Conflict => Ok(EvacOutcome::Conflict),
++    }
++}
++
++fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
++    std::str::from_utf8(key)
++        .ok()?
++        .strip_prefix("inode:")?
++        .parse()
++        .ok()
++}
++
++/// Emit the **capacity plane's per-failure-domain utilization** on the durability-plane
++/// seam (ADR-0011 / ADR-0012, `0005:341-343`): one gauge sample per failure domain, the
++/// `DurabilityTelemetry` `tracing`→OTel bridge fans out (the `domain` label carries the
++/// opaque domain id).
++fn emit_domain_utilization(topology: &Topology) {
++    for (domain, used) in topology.domain_utilization() {
++        tracing::info!(
++            gauge.capacity_domain_utilization = used,
++            domain = domain.0.as_str(),
++        );
++    }
++}
++
++/// Emit an **evacuation** on the durability-plane seam (`0005:336-340`): the metric the
++/// `tracing`→OTel bridge counts plus an append-only audit event for a chunk the pass
++/// drained off a draining server.
++fn emit_evacuated(chunk: ChunkId, moved: usize) {
++    tracing::info!(monotonic_counter.rebalance_fragments_evacuated = moved as u64);
++    tracing::info!(
++        target: "wyrd.custodian.rebalance.audit",
++        action = "evacuate",
++        chunk = %chunk,
++        moved,
++        "rebalance evacuated fragment(s) off a draining server and repointed the placement record",
++    );
++}
++
++/// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the
++/// copied fragments are now collectable garbage.
++fn emit_conflict(chunk: ChunkId) {
++    tracing::info!(monotonic_counter.rebalance_conflict = 1_u64);
++    tracing::info!(
++        target: "wyrd.custodian.rebalance.audit",
++        action = "conflict",
++        chunk = %chunk,
++        "rebalance lost the version-conditional commit; copied fragments are collectable garbage",
++    );
++}
+diff --git a/crates/custodian/src/reconciliation.rs b/crates/custodian/src/reconciliation.rs
+index e3b6351..1dc9255 100644
+--- a/crates/custodian/src/reconciliation.rs
++++ b/crates/custodian/src/reconciliation.rs
+@@ -10,6 +10,7 @@
+ 
+ use crate::gc::{self, GcContext};
+ use crate::leadership::{Custodian, FenceError, FencedZone};
++use crate::rebalance::{self, RebalanceContext};
+ use crate::reconstruction::{self, ReconstructionContext};
+ use crate::scrub::{self, ScrubContext};
+ 
+@@ -55,16 +56,19 @@ impl std::error::Error for ReconcileError {}
+ /// The supplied maintenance inputs select which loops the step dispatches: `gc`
+ /// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
+ /// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), `reconstruction` runs the
+-/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), and all
+-/// `None` exercises the fence alone (no maintenance inputs wired). When several are
+-/// supplied the step runs each independent loop and reports [`Reconciled::Changed`] if
+-/// **any** converged. Rebalance (slice 7) is not yet dispatched.
++/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), `rebalance`
++/// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
++/// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
++/// wired). When several are supplied the step runs each independent loop and reports
++/// [`Reconciled::Changed`] if **any** converged.
++#[allow(clippy::too_many_arguments)]
+ pub async fn reconcile_step(
+     zone: &FencedZone,
+     custodian: &Custodian,
+     gc: Option<&GcContext<'_>>,
+     scrub: Option<&ScrubContext<'_>>,
+     reconstruction: Option<&ReconstructionContext<'_>>,
++    rebalance: Option<&RebalanceContext<'_>>,
+     now_millis: u64,
+ ) -> Result<Reconciled, ReconcileError> {
+     zone.authorize(custodian.term())
+@@ -98,5 +102,14 @@ pub async fn reconcile_step(
+             outcome = Reconciled::Changed;
+         }
+     }
++    if let Some(ctx) = rebalance {
++        if rebalance::reconcile(ctx, now_millis)
++            .await
++            .map_err(ReconcileError::Store)?
++            == Reconciled::Changed
++        {
++            outcome = Reconciled::Changed;
++        }
++    }
+     Ok(outcome)
+ }
+diff --git a/crates/custodian/tests/gc.rs b/crates/custodian/tests/gc.rs
+index a9637f6..665f13c 100644
+--- a/crates/custodian/tests/gc.rs
++++ b/crates/custodian/tests/gc.rs
+@@ -207,7 +207,7 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
+     };
+ 
+     // now = 200: past the lease (100) and past the orphan window (0 + 50).
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 200)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
+         .await
+         .unwrap();
+     assert_eq!(outcome, Reconciled::Changed, "GC reclaimed fragment bytes");
+@@ -271,7 +271,7 @@ async fn never_reclaims_a_referenced_fragment() {
+         grace_window_millis: 0,
+     };
+ 
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 1_000_000)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+         .await
+         .unwrap();
+ 
+@@ -306,7 +306,7 @@ async fn honours_the_reader_safe_grace_window() {
+ 
+     // WITHIN the window (now = 120 < 150): not reclaimed, and a reader holding the
+     // prior version still resolves the fragment.
+-    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 120)
++    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 120)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -320,7 +320,7 @@ async fn honours_the_reader_safe_grace_window() {
+     );
+ 
+     // AFTER the window (now = 160 >= 150): reclaimed.
+-    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 160)
++    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 160)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -366,7 +366,7 @@ async fn emits_gc_actions_on_the_durability_seam() {
+     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+ 
+-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 100)
++    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 100)
+         .with_subscriber(subscriber)
+         .await
+         .unwrap();
+diff --git a/crates/custodian/tests/rebalance.rs b/crates/custodian/tests/rebalance.rs
+new file mode 100644
+index 0000000..5869c64
+--- /dev/null
++++ b/crates/custodian/tests/rebalance.rs
+@@ -0,0 +1,849 @@
++//! M3.7 (issue #145, proposal 0005 slice 7, `0005:537-540`): the **rebalance custodian
++//! loop** — declarative drain/decommission evacuation + the capacity plane — driven
++//! through the real [`reconcile_step`] fenced control point.
++//!
++//! The BINDING legs of the success criterion, proven in-process over the trait stores
++//! (Option A — no deployed custodian process exists yet, `0005:519-523`):
++//!
++//! 1. **Drain-and-evacuate, spread preserved** (`0005:297-303`, the central DoD): an
++//!    operator writes desired state marking a D server draining; through `reconcile_step`
++//!    the custodian evacuates that server's referenced fragment onto a healthy D server
++//!    in a **distinct failure domain** via the **same commit-point-atomic,
++//!    version-conditional `MetadataStore::commit` re-place as a reconstruction**
++//!    (`0005:298-299`, `0005:486`) — after which the drained server holds **no referenced
++//!    fragment** and the chunk retains **full redundancy across `n` distinct domains**.
++//!    Flippable (recorded in build-notes): skip the desired-state read in
++//!    `rebalance::reconcile` (treat the drain as absent) and nothing is evacuated — the
++//!    assertions here fire.
++//! 2. **"Changed" vs "satisfied" are distinct, observable moments** (`0005:351-352`): the
++//!    operator write records desired state (changed → `Pending`); after reconciliation
++//!    reality matches (satisfied → `Satisfied`).
++//! 3. **Spread wins** (`0005:302-303`, durability is gate-zero): where the move cannot
++//!    keep the chunk on `n` distinct domains, the evacuation is **refused** rather than
++//!    collapse the spread — the fragment stays put.
++//! 4. **Per-failure-domain utilization** is emitted on the `DurabilityTelemetry` seam
++//!    (`0005:341-343`, ADR-0011/0012) and read back in-process via `gather_prometheus`.
++//! 5. **Multi-fragment evacuation in ONE commit** (`0005:298`, the distinctness invariant
++//!    `0005:491`): when **two** servers holding fragments of the *same* chunk are drained
++//!    at once, the loop re-places **both** evacuated fragments — each into a domain
++//!    distinct from the survivor and from each other — in a **single** version-conditional
++//!    commit, so the chunk keeps `n` distinct domains. This exercises the `evac.len() > 1`
++//!    leg of `select_distinct_domains_excluding` (`count = 2`).
++//! 6. **Lost-CAS: a racing writer loses rather than corrupts the record** (`0005:298-299`,
++//!    `0005:486`; ADR-0015 the second fence): when a concurrent inode mutation lands
++//!    between the loop's read (`plan_evacuations`) and its commit, the version-conditional
++//!    `MetadataStore::commit` precondition fails — the custodian's repoint is **rejected**,
++//!    the placement record reflects the racing writer (not the custodian), the copied
++//!    fragment is left as **collectable garbage** (no orphan record, no torn chunk), and
++//!    the conflict is surfaced on the durability seam.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord};
++use wyrd_core::placement::Topology;
++use wyrd_core::read::read_object;
++use wyrd_core::write::write_new_object_placed;
++use wyrd_custodian::{
++    reconcile_step, reconciliation_status, set_lifecycle, Custodian, DServerLifecycle,
++    DurabilityTelemetry, ExporterConfig, FencedZone, RebalanceContext, Reconciled,
++    ReconciliationStatus,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
++    PlacementChunkStore, Result, WriteBatch,
++};
++
++// ---- in-memory trait stores (backend-agnostic; the loop is proven over the seams) ----
++
++/// A trivial in-memory metadata store (with version-conditional commit).
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
++/// stored fragment bytes (so their checksums verify and the moved fragment round-trips).
++#[derive(Default)]
++struct MemDServer {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++/// A **placement-aware** fleet over several [`MemDServer`]s: it routes `_at` calls to the
++/// D server the placement record names, so the read path (and the write fan-out) resolve
++/// each fragment from its recorded location — the seam a custodian re-placement flips.
++struct Fleet<'a> {
++    servers: Vec<(DServerId, &'a MemDServer)>,
++}
++
++impl<'a> Fleet<'a> {
++    fn store(&self, dserver: DServerId) -> Option<&'a MemDServer> {
++        self.servers
++            .iter()
++            .find(|(id, _)| *id == dserver)
++            .map(|(_, s)| *s)
++    }
++}
++
++#[async_trait]
++impl ChunkStore for Fleet<'_> {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        if let Some(store) = self.store(DServerId::from(id.index)) {
++            store.put_fragment(id, fragment).await?;
++        }
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        for (_, store) in &self.servers {
++            if let Some(bytes) = store.get_fragment(id).await? {
++                return Ok(Some(bytes));
++            }
++        }
++        Ok(None)
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        let mut all = Vec::new();
++        for (_, store) in &self.servers {
++            all.extend(store.list_fragments().await?);
++        }
++        Ok(all)
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        for (_, store) in &self.servers {
++            store.delete_fragment(id).await?;
++        }
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++#[async_trait]
++impl PlacementChunkStore for Fleet<'_> {
++    async fn get_fragment_at(&self, dserver: DServerId, id: FragmentId) -> Result<Option<Bytes>> {
++        match self.store(dserver) {
++            Some(store) => store.get_fragment(id).await,
++            None => Ok(None),
++        }
++    }
++
++    async fn put_fragment_at(
++        &self,
++        dserver: DServerId,
++        id: FragmentId,
++        fragment: Bytes,
++    ) -> Result<()> {
++        if let Some(store) = self.store(dserver) {
++            store.put_fragment(id, fragment).await?;
++        }
++        Ok(())
++    }
++}
++
++// ---- helpers ----
++
++const ROOT: InodeId = 0;
++const CHUNK: ChunkId = 0xC0FFEE;
++
++fn frag(index: u16) -> FragmentId {
++    FragmentId {
++        chunk: CHUNK,
++        index,
++    }
++}
++
++/// A four-domain topology A..D (servers 0..3). `select_distinct_domains` places a 3-wide
++/// chunk on the first three domains A,B,C → servers 0,1,2 (all util 0, lowest labels).
++fn four_domains() -> Topology {
++    let mut t = Topology::default();
++    t.register(0, "A")
++        .register(1, "B")
++        .register(2, "C")
++        .register(3, "D");
++    t
++}
++
++/// A five-domain topology A..E (servers 0..4). `select_distinct_domains` still places a
++/// 3-wide chunk on the first three domains A,B,C → servers 0,1,2 (all util 0, lowest
++/// labels); the two spare domains D,E are the re-placement pool when **two** of the
++/// chunk's servers are drained at once.
++fn five_domains() -> Topology {
++    let mut t = Topology::default();
++    t.register(0, "A")
++        .register(1, "B")
++        .register(2, "C")
++        .register(3, "D")
++        .register(4, "E");
++    t
++}
++
++async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
++    let leader = Custodian::elect(coord, "zone-rebalance").await.unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    (zone, leader)
++}
++
++async fn read_inode(meta: &MemMeta) -> InodeRecord {
++    let bytes = meta
++        .get(&metadata::inode_key(1))
++        .await
++        .unwrap()
++        .expect("inode present");
++    metadata::decode(&bytes).unwrap()
++}
++
++/// Write one RS(2,1) chunk via the real write path, placed across distinct domains: n =
++/// 3 fragments on servers 0,1,2 (domains A,B,C). Returns the original object bytes.
++async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec<u8> {
++    let data = b"evacuate this erasure-coded chunk, every byte of it".to_vec();
++    let outcome = write_new_object_placed(
++        meta,
++        fleet,
++        ROOT,
++        "obj",
++        1,
++        &data,
++        data.len(),
++        EcScheme::ReedSolomon { k: 2, m: 1 },
++        topo,
++        0,
++        1_000,
++        || CHUNK,
++    )
++    .await
++    .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++    assert_eq!(
++        read_inode(meta).await.chunk_map[0].placement,
++        vec![0, 1, 2],
++        "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
++    );
++    data
++}
++
++// ---- criterion 1+2: drain a D server, evacuate to a distinct domain, observe moments ----
++
++#[tokio::test]
++async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_step() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2, d3) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let fleet = Fleet {
++        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
++    };
++    let topo = four_domains();
++    let data = write_rs_2_1(&meta, &fleet, &topo).await;
++
++    // The operator marks D server 1 (domain B) DRAINING — the "policy changed" moment.
++    set_lifecycle(&meta, 1, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++    assert_eq!(
++        reconciliation_status(&meta, 1).await.unwrap(),
++        ReconciliationStatus::Pending,
++        "policy changed but not yet satisfied: server 1 still holds a referenced fragment"
++    );
++
++    // Reconcile through the real fenced control point. Server 1 is alive (graceful drain),
++    // so the topology/fleet still include it; the loop excludes it as a re-placement
++    // target and copies its fragment to the one free distinct domain, D (server 3).
++    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
++    let ctx = RebalanceContext {
++        meta: &meta,
++        fleet: &dyn_fleet,
++        topology: &topo,
++    };
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "the draining server's fragment was evacuated"
++    );
++
++    // "Policy satisfied": reality now matches the desired state — server 1 holds no
++    // referenced fragment. A distinct, observable moment from "changed".
++    assert_eq!(
++        reconciliation_status(&meta, 1).await.unwrap(),
++        ReconciliationStatus::Satisfied,
++        "policy satisfied: server 1 is no longer referenced by any committed placement"
++    );
++
++    // ONE version-conditional commit: the inode version bumped by EXACTLY one and the
++    // placement flipped atomically — fragment 1 now lives on server 3 (domain D).
++    let record = read_inode(&meta).await;
++    assert_eq!(record.version, 2, "exactly one version-conditional commit");
++    assert_eq!(
++        record.chunk_map[0].placement,
++        vec![0, 3, 2],
++        "the evacuated fragment was re-placed on a healthy server in a distinct domain"
++    );
++
++    // FULL REDUNDANCY across n=3 DISTINCT domains, spread preserved.
++    let domains: std::collections::HashSet<_> = record.chunk_map[0]
++        .placement
++        .iter()
++        .map(|id| topo.domain_of(*id).unwrap().clone())
++        .collect();
++    assert_eq!(
++        domains.len(),
++        3,
++        "n fragments on n distinct failure domains"
++    );
++
++    // The copied fragment is intact at its new home; the displaced fragment is orphaned
++    // (a `orphan:` grace record GC reclaims after its window) — collectable garbage, not
++    // a referenced fragment.
++    assert!(
++        wyrd_core::repair::fragment_intact(
++            &d3.get_fragment(frag(1))
++                .await
++                .unwrap()
++                .expect("moved fragment present"),
++            CHUNK
++        ),
++        "the evacuated fragment verifies its checksum at its new home (server 3)"
++    );
++    assert!(
++        !meta.scan(b"orphan:").await.unwrap().is_empty(),
++        "the displaced fragment on the draining server is orphaned for GC"
++    );
++
++    // Reads still succeed and return the same bytes — full redundancy, atomic flip, no
++    // torn chunk (readers resolve fragment 1 from its new location, server 3).
++    assert_eq!(
++        read_object(&meta, &fleet, 1).await.unwrap(),
++        Some(data),
++        "the object reads correctly after the drain evacuation (atomic flip)"
++    );
++}
++
++// ---- criterion 3: spread wins — refuse the move rather than collapse the spread ----
++
++#[tokio::test]
++async fn spread_wins_when_no_free_distinct_domain_remains() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let fleet = Fleet {
++        servers: vec![(0, &d0), (1, &d1), (2, &d2)],
++    };
++    // Exactly three domains for a 3-wide chunk — no spare domain to evacuate into.
++    let mut topo = Topology::default();
++    topo.register(0, "A").register(1, "B").register(2, "C");
++    let data = b"three fragments, three domains, no spare".to_vec();
++    let outcome = write_new_object_placed(
++        &meta,
++        &fleet,
++        ROOT,
++        "obj",
++        1,
++        &data,
++        data.len(),
++        EcScheme::ReedSolomon { k: 2, m: 1 },
++        &topo,
++        0,
++        1_000,
++        || CHUNK,
++    )
++    .await
++    .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++
++    // Mark server 1 draining. Its domain B has no other server, and A/C are held by the
++    // survivors — there is NO free distinct domain. Spread wins: refuse to move.
++    set_lifecycle(&meta, 1, DServerLifecycle::Decommissioning)
++        .await
++        .unwrap();
++    let dyn_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (1, &d1), (2, &d2)];
++    let ctx = RebalanceContext {
++        meta: &meta,
++        fleet: &dyn_fleet,
++        topology: &topo,
++    };
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
++        .await
++        .unwrap();
++
++    assert_eq!(
++        outcome,
++        Reconciled::Satisfied,
++        "no move: collapsing the chunk's spread would violate durability (gate-zero)"
++    );
++    let record = read_inode(&meta).await;
++    assert_eq!(record.version, 1, "the placement record is untouched");
++    assert_eq!(
++        record.chunk_map[0].placement,
++        vec![0, 1, 2],
++        "the fragment stays on the draining server rather than collapse the spread"
++    );
++    assert_eq!(
++        reconciliation_status(&meta, 1).await.unwrap(),
++        ReconciliationStatus::Pending,
++        "the drain remains unsatisfied — surfaced, not silently collapsed"
++    );
++}
++
++// ---- criterion 4: per-failure-domain utilization on the durability seam, read back ----
++
++#[tokio::test]
++async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2, d3) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
++
++    // Two servers share domain A (10 + 5 → 15); B has 7; D has none (→ 0).
++    let mut topo = Topology::default();
++    topo.register(0, "A").register(1, "A").register(2, "B");
++    topo.register(3, "D");
++    topo.set_utilization(0, 10)
++        .set_utilization(1, 5)
++        .set_utilization(2, 7);
++    let ctx = RebalanceContext {
++        meta: &meta,
++        fleet: &dyn_fleet,
++        topology: &topo,
++    };
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
++
++    // A pass with no desired state still emits the capacity plane as a by-product.
++    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 0)
++        .with_subscriber(subscriber)
++        .await
++        .unwrap();
++    assert_eq!(outcome, Reconciled::Satisfied);
++
++    telemetry.flush().unwrap();
++    let exposed = telemetry
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert!(
++        exposed.contains("capacity_domain_utilization"),
++        "the per-failure-domain capacity metric is exported; got:\n{exposed}"
++    );
++    for domain in ["domain=\"A\"", "domain=\"B\"", "domain=\"D\""] {
++        assert!(
++            exposed.contains(domain),
++            "per-failure-domain utilization carries a `{domain}` series; got:\n{exposed}"
++        );
++    }
++}
++
++// ---- criterion 5: TWO servers drained at once → both fragments evacuated in ONE commit ----
++
++#[tokio::test]
++async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2, d3, d4) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let fleet = Fleet {
++        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (4, &d4)],
++    };
++    let topo = five_domains();
++    // RS(2,1): n = 3 fragments on servers 0,1,2 (domains A,B,C). Spare domains D,E.
++    let data = write_rs_2_1(&meta, &fleet, &topo).await;
++
++    // The operator marks BOTH server 0 (domain A) and server 1 (domain B) draining — two
++    // fragments of the SAME chunk must move at once (the `evac.len() > 1` leg).
++    set_lifecycle(&meta, 0, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++    set_lifecycle(&meta, 1, DServerLifecycle::Decommissioning)
++        .await
++        .unwrap();
++    assert_eq!(
++        reconciliation_status(&meta, 0).await.unwrap(),
++        ReconciliationStatus::Pending,
++        "policy changed: server 0 still holds a referenced fragment"
++    );
++    assert_eq!(
++        reconciliation_status(&meta, 1).await.unwrap(),
++        ReconciliationStatus::Pending,
++        "policy changed: server 1 still holds a referenced fragment"
++    );
++
++    let dyn_fleet: [(DServerId, &dyn ChunkStore); 5] =
++        [(0, &d0), (1, &d1), (2, &d2), (3, &d3), (4, &d4)];
++    let ctx = RebalanceContext {
++        meta: &meta,
++        fleet: &dyn_fleet,
++        topology: &topo,
++    };
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "both draining servers' fragments were evacuated"
++    );
++
++    // ONE version-conditional commit moved BOTH fragments: the version bumped by EXACTLY
++    // one (not two) even though two fragments were re-placed — the move is one atomic
++    // repoint of the chunk's placement vector.
++    let record = read_inode(&meta).await;
++    assert_eq!(
++        record.version, 2,
++        "exactly ONE version-conditional commit re-placed both evacuated fragments"
++    );
++    assert_eq!(
++        record.chunk_map[0].placement,
++        vec![3, 4, 2],
++        "fragment 0 → server 3 (domain D), fragment 1 → server 4 (domain E); survivor \
++         fragment 2 stays on server 2 (domain C)"
++    );
++
++    // The chunk still spans n = 3 DISTINCT failure domains — distinctness preserved across
++    // a multi-fragment move (closes the `count = 2` leg of select_distinct_domains_excluding).
++    let domains: std::collections::HashSet<_> = record.chunk_map[0]
++        .placement
++        .iter()
++        .map(|id| topo.domain_of(*id).unwrap().clone())
++        .collect();
++    assert_eq!(
++        domains.len(),
++        3,
++        "two evacuated fragments land in domains distinct from each other and the survivor"
++    );
++
++    // Both drains are now satisfied — neither drained server is referenced any longer.
++    assert_eq!(
++        reconciliation_status(&meta, 0).await.unwrap(),
++        ReconciliationStatus::Satisfied,
++        "policy satisfied: server 0 no longer referenced"
++    );
++    assert_eq!(
++        reconciliation_status(&meta, 1).await.unwrap(),
++        ReconciliationStatus::Satisfied,
++        "policy satisfied: server 1 no longer referenced"
++    );
++
++    // Both copied fragments verify their checksums at their new homes.
++    assert!(
++        wyrd_core::repair::fragment_intact(
++            &d3.get_fragment(frag(0))
++                .await
++                .unwrap()
++                .expect("moved fragment 0 present"),
++            CHUNK
++        ),
++        "evacuated fragment 0 verifies at its new home (server 3)"
++    );
++    assert!(
++        wyrd_core::repair::fragment_intact(
++            &d4.get_fragment(frag(1))
++                .await
++                .unwrap()
++                .expect("moved fragment 1 present"),
++            CHUNK
++        ),
++        "evacuated fragment 1 verifies at its new home (server 4)"
++    );
++
++    // Both displaced fragments are orphaned for GC — collectable garbage, not referenced.
++    assert_eq!(
++        meta.scan(b"orphan:").await.unwrap().len(),
++        2,
++        "both displaced fragments (on servers 0 and 1) are orphaned in the same commit"
++    );
++
++    // Reads still succeed and return the original bytes (atomic flip, full redundancy).
++    assert_eq!(
++        read_object(&meta, &fleet, 1).await.unwrap(),
++        Some(data),
++        "the object reads correctly after evacuating two of its three fragments"
++    );
++}
++
++// ---- criterion 6: a racing writer loses the version-conditional commit (lost CAS) ----
++
++/// A [`MetadataStore`] that injects a **single** concurrent inode mutation the first time
++/// the custodian attempts a version-conditional commit — modelling a racing writer that
++/// supersedes the inode between the rebalance loop's read (`plan_evacuations`) and its
++/// commit. The injected write bumps the inode version (placement unchanged) so the
++/// custodian's `require(prior)` precondition fails: the custodian loses the CAS rather
++/// than corrupting the placement record.
++struct RacingMeta {
++    inner: MemMeta,
++    /// Becomes `true` once the test has finished setup and wants the race injected.
++    armed: Mutex<bool>,
++    /// Ensures the race is injected exactly once (on the first inode-conditional commit).
++    raced: Mutex<bool>,
++}
++
++impl RacingMeta {
++    fn new() -> Self {
++        Self {
++            inner: MemMeta::default(),
++            armed: Mutex::new(false),
++            raced: Mutex::new(false),
++        }
++    }
++
++    /// Arm the race: subsequent inode-conditional commits trigger one concurrent mutation.
++    fn arm(&self) {
++        *self.armed.lock().unwrap() = true;
++    }
++}
++
++#[async_trait]
++impl MetadataStore for RacingMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let inject = {
++            let armed = *self.armed.lock().unwrap();
++            let mut raced = self.raced.lock().unwrap();
++            let targets_inode = batch
++                .preconditions
++                .iter()
++                .any(|p| p.key.starts_with(b"inode:"));
++            if armed && !*raced && targets_inode {
++                *raced = true;
++                true
++            } else {
++                false
++            }
++        };
++        if inject {
++            // A racing writer touches the same inode between the loop's read and commit:
++            // bump its version (placement unchanged) so the custodian's CAS will miss.
++            let key = batch
++                .preconditions
++                .iter()
++                .find(|p| p.key.starts_with(b"inode:"))
++                .unwrap()
++                .key
++                .clone();
++            if let Some(bytes) = self.inner.get(&key).await? {
++                let mut record: InodeRecord = metadata::decode(&bytes).unwrap();
++                record.version += 1;
++                let outcome = self
++                    .inner
++                    .commit(WriteBatch::new().put(key, metadata::encode(&record)))
++                    .await?;
++                assert_eq!(outcome, CommitOutcome::Committed, "racing writer commits");
++            }
++        }
++        self.inner.commit(batch).await
++    }
++}
++
++#[tokio::test]
++async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_garbage() {
++    let racing = RacingMeta::new();
++    let (d0, d1, d2, d3) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let fleet = Fleet {
++        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
++    };
++    let topo = four_domains();
++
++    // Setup (race disarmed): RS(2,1) on servers 0,1,2 (A,B,C), then mark server 1 draining.
++    let data = b"a racing writer must lose, not corrupt the placement record".to_vec();
++    let outcome = write_new_object_placed(
++        &racing,
++        &fleet,
++        ROOT,
++        "obj",
++        1,
++        &data,
++        data.len(),
++        EcScheme::ReedSolomon { k: 2, m: 1 },
++        &topo,
++        0,
++        1_000,
++        || CHUNK,
++    )
++    .await
++    .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++    set_lifecycle(&racing, 1, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++
++    // Snapshot the inode the custodian will read and try to CAS on.
++    let prior: InodeRecord =
++        metadata::decode(&racing.get(&metadata::inode_key(1)).await.unwrap().unwrap()).unwrap();
++    assert_eq!(prior.version, 1);
++    assert_eq!(prior.chunk_map[0].placement, vec![0, 1, 2]);
++
++    // Arm the race: the next inode-conditional commit (the custodian's evac repoint) will
++    // find the inode mutated underneath it.
++    racing.arm();
++
++    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
++    let ctx = RebalanceContext {
++        meta: &racing,
++        fleet: &dyn_fleet,
++        topology: &topo,
++    };
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++
++    // Capture the durability seam so the lost-CAS conflict is observable as a metric.
++    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
++    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
++        .with_subscriber(subscriber)
++        .await
++        .unwrap();
++    // No chunk converged: the only candidate move lost its CAS race.
++    assert_eq!(
++        outcome,
++        Reconciled::Satisfied,
++        "the only evacuation lost the CAS, so no placement was repointed this pass"
++    );
++
++    // SAFETY: the placement record reflects the RACING WRITER (version bumped, placement
++    // untouched), NOT the custodian's repoint. The custodian lost rather than corrupting.
++    let record: InodeRecord =
++        metadata::decode(&racing.get(&metadata::inode_key(1)).await.unwrap().unwrap()).unwrap();
++    assert_eq!(
++        record.version, 2,
++        "the racing writer's commit landed (version 1 → 2)"
++    );
++    assert_eq!(
++        record.chunk_map[0].placement,
++        vec![0, 1, 2],
++        "the placement record is the racing writer's, NOT the custodian's repoint \
++         (which would be [0, 3, 2]) — a racing writer loses rather than corrupts"
++    );
++
++    // The copied fragment IS at its new home (server 3) — but it is collectable GARBAGE:
++    // the atomic commit that would have referenced it and orphaned the source was rejected,
++    // so no orphan record exists and the record never points at it.
++    assert!(
++        d3.get_fragment(frag(1)).await.unwrap().is_some(),
++        "the pre-commit copy landed on server 3 — now unreferenced collectable garbage"
++    );
++    assert!(
++        racing.scan(b"orphan:").await.unwrap().is_empty(),
++        "the lost commit was atomic: the displaced fragment was NOT orphaned (no torn move)"
++    );
++
++    // The drain is still unsatisfied — server 1 remains referenced; reconciliation re-tries.
++    assert_eq!(
++        reconciliation_status(&racing, 1).await.unwrap(),
++        ReconciliationStatus::Pending,
++        "the drain is re-assessed next pass; reality has not converged"
++    );
++
++    // The conflict is surfaced on the durability seam (emit_conflict).
++    telemetry.flush().unwrap();
++    let exposed = telemetry
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert!(
++        exposed.contains("rebalance_conflict"),
++        "the lost-CAS conflict is emitted on the durability seam; got:\n{exposed}"
++    );
++}
+diff --git a/crates/custodian/tests/reconstruction.rs b/crates/custodian/tests/reconstruction.rs
+index 296f6c5..af03cac 100644
+--- a/crates/custodian/tests/reconstruction.rs
++++ b/crates/custodian/tests/reconstruction.rs
+@@ -323,7 +323,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
+ 
+     let coord = MemCoordination::new();
+     let (zone, custodian) = elect(&coord).await;
+-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
++    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -416,7 +416,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
+ 
+     let coord = MemCoordination::new();
+     let (zone, custodian) = elect(&coord).await;
+-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
++    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+         .await
+         .unwrap();
+     assert_eq!(outcome, Reconciled::Changed);
+@@ -478,7 +478,7 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
+     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+ 
+-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
++    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+         .with_subscriber(subscriber)
+         .await
+         .unwrap();
+diff --git a/crates/custodian/tests/scrub.rs b/crates/custodian/tests/scrub.rs
+index 41ddf78..f190cec 100644
+--- a/crates/custodian/tests/scrub.rs
++++ b/crates/custodian/tests/scrub.rs
+@@ -204,7 +204,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
+         fleet: &fleet,
+     };
+ 
+-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -241,7 +241,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
+         fleet: &fleet,
+     };
+ 
+-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -309,7 +309,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
+         fleet: &fleet,
+     };
+ 
+-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+         .await
+         .unwrap();
+     assert_eq!(
+@@ -373,7 +373,7 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
+     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+ 
+-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+         .with_subscriber(subscriber)
+         .await
+         .unwrap();
+diff --git a/crates/custodian/tests/skeleton.rs b/crates/custodian/tests/skeleton.rs
+index c093ba9..bc892d3 100644
+--- a/crates/custodian/tests/skeleton.rs
++++ b/crates/custodian/tests/skeleton.rs
+@@ -38,7 +38,7 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
+     // The active leader's reconciliation step is admitted (the bare fence path: no
+     // maintenance inputs wired, so the control point reports a satisfied zone).
+     assert_eq!(
+-        reconcile_step(&zone, &leader, None, None, None, 0)
++        reconcile_step(&zone, &leader, None, None, None, None, 0)
+             .await
+             .unwrap(),
+         Reconciled::Satisfied,
+@@ -55,12 +55,12 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
+ 
+     // The new leader acts; the DEPOSED leader is now fenced out.
+     assert_eq!(
+-        reconcile_step(&zone, &usurper, None, None, None, 0)
++        reconcile_step(&zone, &usurper, None, None, None, None, 0)
+             .await
+             .unwrap(),
+         Reconciled::Satisfied
+     );
+-    let rejected = reconcile_step(&zone, &leader, None, None, None, 0).await;
++    let rejected = reconcile_step(&zone, &leader, None, None, None, None, 0).await;
+     assert!(
+         rejected.is_err(),
+         "a deposed leader's coordination action must be rejected by its stale fencing token"
