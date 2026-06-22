@@ -190,6 +190,37 @@ class FlowSlice(unittest.TestCase):
         self.assertEqual(set(results), {"BATCH1", "BATCH2"})
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
 
+    def test_batch_iterate_plan_then_complete(self) -> None:
+        # A batch member iterates-to-PLAN on its first sign-off: the attempt is archived
+        # and the bundle re-opened to UNPLANNED, then a later pass re-plans + rebuilds it
+        # to COMPLETE. Regression (pre-existing): the sweep used to stall at UNPLANNED —
+        # with nothing left to sign off it broke early, so the re-planned iteration was
+        # never produced (the bundle was left stuck at UNPLANNED).
+        iterated = {"done": False}
+
+        def signoff_batch(cfg: Config, bundles: list[Path]) -> None:
+            for d in bundles:
+                summ = d / "SUMMARY.md"
+                if d.name == "issue_BATCH1" and not iterated["done"]:
+                    iterated["done"] = True
+                    (d / leaves.SIGNOFF_DECISION).write_text(
+                        "iterate-plan\nre-scope the approach\n", encoding="utf-8")
+                    continue
+                summ.write_text(summ.read_text().replace("- [ ]", "- [x]"), encoding="utf-8")
+                (d / leaves.SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
+
+        orig = leaves.run_signoff_batch
+        leaves.run_signoff_batch = signoff_batch
+        try:
+            results = flow.flow_batch(self.cfg, today="2026-06-04", max_passes=6)
+        finally:
+            leaves.run_signoff_batch = orig
+        self.assertTrue(iterated["done"])
+        self.assertEqual(set(results), {"BATCH1", "BATCH2"})
+        self.assertTrue(all(s == state.COMPLETE for s in results.values()))
+        # The first attempt was archived — the re-plan really ran, it did not just stall.
+        self.assertTrue((self.cfg.bundle("BATCH1") / "iteration-v1").exists())
+
     def test_batch_signoff_chunks_into_sessions(self) -> None:
         # The cheap-first queue is signed off in ONE session per chunk of
         # SIGNOFF_BATCH_SIZE (=5): six halted bundles → sessions of 5 then 1, all
@@ -337,20 +368,55 @@ class FlowSlice(unittest.TestCase):
         for iid in ("GOOD", "BAD"):
             leaves.do_plan(self.cfg.bundle(iid), self.cfg)
 
-        real_run = driver.run_issue
+        # Beat-synchronised band: the unit of work is driver.advance (one beat), not a
+        # whole-bundle run_issue. A leaf that raises leaves the state unchanged, so the
+        # sweep drops BAD and drives the rest.
+        real_advance = driver.advance
 
-        def flaky(d: Path, cfg: Config) -> str:
+        def flaky(d: Path, cfg: Config) -> None:
             if d.name == "issue_BAD":
                 raise RuntimeError("boom: leaf left the bundle half-written")
-            return real_run(d, cfg)
+            real_advance(d, cfg)
 
-        flow.driver.run_issue = flaky
+        flow.driver.advance = flaky
         try:
             results = flow.flow_ids(self.cfg, ["GOOD", "BAD"], today="2026-06-06")
         finally:
-            flow.driver.run_issue = real_run
+            flow.driver.advance = real_advance
         self.assertEqual(results["GOOD"], state.COMPLETE)    # other bundle proceeded
         self.assertNotEqual(results["BAD"], state.COMPLETE)  # failing one isolated
+
+    def test_build_all_batches_by_beat(self) -> None:
+        # The unattended band advances the wave one beat at a time: every bundle's Do
+        # runs before ANY bundle's Check (gates+review), which runs before any assemble —
+        # the "all dos, then all checks" ordering. Spy driver.advance; the state BEFORE
+        # each call is the beat run (PLANNED→Do, BUILT→gates+review, CHECKED→assemble).
+        ids = ["B1", "B2", "B3"]
+        for iid in ids:
+            leaves.do_plan(self.cfg.bundle(iid), self.cfg)
+        kinds: list[str] = []
+        real = driver.advance
+
+        def spy(d: Path, cfg: Config):
+            kinds.append(state.state(d))  # beat-kind = the state being advanced from
+            return real(d, cfg)
+
+        driver.advance = spy
+        try:
+            flow.flow_ids(self.cfg, ids, do_publish=False, do_act=False, today="2026-06-04")
+        finally:
+            driver.advance = real
+
+        def first(k: str) -> int:
+            return min(i for i, x in enumerate(kinds) if x == k)
+
+        def last(k: str) -> int:
+            return max(i for i, x in enumerate(kinds) if x == k)
+
+        self.assertEqual(kinds.count(state.PLANNED), len(ids))  # one Do beat per bundle
+        self.assertEqual(kinds.count(state.BUILT), len(ids))    # one Check beat per bundle
+        self.assertLess(last(state.PLANNED), first(state.BUILT))   # all Dos before any Check
+        self.assertLess(last(state.BUILT), first(state.CHECKED))   # all Checks before any assemble
 
     def test_queue_skips_a_bundle_whose_read_raises(self) -> None:
         # A bundle halted at AWAITING_SIGNOFF whose §6 read raises must be skipped by
@@ -723,42 +789,42 @@ class DeclaredOrdering(unittest.TestCase):
         self._brief("AA", depends_on="ZZ")
         self._brief("ZZ")
         seen = {}
-        real = driver.run_issue
+        real = driver.advance  # the beat-synchronised band's unit of work
 
         def spy(d: Path, cfg: Config):
             if d.name == "issue_AA" and "zz_state" not in seen:
                 seen["zz_state"] = state.state(cfg.bundle("ZZ"))
             return real(d, cfg)
 
-        driver.run_issue = spy
+        driver.advance = spy
         try:
             results = flow.flow_ids(self.cfg, ["AA", "ZZ"], do_publish=False,
                                     do_act=False, today="2026-06-04")
         finally:
-            driver.run_issue = real
+            driver.advance = real
         self.assertEqual(seen.get("zz_state"), state.COMPLETE)  # ZZ done before AA built
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
 
     def test_no_deps_keeps_sort_by_name_dispatch(self) -> None:
-        # No Depends-on fields → the serial build order is exactly sort-by-name, byte
-        # for byte today's behaviour.
+        # No Depends-on fields → bundles first enter the Do beat in exactly sort-by-name
+        # order (the beat-synchronised band advances the wave in the caller's order).
         ids = ["N3", "N1", "N2"]
         for iid in ids:
             self._brief(iid)
         order: list[str] = []
-        real = driver.run_issue
+        real = driver.advance
 
         def spy(d: Path, cfg: Config):
             if d.name not in order:
-                order.append(d.name)
+                order.append(d.name)  # first touch = the Do beat, in dispatch order
             return real(d, cfg)
 
-        driver.run_issue = spy
+        driver.advance = spy
         try:
             flow.flow_ids(self.cfg, ids, do_publish=False, do_act=False,
                           today="2026-06-04")
         finally:
-            driver.run_issue = real
+            driver.advance = real
         self.assertEqual(order, ["issue_N1", "issue_N2", "issue_N3"])
 
     def test_conflict_pair_never_co_scheduled(self) -> None:
@@ -777,7 +843,7 @@ class DeclaredOrdering(unittest.TestCase):
         together: set[tuple[str, str]] = set()
         max_conc = [0]
         lk = threading.Lock()
-        real = driver.run_issue
+        real = driver.advance  # one beat is the pooled unit; conflicts hold per beat
 
         def spy(d: Path, cfg: Config):
             with lk:
@@ -794,12 +860,12 @@ class DeclaredOrdering(unittest.TestCase):
                 with lk:
                     active.discard(d.name)
 
-        driver.run_issue = spy
+        driver.advance = spy
         try:
             results = flow.flow_ids(self.cfg, ["C", "D", "E", "F"], do_publish=False,
                                     do_act=False, today="2026-06-04")
         finally:
-            driver.run_issue = real
+            driver.advance = real
         self.assertNotIn(("issue_C", "issue_D"), together)  # conflict respected
         self.assertEqual(max_conc[0], 2)                     # pool genuinely concurrent
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
