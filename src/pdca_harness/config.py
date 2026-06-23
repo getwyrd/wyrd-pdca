@@ -78,6 +78,11 @@ class Config:
     # retrieve a bundle's tracker thread into issue_<id>/notes.json (the planner reads it).
     # $PDCA_BUNDLE = the bundle dir; the command writes notes.json itself. "" ⇒ no fetch.
     notes_cmd: str = ""
+    # Composable Plan-seeding sources (issue #102): a list of [[plan.source]] providers the
+    # Plan beat runs to seed a bundle's sources/ dir, so a brief can draw on the ticket AND
+    # a linked proposal AND a spec — not just one notes_cmd. Each: {type, ...} where type ∈
+    # {github, gitlab, csv, file, command}; empty ⇒ only the legacy notes_cmd path.
+    plan_sources: list[dict] = field(default_factory=list)
     # Publish mechanics — config-driven so the harness ships project-agnostic.
     # Branch patterns are .format(id=, slug=) strings; issue_trailer is .format(id=).
     fix_branch_pattern: str = "fix/{id}-{slug}"
@@ -122,6 +127,12 @@ class Config:
     # checkout directly, as before). Best-effort: a target that isn't a worktree-capable
     # git checkout silently falls back to in-place.
     worktree: bool = True
+    # Act cadence (issue #109): Act is a cross-cycle beat that only yields a real delta
+    # once enough cycles have frozen to show a pattern, so ``flow`` auto-runs it only when
+    # this many cycles have frozen SINCE the last Act review (counted across flow
+    # invocations, not per-run). Below it, the flow skips Act with a hint. ``1`` restores
+    # run-after-every-flow; ``--no-act`` always forces skip. ``[driver].act_cadence``.
+    act_cadence: int = 5
     # Close-disposition fast path (issue #60): the disposition-hint classes that mark a
     # bundle as close / no-fix, so the driver skips the builder + reviewer leaves and
     # routes it straight to sign-off. ``[driver].close_dispositions`` in pdca.toml; the
@@ -154,6 +165,7 @@ class Config:
 
         paths = data.get("paths", {})
         tracker = data.get("tracker", {})
+        plan_sources = list(data.get("plan", {}).get("source", []))  # [[plan.source]] (#102)
         publisher_cfg = data.get("publisher", {})
         leaves = data.get("leaves", {})
         gates = data.get("gates", {})
@@ -207,6 +219,7 @@ class Config:
             lanes = int(os.environ["PDCA_LANES"])
         lanes = max(1, lanes)
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
+        act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
 
         # Close-disposition classes (issue #60): a configured list retunes the default
         # for an instance's tracker vocabulary; absent ⇒ the built-in default.
@@ -224,6 +237,7 @@ class Config:
             issue_id_example=tracker.get("issue_id_example", ""),
             tracker_export_csv=tracker.get("export_csv", ""),
             notes_cmd=tracker.get("notes_cmd", ""),
+            plan_sources=plan_sources,
             fix_branch_pattern=publisher_cfg.get("fix_branch_pattern", "fix/{id}-{slug}"),
             feature_branch_pattern=publisher_cfg.get("feature_branch_pattern", "enhancement/{id}-{slug}"),
             base_remote=publisher_cfg.get("base_remote", "upstream"),
@@ -244,6 +258,7 @@ class Config:
             gates_runner=gates_runner,
             lanes=lanes,
             worktree=worktree,
+            act_cadence=act_cadence,
             close_dispositions=close_dispositions,
         )
 

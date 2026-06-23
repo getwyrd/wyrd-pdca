@@ -59,6 +59,19 @@ def planning_artifact(brief_path: Path) -> str:
     return field(brief_path, "planning artifact", "plan artifact", "plan source")
 
 
+def is_placeholder(brief_path: Path) -> bool:
+    """True if the brief is still an unfilled template — Slug missing or a ``<…>`` token.
+
+    A ``brief.md`` copied from ``brief.md.tpl`` but never authored *looks* PLANNED (the
+    file exists) yet carries no ticket content; ``state`` treats it as UNPLANNED so the
+    Plan beat re-plans it instead of the planner being silently skipped (issue #113). The
+    Slug — the first, always-filled field of any real brief — is the cheap, reliable
+    sentinel: an authored slug is kebab-case, never an angle-bracket placeholder.
+    """
+    slug = field(brief_path, "slug").strip()
+    return not slug or slug.startswith("<")
+
+
 def test_files(brief_path: Path) -> list[Path]:
     """Paths named by the brief's test-requirement field, relative to the bundle.
 
@@ -81,6 +94,19 @@ def depends_on(brief_path: Path) -> list[str]:
     ``[]`` ⇒ today's sort-by-name scheduling, unaffected.
     """
     return _id_list(field(brief_path, "depends on", "depends_on"))
+
+
+def depends_on_merged(brief_path: Path) -> list[str]:
+    """Issue ids whose PR must be **merged** before this bundle runs (issue #107).
+
+    The optional ``- **Depends on (merged):** <id>[, <id>…]`` field (docs 09): a stricter
+    ``Depends on`` for a dependent that edits files a prerequisite also edits. Plain
+    ``Depends on`` only waits for the prereq to reach COMPLETE — a draft PR, **not
+    merged** — so a dependent built off the target base misses the prereq's diff and
+    conflicts at merge. This gate holds the dependent until the prereq is merged into the
+    base, so Do genuinely builds on the predecessor. Absent ⇒ ``[]``.
+    """
+    return _id_list(field(brief_path, "depends on (merged)", "depends_on_merged"))
 
 
 def conflicts_with(brief_path: Path) -> list[str]:
@@ -111,12 +137,27 @@ def onto_branch(brief_path: Path) -> tuple[str, str] | None:
 
 
 def _id_list(raw: str) -> list[str]:
-    """Issue ids out of a comma/space-separated field value, normalised to bare ids.
+    """Issue ids out of the **leading id-list** of a field value, normalised to bare ids.
 
     Tolerates a leading ``#`` and the ``issue_`` bundle prefix so a brief may write
     ``#36`` / ``36`` / ``issue_36`` interchangeably; matches how ``cfg.bundle(id)``
-    keys bundles. Mirrors :func:`test_files`' tokenise-the-value approach.
+    keys bundles.
+
+    Parses only the leading run of id tokens and **stops at the first non-id token**, so
+    a trailing rationale is ignored (issue #103). ``Depends on:`` / ``Conflicts with:``
+    are the only list-parsed brief fields, yet authors and the headless planner routinely
+    append a note — a parenthetical, or an em-dash meaning "none" — mirroring the
+    template's own ``value (explanation)`` hint; left whole, that prose parsed into bogus
+    ids and crashed the whole batch in ``_check_dep_graph``. An id is a bare reference
+    (an issue number ``139``, or a tracker key ``PROJ-12`` / ``AA``); a natural-language
+    rationale word — lowercase letters and no digit (``no``, ``kept``, ``PR-order``) —
+    ends the run, so a value of pure prose or a bare ``—`` for "none" yields ``[]``.
     """
-    if not raw:
-        return []
-    return [t.lstrip("#").removeprefix("issue_") for t in re.findall(r"#?[\w./-]+", raw)]
+    ids: list[str] = []
+    for tok in re.findall(r"#?[\w./-]+", raw or ""):
+        bare = tok.lstrip("#").removeprefix("issue_")
+        is_id = any(ch.isdigit() for ch in bare) or not any(ch.islower() for ch in bare)
+        if not is_id:
+            break  # a rationale word — the id-list has ended
+        ids.append(bare)
+    return ids
