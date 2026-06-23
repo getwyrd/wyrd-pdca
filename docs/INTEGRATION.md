@@ -37,7 +37,11 @@
   never touched and concurrent lanes get private worktrees. `engine/xtask.sh` runs
   `cargo xtask ci` in `$PDCA_WORKTREE` (falling back to `../wyrd` if isolation is off), so
   the gate tests the SAME tree the builder edited; the per-fix `C4-verify` gate uses its
-  own dedicated `../wyrd-verify` worktree off `origin/main` (`$WYRD_REPO` overrides).
+  own dedicated `../wyrd-verify` worktree off `origin/main` (`$WYRD_REPO` overrides). Both
+  the cycle worktree and the `C4-verify` worktree (and its `pdca-verify` branch) are
+  **scoped per lane** under in-driver concurrency (`-l<slot>` suffix from `$PDCA_LANE`), so
+  `--lanes N` runs without two lanes colliding on a checkout or a branch — the active gate
+  set (`C4-ci`, `C4-verify`) is multi-lane-safe.
 - **Per-area branch map:** everything targets **`main`**. Wyrd is early and has **no
   maintenance branches** today (no `maintenance/*`, no master-vs-maintenance split) — say
   so rather than invent one; add a map here if/when a release branch is cut.

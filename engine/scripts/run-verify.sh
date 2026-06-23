@@ -21,12 +21,33 @@
 # Isolation: runs in a dedicated `../wyrd-verify` git worktree off origin/main —
 # never the live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY override.
 #
-#   run-verify.sh --classify <patch>   # print the file classification + exit (test hook)
+# Lane-safe (docs 09 §parallel lanes): under in-driver concurrency the driver pins each
+# worker to a slot and exports $PDCA_LANE (0..N-1); a serial run leaves it unset. The
+# per-fix verify worktree AND the branch it checks out are a shared mutable resource, so
+# BOTH are scoped per lane — two concurrent lanes never collide on the same checkout dir
+# nor try to check out one branch in two worktrees. Mirrors the driver's own
+# `<name>.pdca-wt-l<slot>` worktree naming (worktree.py). Serial → `../wyrd-verify` on
+# branch `pdca-verify`, unchanged.
+#
+#   run-verify.sh --classify <patch>     # print the file classification + exit (test hook)
+#   run-verify.sh --print-isolation      # print the lane-scoped VERIFY dir + branch (test hook)
 set -euo pipefail
 
 case "${1:-}" in
   -h | --help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
 esac
+
+# --- lane-scoped verify worktree + branch (shared by the run and the test hook) -------
+_here()          ( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )
+_lane_suffix()   { printf '%s' "${PDCA_LANE:+-l$PDCA_LANE}"; }
+_verify_dir()    { printf '%s' "${WYRD_VERIFY:-"$(_here)/../../../wyrd-verify$(_lane_suffix)"}"; }
+_verify_branch() { printf '%s' "pdca-verify$(_lane_suffix)"; }
+
+if [ "${1:-}" = "--print-isolation" ]; then
+  echo "VERIFY $(basename "$(_verify_dir)")"
+  echo "BRANCH $(_verify_branch)"
+  exit 0
+fi
 
 # --- pure patch-classification helpers (unit-tested via --classify) ---------------
 # Every `+++ b/<path>` is a changed file; a `--- /dev/null` immediately before it
@@ -61,7 +82,8 @@ PATCH="$(cd "$(dirname "$PATCH_REL")" && pwd)/$(basename "$PATCH_REL")"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WYRD_REPO="${WYRD_REPO:-"$(cd "$here/../../../wyrd" 2>/dev/null && pwd || true)"}"
-VERIFY="${WYRD_VERIFY:-"$here/../../../wyrd-verify"}"
+VERIFY="$(_verify_dir)"
+VERIFY_BRANCH="$(_verify_branch)"
 
 if [ -z "$WYRD_REPO" ] || [ ! -f "$WYRD_REPO/Cargo.toml" ]; then
   echo "run-verify.sh: live Wyrd repo not found (set WYRD_REPO, or place this project beside ~/wyrd/wyrd)." >&2
@@ -72,7 +94,7 @@ fi
 git -C "$WYRD_REPO" fetch -q origin 2>/dev/null || true
 git -C "$WYRD_REPO" worktree prune
 if [ ! -e "$VERIFY/Cargo.toml" ]; then
-  git -C "$WYRD_REPO" worktree add -q -B pdca-verify "$VERIFY" origin/main
+  git -C "$WYRD_REPO" worktree add -q -B "$VERIFY_BRANCH" "$VERIFY" origin/main
 fi
 git -C "$VERIFY" reset -q --hard origin/main
 git -C "$VERIFY" clean -fdq
