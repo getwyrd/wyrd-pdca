@@ -61,3 +61,5 @@ test: check
 
 check:
 	$(PYTHON) -m unittest discover -s tests
+	@echo "== engine verification-script tests (wyrd-owned gates) =="
+	@for t in engine/tests/*.sh; do echo "  -> $$t"; bash "$$t" || exit 1; done

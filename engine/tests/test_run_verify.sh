@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for engine/scripts/run-verify.sh's patch classification (the `--classify`
-# hook), so the red->green wiring doesn't rot. Pure: no worktree, no cargo, no git.
+# hook) and its lane-scoped isolation (the `--print-isolation` hook), so the
+# red->green wiring and multi-lane safety don't rot. Pure: no worktree, no cargo, no git.
 #
 #   engine/tests/test_run_verify.sh   # exits 0 iff all cases pass
 set -euo pipefail
@@ -78,5 +79,22 @@ EOF
 check "added .rs test is the discriminator, Dockerfile is not" \
   $'ADDED_TEST crates/chunkstore-grpc/tests/tier2.rs\nCRATE crates/chunkstore-grpc' \
   "$("$RV" --classify "$TMP/addnontest.diff")"
+
+# 5. lane isolation — a serial run (no $PDCA_LANE) keeps the historical names.
+check "serial -> ../wyrd-verify on branch pdca-verify" \
+  $'VERIFY wyrd-verify\nBRANCH pdca-verify' \
+  "$(PDCA_LANE='' "$RV" --print-isolation)"
+
+# 6. a concurrent lane scopes BOTH the worktree dir and the branch by the slot, so two
+#    lanes never collide on the checkout or check out one branch in two worktrees.
+check "lane 2 -> wyrd-verify-l2 on branch pdca-verify-l2" \
+  $'VERIFY wyrd-verify-l2\nBRANCH pdca-verify-l2' \
+  "$(PDCA_LANE=2 "$RV" --print-isolation)"
+
+# 7. an explicit $WYRD_VERIFY wins for the dir, but the branch still scopes per lane
+#    (the branch is the resource two lanes would actually fight over).
+check "WYRD_VERIFY override + lane -> custom dir, lane-scoped branch" \
+  $'VERIFY custom-verify\nBRANCH pdca-verify-l1' \
+  "$(PDCA_LANE=1 WYRD_VERIFY=/tmp/custom-verify "$RV" --print-isolation)"
 
 [ "$fail" -eq 0 ] && { echo "test_run_verify.sh: all passed"; exit 0; } || { echo "test_run_verify.sh: FAILURES"; exit 1; }
