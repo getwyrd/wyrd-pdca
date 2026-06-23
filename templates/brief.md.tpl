@@ -42,7 +42,26 @@
   PR run, real hardware). When you declare a deferred posture: NAME where/who confirms the
   deferred green, and ask Do to capture a *demonstrated* red where feasible (a temporary
   negation/stub proving the new seam is load-bearing) rather than resting red on
-  non-existence.>
+  non-existence. FORCING FUNCTION (deferred ≠ unbuilt — the #146 Tier-1/2 gap): a
+  deferred/off-Check posture is ONLY for code that EXISTS but cannot be verified HERE; it
+  MUST NOT wave through a deliverable that is not built. When you declare it, state (i) what
+  IS built AND exercised at Check (the seam/harness code, unit-tested in this slice) vs.
+  what is deferred, and (ii) that the deferred deliverable is itself BUILT and exercised by
+  SOMETHING at Check (e.g. unit tests over the harness code) — never merely inert dispatch
+  scaffolding. If a tier/job is not yet functionally implemented, it is a SEPARATE work item,
+  not a deferred-verification line.>
+- **Production reach:** <OPTIONAL — declare HERE when this slice builds a SEAM ahead of its
+  production consumer, so the BINDING criterion is honoured only by a test double, a
+  hand-authored fixture, or an in-process (Option-A) stand-in while the LIVE path still
+  collapses to the old behaviour (e.g. routing through `index % n`, an identity/default
+  record, a static-endpoints bypass). State: (a) WHAT honours the seam now (the double /
+  fixture / in-process loop) vs. what production still does; (b) WHERE the production wiring
+  lands — which later slice, and what must exist first (e.g. "a discovery-driven gateway write
+  must exist first"); (c) that the double exercises the seam LOAD-BEARINGLY (not dead
+  scaffolding). This converts the recurring "is a test-double-only seam causally sufficient?"
+  C5/T5 question into a PRE-DECLARED sign-off item rather than a surprise NEEDS-HUMAN. Distinct
+  from `Verification posture` (that is red/green observability at Check; this is whether the
+  LIVE path reaches the seam at all). Omit when production traverses the seam at Check.>
 - **Citations expected:** Do must cite path:line on the target branch for every change.
 - **Prior-art check (triage cycles):** <searched by file path — merged history / open PRs / closed PRs — result>
 - **Disposition hint:** <one triage flag — drives the driver's Do path. FIX (full

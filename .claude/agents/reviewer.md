@@ -36,7 +36,12 @@ physically cannot patch what you judge.
   `$PDCA_TARGET`** (read-only; the driver resolves it from the brief's target and adds
   it for you). Ground only there — do **not** wander into other checkouts on the
   machine; if `$PDCA_TARGET` is unset, ground against `patch.diff` alone. Drop findings
-  that do not ground.
+  that do not ground. If `$PDCA_TARGET` is SET but **stale** — its base lacks a declared
+  `Depends on` the worktree/gates already ran against (the gates run off `origin/main`,
+  INTEGRATION.md §2) — that is a *target-state caveat*, **not** a patch defect: note the
+  staleness and ground the affected citations on `patch.diff`. Do NOT present a stale- or
+  unreadable-target "patch cannot apply/compile" as a blocking C4 FAIL — that fabricates an
+  ordering-gate blocker (#145).
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + one-line rationale + path:line.
 
 ## Always emit the complete 5/5/1 verdict table

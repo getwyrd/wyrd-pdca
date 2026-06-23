@@ -20,7 +20,12 @@ driver enforces this by not passing the file; do not ask for it.
 - Re-check that every `path:line` the patch cites resolves on the **target source at
   `$PDCA_TARGET`** (the driver resolves it from the brief's target). Ground only there —
   do **not** search other checkouts on the machine; if `$PDCA_TARGET` is unset, ground
-  against `patch.diff` alone. Drop any finding that does not ground.
+  against `patch.diff` alone. Drop any finding that does not ground. If `$PDCA_TARGET` is
+  SET but **stale** — its base lacks a declared `Depends on` the worktree/gates already ran
+  against (the gates run off `origin/main`, INTEGRATION.md §2) — that is a *target-state
+  caveat*, **not** a patch defect: note the staleness and ground the affected citations on
+  `patch.diff`. Do NOT present a stale- or unreadable-target "patch cannot apply/compile" as
+  a blocking C4 FAIL — that fabricates an ordering-gate blocker (#145).
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + a one-line rationale + a path:line.
   No free-form prose verdict. The rationale states **context and impact** — what the
   change touches and what the human's decision turns on — not a restatement of the
