@@ -15,7 +15,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import act, brief, driver, flow, gates, publish, queue, revalidate, signoff, state
+from . import (act, brief, driver, flow, gates, merged, publish, queue, revalidate,
+               signoff, state)
 from .config import Config
 
 
@@ -52,9 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     # No subcommand → status (the bundle dashboard), the most-reached-for view (#88).
     sub = parser.add_subparsers(dest="cmd")
 
-    p_init = sub.add_parser("init-issue", help="create a bundle and seed brief.md")
+    p_init = sub.add_parser("init-issue",
+                            help="seed a bundle from a pre-authored brief (requires --from-brief; "
+                                 "to start from a ticket use `flow <id>`, which auto-plans)")
     p_init.add_argument("issue_id")
-    p_init.add_argument("--from-brief", type=Path, help="copy this file as brief.md")
+    p_init.add_argument("--from-brief", type=Path,
+                        help="REQUIRED: copy this file as the bundle's brief.md")
 
     p_run = sub.add_parser("run", help="advance an issue to a halted state")
     p_run.add_argument("issue_id")
@@ -164,16 +168,26 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _init_issue(cfg: Config, issue_id: str, from_brief: Path | None) -> int:
+    # init-issue seeds a bundle from a brief you authored OUTSIDE the loop. With no
+    # --from-brief it used to copy the blank brief.md.tpl, which left a content-less
+    # PLANNED bundle that bypassed the planner (the Plan pre-pass only plans UNPLANNED)
+    # and whose hint lines parsed as a bogus depends_on — a footgun (#113). To start a
+    # new issue from its ticket, `pdca flow <id>` auto-plans; init-issue is now strictly
+    # the pre-authored-brief seeder.
+    if from_brief is None:
+        print("init-issue needs --from-brief <file>. To start a new issue from its "
+              f"ticket, run `pdca flow {issue_id}` — it auto-plans (scrapes the ticket "
+              "and authors the brief).", file=sys.stderr)
+        return 2
+    if not from_brief.exists():
+        print(f"no brief source: {from_brief}", file=sys.stderr)
+        return 1
     d = cfg.bundle(issue_id)
     if d.exists():
         print(f"bundle already exists: {d}", file=sys.stderr)
         return 1
     d.mkdir(parents=True)
-    src = from_brief or (cfg.templates_dir / "brief.md.tpl")
-    if not src.exists():
-        print(f"no brief source: {src}", file=sys.stderr)
-        return 1
-    shutil.copyfile(src, d / "brief.md")
+    shutil.copyfile(from_brief, d / "brief.md")
     print(f"{state.state(d)}\t{d}")
     return 0
 
@@ -307,12 +321,19 @@ def _publish_flag(d: Path) -> str:
 
 
 def _blocked_by(cfg: Config, d: Path) -> list[str]:
-    """Declared `Depends on` ids of bundle ``d`` that are not yet COMPLETE (issue #36)."""
+    """Declared prerequisites of bundle ``d`` that aren't satisfied yet.
+
+    `Depends on` ids not yet COMPLETE (issue #36), plus `Depends on (merged)` ids whose
+    PR isn't merged yet, tagged ``(unmerged)`` so the held dependent reads as awaiting a
+    human merge, not a stuck cycle (issue #107)."""
     bp = d / "brief.md"
     if not bp.exists():
         return []
-    return [dep for dep in brief.depends_on(bp)
-            if state.state(cfg.bundle(dep)) != state.COMPLETE]
+    blocked = [dep for dep in brief.depends_on(bp)
+               if state.state(cfg.bundle(dep)) != state.COMPLETE]
+    blocked += [f"{dep} (unmerged)" for dep in brief.depends_on_merged(bp)
+                if not merged.is_merged(cfg, dep)]
+    return blocked
 
 
 def _queue(cfg: Config) -> int:
@@ -403,6 +424,7 @@ def _act_log(cfg: Config, args: argparse.Namespace) -> int:
     text = act.scaffold_entry(entries, act.patterns(entries), date=args.date)
     if args.append:
         log = act.append_entry(cfg, text)
+        act.mark_reviewed(cfg)  # a manual Act review resets the flow cadence too (#109)
         print(f"appended entry to {log}")
     else:
         print(text)

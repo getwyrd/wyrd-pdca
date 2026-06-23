@@ -9,18 +9,23 @@ publisher leaf is stubbed (never pushes offline). Run from the project root:
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from pdca_harness import brief, cli, driver, flow, leaves, queue, signoff, state
+from pdca_harness import act, brief, cli, driver, flow, leaves, queue, signoff, state
 from pdca_harness.config import Config, LeafConfig
 
-DESIGN_TPL = Path(__file__).resolve().parents[1] / "templates" / "design-proposal.md.tpl"
-POINTER_TPL = Path(__file__).resolve().parents[1] / "templates" / "plan-pointer.md.tpl"
+TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
+DESIGN_TPL = TEMPLATES / "design-proposal.md.tpl"
+POINTER_TPL = TEMPLATES / "plan-pointer.md.tpl"
+BRIEF_TPL = TEMPLATES / "brief.md.tpl"
 
 
 def _stub_config(root: Path) -> Config:
@@ -40,6 +45,7 @@ def _stub_config(root: Path) -> Config:
         signoff=LeafConfig(mode="stub", family="claude", interactive=True),
         publisher=LeafConfig(mode="stub", family="claude", interactive=True),
         act=LeafConfig(mode="stub", family="claude", interactive=True),
+        act_cadence=1,  # most flow tests assert Act runs after a flow; cadence #109 tested separately
     )
 
 
@@ -191,11 +197,9 @@ class FlowSlice(unittest.TestCase):
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
 
     def test_batch_iterate_plan_then_complete(self) -> None:
-        # A batch member iterates-to-PLAN on its first sign-off: the attempt is archived
-        # and the bundle re-opened to UNPLANNED, then a later pass re-plans + rebuilds it
-        # to COMPLETE. Regression (pre-existing): the sweep used to stall at UNPLANNED —
-        # with nothing left to sign off it broke early, so the re-planned iteration was
-        # never produced (the bundle was left stuck at UNPLANNED).
+        # iterate-plan re-opens a batch member to UNPLANNED (archiving its attempt to
+        # iteration-v1/); the sweep must keep looping so a LATER pass re-plans + rebuilds
+        # it, rather than break at UNPLANNED when nothing is awaiting sign-off (#105).
         iterated = {"done": False}
 
         def signoff_batch(cfg: Config, bundles: list[Path]) -> None:
@@ -203,8 +207,7 @@ class FlowSlice(unittest.TestCase):
                 summ = d / "SUMMARY.md"
                 if d.name == "issue_BATCH1" and not iterated["done"]:
                     iterated["done"] = True
-                    (d / leaves.SIGNOFF_DECISION).write_text(
-                        "iterate-plan\nre-scope the approach\n", encoding="utf-8")
+                    (d / leaves.SIGNOFF_DECISION).write_text("iterate-plan\n", encoding="utf-8")
                     continue
                 summ.write_text(summ.read_text().replace("- [ ]", "- [x]"), encoding="utf-8")
                 (d / leaves.SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
@@ -218,8 +221,8 @@ class FlowSlice(unittest.TestCase):
         self.assertTrue(iterated["done"])
         self.assertEqual(set(results), {"BATCH1", "BATCH2"})
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
-        # The first attempt was archived — the re-plan really ran, it did not just stall.
-        self.assertTrue((self.cfg.bundle("BATCH1") / "iteration-v1").exists())
+        # the re-opened bundle re-planned, rebuilt, and preserved its first attempt
+        self.assertTrue((self.cfg.bundle("BATCH1") / "iteration-v1").is_dir())
 
     def test_batch_signoff_chunks_into_sessions(self) -> None:
         # The cheap-first queue is signed off in ONE session per chunk of
@@ -368,15 +371,12 @@ class FlowSlice(unittest.TestCase):
         for iid in ("GOOD", "BAD"):
             leaves.do_plan(self.cfg.bundle(iid), self.cfg)
 
-        # Beat-synchronised band: the unit of work is driver.advance (one beat), not a
-        # whole-bundle run_issue. A leaf that raises leaves the state unchanged, so the
-        # sweep drops BAD and drives the rest.
         real_advance = driver.advance
 
-        def flaky(d: Path, cfg: Config) -> None:
+        def flaky(d: Path, cfg: Config):
             if d.name == "issue_BAD":
                 raise RuntimeError("boom: leaf left the bundle half-written")
-            real_advance(d, cfg)
+            return real_advance(d, cfg)
 
         flow.driver.advance = flaky
         try:
@@ -633,7 +633,10 @@ class DesignProposalBrief(unittest.TestCase):
         self.cfg = _stub_config(self.tmp)
         self.d = self.cfg.bundle("GEPS")
         self.d.mkdir(parents=True)
-        shutil.copyfile(DESIGN_TPL, self.d / "brief.md")  # the design-proposal template
+        # An authored design-proposal brief: fill the slug so it's a real PLANNED brief,
+        # not the raw template (a placeholder-slug template now reads UNPLANNED, #113).
+        text = DESIGN_TPL.read_text(encoding="utf-8").replace("<short-kebab-slug>", "geps-feature")
+        (self.d / "brief.md").write_text(text, encoding="utf-8")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -661,7 +664,10 @@ class PlanPointerBrief(unittest.TestCase):
         self.cfg = _stub_config(self.tmp)
         self.d = self.cfg.bundle("ADR")
         self.d.mkdir(parents=True)
-        shutil.copyfile(POINTER_TPL, self.d / "brief.md")  # the plan-pointer template
+        # An authored pointer-brief: fill the slug so it's a real PLANNED brief, not the
+        # raw template (a placeholder-slug template now reads UNPLANNED, #113).
+        text = POINTER_TPL.read_text(encoding="utf-8").replace("<short-kebab-slug>", "adr-pointer")
+        (self.d / "brief.md").write_text(text, encoding="utf-8")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -772,12 +778,15 @@ class DeclaredOrdering(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _brief(self, iid: str, *, depends_on: str = "", conflicts_with: str = "") -> Path:
+    def _brief(self, iid: str, *, depends_on: str = "", conflicts_with: str = "",
+               depends_on_merged: str = "") -> Path:
         d = self.cfg.bundle(iid)
         d.mkdir(parents=True)
         body = _TOY_BRIEF.format(slug=iid.lower())
         if depends_on:
             body += f"- **Depends on:** {depends_on}\n"
+        if depends_on_merged:
+            body += f"- **Depends on (merged):** {depends_on_merged}\n"
         if conflicts_with:
             body += f"- **Conflicts with:** {conflicts_with}\n"
         (d / "brief.md").write_text(body, encoding="utf-8")
@@ -789,7 +798,7 @@ class DeclaredOrdering(unittest.TestCase):
         self._brief("AA", depends_on="ZZ")
         self._brief("ZZ")
         seen = {}
-        real = driver.advance  # the beat-synchronised band's unit of work
+        real = driver.advance  # the batch band advances one beat at a time now (#104)
 
         def spy(d: Path, cfg: Config):
             if d.name == "issue_AA" and "zz_state" not in seen:
@@ -804,6 +813,41 @@ class DeclaredOrdering(unittest.TestCase):
             driver.advance = real
         self.assertEqual(seen.get("zz_state"), state.COMPLETE)  # ZZ done before AA built
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
+
+    def test_merge_gated_dependent_held_until_prereq_merged(self) -> None:
+        # MB needs MA *merged*, not merely COMPLETE (#107). MA is in the batch and reaches
+        # COMPLETE (a draft PR) this run, but the flow never merges it — so MB is held and
+        # left for a later `pdca flow` run, after a human merges MA's PR.
+        self._brief("MA")
+        self._brief("MB", depends_on_merged="MA")
+        driven: list[str] = []
+        real = driver.run_issue
+
+        def spy(d: Path, cfg: Config):
+            driven.append(d.name)
+            return real(d, cfg)
+
+        driver.run_issue = spy
+        try:
+            with mock.patch.object(flow.merged, "is_merged", return_value=False):
+                results = flow.flow_ids(self.cfg, ["MA", "MB"], do_publish=False,
+                                        do_act=False, today="2026-06-04")
+        finally:
+            driver.run_issue = real
+        self.assertEqual(results.get("MA"), state.COMPLETE)   # prereq completes
+        self.assertNotIn("issue_MB", driven)                  # dependent never built
+        self.assertNotEqual(results.get("MB"), state.COMPLETE)
+
+    def test_merge_gated_dependent_proceeds_once_prereq_merged(self) -> None:
+        # With the prereq's PR merged, the same gate lets the dependent run to COMPLETE.
+        self._brief("PA")
+        flow.flow_ids(self.cfg, ["PA"], do_publish=False, do_act=False, today="2026-06-04")
+        self.assertEqual(state.state(self.cfg.bundle("PA")), state.COMPLETE)
+        self._brief("PB", depends_on_merged="PA")
+        with mock.patch.object(flow.merged, "is_merged", return_value=True):
+            results = flow.flow_ids(self.cfg, ["PB"], do_publish=False, do_act=False,
+                                    today="2026-06-04")
+        self.assertEqual(results.get("PB"), state.COMPLETE)
 
     def test_no_deps_keeps_sort_by_name_dispatch(self) -> None:
         # No Depends-on fields → bundles first enter the Do beat in exactly sort-by-name
@@ -825,7 +869,34 @@ class DeclaredOrdering(unittest.TestCase):
                           today="2026-06-04")
         finally:
             driver.advance = real
+        # First-touch order is sort-by-name: the first beat-round advances N1, N2, N3.
         self.assertEqual(order, ["issue_N1", "issue_N2", "issue_N3"])
+
+    def test_beats_are_synchronised_across_the_wave(self) -> None:
+        # #104: the wave advances one beat at a time — all Dos, then all Checks, then all
+        # SUMMARY assembles — not each bundle end-to-end. Record each beat's FROM-state and
+        # assert the last Do precedes the first Check precedes the first assemble.
+        ids = ["S1", "S2", "S3"]
+        for iid in ids:
+            self._brief(iid)
+        beats: list[str] = []
+        real = driver.advance
+
+        def spy(d: Path, cfg: Config):
+            beats.append(state.state(d))  # the state this beat acts ON
+            return real(d, cfg)
+
+        driver.advance = spy
+        try:
+            flow.flow_ids(self.cfg, ids, do_publish=False, do_act=False, today="2026-06-04")
+        finally:
+            driver.advance = real
+        do = [i for i, s in enumerate(beats) if s == state.PLANNED]      # Do beat
+        check = [i for i, s in enumerate(beats) if s == state.BUILT]     # Check (gates+review)
+        assemble = [i for i, s in enumerate(beats) if s == state.CHECKED]  # SUMMARY assemble
+        self.assertTrue(do and check and assemble)
+        self.assertLess(max(do), min(check))         # every Do before any Check
+        self.assertLess(max(check), min(assemble))   # every Check before any assemble
 
     def test_conflict_pair_never_co_scheduled(self) -> None:
         # C conflicts with D; E/F are free. Under a 2-lane pool, C and D must never be
@@ -843,7 +914,7 @@ class DeclaredOrdering(unittest.TestCase):
         together: set[tuple[str, str]] = set()
         max_conc = [0]
         lk = threading.Lock()
-        real = driver.advance  # one beat is the pooled unit; conflicts hold per beat
+        real = driver.advance  # one beat is the concurrent unit now (#104)
 
         def spy(d: Path, cfg: Config):
             with lk:
@@ -866,7 +937,7 @@ class DeclaredOrdering(unittest.TestCase):
                                     do_act=False, today="2026-06-04")
         finally:
             driver.advance = real
-        self.assertNotIn(("issue_C", "issue_D"), together)  # conflict respected
+        self.assertNotIn(("issue_C", "issue_D"), together)  # conflict respected, every beat
         self.assertEqual(max_conc[0], 2)                     # pool genuinely concurrent
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
 
@@ -987,6 +1058,85 @@ class PublishOnAccept(unittest.TestCase):
         d2.mkdir(parents=True)
         (d2 / "patch.diff").write_text("", encoding="utf-8")  # close/no-fix → no PR expected
         self.assertEqual(cli._publish_flag(d2), "  [close: no PR]")
+
+
+class InitIssueAndPlaceholderGuard(unittest.TestCase):
+    """init-issue is the pre-authored-brief seeder; its no-brief blank-template path is
+    dropped, and a still-unfilled template brief reads UNPLANNED so the Plan beat re-plans
+    it rather than being silently skipped (issue #113)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = _stub_config(self.tmp)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_init_issue_without_from_brief_errors_and_scaffolds_nothing(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli._init_issue(self.cfg, "NEW", None)
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.cfg.bundle("NEW").exists())   # no content-less PLANNED trap
+        self.assertIn("flow NEW", buf.getvalue())           # points to the auto-plan path
+
+    def test_init_issue_with_from_brief_seeds_planned_bundle(self) -> None:
+        src = self.tmp / "authored.md"
+        src.write_text("- **Slug:** real-fix\n", encoding="utf-8")
+        rc = cli._init_issue(self.cfg, "SEED", src)
+        self.assertEqual(rc, 0)
+        d = self.cfg.bundle("SEED")
+        self.assertEqual(state.state(d), state.PLANNED)
+        self.assertEqual((d / "brief.md").read_text(encoding="utf-8"), "- **Slug:** real-fix\n")
+
+    def test_unfilled_template_brief_reads_unplanned(self) -> None:
+        # The #113 footgun shape: a brief.md that's the raw template (placeholder slug).
+        d = self.cfg.bundle("TPL")
+        d.mkdir(parents=True)
+        shutil.copyfile(BRIEF_TPL, d / "brief.md")
+        self.assertTrue(brief.is_placeholder(d / "brief.md"))
+        self.assertEqual(state.state(d), state.UNPLANNED)   # planner not skipped
+
+    def test_authored_brief_reads_planned(self) -> None:
+        d = self.cfg.bundle("REAL")
+        d.mkdir(parents=True)
+        (d / "brief.md").write_text("- **Slug:** a-real-slug\n", encoding="utf-8")
+        self.assertFalse(brief.is_placeholder(d / "brief.md"))
+        self.assertEqual(state.state(d), state.PLANNED)
+
+
+class ActCadence(unittest.TestCase):
+    """flow auto-runs Act only when act_cadence cycles have frozen since the last Act —
+    counted across flow invocations, not per-run (issue #109)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = _stub_config(self.tmp)
+        self.cfg.act_cadence = 3
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _log(self) -> Path:
+        return self.cfg.process_dir / "act-log.md"
+
+    def test_act_held_below_cadence_then_fires_across_flows(self) -> None:
+        # Three separate single-bundle flows: Act must NOT run until the 3rd freezes the
+        # third cycle (cadence 3), proving the gate persists across invocations.
+        for i in (1, 2):
+            flow.flow(self.cfg, f"AC{i}", do_act=True, today="2026-06-04")
+            self.assertFalse(self._log().exists(), f"Act ran too early (after flow {i})")
+        flow.flow(self.cfg, "AC3", do_act=True, today="2026-06-04")
+        self.assertTrue(self._log().exists())          # the 3rd frozen cycle trips cadence
+
+    def test_act_resets_after_running(self) -> None:
+        for i in (1, 2, 3):
+            flow.flow(self.cfg, f"R{i}", do_act=True, today="2026-06-04")
+        self.assertTrue(self._log().exists())
+        self.assertEqual(act.cycles_since_review(self.cfg), 0)   # marker reset to frozen count
+        before = self._log().read_text(encoding="utf-8")
+        flow.flow(self.cfg, "R4", do_act=True, today="2026-06-04")   # only 1 since → below cadence
+        self.assertEqual(self._log().read_text(encoding="utf-8"), before)  # no new Act entry
 
 
 if __name__ == "__main__":
