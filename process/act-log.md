@@ -29,6 +29,147 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-06-23 — cycles considered: issue_197, issue_198, issue_203, issue_205
+
+> Considers the four cycles that froze on 2026-06-23 and had not yet had an Act
+> review. The same-dated "follow-up filing" entry below it is a *separate* beat
+> (it closed the three prior reviews' routed items and added no cycles); this
+> entry does not re-open it. issue_204 / issue_207 have result dirs but are not in
+> the frozen Act index → out of scope here. No contribution disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **Two of these cycles ARE the PDCA fixes for last review's routed Wyrd bugs — the
+  routing loop closed.** issue_197 lands the `reconstruction_aborted` accounting fix for
+  **getwyrd/wyrd#197** (the #144 telemetry over-count this review chain filed 2026-06-23);
+  issue_198 lands the misplaced-but-intact read-path fix for **getwyrd/wyrd#198** (the #143
+  `header.chunk_id` recheck asymmetry). The PDCA bundle id matches the Wyrd issue id by
+  init-from-issue, so the correspondence is auditable. Evidence the prior reviews' routed
+  follow-ups progressed to merged fixes, not silent drops — **no delta**, recorded as the close.
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle (all 4).** Always-human
+  (INTEGRATION.md §4): V fitness-to-purpose in all four; C5 causal adequacy + T5 judgment in
+  #203 and #205. **No delta warranted** — consistent with all three prior reviews.
+- **The earlier `Verification posture` delta is taking effect — record as evidence, no new
+  delta.** #203's timing-dependent behavioural red (64×16 concurrent writers) surfaced as a
+  *pre-declared sign-off item* ("the brief explicitly defers [whether the red reliably fires on
+  the CI host] to sign-off", §6 T5), not a surprise C2/C4 NEEDS-HUMAN. None of the four raised a
+  surprise C2/C4. Keep watching.
+- **Three single-cycle §10 items, none recurring — each routes as a follow-up, not a process
+  delta.** All three were re-verified against `origin/main` before filing (verify-don't-recall),
+  which materially re-framed two of them: **#197** — the §6 V item asks whether the new *public*
+  metric warrants a contract-doc update. Verified against `origin/main`: the canonical docs name
+  *five durability metrics* (proposal 0005 §319-340) and ADR-0011 enumerates **none** of the
+  `reconstruction_*` accounting counters. (The in-code phrase "the **three** M3 repair metrics" at
+  `reconstruction.rs:3,156` is *accurate* and refers to a different trio — under-replicated count,
+  queue-depth, time-to-repair — not the accounting counters, so it is **not** stale.) The real gap
+  is that the public OTel counters `reconstruction_repaired` / `reconstruction_conflict` /
+  `reconstruction_aborted` (the last new in #238, `reconstruction.rs:441/455/471`) and their
+  success-netting identity are undocumented in any canonical telemetry contract — a documentation
+  addition, not a governance ADR/proposal *decision* change. **#203** — the §10
+  read as "comments cite the non-existent ADR-0034"; in fact **ADR-0034 now exists on `origin/main`**
+  (PR #237, merged 2026-06-23 21:46) and states exactly "Model A — one D server per disk," grounding
+  the citation. The issue_203 review base predated #237's merge, so the reviewer correctly saw no
+  ADR-0034 — a **stale/in-flight-target artifact** (same class as #145/#146, already routed as
+  harness#120), **not** a builder recall-fabrication. The only residual is the genuine §10
+  comment-precision nit: the comments tie the safety to "Model A" specifically, but the load-bearing
+  invariant is *exclusive-open-per-root*, which holds under both Model A and the reserved Model B, so
+  citing "Model A" over-narrows. **#205**: `install_metric_dispatch()` correctness rests on every
+  `#[madsim::test]` calling it first — a convention, not an enforced barrier; a future test added
+  without it silently reintroduces the tracing interest-cache flake. Each is a one-off (1×); none
+  recurs across cycles, so none meets the bar for a spec/ruleset/gate/skill change.
+
+## Process deltas
+
+- **None warranted this review.** The recurring NEEDS-HUMAN classes (V/C5/T5) are always-human by
+  design; the prior deltas (`Verification posture`, `Production reach`, `Success criterion`
+  BINDING/ILLUSTRATIVE, reviewer-Basis skill) are taking effect; and the three §10 items are
+  single-cycle follow-ups, not patterns. A forced change here would be worse than none. (The
+  #203 "fabricated-ADR" worry this entry originally flagged was **withdrawn on verification** —
+  ADR-0034 exists on `origin/main`; the reviewer saw it absent only because the review base
+  predated PR #237's merge. That is the stale/in-flight-target axis already routed upstream as
+  harness#120, *not* a builder recall-fabrication — so no new builder-skill delta is warranted;
+  the existing target-pin follow-up covers it.)
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Documentation update (#197) — FILED getwyrd/wyrd#244:** the public OTel counters
+  `reconstruction_repaired` / `reconstruction_conflict` / `reconstruction_aborted` (the last new in
+  PR #238) and their `successes = repaired − conflict − aborted` identity are documented only in
+  in-code module comments; no canonical telemetry contract (proposal 0005 §319-340's five durability
+  metrics, ADR-0011) describes them, so an operator scraping `reconstruction_aborted` has no
+  reference. Filed as a documentation issue (milestone M3 — Custodians), noting the maintainer must
+  pick the home and that ADR-0011 is Accepted/immutable (a superseding ADR, not an in-place edit, if
+  that is the chosen home). Not a code change; the metric itself is correct and shipped. Grounded
+  against `origin/main` (`crates/custodian/src/reconstruction.rs:441/455/471`).
+- **Comment-precision nit (#203) — NO ACTION (human decision):** the "non-existent ADR-0034"
+  premise is **false** — ADR-0034 exists on `origin/main` (PR #237) and states exactly "Model A —
+  one D server per disk," grounding the citation; the reviewer saw it absent only because the review
+  base predated #237's merge (stale/in-flight target, harness#120). The sole residual is the genuine
+  §10 nit: the comments tie safety to "Model A" specifically, but the load-bearing invariant is
+  *exclusive-open-per-root*, which holds under both Model A and the reserved Model B — so citing
+  "Model A" over-narrows (`results/issue_203/patch.diff:22-23,43-44,77`). Very minor; review caught
+  nothing wrong with the *code*. **No action taken — human decision (2026-06-24): not worth a
+  standalone issue;** fold the comment wording in if that file is next touched. Closed here.
+- **Design issue (Wyrd, future footgun, #205) — needs planning + review, not a one-line fix:**
+  the `install_metric_dispatch()` barrier is enforced only by convention — every
+  `#[madsim::test]` must call it first, and `set_global_default`'s error is swallowed — so a
+  future test added without the call silently reintroduces the tracing interest-cache flake.
+  Making it *enforced* is an architecture choice with options to weigh (a compile-time/test-harness
+  wrapper that installs the dispatch for every test, a custom test macro/attribute, a lint, or at
+  minimum surfacing the swallowed `set_global_default` error) — it needs a dedicated
+  planning/design phase outside this PDCA cycle and a review of the chosen mechanism, not a
+  quick cleanup. **Filed getwyrd/wyrd#243** (milestone M3 — Custodians; grounded against
+  `origin/main` custodian.rs:354-358 + the 7 per-test call sites). Do not author a brief for it
+  here — design + review first.
+- **Design issue (Wyrd, DST determinism, #205) — needs planning + review:** the root cause
+  behind the footgun above is that `tracing`'s **global, process-wide** per-callsite interest
+  cache is mutable state shared across madsim tests — once poisoned to `never` it persists and
+  produces a non-deterministic DST flake, which undercuts the determinism premise DST rests on
+  (ADR-0009). The #205 patch addresses the one observed callsite (scoped `with_subscriber` +
+  `install_metric_dispatch()`), but the general invariant — *no shared mutable global may cross
+  into the DST substrate and defeat seed-determinism* — is unaddressed and broader than tracing
+  (any global static is suspect). Resolving it (forbid/isolate global state in DST: a harness that
+  resets or sandboxes such statics per seed, a lint/audit, or an ADR-0009 amendment stating the
+  rule) is an architecture decision needing a dedicated planning/design phase and review, outside
+  this PDCA cycle. **Filed getwyrd/wyrd#242** (milestone M3 — Custodians; root-cause companion to
+  #243; grounded against `origin/main` custodian.rs:354/952/975 + ADR-0009). Likely resolved via
+  an ADR-0009 follow-on. Do not author a brief for it here — design + review first.
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21)
+  still have not had an Act review and remain absent from this index. → next Act review, if still
+  in scope.
+- Prior reviews' upstream harness follow-ups (eduralph/pdca-harness#120 target-pin,
+  #121 reviewer-Basis) — confirm progressed at next review.
+
+## How effectiveness will be judged
+
+- All actionable §10 items are dispositioned: filed getwyrd/wyrd#242, #243 (the two #205 design
+  items) and #244 (#197 documentation); #203 closed as no-action (human decision). The next review
+  should see the #197/#198 close pattern continue — routed bugs becoming merged PDCA cycles.
+- The #203 "non-existent ADR" turned out to be a **stale/in-flight-target** artifact, not a builder
+  fabrication — the same axis already routed as harness#120 (pin the review target to the base the
+  gates ran against). WATCH the next dependency-/concurrent-ADR-chained cycles: if a reviewer again
+  flags a cited ADR/spec "absent" that is merely in-flight on the real `origin/main`, the harness
+  target-pin is overdue. No builder-skill delta — the earlier framing was withdrawn on verification.
+
+## Session note (2026-06-24 follow-up filing)
+
+- Filed **getwyrd/wyrd#242** (DST: global mutable state can defeat seed-determinism) and
+  **getwyrd/wyrd#243** (`install_metric_dispatch()` barrier relies on convention) — the two #205
+  design items, milestone M3 — Custodians, grounded against `origin/main`.
+- Grounding the remaining two against `origin/main` re-scoped both: **#197** filed as
+  **getwyrd/wyrd#244** (documentation: the public `reconstruction_*` OTel counters + their netting
+  identity are undocumented in any canonical telemetry contract — not the governance ADR change the
+  §6 implied). **#203** closed **no-action** at the human's direction — its "non-existent ADR-0034"
+  premise was false (ADR-0034 exists; in-flight-target artifact), leaving only a trivial comment nit
+  not worth a standalone issue.
+- Verify-don't-recall note: three of the §10/§6 framings (the #203 "fabrication", the #197
+  "governance doc change", and this session's own first-pass "three→four" mis-derivation) were
+  corrected only by reading `origin/main` directly. The local `../wyrd` checkout was **stale**
+  (behind `origin/main`, missing #237/#241) — the same target-drift the harness#120 pin addresses.
+
 # Act review — 2026-06-23 — follow-up filing (no new cycles)
 
 > Not a cycle review — this entry closes the audit loop the three prior reviews
