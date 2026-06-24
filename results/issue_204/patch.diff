@@ -1,0 +1,421 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e059b3c..5fb5e6a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2416,6 +2416,7 @@ dependencies = [
+  "bytes",
+  "pollster",
+  "tempfile",
++ "tokio",
+  "wyrd-chunk-format",
+  "wyrd-traits",
+ ]
+diff --git a/crates/chunkstore-fs/Cargo.toml b/crates/chunkstore-fs/Cargo.toml
+index 0d92ac6..d829dad 100644
+--- a/crates/chunkstore-fs/Cargo.toml
++++ b/crates/chunkstore-fs/Cargo.toml
+@@ -13,10 +13,23 @@ wyrd-traits.workspace = true
+ wyrd-chunk-format.workspace = true
+ async-trait.workspace = true
+ bytes.workspace = true
++# Off-reactor offload of the blocking `std::fs` syscalls (issue #204): the async
++# `ChunkStore` methods hand their syscalls to tokio's blocking pool via
++# `spawn_blocking` so a reactor worker thread is never pinned for a disk syscall
++# (and the d-server's lease-renew heartbeat is not starved). Only the runtime
++# handle + blocking pool are needed, so just the `rt` feature — the store stays
++# runtime-agnostic (the offload no-ops off a tokio runtime, ADR-0009). tokio is
++# already in the workspace tree (the `server` binary host), so this adds no new
++# external dependency to the license/advisory surface.
++tokio = { version = "1", default-features = false, features = ["rt"] }
+ 
+ [dev-dependencies]
+ pollster.workspace = true
+ tempfile.workspace = true
++# The #204 reactor-liveness regression drives the store on a real single-worker
++# tokio runtime and co-schedules a timer task, so it needs the multi-thread
++# runtime + timer driver (the workspace tokio feature set).
++tokio = { workspace = true }
+ 
+ # Inherit the workspace lint policy (single source of truth in the root
+ # Cargo.toml [workspace.lints.*]).
+diff --git a/crates/chunkstore-fs/src/lib.rs b/crates/chunkstore-fs/src/lib.rs
+index 84635c5..7fbaee2 100644
+--- a/crates/chunkstore-fs/src/lib.rs
++++ b/crates/chunkstore-fs/src/lib.rs
+@@ -130,6 +130,51 @@ impl FsChunkStore {
+     }
+ }
+ 
++/// Run `f`'s blocking filesystem work **off the async reactor**.
++///
++/// The [`ChunkStore`] methods are `async` but their bodies are synchronous
++/// `std::fs` syscalls. On the d-server's multi-threaded tokio runtime
++/// (`crates/server/src/cli.rs`, `new_multi_thread().enable_all()`) those
++/// syscalls would otherwise execute on a **reactor worker thread**, pinning it
++/// for the whole syscall and starving every other task on that runtime —
++/// including the lease-renew heartbeat, whose missed tick past the lease TTL
++/// drops the server out of discovery (issue #204). Moving the work to tokio's
++/// blocking pool keeps the reactor — its accept loop, its timers, and every
++/// other in-flight task — schedulable independent of how many storage syscalls
++/// are in flight.
++///
++/// Runtime-agnostic by design (ADR-0009): the offload engages only when a tokio
++/// runtime is actually hosting the call. Driven off a tokio runtime (e.g. a
++/// `pollster::block_on` test) there is no reactor worker thread to starve, so the
++/// work runs inline — preserving the store's executor-independence rather than
++/// hard-wiring it to tokio.
++#[cfg(not(madsim))]
++async fn offload<F, R>(f: F) -> R
++where
++    F: FnOnce() -> R + Send + 'static,
++    R: Send + 'static,
++{
++    match tokio::runtime::Handle::try_current() {
++        Ok(_) => tokio::task::spawn_blocking(f)
++            .await
++            .expect("storage blocking task panicked"),
++        Err(_) => f(),
++    }
++}
++
++/// Under madsim (ADR-0009) the simulator is single-threaded and deterministic and
++/// owns its own clock; offloading to a real OS thread would break seed
++/// reproducibility, so the blocking work runs inline on the simulated thread —
++/// exactly the pre-#204 behaviour, which is already non-starving there because the
++/// simulator has no separate reactor to block.
++#[cfg(madsim)]
++async fn offload<F, R>(f: F) -> R
++where
++    F: FnOnce() -> R,
++{
++    f()
++}
++
+ #[async_trait]
+ impl ChunkStore for FsChunkStore {
+     async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+@@ -143,36 +188,63 @@ impl ChunkStore for FsChunkStore {
+             detail: e.to_string(),
+         })?;
+ 
++        // Compute the paths on the reactor (no I/O — a per-call atomic bump and
++        // path joins), then perform every blocking syscall off the reactor.
+         let final_path = self.fragment_path(id);
+-        // The chunk's directory may not exist yet (first fragment of the chunk).
+-        if let Some(chunk_dir) = final_path.parent() {
+-            fs::create_dir_all(chunk_dir)?;
+-        }
+-        // Write to a per-call private scratch file, then atomically rename it
+-        // onto the final path: the rename is the only publish point, so a
+-        // concurrent same-id write can neither observe nor clobber our partial
+-        // bytes and last-writer-wins is a no-op (same id ⇒ identical bytes). On
+-        // a failed write/rename we remove our *own* scratch (its name is unique,
+-        // so this never touches a concurrent write's file); a hard crash before
+-        // the rename leaves it for `reap_stale_temps` to clear at the next open.
+         let temp = self.temp_path(id);
+-        if let Err(e) = fs::write(&temp, &fragment) {
+-            let _ = fs::remove_file(&temp);
+-            return Err(e.into());
+-        }
+-        if let Err(e) = fs::rename(&temp, &final_path) {
+-            let _ = fs::remove_file(&temp);
+-            return Err(e.into());
+-        }
+-        Ok(())
++        offload(move || -> Result<()> {
++            // Write to a per-call private scratch file, then atomically rename it
++            // onto the final path: the rename is the only publish point, so a
++            // concurrent same-id write can neither observe nor clobber our partial
++            // bytes and last-writer-wins is a no-op (same id ⇒ identical bytes). On
++            // a failed write/rename we remove our *own* scratch (its name is
++            // unique, so this never touches a concurrent write's file); a hard
++            // crash before the rename leaves it for `reap_stale_temps` to clear at
++            // the next open.
++            //
++            // The chunk directory exists after the first fragment of the chunk, so
++            // attempt the scratch write straight away and create the directory only
++            // on the genuine first-fragment `NotFound` — sparing the steady-state
++            // write the per-call `create_dir_all` stat (issue #204).
++            match fs::write(&temp, &fragment) {
++                Ok(()) => {}
++                Err(e) if e.kind() == ErrorKind::NotFound => {
++                    if let Some(chunk_dir) = final_path.parent() {
++                        fs::create_dir_all(chunk_dir)?;
++                    }
++                    if let Err(e) = fs::write(&temp, &fragment) {
++                        let _ = fs::remove_file(&temp);
++                        return Err(e.into());
++                    }
++                }
++                Err(e) => {
++                    let _ = fs::remove_file(&temp);
++                    return Err(e.into());
++                }
++            }
++            if let Err(e) = fs::rename(&temp, &final_path) {
++                let _ = fs::remove_file(&temp);
++                return Err(e.into());
++            }
++            Ok(())
++        })
++        .await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+-        let bytes = match fs::read(self.fragment_path(id)) {
+-            Ok(bytes) => bytes,
+-            // A missing chunk directory or a missing file both read as not-found.
+-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+-            Err(e) => return Err(e.into()),
++        let path = self.fragment_path(id);
++        let bytes = match offload(move || -> Result<Option<Vec<u8>>> {
++            match fs::read(&path) {
++                Ok(bytes) => Ok(Some(bytes)),
++                // A missing chunk directory or a missing file both read as not-found.
++                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
++                Err(e) => Err(e.into()),
++            }
++        })
++        .await?
++        {
++            Some(bytes) => bytes,
++            None => return Ok(None),
+         };
+         // Detect bit-rot / tampering before returning data. A verify failure on the
+         // read path is **stored-data corruption** — surfaced as a seam-level
+@@ -192,54 +264,66 @@ impl ChunkStore for FsChunkStore {
+         // inverse of `fragment_path`. Names that don't match (e.g. a `.tmp` from
+         // an interrupted put, or any foreign entry) are skipped, so a crash mid
+         // write never surfaces as a phantom fragment.
+-        let mut ids = Vec::new();
+-        let chunk_dirs = match fs::read_dir(&self.root) {
+-            Ok(dirs) => dirs,
+-            // A never-written store has no root contents yet — an empty walk.
+-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ids),
+-            Err(e) => return Err(e.into()),
+-        };
+-        for chunk_entry in chunk_dirs {
+-            let chunk_entry = chunk_entry?;
+-            if !chunk_entry.file_type()?.is_dir() {
+-                continue;
+-            }
+-            let Some(chunk) = chunk_entry
+-                .file_name()
+-                .to_str()
+-                .and_then(parse_chunk_dir_name)
+-            else {
+-                continue;
++        // The O(N) walk is the worst worker-thread-starvation source (issue
++        // #204), so the whole two-level directory walk runs off the reactor.
++        let root = self.root.clone();
++        offload(move || -> Result<Vec<FragmentId>> {
++            let mut ids = Vec::new();
++            let chunk_dirs = match fs::read_dir(&root) {
++                Ok(dirs) => dirs,
++                // A never-written store has no root contents yet — an empty walk.
++                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ids),
++                Err(e) => return Err(e.into()),
+             };
+-            for frag_entry in fs::read_dir(chunk_entry.path())? {
+-                let frag_entry = frag_entry?;
+-                if let Some(index) = frag_entry
++            for chunk_entry in chunk_dirs {
++                let chunk_entry = chunk_entry?;
++                if !chunk_entry.file_type()?.is_dir() {
++                    continue;
++                }
++                let Some(chunk) = chunk_entry
+                     .file_name()
+                     .to_str()
+-                    .and_then(parse_fragment_file_name)
+-                {
+-                    ids.push(FragmentId { chunk, index });
++                    .and_then(parse_chunk_dir_name)
++                else {
++                    continue;
++                };
++                for frag_entry in fs::read_dir(chunk_entry.path())? {
++                    let frag_entry = frag_entry?;
++                    if let Some(index) = frag_entry
++                        .file_name()
++                        .to_str()
++                        .and_then(parse_fragment_file_name)
++                    {
++                        ids.push(FragmentId { chunk, index });
++                    }
+                 }
+             }
+-        }
+-        Ok(ids)
++            Ok(ids)
++        })
++        .await
+     }
+ 
+     async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+-        // Idempotent: a missing file is a successful no-op, so a retried GC
+-        // reclaim never errors.
+-        match fs::remove_file(self.fragment_path(id)) {
+-            Ok(()) => Ok(()),
+-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+-            Err(e) => Err(e.into()),
+-        }
++        let path = self.fragment_path(id);
++        offload(move || -> Result<()> {
++            // Idempotent: a missing file is a successful no-op, so a retried GC
++            // reclaim never errors.
++            match fs::remove_file(&path) {
++                Ok(()) => Ok(()),
++                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
++                Err(e) => Err(e.into()),
++            }
++        })
++        .await
+     }
+ 
+     async fn health(&self) -> Result<Health> {
+-        Ok(match fs::metadata(&self.root) {
++        let root = self.root.clone();
++        Ok(offload(move || match fs::metadata(&root) {
+             Ok(meta) if meta.is_dir() => Health::Healthy,
+             _ => Health::Unhealthy,
+         })
++        .await)
+     }
+ }
+ 
+diff --git a/crates/chunkstore-fs/tests/blocking_offload.rs b/crates/chunkstore-fs/tests/blocking_offload.rs
+new file mode 100644
+index 0000000..c3ef10c
+--- /dev/null
++++ b/crates/chunkstore-fs/tests/blocking_offload.rs
+@@ -0,0 +1,129 @@
++//! Reactor-liveness regression for `FsChunkStore`'s async `ChunkStore` methods
++//! (issue #204).
++//!
++//! `FsChunkStore` implements the **async** `ChunkStore` trait, but its method
++//! bodies are synchronous blocking `std::fs` syscalls. The d-server hosts the
++//! store on a multi-threaded tokio runtime and dispatches each storage RPC as a
++//! task; if a method runs its syscall directly on the reactor worker thread, that
++//! thread is **pinned for the whole syscall** and every other task on the runtime
++//! is starved — including the lease-renew heartbeat, whose missed tick past the
++//! lease TTL drops the server out of discovery.
++//!
++//! This test makes that starvation observable on a **constrained** runtime: a
++//! single worker thread, with a co-scheduled timer task and a burst of storage
++//! I/O (`list_fragments`, the O(N) walk that is the worst starvation source). Both
++//! the timer and the burst are spawned **tasks on the one worker**, so they share
++//! that worker cooperatively:
++//!
++//!   * Before the fix — the burst runs every `list_fragments` walk synchronously
++//!     on the worker and never yields, so it monopolises the single worker for the
++//!     whole burst; the timer task cannot be polled and makes **zero** progress
++//!     while the I/O is in flight.
++//!   * After the fix — each walk is offloaded to tokio's blocking pool, so the
++//!     worker is free between awaits; the timer task interleaves and keeps ticking
++//!     while the I/O runs.
++//!
++//! We assert the timer advanced *during* the burst. `list_fragments` only parses
++//! directory-entry names (it never reads file contents), so the store is populated
++//! with empty `.frag` files directly — no fragment encoding needed — keeping the
++//! unit under test import-light (no GUI / display) and safe on a headless runner.
++
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::Arc;
++use std::time::Duration;
++
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_traits::ChunkStore;
++
++/// Chunk directories to lay down under the store root.
++const CHUNK_DIRS: u128 = 64;
++/// Fragment files per chunk directory — `CHUNK_DIRS * FRAGS_PER_DIR` entries make
++/// each `list_fragments` walk a non-trivial, observably-slow syscall sequence.
++const FRAGS_PER_DIR: u16 = 16;
++/// How many `list_fragments` walks the burst performs back-to-back.
++const BURST_WALKS: usize = 500;
++/// The timer ticks every millisecond; the burst takes far longer than a few
++/// milliseconds, so a freed reactor accumulates many ticks. Before the fix the
++/// pinned worker yields **zero** ticks during the burst — this threshold sits well
++/// inside that gap so the test flips red→green on the offload, not on timing noise.
++const MIN_TICKS_DURING_BURST: u64 = 5;
++
++/// Populate `root` with `CHUNK_DIRS` chunk directories, each holding
++/// `FRAGS_PER_DIR` empty `<index>.frag` files, mirroring the on-disk layout
++/// `root/<32-hex chunk>/<05-index>.frag` that `list_fragments` walks.
++fn populate(root: &std::path::Path) {
++    for chunk in 0..CHUNK_DIRS {
++        let dir = root.join(format!("{chunk:032x}"));
++        std::fs::create_dir_all(&dir).expect("create chunk dir");
++        for index in 0..FRAGS_PER_DIR {
++            std::fs::write(dir.join(format!("{index:05}.frag")), b"").expect("write frag file");
++        }
++    }
++}
++
++#[test]
++fn storage_io_burst_does_not_starve_a_co_scheduled_timer() {
++    let dir = tempfile::tempdir().expect("temp dir");
++    populate(dir.path());
++    let store = Arc::new(FsChunkStore::open(dir.path()).expect("open store"));
++
++    // A single reactor worker thread is the constrained runtime that makes the
++    // starvation observable: with only one worker, a method that blocks it leaves
++    // nothing to run the co-scheduled timer.
++    let rt = tokio::runtime::Builder::new_multi_thread()
++        .worker_threads(1)
++        .enable_all()
++        .build()
++        .expect("build runtime");
++
++    let ticks = Arc::new(AtomicU64::new(0));
++    let stop = Arc::new(AtomicBool::new(false));
++
++    let during = rt.block_on({
++        let ticks = Arc::clone(&ticks);
++        let stop = Arc::clone(&stop);
++        async move {
++            // Co-scheduled timer task: tick, then sleep a millisecond, until told
++            // to stop. Spawned (not the block_on root) so it lives on the single
++            // worker thread alongside the burst and competes for it.
++            let timer = tokio::spawn({
++                let ticks = Arc::clone(&ticks);
++                let stop = Arc::clone(&stop);
++                async move {
++                    while !stop.load(Ordering::Relaxed) {
++                        ticks.fetch_add(1, Ordering::Relaxed);
++                        tokio::time::sleep(Duration::from_millis(1)).await;
++                    }
++                }
++            });
++
++            // The storage-I/O burst, also a task on the one worker.
++            let burst = tokio::spawn({
++                let store = Arc::clone(&store);
++                let ticks = Arc::clone(&ticks);
++                async move {
++                    let start = ticks.load(Ordering::Relaxed);
++                    for _ in 0..BURST_WALKS {
++                        store.list_fragments().await.expect("list_fragments");
++                    }
++                    // Ticks the timer managed to fire *while the burst was in
++                    // flight*. Zero ⇒ the worker was pinned by the blocking walk.
++                    ticks.load(Ordering::Relaxed) - start
++                }
++            });
++
++            let during = burst.await.expect("burst task");
++            stop.store(true, Ordering::Relaxed);
++            timer.abort();
++            during
++        }
++    });
++
++    assert!(
++        during >= MIN_TICKS_DURING_BURST,
++        "a co-scheduled timer made only {during} tick(s) during the storage-I/O burst \
++         (expected >= {MIN_TICKS_DURING_BURST}): the blocking filesystem syscalls are \
++         pinning the reactor worker thread instead of running off the reactor, so the \
++         heartbeat/timer is starved while storage I/O is in flight (issue #204)"
++    );
++}
