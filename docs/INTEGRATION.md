@@ -53,6 +53,17 @@
 - **Immutability rule (host-enforced):** Wyrd's `adr-immutability` gate forbids editing an
   Accepted ADR (`../wyrd/docs/design/adr/`, ADR-0001). A Plan that needs to change an
   accepted decision authors a **new** superseding ADR — never edits the old one.
+- **Plan foundation — the design corpus, referenced in place (never copied):** when
+  briefing, ground the plan not only on the tracker (the issue source) but on the target
+  repo's existing **design corpus**, read in place under the `../wyrd` checkout with the
+  safe `git -C ../wyrd …` / Read / Grep idiom — **never** copied into the bundle. That
+  corpus is `../wyrd/docs/design/`: the ADRs (`adr/`), proposals (`proposals/`),
+  architecture notes (`architecture/`), and normative specs (`specs/`), indexed by
+  `docs/design/README.md`; brief against it alongside the code you cite for root cause. It
+  anchors a brief in the accepted decisions and strengthens the prior-art / superseding
+  check (the immutability rule above). These are **reference foundation, not bundle
+  artifacts** — do not wire them as copy-based `[[plan.source]]` providers; the planner
+  reads them live from `../wyrd`, so nothing is duplicated into `results/`.
 
 ## 3. Reproduction fixtures and runners
 - **Canonical fixture path:** the on-disk-format **conformance vectors** at
