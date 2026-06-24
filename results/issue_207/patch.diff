@@ -1,0 +1,628 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3faad40..e059b3c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2484,11 +2484,13 @@ dependencies = [
+  "opentelemetry-prometheus",
+  "opentelemetry_sdk",
+  "prometheus",
++ "tempfile",
+  "tokio",
+  "tracing",
+  "tracing-opentelemetry",
+  "tracing-subscriber",
+  "wyrd-chunk-format",
++ "wyrd-chunkstore-fs",
+  "wyrd-coordination-mem",
+  "wyrd-core",
+  "wyrd-testkit",
+diff --git a/crates/chunkstore-fs/src/lib.rs b/crates/chunkstore-fs/src/lib.rs
+index 3ecc1db..84635c5 100644
+--- a/crates/chunkstore-fs/src/lib.rs
++++ b/crates/chunkstore-fs/src/lib.rs
+@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use async_trait::async_trait;
+ use bytes::Bytes;
+ use wyrd_chunk_format::{decode, FragmentError};
+-use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
++use wyrd_traits::{
++    ChunkId, ChunkStore, FragmentId, Health, IntegrityFault, PlacementChunkStore, Result,
++};
+ 
+ /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
+ pub struct FsChunkStore {
+@@ -132,8 +134,14 @@ impl FsChunkStore {
+ impl ChunkStore for FsChunkStore {
+     async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+         // Verify integrity and that the fragment belongs under this id before
+-        // acknowledging the write.
+-        Self::verify(id, fragment.as_ref())?;
++        // acknowledging the write. A verify failure here is a **malformed fragment
++        // the caller offered** — surfaced as a seam-level `IntegrityFault` so the
++        // networked seam can classify it as a client (invalid-argument) fault, not
++        // a server-internal one that invites futile retries.
++        Self::verify(id, fragment.as_ref()).map_err(|e| IntegrityFault {
++            id,
++            detail: e.to_string(),
++        })?;
+ 
+         let final_path = self.fragment_path(id);
+         // The chunk's directory may not exist yet (first fragment of the chunk).
+@@ -166,8 +174,15 @@ impl ChunkStore for FsChunkStore {
+             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+             Err(e) => return Err(e.into()),
+         };
+-        // Detect bit-rot / tampering before returning data.
+-        Self::verify(id, &bytes)?;
++        // Detect bit-rot / tampering before returning data. A verify failure on the
++        // read path is **stored-data corruption** — surfaced as a seam-level
++        // `IntegrityFault` so a consumer (scrub, the read path) records a repair
++        // obligation and carries on, rather than retrying bytes that cannot heal.
++        // The corrupt bytes are never returned as a valid fragment.
++        Self::verify(id, &bytes).map_err(|e| IntegrityFault {
++            id,
++            detail: e.to_string(),
++        })?;
+         Ok(Some(Bytes::from(bytes)))
+     }
+ 
+diff --git a/crates/chunkstore-grpc/src/client.rs b/crates/chunkstore-grpc/src/client.rs
+index 9a24106..19cc2a9 100644
+--- a/crates/chunkstore-grpc/src/client.rs
++++ b/crates/chunkstore-grpc/src/client.rs
+@@ -4,17 +4,35 @@
+ use async_trait::async_trait;
+ use bytes::Bytes;
+ use tonic::transport::{Channel, Endpoint};
+-use tonic::Request;
++use tonic::{Code, Request, Status};
+ use wyrd_proto::v0::chunk_store_client::ChunkStoreClient;
+ use wyrd_proto::v0::{
+     FragmentDeleteRequest, FragmentGetRequest, FragmentListRequest, FragmentPutRequest,
+     HealthRequest,
+ };
+-use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
++use wyrd_traits::{BoxError, ChunkStore, FragmentId, Health, IntegrityFault, Result};
+ 
+ use crate::conv;
+ use crate::error::TransportError;
+ 
++/// Classify a `get_fragment` error status. A `DATA_LOSS` status is the wire form of a
++/// stored-fragment **integrity** failure the D server detected on read (bit rot / a
++/// misplaced fragment): surface it as the seam-level [`IntegrityFault`] so a consumer
++/// (scrub, the read path) classifies it the *same* as a local store's corruption —
++/// repair-and-continue, not retry — without depending on this crate's
++/// [`TransportError`]. Every other status stays a [`TransportError`] (transient or
++/// generic rpc), preserving the retry policy's existing classification.
++fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
++    if status.code() == Code::DataLoss {
++        Box::new(IntegrityFault {
++            id,
++            detail: status.message().to_string(),
++        })
++    } else {
++        Box::new(TransportError::from(status))
++    }
++}
++
+ /// A [`ChunkStore`] implemented over a gRPC channel to one D server.
+ ///
+ /// The trait's `&self` methods clone the inner tonic client per call — tonic
+@@ -69,7 +87,7 @@ impl ChunkStore for GrpcChunkStore {
+         let response = client
+             .get_fragment(Request::new(request))
+             .await
+-            .map_err(TransportError::from)?;
++            .map_err(|status| classify_get_status(id, status))?;
+         // Absent bytes preserve the trait's `Ok(None)` not-found contract — a
+         // miss is not a transport error.
+         Ok(response.into_inner().fragment.map(Bytes::from))
+diff --git a/crates/chunkstore-grpc/src/server.rs b/crates/chunkstore-grpc/src/server.rs
+index f3d9778..09365c1 100644
+--- a/crates/chunkstore-grpc/src/server.rs
++++ b/crates/chunkstore-grpc/src/server.rs
+@@ -4,7 +4,7 @@
+ use std::sync::Arc;
+ 
+ use bytes::Bytes;
+-use tonic::{Request, Response, Status};
++use tonic::{Code, Request, Response, Status};
+ use wyrd_proto::v0::chunk_store_server::ChunkStore as ChunkStoreRpc;
+ use wyrd_proto::v0::{
+     FragmentDeleteRequest, FragmentDeleteResponse, FragmentGetRequest, FragmentGetResponse,
+@@ -52,11 +52,20 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
+         let request = request.into_inner();
+         let id = conv::from_wire_fragment_id(request.id)?;
+         // The store verifies the fragment's checksums before acknowledging
+-        // (write step 2); a verification or I/O failure becomes an error status.
++        // (write step 2). A malformed/failing-integrity fragment is the **client's**
++        // fault — surface it as `INVALID_ARGUMENT`, not `INTERNAL`, so the caller
++        // does not retry bytes that can never verify; a true I/O failure stays
++        // internal.
+         self.inner
+             .put_fragment(id, Bytes::from(request.fragment))
+             .await
+-            .map_err(|e| Status::internal(e.to_string()))?;
++            .map_err(|e| {
++                if wyrd_traits::is_integrity_fault(e.as_ref()) {
++                    Status::invalid_argument(e.to_string())
++                } else {
++                    Status::internal(e.to_string())
++                }
++            })?;
+         Ok(Response::new(FragmentPutResponse {}))
+     }
+ 
+@@ -66,11 +75,18 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
+     ) -> std::result::Result<Response<FragmentGetResponse>, Status> {
+         let request = request.into_inner();
+         let id = conv::from_wire_fragment_id(request.id)?;
+-        let fragment = self
+-            .inner
+-            .get_fragment(id)
+-            .await
+-            .map_err(|e| Status::internal(e.to_string()))?;
++        // Stored-data corruption the store detected on read (bit rot / a misplaced
++        // fragment) travels as `DATA_LOSS` — categorically distinct from a transient
++        // (`UNAVAILABLE`/`DEADLINE_EXCEEDED`) status — so the client can reconstruct
++        // it as a corruption finding and the scrub/read consumer can repair rather
++        // than retry. Any other failure is internal.
++        let fragment = self.inner.get_fragment(id).await.map_err(|e| {
++            if wyrd_traits::is_integrity_fault(e.as_ref()) {
++                Status::new(Code::DataLoss, e.to_string())
++            } else {
++                Status::internal(e.to_string())
++            }
++        })?;
+         // `None` travels as an absent field, not a NOT_FOUND status — the
+         // client maps it back to the trait's `Ok(None)`.
+         Ok(Response::new(FragmentGetResponse {
+diff --git a/crates/chunkstore-grpc/tests/round_trip.rs b/crates/chunkstore-grpc/tests/round_trip.rs
+index 682f0dd..7ba72e6 100644
+--- a/crates/chunkstore-grpc/tests/round_trip.rs
++++ b/crates/chunkstore-grpc/tests/round_trip.rs
+@@ -11,9 +11,10 @@
+ use bytes::Bytes;
+ use tokio_stream::wrappers::TcpListenerStream;
+ use tonic::transport::Server;
++use tonic::Code;
+ use wyrd_chunk_format::{encode, FragmentHeader};
+-use wyrd_chunkstore_fs::FsChunkStore;
+-use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, GrpcChunkStore};
++use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
++use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, GrpcChunkStore, TransportError};
+ use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health};
+ 
+ fn fid(chunk: ChunkId, index: u16) -> FragmentId {
+@@ -92,3 +93,79 @@ async fn put_get_health_round_trip_over_grpc() {
+ 
+     server.abort();
+ }
++
++/// The gRPC `Status::code` carried by a `ChunkStore` boxed error — the
++/// `GrpcChunkStore` boxes a [`TransportError`] wrapping the wire `Status`.
++fn transport_status_code(err: &wyrd_traits::BoxError) -> Code {
++    let te = err
++        .downcast_ref::<TransportError>()
++        .expect("a transport failure carries a TransportError");
++    match te {
++        TransportError::Unavailable(s) | TransportError::Timeout(s) | TransportError::Rpc(s) => {
++            s.code()
++        }
++        TransportError::Connect(e) => panic!("expected a gRPC status, got a connect error: {e}"),
++    }
++}
++
++/// Issue #207 — the gRPC **corruption** classification leg: a fragment that rots on the
++/// D server's disk is detected on read and surfaced over the wire **distinguishably**
++/// from a transient fault. The server emits `DATA_LOSS` (not `INTERNAL`), and the client
++/// reconstructs it as a seam-level [`wyrd_traits::IntegrityFault`] — the exact predicate
++/// scrub branches on (`is_integrity_fault` ⇒ repair-and-continue, not retry). Without the
++/// fix the store's verify failure surfaced as `INTERNAL`/`Rpc`, indistinguishable from a
++/// transient fault.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn get_of_a_rotten_fragment_is_an_integrity_fault_over_grpc() {
++    let (client, dir, server) = connected().await;
++
++    // Store a valid fragment, then rot its on-disk bytes behind the server's back.
++    let id = fid(0xC0DE_0000_0000_0000_0000_0000_0000_0001, 0);
++    client
++        .put_fragment(id, fragment(id, b"healthy until it rots"))
++        .await
++        .unwrap();
++    let path = fragment_path(dir.path(), id);
++    let mut bytes = std::fs::read(&path).unwrap();
++    *bytes.last_mut().unwrap() ^= 0xff; // break the trailing checksum
++    std::fs::write(&path, &bytes).unwrap();
++
++    let err = client
++        .get_fragment(id)
++        .await
++        .expect_err("a corrupt fragment must not round-trip as valid bytes");
++
++    assert!(
++        wyrd_traits::is_integrity_fault(err.as_ref()),
++        "a rotten fragment surfaces as a corruption finding the consumer can repair, \
++         not a transient fault to retry"
++    );
++    assert!(
++        err.downcast_ref::<TransportError>().is_none(),
++        "corruption is NOT carried as a transient/rpc TransportError — it is distinguishable"
++    );
++
++    server.abort();
++}
++
++/// Issue #207 — the gRPC **PUT classification** leg: a client that offers a malformed
++/// fragment gets `INVALID_ARGUMENT` (a client fault), not `INTERNAL` (a server fault that
++/// invites futile retries). Same error-classification seam as the corruption leg, the
++/// opposite direction: the bytes are the *caller's* to fix, so the code names the client.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn put_of_a_malformed_fragment_is_invalid_argument_over_grpc() {
++    let (client, _dir, server) = connected().await;
++
++    let err = client
++        .put_fragment(fid(7, 0), Bytes::from_static(b"not a fragment"))
++        .await
++        .expect_err("a non-fragment put must be rejected");
++
++    assert_eq!(
++        transport_status_code(&err),
++        Code::InvalidArgument,
++        "a malformed-fragment put is a client (invalid-argument) fault, not server-internal"
++    );
++
++    server.abort();
++}
+diff --git a/crates/custodian/Cargo.toml b/crates/custodian/Cargo.toml
+index 2bae0f5..8d1299f 100644
+--- a/crates/custodian/Cargo.toml
++++ b/crates/custodian/Cargo.toml
+@@ -42,6 +42,13 @@ bytes.workspace = true
+ # writer. Test-only — the scrub loop itself borrows `core`'s verify and gains no
+ # chunk-format dependency (ADR-0010).
+ wyrd-chunk-format.workspace = true
++# The verifying-backend scrub test drives the loop over the REAL on-disk D server
++# (`FsChunkStore`), whose `get_fragment` rejects a corrupt fragment with an
++# `IntegrityFault` instead of returning bytes — the backend whose silent-abort bug
++# this exercises end-to-end. A test/dev composition may name a concrete (ADR-0010);
++# the scrub loop itself still depends only on the trait seam.
++wyrd-chunkstore-fs.workspace = true
++tempfile.workspace = true
+ 
+ # Inherit the workspace lint policy (single source of truth).
+ [lints]
+diff --git a/crates/custodian/src/scrub.rs b/crates/custodian/src/scrub.rs
+index b600f55..66027a9 100644
+--- a/crates/custodian/src/scrub.rs
++++ b/crates/custodian/src/scrub.rs
+@@ -64,24 +64,48 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+             if !referenced.contains(&(dserver, frag)) {
+                 continue;
+             }
+-            // Fetch the bytes named by the chunk map. A fragment that vanished between
+-            // the walk and the fetch is a loss for GC/reconstruction to notice, not a
+-            // checksum finding — skip it rather than raise a false positive.
+-            let Some(bytes) = store.get_fragment(frag).await? else {
+-                continue;
+-            };
+-
+-            // COVERAGE: a referenced fragment scrub walked and verified.
+-            emit_scrubbed(dserver, frag);
++            // Fetch the bytes named by the chunk map, then decide what the fetch told
++            // us. A backend that does not verify on read (an in-memory fake) hands
++            // back the raw bytes for scrub's own `fragment_intact` to check; a
++            // verifying backend (the on-disk / networked D server) instead *rejects*
++            // a corrupt fragment with an `IntegrityFault` rather than returning bytes
++            // that already failed the very same check — so corruption must be handled
++            // on BOTH arms, and a single rotten fragment must never abort the pass.
++            match store.get_fragment(frag).await {
++                Ok(Some(bytes)) => {
++                    // COVERAGE: a referenced fragment scrub walked and verified.
++                    emit_scrubbed(dserver, frag);
+ 
+-            // VERIFY the self-describing checksum against the committed chunk map.
+-            // `frag.chunk` is the id the chunk map references it under.
+-            if !repair::fragment_intact(&bytes, frag.chunk) {
+-                // CORRUPTION: exclude the failing fragment (never decode it) and
+-                // enqueue its chunk on the shared repair queue the read path feeds.
+-                emit_corruption(dserver, frag);
+-                repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
+-                changed = true;
++                    // VERIFY the self-describing checksum against the committed chunk
++                    // map. `frag.chunk` is the id the chunk map references it under.
++                    if !repair::fragment_intact(&bytes, frag.chunk) {
++                        // CORRUPTION: exclude the failing fragment (never decode it)
++                        // and enqueue its chunk on the shared repair queue.
++                        emit_corruption(dserver, frag);
++                        repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
++                        changed = true;
++                    }
++                }
++                // A fragment that vanished between the walk and the fetch is a loss
++                // for GC/reconstruction to notice, not a checksum finding — skip it
++                // rather than raise a false positive.
++                Ok(None) => continue,
++                // The store REJECTED the fetch. Distinguish a **corruption** fault
++                // (the bytes failed their self-describing integrity check — a
++                // verifying backend's way of reporting bit rot / a misplaced
++                // fragment, locally or across the gRPC seam) from a **transient** one
++                // (unreachable / timed out / busy). Corruption is the same durable
++                // repair obligation as the mismatch above, and scrub must record it
++                // and CONTINUE past it — never abort the whole pass over one rotten
++                // fragment. A transient fault carries no such signal: propagate it so
++                // the retry policy, not scrub, decides.
++                Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
++                    emit_scrubbed(dserver, frag);
++                    emit_corruption(dserver, frag);
++                    repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
++                    changed = true;
++                }
++                Err(e) => return Err(e),
+             }
+         }
+     }
+diff --git a/crates/custodian/tests/scrub.rs b/crates/custodian/tests/scrub.rs
+index f190cec..0708f9f 100644
+--- a/crates/custodian/tests/scrub.rs
++++ b/crates/custodian/tests/scrub.rs
+@@ -27,6 +27,7 @@ use bytes::Bytes;
+ use tracing::instrument::WithSubscriber;
+ use tracing_subscriber::prelude::*;
+ use wyrd_chunk_format::{encode, FragmentHeader, CORE_HEADER_LEN};
++use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
+ use wyrd_coordination_mem::MemCoordination;
+ use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
+ use wyrd_core::repair;
+@@ -392,3 +393,178 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
+         "the scrub-detected corruption rate is exported on the durability seam; got:\n{exposed}"
+     );
+ }
++
++// ---- issue #207: a VERIFYING backend (FsChunkStore) — corruption is enqueued AND the
++//      pass continues; it never aborts at the first rotten fragment ----
++//
++// The earlier criteria run over `MemDServer`, which returns the raw (corrupt) bytes for
++// scrub's own `fragment_intact` to check. A real on-disk / networked D server instead
++// **verifies on read** and *rejects* a corrupt fragment with a
++// `wyrd_traits::IntegrityFault` (over gRPC, a `DATA_LOSS` status) — it never hands back
++// bytes that already failed the same check. Before the fix scrub propagated that `Err`
++// with `?`, aborting the whole pass at the first rotten fragment: bit rot was never
++// enqueued, the fragments after it were never scrubbed, and the corruption/coverage
++// telemetry stayed all-green. These two tests pin the restored contract — corruption is
++// classified, enqueued, and the pass continues — against the real `FsChunkStore` and a
++// transient-fault fake, so the corrupt-vs-transient distinction is exercised both ways.
++
++/// A D server whose `get_fragment` always fails with a **non-integrity** (transient)
++/// error — the shape of an unreachable / timed-out backend (no `IntegrityFault` in the
++/// chain). It lists one referenced fragment so scrub reaches the fetch.
++struct TransientDServer {
++    id: FragmentId,
++}
++
++#[async_trait]
++impl ChunkStore for TransientDServer {
++    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++        Ok(())
++    }
++
++    async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
++        Err(Box::new(std::io::Error::new(
++            std::io::ErrorKind::ConnectionReset,
++            "d server unreachable",
++        )))
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(vec![self.id])
++    }
++
++    async fn delete_fragment(&self, _id: FragmentId) -> Result<()> {
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Unhealthy)
++    }
++}
++
++#[tokio::test]
++async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
++    let meta = MemMeta::default();
++    let dir = tempfile::tempdir().unwrap();
++    let store = FsChunkStore::open(dir.path()).unwrap();
++
++    // Three referenced fragments on the on-disk D server: TWO bit-rotten, one intact.
++    let rotten_a: ChunkId = 0xF1;
++    let rotten_b: ChunkId = 0xF2;
++    let intact: ChunkId = 0xF3;
++    for chunk in [rotten_a, rotten_b, intact] {
++        store
++            .put_fragment(frag(chunk, 0), valid_fragment(chunk))
++            .await
++            .unwrap();
++    }
++    // Rot the two on disk *after* a valid write — flip a payload byte so the stored
++    // bytes no longer verify. (We cannot `put` corrupt bytes: put verifies too.) This
++    // is the bit-rot the repro describes; `get_fragment` will now reject each with an
++    // `IntegrityFault` rather than return bytes.
++    for chunk in [rotten_a, rotten_b] {
++        std::fs::write(
++            fragment_path(dir.path(), frag(chunk, 0)),
++            corrupt_fragment(chunk),
++        )
++        .unwrap();
++    }
++    commit_reference(&meta, 1, "rotten-a", rotten_a, 0).await;
++    commit_reference(&meta, 2, "rotten-b", rotten_b, 0).await;
++    commit_reference(&meta, 3, "intact", intact, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &store)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    // Run under the durability seam so the corruption metric (leg b) can be read back.
++    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
++
++    // PRE-FIX: `get_fragment` on the first rotten fragment returns `Err`, scrub
++    // propagates it with `?` and ABORTS — `reconcile_step` returns `Err`, so this
++    // `unwrap` panics (red). POST-FIX scrub classifies it as corruption, enqueues, and
++    // continues over the rest of the D server.
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
++        .with_subscriber(subscriber)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "the pass detects corruption and produces repair obligations, not an aborting Err"
++    );
++
++    // (a) BOTH rotten chunks are enqueued for reconstruction — and only those. That
++    // BOTH are queued is the order-independent proof the pass CONTINUED past the first
++    // rotten fragment (leg c): had it aborted at the first, the second could never be
++    // enqueued.
++    let mut queued = repair::queued_repairs(&meta).await.unwrap();
++    queued.sort_unstable();
++    assert_eq!(
++        queued,
++        vec![rotten_a, rotten_b],
++        "both rotten chunks enqueued (the intact one is not) — the pass continued past the first"
++    );
++
++    // (b) the corruption + coverage metrics are emitted on the durability seam for the
++    // verifying-backend (Err) path, so the plane no longer reports all-green while data
++    // rots.
++    telemetry.flush().unwrap();
++    let exposed = telemetry
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert!(
++        exposed.contains("scrub_corruption_detected"),
++        "corruption is emitted on the verifying-backend path; got:\n{exposed}"
++    );
++    assert!(
++        exposed.contains("scrub_coverage"),
++        "coverage is emitted across the pass; got:\n{exposed}"
++    );
++
++    // The intact fragment is still served as valid bytes; a corrupt fragment is never
++    // returned as a valid payload — its get is an `Err`, never `Ok(Some(bytes))`.
++    assert!(
++        store.get_fragment(frag(intact, 0)).await.unwrap().is_some(),
++        "the intact referenced fragment is untouched and still served"
++    );
++    assert!(
++        store.get_fragment(frag(rotten_a, 0)).await.is_err(),
++        "a corrupt fragment is rejected on read, never served as a valid payload"
++    );
++}
++
++#[tokio::test]
++async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
++    let meta = MemMeta::default();
++    let chunk: ChunkId = 0xAA;
++    let store = TransientDServer { id: frag(chunk, 0) };
++    commit_reference(&meta, 1, "transient", chunk, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &store)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    // A transient fault carries no integrity signal, so it is NOT corruption: scrub must
++    // not mint a false repair obligation for it. It propagates for the retry policy to
++    // decide — the other half of the corrupt-vs-transient distinction at scrub's
++    // decision point. (Were the two collapsed, this would either be swallowed as a
++    // false repair or abort the pass the way real corruption used to.)
++    let result = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0).await;
++    assert!(
++        result.is_err(),
++        "a transient get fault propagates for retry; it is not classified as corruption"
++    );
++    assert!(
++        repair::queued_repairs(&meta).await.unwrap().is_empty(),
++        "a transient fault never enqueues a repair obligation"
++    );
++}
+diff --git a/crates/traits/src/lib.rs b/crates/traits/src/lib.rs
+index 530e88d..1d0d47d 100644
+--- a/crates/traits/src/lib.rs
++++ b/crates/traits/src/lib.rs
+@@ -15,6 +15,7 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++use std::fmt;
+ use std::time::Duration;
+ 
+ use async_trait::async_trait;
+@@ -60,6 +61,60 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+ /// A convenience result alias for the trait surface.
+ pub type Result<T> = std::result::Result<T, BoxError>;
+ 
++/// A fragment failed its **integrity** check: its self-describing checksum did not
++/// verify, or its header named a different chunk/index than the [`FragmentId`] it is
++/// filed under (bit rot / a tampered or misplaced fragment, `chunk-format` ADR-0019).
++///
++/// This is a **corruption** fault, categorically distinct from a **transient** one
++/// (unreachable / timed out / busy): the bytes are bad, so *retrying the same fetch
++/// cannot help*. A consumer that walks fragments — the custodian's scrub loop, the
++/// read path — must turn it into a **durable repair obligation** (enqueue the chunk
++/// for reconstruction) and carry on past it, never retry it; the two faults are
++/// handled differently (repair vs. retry), so they must stay distinguishable along
++/// the whole path from the store to the consumer's decision point.
++///
++/// It lives in the seam crate so **every** backend produces the *same* type and
++/// every consumer classifies it the *same* way ([`is_integrity_fault`]) without
++/// depending on a concrete store (ADR-0010). A networked backend that surfaces the
++/// fault over gRPC (a `DATA_LOSS` status, not a transient one) reconstructs *this*
++/// type on the client side, so the distinction survives the wire seam too.
++#[derive(Debug)]
++pub struct IntegrityFault {
++    /// The fragment whose stored (or offered) bytes failed integrity.
++    pub id: FragmentId,
++    /// Backend detail for the durability audit trail — the concrete
++    /// checksum/decode or id-mismatch reason.
++    pub detail: String,
++}
++
++impl fmt::Display for IntegrityFault {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "fragment integrity failure (chunk {:032x} index {}): {}",
++            self.id.chunk, self.id.index, self.detail
++        )
++    }
++}
++
++impl std::error::Error for IntegrityFault {}
++
++/// Whether `err` is an [`IntegrityFault`] (a corruption / integrity failure) anywhere
++/// in its source chain — the seam-level classifier that lets a consumer branch
++/// **repair-and-continue** (corruption) vs. **propagate/retry** (transient) without
++/// knowing the backend's concrete error type. Walks [`source`](std::error::Error::source)
++/// so a backend may wrap the fault in its own error and still be classified.
++pub fn is_integrity_fault(err: &(dyn std::error::Error + 'static)) -> bool {
++    let mut next = Some(err);
++    while let Some(e) = next {
++        if e.is::<IntegrityFault>() {
++            return true;
++        }
++        next = e.source();
++    }
++    false
++}
++
+ /// A coarse health signal a backend reports about itself.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Health {
