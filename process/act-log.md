@@ -29,6 +29,114 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-06-25 — cycles considered: issue_195, issue_196, issue_204, issue_207, issue_251
+
+> Considers the five frozen cycles that had not yet had an Act review (the index's 24 minus
+> the 19 covered through 2026-06-23). issue_115 (ACCEPTED, 2026-06-20) and issue_153
+> (discontinued, 2026-06-21) remain absent from the frozen index → still out of scope, carried.
+> No contribution disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **Two of these cycles ARE the PDCA fixes for last chain's routed Wyrd work — the routing
+  loop closed again.** issue_195 lands the **Tier-1 dm-flakey/dm-error** disk-fault campaign
+  for **getwyrd/wyrd#195** and issue_196 lands the **Tier-2 kill-and-reconstruct** scenario for
+  **getwyrd/wyrd#196** — the two M3.9/M3.10 tier-split items this review chain filed in the
+  2026-06-23 follow-up (the #146 "Tier-1/Tier-2 not functionally implemented" gap). Bundle id =
+  issue id by init-from-issue, so the correspondence is auditable. issue_251 *self-filed* its own
+  §10 gap as **getwyrd/wyrd#268** (gRPC seam strips the `EIO` signal). Evidence the prior reviews'
+  routed follow-ups progressed to merged PDCA cycles + a tracked issue, not silent drops — **no
+  delta**, recorded as the close (cf. #197/#198 last review).
+- **The `Verification posture` + `Production reach` deltas are carried in the briefs and taking
+  effect — record as evidence, no new delta.** Both #195 and #196 carry an explicit
+  `Verification posture: DEFERRED/off-Check, NET-NEW` line invoking the 2026-06-22 "deferred ≠
+  unbuilt" forcing function (`results/issue_195/brief.md:129,147`; `issue_196/brief.md:112,128`)
+  and a `Production reach: N/A as a production seam` line (`issue_195/brief.md:153`;
+  `issue_196/brief.md:132`). The residual fidelity questions — #195's dm-flakey-vs-direct-`fs::write`
+  scrub leg, #196's in-process `MemMeta`/`CrashMeta` metadata vs proposal 0005 §13.2's
+  "real NVMe/fsync" mandate — correctly land as **pre-declared §6 ratification / sign-off items**,
+  not surprise C2/C4 NEEDS-HUMAN. That is exactly the conversion those fields exist to produce;
+  the human judgment they surface is *expected*, not eliminated. Working as designed — **no delta**.
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle.** V fitness-to-purpose in all five
+  (204, 207, 251, 195, 196); C5 + T5 in #251; T5 + V in #196. Always-human (INTEGRATION.md §4).
+  **No delta warranted** — consistent with all four prior reviews.
+- **NEW — a denied rustdoc lint is never exercised by the gate, so a broken-intra-doc-link defect
+  class passes Check and surfaces only at sign-off (recurring: #196 iteration 1 AND iteration 2,
+  plus the #195 sibling).** Root `Cargo.toml:170` sets `rustdoc::broken_intra_doc_links = "deny"`,
+  but `cargo xtask ci` runs **no `cargo doc` step** (`results/issue_196/build-notes.md:11-13`;
+  `check-review.md:43-44`), so the lint is never exercised by C4-ci. A green C4-ci therefore does
+  **not** clear it. It bit #196 twice — iteration 1 (`faults.rs:149` dangling link,
+  `iteration-v1/SUMMARY.md:62`) and iteration 2 (the re-homed `assert_*` helpers left three dangling
+  references after the orphan was fixed) — each caught only by the codex advisory at sign-off, each
+  forcing a reject. This is a **gate-coverage gap**, not a model error. Its fix lives in Wyrd's
+  single-source gate (`cargo xtask ci`, ADR-0016) — adding it PDCA-side would *drift* from Wyrd's
+  one gate definition (INTEGRATION.md §4/§9, "Wyrd owns the gate defs, no drift") — so it **routes to
+  Wyrd**, not a `pdca.toml` delta.
+- **NEW — a reviewer leaf failed to run yet the cycle still assembled SUMMARY and reached
+  AWAITING_SIGNOFF with no advisory review (#195).** §6: *"re-run the Check reviewer; this bundle
+  has no advisory review and must not be accepted until one exists"* — the Claude reviewer leaf
+  silently failed to run; only the codex cross-vendor review existed. The C6 accept-guard + the §6
+  row **held** (the iteration was rejected, `issue_195/brief.md:227`), so nothing wrong merged — but
+  a leaf failing *without a hard error* while the Check beat still composes a sign-off-ready SUMMARY
+  is a harness-robustness gap. Single occurrence → route + watch, not a forced delta.
+
+## Process deltas
+
+- **None warranted this review.** The recurring NEEDS-HUMAN classes (V/C5/T5) are always-human by
+  design; the `Verification posture` / `Production reach` / "deferred ≠ unbuilt" deltas are carried
+  in the briefs and taking effect; and the two new findings (the rustdoc gate gap, the reviewer-leaf
+  robustness gap) are **not** PDCA spec/ruleset/gate/skill changes — the first belongs in Wyrd's
+  single-source `cargo xtask ci` (adding it to `pdca.toml` would drift from Wyrd's one gate
+  definition), the second is harness machinery upstream of this repo. Both route below. A forced
+  PDCA delta here would be worse than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Gate gap (Wyrd) — `cargo xtask ci` never exercises the denied `broken_intra_doc_links` lint.**
+  `cargo doc` is run by no gate step, so a dangling intra-doc link passes C4-ci and is caught only by
+  the advisory reviewer at sign-off — it bit #196 across both iterations (`faults.rs:149`, then the
+  re-homed `assert_*` helpers). Fix lives in Wyrd's gate (ADR-0016 single source): add a `cargo doc`
+  / rustdoc step to `cargo xtask ci`. → owner: Eduard; next step: file against getwyrd/wyrd
+  (milestone M3); record id next review. Not a `pdca.toml` change (would drift from the single gate).
+- **Workflow bug (Wyrd, #195 §10 codex advisory) — privileged Tier-1 harness runs without sudo.**
+  `.github/workflows/tier1-disk-faults.yml:66` runs the harness as the default Actions user, but the
+  test performs root-only ops (`losetup`/`dmsetup`/`mount`/`drop_caches`); on hosted Ubuntu the job
+  will fail before exercising the harness unless the step runs under `sudo`
+  (`results/issue_195/SUMMARY.md:43,68`). Non-blocking advisory, but a real off-Check CI defect that
+  lands in Wyrd's tree. → owner: Eduard; next step: file against getwyrd/wyrd (milestone M3.9);
+  record id next review.
+- **Harness/driver robustness (upstream template) — a reviewer leaf can fail silently and the Check
+  beat still assembles a sign-off-ready SUMMARY with no advisory-review artifact (#195).** The C6
+  guard + §6 caught it this time, but a failed leaf should surface as a hard error / the Check beat
+  should refuse to reach AWAITING_SIGNOFF with no advisory review present, rather than relying on the
+  reviewer to write a "re-run me" §6 row. This is harness machinery (`src/pdca_harness/**` /
+  leaf orchestration), so it routes **upstream to the template** the harness is rendered from.
+  → owner: Eduard; next step: open a harness/template-feedback issue when bumping the harness;
+  record id next review.
+- **issue_251 §10 — already self-filed getwyrd/wyrd#268** (M3 epic #147): the gRPC seam strips the
+  `EIO` signal, so the #251 read-around no-ops for remote D servers until the wire carries a distinct
+  block-read-fault code. No Act action — recorded as auditable (the cycle filed its own follow-up).
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21) still
+  have not had an Act review and remain absent from this index. → next Act review, if still in scope.
+- Prior reviews' upstream harness follow-ups (eduralph/pdca-harness#120 target-pin, #121
+  reviewer-Basis) and the design issues getwyrd/wyrd#242/#243 + doc #244 — confirm progressed at the
+  next review.
+
+## How effectiveness will be judged
+
+- The two new routed items (Wyrd `cargo doc` gate step; the tier1-disk-faults.yml sudo fix) and the
+  upstream reviewer-leaf-robustness item should appear as tracker/issue ids (or an explicit "still
+  deferred") at the next review — follow-ups stay auditable.
+- WATCH the next ~5 cycles for a **recurrence of a broken-intra-doc-link (or any rustdoc-deny)
+  defect reaching sign-off**: if it recurs after the Wyrd `cargo doc` gate step lands, the gate fix
+  was the right call; if it recurs *before* it lands, the routed item is overdue.
+- WATCH whether another bundle reaches AWAITING_SIGNOFF with a silently-failed reviewer leaf; one
+  more occurrence promotes the harness-robustness route from "watch" to "overdue."
+- The #195/#196 close-the-loop should continue — routed M3 tier work becoming merged PDCA cycles.
+
 # Act review — 2026-06-23 — cycles considered: issue_197, issue_198, issue_203, issue_205
 
 > Considers the four cycles that froze on 2026-06-23 and had not yet had an Act
