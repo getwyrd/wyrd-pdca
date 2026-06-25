@@ -34,11 +34,13 @@ subprocess in the working dir; ``interactive`` leaves inherit the terminal.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import act as act_mod
@@ -61,6 +63,27 @@ VALID_DECISIONS = frozenset({"accept", "iterate-do", "iterate-plan", "discontinu
 # ----------------------------------------------------------------------------
 # Subprocess invocation — the one place a leaf command is run.
 # ----------------------------------------------------------------------------
+class LeafError(subprocess.CalledProcessError):
+    """A headless leaf exited non-zero. Carries the captured stderr tail
+    (``output``) so a failed reviewer/advisory leaf leaves recoverable error text
+    in the bundle (#138), and ``produced`` — whether the child emitted a substantive
+    stream event (real work) before exiting, vs only the CLI's ``system``/``init``
+    or ``api_retry`` events. ``produced is False`` is the transient-infra signal: the
+    child died at/near invocation (usage/rate limit, 5xx, auth, network) before doing
+    any work, so a retry is likely to succeed."""
+
+    def __init__(self, returncode: int, cmd, output: str = "", produced: bool = False):
+        super().__init__(returncode, cmd, output=output)
+        self.produced = produced
+
+    @property
+    def transient(self) -> bool:
+        """A no-output non-zero exit — almost certainly transient infra, not a
+        reviewer that looked at the diff and couldn't decide."""
+        return not self.produced
+
+
+
 def _invoke(
     leaf: LeafConfig,
     workdir: Path,
@@ -98,11 +121,66 @@ def _invoke(
     use_stream = stream_json and leaf.family == "claude"
     if use_stream:
         argv += ["--output-format", "stream-json", "--verbose"]
-    rc, _ = progress.run_with_heartbeat(
+    rc, output, produced = progress.run_with_heartbeat(
         argv, cwd=workdir, input_text=prompt, label=label, status=status,
         stream_json=use_stream, env=run_env)
     if rc != 0:
-        raise subprocess.CalledProcessError(rc, argv)
+        # Only the stream path gives a real "did a session start" signal. Without it
+        # (a non-claude leaf) we cannot tell invocation-death from a substantive
+        # failure, so report produced=True → not transient, not retried — preserving
+        # the prior immediate-placeholder behavior for non-stream leaves.
+        raise LeafError(rc, argv, output=output, produced=produced or not use_stream)
+
+
+def _invoke_leaf_resilient(
+    leaf: LeafConfig,
+    workdir: Path,
+    prompt: str,
+    *,
+    error_log: Path,
+    attempts: int = 3,
+    backoff: float = 4.0,
+    **kw,
+) -> Exception | None:
+    """Run a headless reviewer/advisory leaf with bounded retry + error capture (#138).
+
+    A non-zero exit that produced **no output** is the transient-infra signal — the
+    child died at/near invocation (usage/rate limit, 5xx, auth, network), not a
+    reviewer that read the diff and couldn't decide — so retry it with exponential
+    backoff. A failure that *did* produce output, or a non-LeafError (e.g. command
+    not found), is substantive: do not retry. On final failure the captured stderr
+    tail of every attempt is written to ``error_log`` so the bundle carries
+    recoverable error text, not just an exit code. Returns ``None`` on success, else
+    the final exception (a :class:`LeafError` exposes ``.transient``)."""
+    error_log.unlink(missing_ok=True)  # clear any stale tail from a prior cycle run
+    records: list[str] = []
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _invoke(leaf, workdir, prompt, **kw)
+            return None  # success — leave no error log behind
+        except Exception as exc:  # noqa: BLE001 — a failed leaf must never crash the cycle
+            last = exc
+            records.append(_format_leaf_attempt(exc, attempt))
+            transient = getattr(exc, "transient", False)
+            if not transient or attempt == attempts:
+                break
+            delay = backoff * (2 ** (attempt - 1))
+            print(f"leaves: {workdir.name} — leaf exited {getattr(exc, 'returncode', '?')} "
+                  f"with no output (transient); retry {attempt}/{attempts - 1} in "
+                  f"{delay:.0f}s", file=sys.stderr)
+            time.sleep(delay)
+    error_log.write_text("".join(records), encoding="utf-8")
+    return last
+
+
+def _format_leaf_attempt(exc: Exception, attempt: int) -> str:
+    """One attempt's record for the error log: the captured stderr tail, or the
+    exception text when nothing was captured (e.g. command not found)."""
+    tail = (getattr(exc, "output", "") or "").strip()
+    rc = getattr(exc, "returncode", "?")
+    body = tail if tail else f"(no output captured) {type(exc).__name__}: {exc}"
+    return f"----- attempt {attempt} — exit {rc} -----\n{body}\n\n"
 
 
 # ----------------------------------------------------------------------------
@@ -124,7 +202,7 @@ def ensure_notes(cfg: Config, d: Path) -> None:
     cmd = cfg.notes_cmd.format(id=issue_id)
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
     try:
-        rc, _ = progress.run_with_heartbeat(
+        rc, _, _ = progress.run_with_heartbeat(
             cmd, cwd=cfg.root, shell=True, env=env, capture=True,
             label=f"fetch notes {d.name}")
     except Exception as exc:  # noqa: BLE001 — a failed scrape must not break Plan
@@ -193,7 +271,9 @@ def _plan_prompt(cfg: Config, csv: str | None, d: Path) -> str:
         "plan ALREADY lives in a host artifact (an ADR / proposal / normative spec): the "
         "brief then POINTS at that document (a `Planning artifact:` reference) instead of "
         "restating it. Keep the parsed `- **Label:** value` field shape; resolve the repo + "
-        "branch target per INTEGRATION §2. One bundle = one brief.md. Plan only."
+        "branch target per INTEGRATION §2; set `Difficulty` (the fix's blast-radius / "
+        "cross-file reach, NOT edge-case density) so Do/review routing can key on it. "
+        "One bundle = one brief.md. Plan only."
     )
 
 
@@ -238,7 +318,8 @@ def _plan_batch_prompt(cfg: Config, csv: str | None, ids: list[str] | None = Non
     geps_tpl = cfg.templates_dir / "design-proposal.md.tpl"
     tpl_line = (
         f"use the fitting template: a bug fix → {fix_tpl}; a feature / enhancement → "
-        f"{geps_tpl}. Keep the parsed `- **Label:** value` field shape")
+        f"{geps_tpl}. Keep the parsed `- **Label:** value` field shape; set `Difficulty` "
+        "(the change's blast-radius / cross-file reach, NOT edge-case density) for routing")
     if ids:
         listing = ", ".join(ids)
         return (
@@ -280,18 +361,120 @@ def _stub_plan_batch(cfg: Config, ids: list[str] | None = None) -> None:
 # ----------------------------------------------------------------------------
 # Leaf 1 — Do (builder, headless): writes patch.diff + the test + build-notes.md.
 # ----------------------------------------------------------------------------
+def attempt_no(d: Path) -> int:
+    """This bundle's current Do attempt number (1-based). Mirrors the driver's iteration
+    numbering: each iterate archives the prior attempt into ``iteration-v<N>/``, so the
+    count of archives + 1 is the attempt about to run."""
+    return len(list(d.glob("iteration-v*"))) + 1
+
+
+def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
+    """A LeafConfig from an escalation/variant spec, inheriting any field the spec omits
+    from ``default`` (so a variant need only override what differs, e.g. just ``argv``)."""
+    return LeafConfig(
+        mode=spec.get("mode") or default.mode,
+        family=spec.get("family", default.family),
+        argv=list(spec.get("argv") or default.argv),
+        interactive=bool(spec.get("interactive", default.interactive)),
+    )
+
+
+def _variant_applies(spec: dict, d: Path) -> bool:
+    """True iff this builder variant's ``when`` ({field, substring}) matches bundle ``d``'s
+    brief (issue #134) — modelled on :func:`_advisory_applies`. **Default-open**: a variant
+    with no condition, or whose field is absent/doesn't match, does NOT apply, so a missing
+    difficulty tag falls back to the default builder rather than silently reducing
+    capability."""
+    when = spec.get("when") or {}
+    needle = (when.get("substring") or "").lower()
+    if not needle:
+        return False
+    return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
+
+
+def select_builder(d: Path, cfg: Config, n: int) -> LeafConfig:
+    """Pick the Do builder backend for bundle ``d`` on attempt ``n`` (issues #134/#135).
+
+    Two layers over the default ``[leaves.builder]``:
+      1. **Difficulty-routed variant (#134)** — the first ``[[leaves.builder_variant]]``
+         whose ``when`` matches the brief (e.g. difficulty=high) wins; default-open, so an
+         absent/unknown field keeps the default.
+      2. **Escalation ladder (#135)** — the entry with the highest ``min_iteration`` ≤ ``n``
+         **overrides the variant**, so a bundle that iterates escalates regardless of its
+         self-reported difficulty (a hard bundle mis-rated "low" can't loop forever on an
+         underpowered executor)."""
+    builder = cfg.builder
+    for spec in cfg.builder_variants:  # 1. difficulty routing (first match wins)
+        if _variant_applies(spec, d):
+            builder = _leaf_from_spec(spec, cfg.builder)
+            break
+    chosen = -1
+    for spec in cfg.builder_escalation:  # 2. escalation OVERRIDES the difficulty pick
+        threshold = int(spec.get("min_iteration", 0))
+        if chosen < threshold <= n:
+            chosen = threshold
+            builder = _leaf_from_spec(spec, cfg.builder)
+    return builder
+
+
+def _record_loop_attempt(d: Path, n: int, builder: LeafConfig) -> None:
+    """Append this Do attempt to ``loop-telemetry.json`` (issue #135) so iterations-to-pass
+    and which backend ran each pass are visible. Loop cost ≈ plan + iterations×review (an
+    iterate re-runs builder *and* the frontier reviewer), so the attempt count is the
+    go/no-go metric for adopting a cheaper local executor. The file persists across
+    iterations (it is not archived), so it accumulates. Best-effort: never break Do."""
+    path = d / "loop-telemetry.json"
+    data: dict = {"attempts": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            loaded = None
+        # Only adopt a well-shaped prior file; a hand edit / older writer that left a
+        # top-level array (or a non-list `attempts`) must not abort Do via AttributeError —
+        # this sidecar is best-effort. Anything else is replaced with a fresh dict.
+        if isinstance(loaded, dict) and isinstance(loaded.get("attempts"), list):
+            data = loaded
+    label = builder.argv[0] if builder.argv else builder.mode
+    data["attempts"].append({"n": n, "builder": label, "family": builder.family})
+    data["iterations_to_pass"] = len(data["attempts"])
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def do_build(d: Path, cfg: Config) -> None:
-    if cfg.builder.mode == "command":
+    # Route the builder FIRST, then dispatch on the SELECTED backend's mode — a variant /
+    # escalation entry may set its own mode, so keying the command-vs-stub decision on
+    # cfg.builder.mode would run a command variant as a stub (or vice versa) (#134).
+    n = attempt_no(d)
+    builder = select_builder(d, cfg, n)  # escalate-on-iterate (#135); difficulty (#134)
+    if builder.mode == "command":
+        _record_loop_attempt(d, n, builder)
         # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
-        # primary checkout is never mutated; expose it as $PDCA_WORKTREE + grant the
-        # claude builder read/write there. Best-effort: None ⇒ edit in place, as before.
+        # primary checkout is never mutated. Best-effort: None ⇒ edit in place, as before.
         wt = worktree.ensure(d, cfg)
-        env = {"PDCA_WORKTREE": str(wt)} if wt else None
-        extra = ["--add-dir", str(wt)] if wt and cfg.builder.family == "claude" else None
-        # The builder runs from cfg.root but writes into the bundle d — watch d so the
-        # heartbeat shows patch.diff / build-notes.md appearing as it works.
+        if wt and builder.family == "claude":
+            # The claude builder discovers its `builder` subagent AND the builder_guard
+            # PreToolUse hook by walking up from its cwd, so cwd MUST stay the harness root
+            # (.claude/agents + .claude/settings live there). Confining its cwd to the
+            # worktree would hide both — `--agent builder` would not resolve and the
+            # STOP-discipline guard would not load. It is grounded in the worktree via
+            # --add-dir + the prompt instead (as in #94), not by cwd. (Family is the
+            # SELECTED builder's, so an escalated/variant claude backend gets this too.)
+            workdir, env, extra = cfg.root, {"PDCA_WORKTREE": str(wt)}, ["--add-dir", str(wt)]
+        elif wt:
+            # A non-claude command builder (a local agentic CLI) has no --add-dir / agent
+            # machinery, so CONFINE it by running it *in* the worktree (cwd): otherwise it
+            # is launched from the harness root with nothing stopping it from writing the
+            # host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
+            workdir, env, extra = wt, {"PDCA_WORKTREE": str(wt)}, None
+        else:
+            workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
+        # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
         _invoke(
-            cfg.builder, cfg.root, _build_prompt(d),
+            builder, workdir, _build_prompt(d),
             label=f"Do {d.name}",
             status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
             stream_json=True,  # Tier 3: show the builder's live tool-use
@@ -383,7 +566,13 @@ _REVIEW_PROMPT = (
     "reason when an element does not apply. "
     "Ground every cited path:line on the target source at $PDCA_TARGET (read-only); "
     "if $PDCA_TARGET is unset, ground against patch.diff alone — do NOT search other "
-    "checkouts on the machine."
+    "checkouts on the machine. If $PDCA_TARGET is SET yet stale or unreadable (its base "
+    "lags what the patch was built/verified against — a dependent/stacked cycle's base "
+    "routinely trails its prerequisite until it merges), that is a target-state caveat, "
+    "NOT a patch defect: note the staleness and ground the affected citations on "
+    "patch.diff. Do NOT present a stale- or unreadable-target 'patch cannot apply / does "
+    "not compile' as a blocking C4 (verification) FAIL — that fabricates an ordering-gate "
+    "blocker for a patch that is in fact correct."
 )
 
 
@@ -450,16 +639,21 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
         extra_argv = ["--add-dir", str(target)] if target and cfg.reviewer.family == "claude" else None
-        try:
-            _invoke(
-                cfg.reviewer, sandbox, _REVIEW_PROMPT,
-                label=f"Check review {d.name}",
-                status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
-                stream_json=True,  # Tier 3 (no-op unless the reviewer family is claude)
-                env=env, extra_argv=extra_argv,
-            )
-        except Exception as exc:  # a failed reviewer (e.g. dropped connection) must
-            _review_unavailable(d, f"reviewer leaf failed: {exc}")  # not crash the cycle
+        error_log = d / "check-review.error.log"
+        # A transient (no-output) reviewer failure is retried with backoff before it
+        # degrades to a §6 placeholder; the failed attempts' stderr lands in error_log.
+        err = _invoke_leaf_resilient(
+            cfg.reviewer, sandbox, _REVIEW_PROMPT,
+            error_log=error_log,
+            label=f"Check review {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
+            stream_json=True,  # Tier 3 (no-op unless the reviewer family is claude)
+            env=env, extra_argv=extra_argv,
+        )
+        if err is not None:
+            transient = getattr(err, "transient", False)
+            _review_unavailable(d, f"reviewer leaf failed: {err}",
+                                transient=transient, error_log=error_log)
             return
         produced = sandbox / "check-review.md"
         if produced.exists():
@@ -468,18 +662,42 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             _review_unavailable(d, "reviewer produced no check-review.md")
 
 
-def _review_unavailable(d: Path, reason: str) -> None:
+def _review_unavailable(d: Path, reason: str, *, transient: bool = False,
+                        error_log: Path | None = None) -> None:
     """Write a placeholder review flagging the gap as a §6 NEEDS-HUMAN, so a failed or
     interrupted reviewer leaves a re-runnable bundle — not a half-checked one that
-    crashes assemble. The bundle still reaches sign-off; accept is blocked (C6)."""
+    crashes assemble. The bundle still reaches sign-off; accept is blocked (C6).
+
+    ``transient`` classifies the placeholder (#138) so the human can tell a transient
+    infra blip (safe to re-run) from a reviewer that genuinely needs a human; when an
+    ``error_log`` with the failed attempts' output exists, the placeholder points at it."""
     print(f"leaves: {d.name} — advisory review unavailable ({reason})", file=sys.stderr)
     (d / "check-review.md").write_text(
         "# Advisory review — NOT COMPLETED\n\n"
         f"The reviewer did not produce a verdict table ({reason}).\n\n"
-        "- NEEDS-HUMAN — re-run the Check reviewer; this bundle has no advisory review "
+        + _unavailable_classification(transient, error_log)
+        + "- NEEDS-HUMAN — re-run the Check reviewer; this bundle has no advisory review "
         "and must not be accepted until one exists.\n",
         encoding="utf-8",
     )
+
+
+def _unavailable_classification(transient: bool, error_log: Path | None) -> str:
+    """Shared classification block for a failed reviewer/advisory placeholder (#138):
+    name the failure class and point at the captured error log when present."""
+    if transient:
+        kind = ("**transient infra — safe to re-run.** The leaf exited non-zero with no "
+                "output and retries did not recover, so it almost certainly hit a usage/"
+                "rate limit or a transient API/network error rather than reviewing the "
+                "diff; a sibling advisory leaf of a different family may already have "
+                "covered it.")
+    else:
+        kind = ("**substantive — needs a human.** The leaf ran but did not yield a usable "
+                "verdict; do not assume an infra blip.")
+    log_ref = ""
+    if error_log is not None and error_log.exists():
+        log_ref = f" See `{error_log.name}` in this bundle for the captured error."
+    return f"Failure class: {kind}{log_ref}\n\n"
 
 
 # Stub bases per 5/5/1 element — what a real reviewer would re-derive; the offline
@@ -584,13 +802,17 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         env = {"PDCA_TARGET": str(target)} if target else None
         extra = ["--add-dir", str(target)] if target and leaf.family == "claude" else None
         out = sandbox / f"check-advisory-{leaf_id}.md"
-        try:
-            _invoke(leaf, sandbox, _advisory_prompt(spec, leaf_id),
-                    label=f"Advisory {leaf_id} {d.name}",
-                    status=lambda: progress.bundle_activity(sandbox, (out.name,)),
-                    stream_json=True, env=env, extra_argv=extra)
-        except Exception as exc:  # noqa: BLE001 — advisory must never crash the cycle
-            _advisory_unavailable(d, leaf_id, f"leaf failed: {exc}")
+        error_log = d / f"check-advisory-{leaf_id}.error.log"
+        err = _invoke_leaf_resilient(
+            leaf, sandbox, _advisory_prompt(spec, leaf_id),
+            error_log=error_log,
+            label=f"Advisory {leaf_id} {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, (out.name,)),
+            stream_json=True, env=env, extra_argv=extra)
+        if err is not None:  # advisory must never crash the cycle
+            transient = getattr(err, "transient", False)
+            _advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
+                                  transient=transient, error_log=error_log)
             return
         if out.exists():
             shutil.copy2(out, advisory_artifact(d, leaf_id))
@@ -608,11 +830,13 @@ def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
         encoding="utf-8")
 
 
-def _advisory_unavailable(d: Path, leaf_id: str, reason: str) -> None:
+def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *, transient: bool = False,
+                          error_log: Path | None = None) -> None:
     print(f"leaves: {d.name} — advisory '{leaf_id}' unavailable ({reason})", file=sys.stderr)
     advisory_artifact(d, leaf_id).write_text(
         f"# Advisory review — {leaf_id} — NOT COMPLETED\n\n"
-        f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
+        + _unavailable_classification(transient, error_log)
+        + f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
         "re-run it or adjudicate by hand.\n",
         encoding="utf-8")
 
