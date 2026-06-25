@@ -1,0 +1,104 @@
+# Result — issue 195 / tier1-disk-fault-harness
+
+## 1. Spec (from brief.md)              ← Check verifies against THIS
+- Defect / goal: M3.8 (#146) shipped only the Tier-0 DST campaign. The Tier-1 legs of the
+- Success criterion: Real in-repo Tier-1 disk-fault harness code exists and is
+- Repo + branch target: getwyrd/wyrd @ main   (no maintenance branches today; INTEGRATION §2)
+- Scope (one logical fix) / out of scope: Build the Tier-1 disk-fault harness as **real in-repo Rust**, mirroring the
+
+## 2. Disposition claimed               ← sign-off confirms or overrides
+- Outcome: likely-fix
+- Confidence: medium
+- Recommendation: (set by Do)
+
+## 3. Correctness (Check — chain)
+- C1 Spec: none — brief.md
+- C2 Reproduction (red pre-fix): none — (no gate configured)
+- C3 Change: none — patch.diff
+- C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance): pass — xtask ci: all checks passed
+- C4 per-fix red->green: this patch's test red pre-fix, green post-fix: pass — run-verify.sh: PASS — red without the fix, green with it.
+- C5 Causal adequacy: none — reviewer + human sign-off
+
+## 4. Conformance (Check — stack)
+- T1 Structure: none — (no gate configured)
+- T2 Shape: none — (no gate configured)
+- T3 Runtime: none — (no gate configured)
+- T4 Contribution: none — (no gate configured)
+- T5 Judgment: none — reviewer + human sign-off
+- T5 judgment: → see §5.
+
+## 5. Advisory review (artifact-only, decorrelated)
+Reviewer ran without build-notes.md. Summary:
+
+# Check review — issue 195 / tier1-disk-fault-harness (iteration 2)
+
+Advisory, artifact-only, decorrelated from the builder. Inputs: `patch.diff`,
+`brief.md`, `check-gates.json`. `build-notes.md` deliberately withheld. Citations
+re-derived against the target worktree (`crates/...`) read-only and against `patch.diff`.
+
+## Verdict table
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 — C1 Spec | PASS | Success criterion is concrete and binding (brief.md:19-33): real in-repo Tier-1 harness whose dm-table planning + fault steps + post-repair redundancy/no-read-error verdict are implemented in-repo and test-exercised, replacing the `WYRD_TIER1_DISK_CMD` shell-out, with `xtask.sh ci` still green and the privileged path excluded. Oracle (the load-bearing "did it work" sentence) is unambiguous. |
+| C2 — C2 Reproduction (red pre-fix) | PASS | The flippable red is `crates/custodian/tests/reconstruction_read_fault.rs:448` (`reconcile_step(...).expect(...)`). Pre-fix `assess` read the placed fragment with `store.get_fragment(frag).await?` (patch.diff:84) — re-derived against the target: a `dm-error`/EIO is NOT `NotFound`, so `FsChunkStore::get_fragment` returns `Err` (chunkstore-fs/src/lib.rs:240, only `NotFound`→`Ok(None)`); the `?` propagates it, `reconcile_step` returns `Err`, `.expect()` panics → RED. Gate C4-verify confirms red-without/green-with (check-gates.json:46). |
+| C3 — C3 Change | PASS | Change is present and coherent: new in-repo harness `xtask/src/disk_faults.rs` (DmTablePlan/setup-teardown steps/CampaignReport+assert_campaign_passed, all `#[cfg(test)]`-covered), `faults.rs::run_disk_faults` now gates→`disk_faults::run` instead of `execute(...,"WYRD_TIER1_DISK_CMD")` (patch.diff:1591-1599), the `#[ignore]`d scenario `tier1_disk_faults.rs`, the root-free `reconstruction_read_fault.rs`, and the privileged workflow `.github/workflows/tier1-disk-faults.yml`. RIDER (owed to C5/V): the diff ALSO mutates production behaviour (`reconstruction.rs:258`), a second logical change folded into the harness bundle. |
+| C4 — C4 Verification (red→green) | PASS | Both gates green: C4-ci "xtask ci: all checks passed" (check-gates.json:37) and C4-verify "red without the fix, green with it" (check-gates.json:46). Re-derived: post-fix `Some(store) => store.get_fragment(frag).await.ok().flatten()` (reconstruction.rs:258) reads the EIO around → fragment classified `missing` (reconstruction.rs:275) → rebuilt → `Reconciled::Changed`, test green. NB a green `ci` proves compile+unit pass, NOT that the privileged dm-error body ran (it is `#[ignore]`d, compiled only — tier1_disk_faults.rs:776); that leg's green is off-Check evidence, not Check-gating (brief.md:29-33). |
+| C5 — C5 Causal adequacy | NEEDS-HUMAN | The fault is now load-bearing (victim kept IN the reconstruction fleet view, tier1_disk_faults.rs:887-890 / reconstruction_read_fault.rs:433-438; remove the fault and the victim returns valid bytes → `Assessment::Drain` at reconstruction.rs:281, no `Changed`) — this clears the iteration-1 C5 rejection (brief.md:165). BUT the load-bearing path now runs THROUGH a production behaviour change at reconstruction.rs:258. DECISION OWED: the brief's Scope lists "any change to production custodian / reconstruction behaviour" as OUT OF SCOPE (brief.md:85-87), while the iteration-1 carry-forward directed exactly this fix and said "widen scope, or split the fix into its own issue" (brief.md:165) — that contradiction was never resolved in the brief body. Human must decide whether read-around-EIO is the legitimately-scoped root-cause fix (ADR-0009 promotion) for #195 or a separable production change owed its own issue. Compounding correctness risk: `.ok().flatten()` swallows EVERY `get_fragment` error, not only block-layer EIO — a transient error from a HEALTHY server is now classified as permanent loss and triggers a re-placement (the read path's `Ok(Some)` gate at read.rs:189 only read-arounds a single degraded READ; reconstruction permanently moves the fragment and drops the victim reference). Owner of the custodian repair path must weigh spurious-rebuild / bug-masking risk. |
+| T1 — T1 Structure | PASS | Tests live where the brief's two-part mandate places them (brief.md:99-111): scenario in `crates/custodian/tests/tier1_disk_faults.rs` attributed exactly like the Tier-2 precedent (`#[ignore = "Tier-1: needs root + device-mapper ..."]`, tier1_disk_faults.rs:776); orchestration unit tests in `xtask/src/disk_faults.rs` `#[cfg(test)] mod tests` (patch.diff:1414+); plus the root-free `reconstruction_read_fault.rs`. Helper seams (MemMeta/FaultyDServer/Fleet) are local and self-contained. |
+| T2 — T2 Shape | PASS | Assertions test the criterion, not a tautology: chunk driven to full redundancy on N distinct domains (reconstruction_read_fault.rs:488-497), fragment moved OFF the victim (reconstruction_read_fault.rs:471-473), exactly one version-conditional commit (record.version==2, :464), obligation drained (:460-462), every placed fragment passes `repair::fragment_intact` (:483-486), and no read error during repair (read_errors==0, tier1_disk_faults.rs:959-962). The orchestration verdict asserts pass ⟺ ≥1 chunk AND all-full-redundancy AND zero read errors (assert_campaign_passed, patch.diff:1215-1233) with negative cases (patch.diff:1506-1523). |
+| T3 — T3 Runtime | PASS | What actually executes at Check: `reconstruction_read_fault.rs` is a plain `#[tokio::test]` (reconstruction_read_fault.rs:361, NOT ignored) → runs under `cargo test --workspace`; `disk_faults.rs` unit tests run inside `cargo xtask ci`. The privileged scenario is `#[ignore]`d so `ci` only compiles/type-checks it against the real `FsChunkStore`/`reconcile_step`/`scrub`/`reconstruction` API (tier1_disk_faults.rs:776) — compilation is the Check-time guard against reverting to inert dispatch. Gate C4-ci PASS corroborates all of this builds+runs (check-gates.json:37). |
+| T4 — T4 Contribution | PASS | Net-new coverage over the Tier-0 in-memory campaign: the EIO-asymmetry branch (reconstruction PROPAGATES vs read PATH reads-around) is only reachable because `get_fragment` can return `Err` distinct from `Ok(None)` (chunkstore-fs/src/lib.rs:240) — the exact branch a real block device flushes and the Tier-0 simulated campaign did not (this is the iteration-1 "adds nothing over Tier-0" objection now answered). Coverage is flippable/born-at-tier: `reconstruction_read_fault` red→green on the production read-around, and `assert_campaign_passed`'s 0-chunk guard (patch.diff:1216-1218, test patch.diff:1518-1523) goes red if the verdict is stubbed to always-Ok. CAVEAT: the brief requires a *demonstrated* red of a stubbed orchestration helper (brief.md:122-123); evidence of that demonstration lives in the withheld build-notes.md — not confirmable from artifacts, though the structure supports it. |
+| T5 — T5 Judgment | NEEDS-HUMAN | Always-human (oracle: reviewer + human sign-off, check-gates.json:98). DECISION OWED: is the in-process `FaultyDServer` returning raw `EIO` (reconstruction_read_fault.rs:226-232) a faithful Check-time stand-in for a `dm-error` device, given the only test that drives a REAL block device (`tier1_disk_faults.rs`) is `#[ignore]`d and its green is asserted solely off-Check by the privileged job (no maintainer-run evidence in artifacts)? And does the scrub leg get genuine coverage — the Check-running test exercises reconstruction only, not `scrub::reconcile`; scrub runs only in the `#[ignore]`d body (tier1_disk_faults.rs:871). Human must judge whether deferring scrub+real-device green entirely off-Check meets the "deferred ≠ unbuilt" bar (brief.md:34-47). |
+| V — Validation — fitness-to-purpose | NEEDS-HUMAN | Always-human (oracle: human at sign-off, check-gates.json:105). DECISION OWED: does this honour the M3 Tier-1 mandate — a real, in-repo, test-exercised disk-fault harness replacing the absent-external-command bypass (brief.md:34-47, proposal 0005 §13.2 `0005:405-408`)? The harness is built and the bypass is gone (faults.rs change, patch.diff:1591-1599), which is the binding deliverable. But fitness turns on the unresolved C5 scope/correctness question: shipping #195 with a production reconstruction behaviour change the brief lists out-of-scope means the human is implicitly accepting both a scope widening AND a custodian-repair semantics change in one bundle. Human must accept (widen scope, keep the ADR-0009-promoted fix here) or split the production fix to its own issue and re-scope #195 to the harness alone. |
+
+## §6 — items the human must clear
+
+1. **(C5 / V) Scope + root-cause contradiction — production reconstruction change.** The
+   patch edits `crates/custodian/src/reconstruction.rs:258` (`?` → `.ok().flatten()`),
+   changing production repair semantics. Brief Scope explicitly forbids "any change to
+   production custodian / reconstruction behaviour" (brief.md:85-87); the iteration-1
+   carry-forward demands exactly this fix and says "widen scope, or split the fix into its
+   own issue" (brief.md:165). Decide: keep here as the ADR-0009-promoted root-cause fix
+   (widen scope), or split to a separate issue and re-scope #195 to the harness only.
+
+2. **(C5) Over-broad error swallow.** `.ok().flatten()` treats EVERY `get_fragment` error
+   as permanent fragment loss and triggers re-placement — not just block-layer EIO. Unlike
+   the read path's transient degraded-read read-around (read.rs:189), reconstruction
+   permanently moves the fragment and drops the victim reference. The custodian-path owner
+   must confirm a transient error from a healthy server being read as loss does not cause
+   spurious rebuild churn or mask genuine store bugs.
+
+3. **(T5) Deferred-tier faithfulness.** The only test driving a real `dm-error` device
+   (`tier1_disk_faults.rs`) and the only `scrub::reconcile` coverage are `#[ignore]`d /
+   off-Check; their green rests on the privileged job, with no maintainer-run evidence in
+   the artifacts. Confirm the off-Check privileged run is green and that the in-process
+   EIO stand-in plus compile-only scenario meet the "deferred ≠ unbuilt" bar.
+
+4. **(T4, advisory) Demonstrated-red evidence.** The brief requires Do to capture a
+   demonstrated red of a stubbed orchestration helper (brief.md:122-123). That evidence is
+   in the withheld build-notes.md; confirm it exists at sign-off.
+
+
+## 6. NEEDS-HUMAN — items the human must clear before sign-off
+- [ ] C5 — C5 Causal adequacy — The fault is now load-bearing (victim kept IN the reconstruction fleet view, tier1_disk_faults.rs:887-890 / reconstruction_read_fault.rs:433-438; remove the fault and the victim returns valid bytes → `Assessment::Drain` at reconstruction.rs:281, no `Changed`) — this clears the iteration-1 C5 rejection (brief.md:165). BUT the load-bearing path now runs THROUGH a production behaviour change at reconstruction.rs:258. DECISION OWED: the brief's Scope lists "any change to production custodian / reconstruction behaviour" as OUT OF SCOPE (brief.md:85-87), while the iteration-1 carry-forward directed exactly this fix and said "widen scope, or split the fix into its own issue" (brief.md:165) — that contradiction was never resolved in the brief body. Human must decide whether read-around-EIO is the legitimately-scoped root-cause fix (ADR-0009 promotion) for #195 or a separable production change owed its own issue. Compounding correctness risk: `.ok().flatten()` swallows EVERY `get_fragment` error, not only block-layer EIO — a transient error from a HEALTHY server is now classified as permanent loss and triggers a re-placement (the read path's `Ok(Some)` gate at read.rs:189 only read-arounds a single degraded READ; reconstruction permanently moves the fragment and drops the victim reference). Owner of the custodian repair path must weigh spurious-rebuild / bug-masking risk.
+- [ ] T5 — T5 Judgment — Always-human (oracle: reviewer + human sign-off, check-gates.json:98). DECISION OWED: is the in-process `FaultyDServer` returning raw `EIO` (reconstruction_read_fault.rs:226-232) a faithful Check-time stand-in for a `dm-error` device, given the only test that drives a REAL block device (`tier1_disk_faults.rs`) is `#[ignore]`d and its green is asserted solely off-Check by the privileged job (no maintainer-run evidence in artifacts)? And does the scrub leg get genuine coverage — the Check-running test exercises reconstruction only, not `scrub::reconcile`; scrub runs only in the `#[ignore]`d body (tier1_disk_faults.rs:871). Human must judge whether deferring scrub+real-device green entirely off-Check meets the "deferred ≠ unbuilt" bar (brief.md:34-47).
+- [ ] V — Validation — fitness-to-purpose — Always-human (oracle: human at sign-off, check-gates.json:105). DECISION OWED: does this honour the M3 Tier-1 mandate — a real, in-repo, test-exercised disk-fault harness replacing the absent-external-command bypass (brief.md:34-47, proposal 0005 §13.2 `0005:405-408`)? The harness is built and the bypass is gone (faults.rs change, patch.diff:1591-1599), which is the binding deliverable. But fitness turns on the unresolved C5 scope/correctness question: shipping #195 with a production reconstruction behaviour change the brief lists out-of-scope means the human is implicitly accepting both a scope widening AND a custodian-repair semantics change in one bundle. Human must accept (widen scope, keep the ADR-0009-promoted fix here) or split the production fix to its own issue and re-scope #195 to the harness alone.
+
+## 7. Proven / not proven
+- Proven by which oracle: gates overall = pass (stub oracles).
+- Unproven / needs manual run: anything flagged in §6.
+
+## 8. Ready-to-ship attachments
+- patch.diff
+- tracker-comment.md     (ALWAYS, every tracker item)
+- build-notes.md         (builder rationale — for the human, not the reviewer)
+
+## 9. Check sign-off                     ← human completes Check here
+- Disposition confirmed / overridden:
+- Outcome: iterated-to-Plan
+- Iteration delta (if iterating): issue_195 — Check sign-off, iteration 2. Disposition: iterate-plan (re-scope the brief). Decision (human): the production reconstruction behaviour change at crates/custodian/src/reconstruction.rs:258 (`?` -> `.ok().flatten()`) is split OUT of #195 into its own issue, getwyrd/wyrd#251. Re-scope #195 to the Tier-1 disk-fault HARNESS ALONE; drop the production reconstruction edit from this bundle's patch. Carry-forward for the next Plan: - #195 brief Scope already forbids "any change to production custodian / reconstruction behaviour" (brief.md:85-87). Honour that: #195 ships the harness only. The reconstruction read-around fix (and the over-broad-swallow correctness nuance — `.ok().flatten()` swallows EVERY get_fragment error, not just block-layer EIO; narrow it) belong to #251. - TENSION to resolve, do not paper over: iteration-2's Check-running red->green test (reconstruction_read_fault.rs) is flippable ONLY because of the production read-around at reconstruction.rs:258. Remove that edit and the test loses its in-scope Check-time production seam — which is exactly iteration-1's "adds nothing over Tier-0" objection (brief.md:165). Plan must decide how a harness-only #195 keeps a genuine born-at-tier, Check-running red->green without depending on the #251 production change: e.g. sequence #251 first and have #195's harness assert the corrected behaviour once it lands, or find an in-scope flippable seam in the harness orchestration itself. - Still-open for whoever owns the harness bundle (T5, carry to the re-scoped brief): the real dm-error device test and the only scrub::reconcile coverage are #[ignore]d / off-Check; their green rests on the privileged CI job with no maintainer-run evidence in the artifacts. Confirm that meets the "deferred != unbuilt" bar and that the privileged run is green.
+- By / date: Eduard Ralph / 2026-06-24
+
+## 10. Act candidates (hints for the next Act review)
+- (empty is the common case)
