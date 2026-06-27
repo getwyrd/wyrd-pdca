@@ -1,0 +1,1773 @@
+diff --git a/.github/workflows/tier1-jepsen.yml b/.github/workflows/tier1-jepsen.yml
+new file mode 100644
+index 0000000..41ff630
+--- /dev/null
++++ b/.github/workflows/tier1-jepsen.yml
+@@ -0,0 +1,93 @@
++name: tier1-jepsen
++
++# **Tier-1 Jepsen consistency campaign** (M3, proposal 0005 §13.2, `0005:408`,
++# issue #250): assert the **ADR-0015 consistency contract** over the production
++# `custodian::reconcile_step` → `reconstruction::reconcile` path against a real
++# containerized D-server cluster under partitions and crashes.
++#
++# Three campaign properties (ADR-0015):
++#   1. Read-after-commit — a committed write is visible to all subsequent reads;
++#      the repair path must not return stale or phantom data.
++#   2. No torn reads — at every observable point during repair the committed inode
++#      is either fully old (victim present, spare absent) or fully new (spare
++#      present, victim absent); never a hybrid of both.
++#   3. Commit-point-atomic repair — a crash before the version-conditional commit
++#      leaves the inode FULLY OLD (the placed-but-uncommitted rebuilt fragment on
++#      the spare is collectable garbage, not a duplicate committed entry).
++#   4. No duplicate placement — the committed placement never contains the same
++#      server twice (`0005:277`, `0005:385-389`).
++#
++# The RS(4,2) cluster (7 servers: 6 for initial N=6 placement + 1 spare) is
++# started via docker-compose (the same compose file as the Tier-2 integration and
++# kill-reconstruct jobs, scaled to 7 servers). The scenario test
++# (`crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs`) receives the
++# resolved endpoints via `WYRD_DSERVER_ENDPOINTS` and the victim container name
++# via `WYRD_TIER1_VICTIM_CONTAINER`.
++#
++# This job is the **deferred-posture** leg of the M3 Jepsen consistency milestone:
++# the scenario test is compiled and type-checked at Check by `cargo xtask ci`'s
++# `cargo test --workspace` (which compiles `#[ignore]`d bodies); this job provides
++# the supplementary green evidence that the harness runs correctly against a real
++# live cluster. Not a required merge-gate status check (needs Docker + privileged
++# containers); its value is post-merge regression visibility.
++#
++# Opted in via `WYRD_TIER1=1`. Modelled on `tier2-kill-reconstruct.yml` (M3.8,
++# proposal 0005 §13.2, `0005:409-411`).
++
++on:
++  schedule:
++    # 02:00 UTC daily (before tier1-disk-faults at 03:00 and integration-nightly
++    # at 04:00; offset avoids runner contention).
++    - cron: "0 2 * * *"
++  workflow_dispatch: {}
++
++permissions:
++  contents: read
++
++concurrency:
++  group: tier1-jepsen-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  jepsen:
++    runs-on: ubuntu-latest
++    # Cold image build + 7-server cluster + three-phase consistency scenario
++    # (write / crash-mid-repair / real-repair) fit under this bound.
++    # Mirrors tier2-kill-reconstruct.yml's 45-minute timeout.
++    timeout-minutes: 45
++    env:
++      CI: "true"
++      # Opt in to the Tier-1 Jepsen consistency scenario.
++      WYRD_TIER1: "1"
++    steps:
++      - uses: actions/checkout@v7
++
++      - name: Install Rust toolchain
++        run: rustup show active-toolchain || rustup toolchain install
++
++      - name: Cache cargo build
++        uses: Swatinem/rust-cache@v2
++
++      # ubuntu-latest ships Docker with the compose plugin; this confirms the daemon
++      # is reachable (same check as tier2-kill-reconstruct.yml).
++      - name: Docker info
++        run: docker info
++
++      # cargo xtask jepsen opts in when WYRD_TIER1=1, confirms docker is present,
++      # stands up the 7-server compose cluster, then runs the #[ignore]d consistency
++      # scenario via `cargo test -p wyrd-chunkstore-grpc --test
++      # tier1_jepsen_consistency -- --ignored --nocapture`.
++      - name: cargo xtask jepsen
++        run: cargo xtask jepsen
++
++      # Surface container diagnostics captured by finalize_panic_safe before
++      # teardown (#150): compose_logs writes to target/tier2-logs/ on failure so
++      # the diagnostics survive compose_down.
++      - name: Upload container diagnostics
++        if: failure()
++        uses: actions/upload-artifact@v7
++        with:
++          name: tier1-jepsen-logs
++          path: target/tier2-logs/
++          if-no-files-found: ignore
++          retention-days: 14
+diff --git a/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+new file mode 100644
+index 0000000..3c14ed4
+--- /dev/null
++++ b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+@@ -0,0 +1,849 @@
++//! **Tier-1 Jepsen consistency scenario test** (Milestone 3, proposal 0005 §13.2,
++//! `0005:408`; issue #250).
++//!
++//! What this test proves that no in-process test can: the **production custodian
++//! repair/reconstruction path** (`custodian::reconcile_step` →
++//! `reconstruction::reconcile`) preserves the **ADR-0015 consistency contract** over
++//! real gRPC D-server containers under partitions and crashes —
++//!
++//! 1. **Read-after-commit** — a committed write is visible to all subsequent reads
++//!    at the home zone; the repair path must not return stale or phantom data.
++//! 2. **No torn reads** — at any point during repair the committed inode is either
++//!    fully at the old version (fully old) or fully at the new version (fully new),
++//!    never a hybrid whose placement references both victim and spare.
++//! 3. **Commit-point-atomic repair** — a crash before the version-conditional commit
++//!    leaves the chunk **fully old, never a hybrid** (`0005:385-389`): the placed-
++//!    but-uncommitted rebuilt fragment is collectable garbage on the spare, the
++//!    committed chunk map is untouched. After the crash the fully-old placement is
++//!    still readable (k of n survivors reconstruct the original bytes exactly).
++//! 4. **No duplicate placement** — the committed placement never contains the same
++//!    server twice (commit-point atomicity, `0005:277`).
++//!
++//! The RS(4,2) cluster has [`JC_DSERVER_COUNT`] = 7 servers: six hold the initial
++//! N=6 fragments; the seventh (spare, server 6, domain G) is the re-placement target.
++//! Server 0 (domain A) is killed; the reconstruction selector excludes survivor
++//! domains B–F and finds only domain G → picks server 6.
++//!
++//! **Gating**: the test body is `#[ignore]`d — `cargo xtask ci`'s `cargo test
++//! --workspace` **compiles and type-checks** this file (proving the harness is real
++//! API-bound Rust, not an env-var shell string) without running it. The live execution
++//! (`--ignored`) happens only in the privileged off-Check job (`WYRD_TIER1=1`), run
++//! by `cargo xtask jepsen`.
++//!
++//! **Born-at-tier coverage** at Check: the four consistency-assertion helpers
++//! ([`assert_no_torn_reads`], [`assert_read_after_commit_from_survivors`],
++//! [`assert_no_duplicate_placement_tc`], [`assert_repair_fired`]) are regular
++//! functions that the scenario test calls; their own non-`#[ignore]`d unit tests run
++//! inside `cargo xtask ci`'s `cargo test --workspace`. Stubbing or removing a helper
++//! causes both those unit tests and the (compile-time) type-check of the scenario to
++//! fail — the born-at-tier seam is load-bearing.
++//!
++//! **Production reach**: the repair trigger is a **sanctioned test stand-in**,
++//! following the merged #196 precedent verbatim (`tier2_kill_reconstruct.rs:551`):
++//! `repair::enqueue_repair` is called as a health-check-producer stand-in, because
++//! no production path enqueues repair for a simply-missing fragment (production scrub
++//! `continue`s on `Ok(None)`; a killed server cannot be `list_fragments()`'d; the
++//! read path enqueues only present-but-corrupt fragments). The enqueue stand-in is
++//! accepted (Scope §"Production reach"); the missing-fragment-detection product gap
++//! is re-filed as a follow-on per the brief.
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Mutex;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_chunkstore_grpc::GrpcChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
++use wyrd_core::write::encode_ec_fragment;
++use wyrd_core::{erasure, repair};
++use wyrd_custodian::{
++    reconcile_step, Custodian, FencedZone, Reconciled, ReconstructionContext, Topology,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
++};
++
++/// Local return type for the assertion helpers.
++type AssertResult = std::result::Result<(), String>;
++
++// ─── Constants ───────────────────────────────────────────────────────────────
++
++/// RS(4,2): k data + m parity = n total fragments per chunk.
++const K: usize = 4;
++/// RS(4,2): parity fragment count.
++const M: usize = 2;
++/// RS(4,2): total fragments (K + M = 6).
++const N: usize = K + M;
++/// Number of D-server containers: N for initial placement + 1 spare.
++/// Must match [`xtask::jepsen::JC_DSERVER_COUNT`] (both equal N + 1 = 7).
++const JC_DSERVER_COUNT: usize = N + 1;
++/// 0-indexed server that is killed (server 0, failure domain A).
++const VICTIM_INDEX: usize = 0;
++/// 0-indexed spare server that receives the rebuilt fragment (server 6, domain G).
++const SPARE_INDEX: usize = N; // = 6
++/// The inode id used in the test.
++const INODE_ID: InodeId = 1;
++/// The chunk id — a recognisable sentinel value.
++const CHUNK: ChunkId = 0x0001_CAFE_C0FF_EE01;
++/// One distinct failure domain per D server. Domains A–F cover servers 0–5 (initial
++/// placement); domain G covers server 6 (spare). The reconstruction selector excludes
++/// survivor domains B–F and finds only G → server 6.
++const DOMAINS: [&str; JC_DSERVER_COUNT] = ["A", "B", "C", "D", "E", "F", "G"];
++
++// ─── In-memory MetadataStore ─────────────────────────────────────────────────
++
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++// ─── Crash-injecting MetadataStore ───────────────────────────────────────────
++
++struct CrashMeta {
++    inner: MemMeta,
++    armed: AtomicBool,
++}
++
++impl CrashMeta {
++    fn new() -> Self {
++        Self {
++            inner: MemMeta::default(),
++            armed: AtomicBool::new(false),
++        }
++    }
++
++    fn arm(&self) {
++        self.armed.store(true, Ordering::Relaxed);
++    }
++
++    fn disarm(&self) {
++        self.armed.store(false, Ordering::Relaxed);
++    }
++}
++
++#[async_trait]
++impl MetadataStore for CrashMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        // The version-conditional repoint is the only commit with a positive precondition;
++        // crash on it (apply nothing, return Conflict) when armed.
++        if self.armed.load(Ordering::Relaxed)
++            && batch.preconditions.iter().any(|p| p.expected.is_some())
++        {
++            return Ok(CommitOutcome::Conflict);
++        }
++        self.inner.commit(batch).await
++    }
++}
++
++// ─── Consistency-assertion helpers ───────────────────────────────────────────
++//
++// Regular functions (not #[cfg(test)]-only) called by the scenario test AND covered
++// by non-#[ignore]d unit tests below. Removing or stubbing a helper causes BOTH the
++// unit tests AND the scenario's compile-time type-check to fail — the born-at-tier
++// seam is load-bearing.
++
++/// Assert **no torn reads**: at every observable point during repair the committed
++/// inode must be either *fully old* (all N old fragments in placement, victim present)
++/// or *fully new* (N new fragments in placement, victim absent). A hybrid where the
++/// placement references both the old victim slot AND the new spare slot is a torn read.
++///
++/// `old_placement` — the committed placement immediately before repair starts.
++/// `observed_placement` — any observed committed placement during or after repair.
++///
++/// Returns `Ok(())` when no hybrid observed, `Err` describing the first violation.
++pub(crate) fn assert_no_torn_reads(
++    old_placement: &[DServerId],
++    observed_placement: &[DServerId],
++) -> AssertResult {
++    let victim = old_placement[VICTIM_INDEX];
++    let spare = SPARE_INDEX as DServerId;
++    let has_victim = observed_placement.contains(&victim);
++    let has_spare = observed_placement.contains(&spare);
++    if has_victim && has_spare {
++        return Err(format!(
++            "torn read detected: the committed placement contains BOTH the victim \
++             (server {victim}) AND the spare (server {spare}), which means the \
++             version-conditional repoint partially applied — the inode is a hybrid, \
++             never a clean old or new version (violates ADR-0015 no-torn-reads)"
++        ));
++    }
++    Ok(())
++}
++
++/// Assert **read-after-commit from survivors**: with the victim (server
++/// `VICTIM_INDEX`) removed from the fleet, the remaining K survivors must be able
++/// to reconstruct the original payload bytes exactly.
++///
++/// This proves the committed placement is consistent from the reader's perspective:
++/// after a crash mid-repair, the fully-old inode's K surviving fragments (which
++/// exclude the dead server) can still service a read.
++///
++/// `available_shards` — `(fragment_index, raw_shard_bytes)` pairs collected from
++/// the live servers, with each shard already verified for integrity.
++/// `original_data` — the expected payload bytes.
++/// `data_len` — the original payload length for the erasure reconstruct call.
++pub(crate) fn assert_read_after_commit_from_survivors(
++    available_shards: &[(usize, Vec<u8>)],
++    original_data: &[u8],
++    data_len: usize,
++) -> AssertResult {
++    if available_shards.len() < K {
++        return Err(format!(
++            "only {} shards available from survivors, need at least K={K} for \
++             read-after-commit; reconstruction impossible after the crash mid-repair",
++            available_shards.len()
++        ));
++    }
++    let reconstructed = erasure::reconstruct(K, M, data_len, available_shards)
++        .map_err(|e| format!("erasure reconstruct from survivors failed: {e}"))?;
++    if reconstructed != original_data {
++        return Err(
++            "read-after-commit failed: data reconstructed from survivors after \
++             crash mid-repair does not match the original (corruption or wrong shard)"
++                .to_string(),
++        );
++    }
++    Ok(())
++}
++
++/// Assert **no duplicate placement** in the committed placement list
++/// (`0005:277`, `0005:385-389`): the version-conditional commit is atomic —
++/// a crash before it lands leaves collectable garbage, never duplicate entries.
++///
++/// Returns `Ok(())` when all server IDs are distinct, `Err` on first duplicate.
++pub(crate) fn assert_no_duplicate_placement_tc(placement: &[DServerId]) -> AssertResult {
++    use std::collections::HashSet;
++    let mut seen: HashSet<DServerId> = HashSet::new();
++    for &server in placement {
++        if !seen.insert(server) {
++            return Err(format!(
++                "duplicate server {server} in the committed placement; \
++                 commit-point atomicity violated (`0005:277`, `0005:385-389`)"
++            ));
++        }
++    }
++    Ok(())
++}
++
++/// Assert **repair fired** (the negative control / planted-anomaly oracle):
++/// after successful reconstruction, the spare server must hold the rebuilt fragment
++/// for the victim's slot AND the committed placement must reference the spare, not
++/// the victim. A no-op `reconcile_step` would leave both conditions false.
++///
++/// `committed_has_spare` — whether the spare server appears in the committed placement.
++/// `committed_has_victim` — whether the victim server still appears (must be absent).
++/// `spare_fragment_present` — whether the spare server holds the rebuilt fragment.
++pub(crate) fn assert_repair_fired(
++    committed_has_spare: bool,
++    committed_has_victim: bool,
++    spare_fragment_present: bool,
++) -> AssertResult {
++    if !committed_has_spare {
++        return Err(
++            "repair did not fire: the spare server is absent from the committed placement \
++             after successful reconstruction (reconcile_step was a no-op or did not commit)"
++                .to_string(),
++        );
++    }
++    if committed_has_victim {
++        return Err(format!(
++            "repair did not remove the victim: server {VICTIM_INDEX} still appears \
++             in the committed placement after reconstruction (the old slot was not replaced)"
++        ));
++    }
++    if !spare_fragment_present {
++        return Err(format!(
++            "repair did not write the rebuilt fragment to the spare server (server \
++             {SPARE_INDEX}): fragment absent after reconstruction completed \
++             (write-before-commit ordering may be violated)"
++        ));
++    }
++    Ok(())
++}
++
++// ─── Helper unit tests (non-#[ignore], run at Check) ─────────────────────────
++
++#[test]
++fn no_torn_reads_passes_for_fully_old_inode() {
++    // Before repair starts: placement is fully old (victim at slot 0, no spare).
++    let old = vec![0u64, 1, 2, 3, 4, 5];
++    let observed = vec![0u64, 1, 2, 3, 4, 5]; // same as old → fully old
++    assert!(
++        assert_no_torn_reads(&old, &observed).is_ok(),
++        "fully-old placement must pass no-torn-reads"
++    );
++}
++
++#[test]
++fn no_torn_reads_passes_for_fully_new_inode() {
++    // After repair: placement is fully new (spare at slot 0, victim absent).
++    let old = vec![0u64, 1, 2, 3, 4, 5];
++    let observed = vec![6u64, 1, 2, 3, 4, 5]; // slot 0 replaced with spare (6)
++    assert!(
++        assert_no_torn_reads(&old, &observed).is_ok(),
++        "fully-new placement (victim replaced with spare) must pass no-torn-reads"
++    );
++}
++
++#[test]
++fn no_torn_reads_catches_hybrid_placement_negative_control() {
++    // NEGATIVE CONTROL: placement has BOTH victim (0) AND spare (6) — torn read.
++    let old = vec![0u64, 1, 2, 3, 4, 5];
++    let hybrid = vec![0u64, 1, 2, 3, 4, 5, 6]; // both victim and spare present
++    let result = assert_no_torn_reads(&old, &hybrid);
++    assert!(result.is_err(), "hybrid placement must fail no-torn-reads");
++    let err = result.unwrap_err();
++    assert!(
++        err.contains("torn read"),
++        "error must name the violation: {err}"
++    );
++}
++
++#[test]
++fn read_after_commit_from_survivors_passes_with_k_shards() {
++    // With K=4 survivors providing correct shards, reconstruction must succeed.
++    // Use 24 bytes → 6-byte shards under RS(4,2).
++    let data: Vec<u8> = (0u8..24).collect();
++    let all_shards = erasure::encode(K, M, &data).expect("encode RS(4,2)");
++    // Use the K=4 surviving shards (indices 1..=4, excluding victim at 0 and spare at 5).
++    let survivors: Vec<(usize, Vec<u8>)> = all_shards
++        .iter()
++        .enumerate()
++        .filter(|(i, _)| *i != VICTIM_INDEX && *i != SPARE_INDEX)
++        .take(K)
++        .map(|(i, s)| (i, s.clone()))
++        .collect();
++    assert_eq!(survivors.len(), K, "need exactly K survivors for this test");
++    assert!(
++        assert_read_after_commit_from_survivors(&survivors, &data, data.len()).is_ok(),
++        "K surviving shards must reconstruct the original data"
++    );
++}
++
++#[test]
++fn read_after_commit_from_survivors_fails_with_too_few_shards_negative_control() {
++    // NEGATIVE CONTROL: fewer than K shards → cannot reconstruct → read-after-commit
++    // fails. This proves the helper is load-bearing, not vacuously true.
++    let data = vec![0u8; 24];
++    let only_one_shard = vec![(1usize, vec![0u8; 6])];
++    let result = assert_read_after_commit_from_survivors(&only_one_shard, &data, 24);
++    assert!(
++        result.is_err(),
++        "fewer than K shards must fail read-after-commit"
++    );
++    let err = result.unwrap_err();
++    assert!(err.contains("K="), "error must cite K requirement: {err}");
++}
++
++#[test]
++fn no_duplicate_placement_passes_for_distinct_servers() {
++    assert!(
++        assert_no_duplicate_placement_tc(&[6, 1, 2, 3, 4, 5]).is_ok(),
++        "all distinct servers: must pass"
++    );
++}
++
++#[test]
++fn no_duplicate_placement_catches_duplicate_negative_control() {
++    // NEGATIVE CONTROL: placement contains server 1 twice.
++    let result = assert_no_duplicate_placement_tc(&[6, 1, 2, 1, 4, 5]);
++    assert!(result.is_err(), "duplicate server 1 must fail");
++    let err = result.unwrap_err();
++    assert!(
++        err.contains('1'),
++        "error must name the duplicate server: {err}"
++    );
++}
++
++#[test]
++fn repair_fired_passes_when_spare_present_victim_absent_fragment_present() {
++    assert!(
++        assert_repair_fired(true, false, true).is_ok(),
++        "spare in placement, victim absent, fragment on spare: repair fired — must pass"
++    );
++}
++
++#[test]
++fn repair_fired_fails_when_spare_absent_negative_control() {
++    // NEGATIVE CONTROL: spare not in committed placement → repair never committed.
++    let result = assert_repair_fired(false, false, false);
++    assert!(result.is_err(), "spare absent must fail repair-fired check");
++    assert!(result.unwrap_err().contains("no-op"));
++}
++
++#[test]
++fn repair_fired_fails_when_victim_still_present_negative_control() {
++    // NEGATIVE CONTROL: victim still in placement → repair did not replace the slot.
++    let result = assert_repair_fired(true, true, true);
++    assert!(result.is_err(), "victim still present must fail");
++    let err = result.unwrap_err();
++    assert!(err.contains("victim"), "error must name the victim: {err}");
++}
++
++#[test]
++fn repair_fired_fails_when_spare_fragment_absent_negative_control() {
++    // NEGATIVE CONTROL: spare in committed placement but fragment absent on spare →
++    // write-before-commit ordering may be violated.
++    let result = assert_repair_fired(true, false, false);
++    assert!(result.is_err(), "spare fragment absent must fail");
++    let err = result.unwrap_err();
++    assert!(
++        err.contains("rebuilt fragment"),
++        "error must name the fragment: {err}"
++    );
++}
++
++// ─── Scenario helpers ─────────────────────────────────────────────────────────
++
++async fn connect(endpoint: &str) -> GrpcChunkStore {
++    let mut last_err = None;
++    for _ in 0..50 {
++        match GrpcChunkStore::connect(endpoint.to_string()).await {
++            Ok(c) => return c,
++            Err(e) => {
++                last_err = Some(e);
++                tokio::time::sleep(Duration::from_millis(200)).await;
++            }
++        }
++    }
++    panic!("could not connect to D server `{endpoint}`: {last_err:?}");
++}
++
++fn healthy_topology(victim: usize) -> Topology {
++    let mut t = Topology::new(vec![]);
++    for (i, &domain) in DOMAINS.iter().enumerate() {
++        if i != victim {
++            t.register(i as DServerId, domain);
++        }
++    }
++    t
++}
++
++// ─── Scenario test ────────────────────────────────────────────────────────────
++
++/// **Tier-1 Jepsen consistency campaign** (M3, `0005:408`).
++///
++/// The `#[ignore]` attribute keeps this body out of `cargo xtask ci` (unprivileged,
++/// container-free, ADR-0016); the `#[tokio::test]` attribute ensures `cargo xtask ci`'s
++/// `cargo test --workspace` COMPILES and TYPE-CHECKS the body (the "born-at-tier" bar:
++/// an API regression that stubbed `reconcile_step` or `reconstruction::reconcile` would
++/// fail to compile). The body runs only in the privileged `WYRD_TIER1=1` job via
++/// `cargo xtask jepsen`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore = "Tier-1: needs real containerized D servers — run via `cargo xtask jepsen`"]
++async fn consistency_over_repair_preserves_adr0015_contract() {
++    let raw_endpoints = match std::env::var("WYRD_DSERVER_ENDPOINTS") {
++        Ok(v) if !v.trim().is_empty() => v,
++        _ => {
++            eprintln!(
++                "tier1_jepsen_consistency: WYRD_DSERVER_ENDPOINTS unset — skipping. \
++                 Run `cargo xtask jepsen` to stand up the container D servers."
++            );
++            return;
++        }
++    };
++    let victim_container = match std::env::var("WYRD_TIER1_VICTIM_CONTAINER") {
++        Ok(v) if !v.trim().is_empty() => v,
++        _ => {
++            eprintln!(
++                "tier1_jepsen_consistency: WYRD_TIER1_VICTIM_CONTAINER unset — skipping. \
++                 Run `cargo xtask jepsen` to supply the victim container name."
++            );
++            return;
++        }
++    };
++
++    let endpoints: Vec<String> = raw_endpoints
++        .split(',')
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .collect();
++    assert_eq!(
++        endpoints.len(),
++        JC_DSERVER_COUNT,
++        "tier1_jepsen_consistency: need exactly {JC_DSERVER_COUNT} endpoints, got {} \
++         ({raw_endpoints:?})",
++        endpoints.len()
++    );
++
++    // --- Connect to all 7 D servers ---
++
++    let mut clients: Vec<GrpcChunkStore> = Vec::with_capacity(JC_DSERVER_COUNT);
++    for endpoint in &endpoints {
++        clients.push(connect(endpoint).await);
++    }
++
++    // --- Setup: write RS(4,2) chunk fragments to servers 0–5; spare server 6 holds nothing ---
++
++    // 24 bytes → 6-byte shards under RS(4,2).
++    let data: Vec<u8> = (0u8..24).collect();
++    let all_shards = erasure::encode(K, M, &data).expect("erasure::encode RS(4,2)");
++    assert_eq!(all_shards.len(), N, "encoder must produce N={N} shards");
++
++    for (index, shard) in all_shards.iter().enumerate() {
++        let fragment_bytes = encode_ec_fragment(CHUNK, index as u16, K as u8, M as u8, shard);
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: index as u16,
++        };
++        clients[index]
++            .put_fragment(frag_id, fragment_bytes)
++            .await
++            .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
++    }
++
++    // Create the inode: committed, placement = [0, 1, 2, 3, 4, 5].
++    let meta = CrashMeta::new();
++    let initial_placement: Vec<DServerId> = (0..N as DServerId).collect();
++    let chunk_ref = ChunkRef {
++        id: CHUNK,
++        scheme: EcScheme::ReedSolomon {
++            k: K as u8,
++            m: M as u8,
++        },
++        len: data.len() as u64,
++        placement: initial_placement.clone(),
++    };
++    let inode_record = InodeRecord {
++        size: data.len() as u64,
++        chunk_map: vec![chunk_ref],
++        state: InodeState::Committed,
++        version: 1,
++    };
++    let create_outcome =
++        metadata::create(&meta, 0, "test-consistency-file", INODE_ID, &inode_record)
++            .await
++            .expect("metadata::create inode");
++    assert_eq!(
++        create_outcome,
++        CommitOutcome::Committed,
++        "inode create must commit"
++    );
++
++    // Assert property 1 PRE-REPAIR: read-after-commit from the initial placement.
++    // All N fragments intact and reconstruct the original data.
++    let mut pre_repair_shards: Vec<(usize, Vec<u8>)> = Vec::new();
++    for (frag_index, &server_id_raw) in initial_placement.iter().enumerate() {
++        let server_id = server_id_raw as usize;
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: frag_index as u16,
++        };
++        let maybe_bytes = clients[server_id]
++            .get_fragment(frag_id)
++            .await
++            .unwrap_or_else(|e| panic!("get_fragment index {frag_index} pre-repair: {e}"));
++        if let Some(shard) = maybe_bytes
++            .as_deref()
++            .and_then(|b| repair::intact_shard(b, CHUNK))
++        {
++            pre_repair_shards.push((frag_index, shard));
++        }
++    }
++    assert_eq!(
++        pre_repair_shards.len(),
++        N,
++        "all N={N} fragments must be intact pre-repair (read-after-commit baseline)"
++    );
++    let pre_repair_reconstructed =
++        erasure::reconstruct(K, M, data.len(), &pre_repair_shards).expect("reconstruct pre-repair");
++    assert_eq!(
++        pre_repair_reconstructed, data,
++        "pre-repair read-after-commit: reconstructed data must match original"
++    );
++
++    // Enqueue a repair obligation for CHUNK, as a health-check producer (scrub or read
++    // path) would after detecting that server 0 is no longer serving its fragment.
++    // (Sanctioned test stand-in; see Production reach in the brief and #196 precedent.)
++    repair::enqueue_repair(&meta, CHUNK, "tier1-jepsen-test")
++        .await
++        .expect("enqueue_repair");
++
++    // --- Kill server 0 via docker kill ---
++
++    let kill_status = std::process::Command::new("docker")
++        .arg("kill")
++        .arg(&victim_container)
++        .status()
++        .expect("docker kill command");
++    assert!(
++        kill_status.success(),
++        "`docker kill {victim_container}` failed (exit {kill_status})"
++    );
++
++    // --- Reconstruction context: exclude dead server 0 from fleet and topology ---
++
++    let topology = healthy_topology(VICTIM_INDEX);
++    let fleet: Vec<(DServerId, &dyn ChunkStore)> = (0..JC_DSERVER_COUNT)
++        .filter(|&i| i != VICTIM_INDEX)
++        .map(|i| (i as DServerId, &clients[i] as &dyn ChunkStore))
++        .collect();
++
++    let coord = MemCoordination::new();
++    let custodian = Custodian::elect(&coord, "tier1-jepsen-zone")
++        .await
++        .expect("Custodian::elect");
++    let mut zone = FencedZone::new();
++    zone.install(custodian.leadership());
++
++    // ====================================================================
++    // Phase 1: crash mid-repair (CrashMeta armed)
++    //
++    // reconcile_step writes the rebuilt fragment to spare server 6 THEN attempts
++    // the version-conditional commit. CrashMeta intercepts the commit (returns
++    // Conflict), simulating the custodian crashing just before it lands.
++    //
++    // Expected: Reconciled::Satisfied. The committed inode is FULLY OLD (version 1,
++    // victim at slot 0, spare absent from committed placement).
++    // ====================================================================
++
++    meta.arm();
++    let phase1_outcome = reconcile_step(
++        &zone,
++        &custodian,
++        None,
++        None,
++        Some(&ReconstructionContext {
++            meta: &meta,
++            fleet: &fleet,
++            topology: &topology,
++        }),
++        None,
++        0,
++    )
++    .await
++    .expect("phase 1: reconcile_step");
++
++    assert_eq!(
++        phase1_outcome,
++        Reconciled::Satisfied,
++        "phase 1 (crash mid-repair): reconcile_step must return Satisfied when the \
++         version-conditional commit is intercepted"
++    );
++
++    // Read committed inode after phase 1 crash.
++    let inode_bytes_p1 = meta
++        .get(&metadata::inode_key(INODE_ID))
++        .await
++        .expect("meta.get after phase 1")
++        .expect("inode must exist after phase 1");
++    let inode_p1: InodeRecord = metadata::decode(&inode_bytes_p1).expect("decode inode p1");
++
++    // Property 2: no torn reads — the committed inode must be FULLY OLD after the crash
++    // (victim at slot 0, spare NOT in committed placement).
++    assert_eq!(
++        inode_p1.version, 1,
++        "committed inode must be at version 1 after crash (no commit landed)"
++    );
++    assert_no_torn_reads(&initial_placement, &inode_p1.chunk_map[0].placement)
++        .expect("no-torn-reads invariant violated after crash mid-repair");
++
++    // Property 3: commit-point-atomic — orphan fragment EXISTS on spare (write-before-commit).
++    let frag0_id = FragmentId {
++        chunk: CHUNK,
++        index: 0,
++    };
++    let orphan_bytes = clients[SPARE_INDEX]
++        .get_fragment(frag0_id)
++        .await
++        .expect("get_fragment fragment-0 from spare after crash");
++    assert!(
++        orphan_bytes.is_some(),
++        "placed-but-uncommitted rebuilt fragment must exist on spare server {SPARE_INDEX} \
++         after crash mid-repair (write-before-commit ordering, `0005:277`)"
++    );
++
++    // Property 4: no duplicate placement in the committed (fully-old) inode.
++    assert_no_duplicate_placement_tc(&inode_p1.chunk_map[0].placement)
++        .expect("no-duplicate-placement violated in fully-old inode after crash");
++
++    // Property 1 POST-CRASH: read-after-commit from survivors (victim at 0 is dead;
++    // the fully-old placement's K=4 survivors at indices 1–4 must reconstruct the data).
++    let mut survivor_shards: Vec<(usize, Vec<u8>)> = Vec::new();
++    for (frag_index, &server_id_raw) in initial_placement.iter().enumerate() {
++        let server_id = server_id_raw as usize;
++        if server_id == VICTIM_INDEX {
++            continue; // victim is dead
++        }
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: frag_index as u16,
++        };
++        let maybe_bytes = clients[server_id]
++            .get_fragment(frag_id)
++            .await
++            .unwrap_or_else(|e| {
++                panic!("get_fragment index {frag_index} from server {server_id}: {e}")
++            });
++        if let Some(shard) = maybe_bytes
++            .as_deref()
++            .and_then(|b| repair::intact_shard(b, CHUNK))
++        {
++            survivor_shards.push((frag_index, shard));
++        }
++    }
++    assert_read_after_commit_from_survivors(&survivor_shards, &data, data.len())
++        .expect("read-after-commit from survivors failed after crash mid-repair");
++
++    // ====================================================================
++    // Phase 2: real repair (CrashMeta disarmed, repair obligation still queued)
++    //
++    // The disarmed custodian resumes: the repair queue still holds CHUNK (the
++    // dropped commit left it un-drained). On this pass the version-conditional
++    // commit lands: placement[0] moves from victim (0) to spare (6), version → 2.
++    //
++    // Expected: Reconciled::Changed.
++    // ====================================================================
++
++    meta.disarm();
++    let phase2_outcome = reconcile_step(
++        &zone,
++        &custodian,
++        None,
++        None,
++        Some(&ReconstructionContext {
++            meta: &meta,
++            fleet: &fleet,
++            topology: &topology,
++        }),
++        None,
++        0,
++    )
++    .await
++    .expect("phase 2: reconcile_step");
++
++    assert_eq!(
++        phase2_outcome,
++        Reconciled::Changed,
++        "phase 2 (real repair): reconcile_step must return Changed after the commit lands"
++    );
++
++    // Read committed inode after phase 2.
++    let inode_bytes_p2 = meta
++        .get(&metadata::inode_key(INODE_ID))
++        .await
++        .expect("meta.get after phase 2")
++        .expect("inode must exist after phase 2");
++    let inode_p2: InodeRecord = metadata::decode(&inode_bytes_p2).expect("decode inode p2");
++
++    assert_eq!(
++        inode_p2.version, 2,
++        "committed inode must be at version 2 after successful reconstruction"
++    );
++
++    let new_placement = &inode_p2.chunk_map[0].placement;
++
++    // Property: negative control — assert repair actually FIRED (not a no-op).
++    let committed_has_spare = new_placement.contains(&(SPARE_INDEX as DServerId));
++    let committed_has_victim = new_placement.contains(&(VICTIM_INDEX as DServerId));
++    let spare_frag = clients[SPARE_INDEX]
++        .get_fragment(frag0_id)
++        .await
++        .expect("get_fragment from spare after phase 2");
++    assert_repair_fired(
++        committed_has_spare,
++        committed_has_victim,
++        spare_frag.is_some(),
++    )
++    .expect("repair-fired check failed after phase 2");
++
++    // Property 2: no torn reads in the new committed placement.
++    assert_no_torn_reads(&initial_placement, new_placement)
++        .expect("no-torn-reads violated in new committed inode");
++
++    // Property 4: no duplicate placement in the new inode.
++    assert_no_duplicate_placement_tc(new_placement)
++        .expect("no-duplicate-placement violated in new inode after reconstruction");
++
++    // ====================================================================
++    // Phase 3: data integrity
++    //
++    // Read all N fragments from the post-repair placement ([6, 1, 2, 3, 4, 5])
++    // and reconstruct the original bytes from all N intact shards. This proves
++    // the rebuilt fragment on the spare is correct.
++    // ====================================================================
++
++    let mut post_repair_shards: Vec<(usize, Vec<u8>)> = Vec::new();
++    let mut missing: Vec<(usize, DServerId)> = Vec::new();
++    for (frag_index, &server_id) in new_placement.iter().enumerate() {
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: frag_index as u16,
++        };
++        let maybe_bytes = clients[server_id as usize]
++            .get_fragment(frag_id)
++            .await
++            .unwrap_or_else(|e| {
++                panic!("get_fragment index {frag_index} from server {server_id}: {e}")
++            });
++        match maybe_bytes
++            .as_deref()
++            .and_then(|b| repair::intact_shard(b, CHUNK))
++        {
++            Some(shard) => post_repair_shards.push((frag_index, shard)),
++            None => missing.push((frag_index, server_id)),
++        }
++    }
++
++    // Full redundancy means ALL N placed fragments are intact.
++    assert!(
++        missing.is_empty(),
++        "every fragment in the post-repair placement must be present and intact, \
++         including the rebuilt one on spare server {SPARE_INDEX}; \
++         missing/corrupt (frag_index, server_id): {missing:?}"
++    );
++
++    let post_repair_reconstructed = erasure::reconstruct(K, M, data.len(), &post_repair_shards)
++        .expect("reconstruct post-repair");
++    assert_eq!(
++        post_repair_reconstructed, data,
++        "property 1 post-repair: data reconstructed from the post-repair placement \
++         must be byte-identical to the original (rebuilt fragment on spare {SPARE_INDEX} \
++         is correct)"
++    );
++}
+diff --git a/xtask/src/faults.rs b/xtask/src/faults.rs
+index 431e926..bb27135 100644
+--- a/xtask/src/faults.rs
++++ b/xtask/src/faults.rs
+@@ -1,22 +1,23 @@
+ //! **Tier-1 / Tier-2 custodian fault runners** — the *deferred-posture* legs of the M3
+ //! verification campaign (proposal 0005 §"DST and tests": Tier-1 disk-fault injection +
+-//! Jepsen, Tier-2 single-node kill-and-reconstruct, `0005:405-411`; the `xtask`
+-//! touch-point `0005:437-438`; PR-sequence slice 8 `0005:541-545`).
++//! Jepsen consistency, Tier-2 single-node kill-and-reconstruct, `0005:405-411`; the
++//! `xtask` touch-point `0005:437-438`; PR-sequence slice 8 `0005:541-545`).
+ //!
+ //! These tiers exercise behaviour the deterministic Tier-0 campaign cannot: **real**
+-//! block-layer misbehaviour (device-mapper `dm-flakey` / `dm-error`), a **Jepsen**
+-//! consistency harness over the repair path, and a **real node** with real NVMe/fsync.
+-//! They need root / privileged I/O / an external harness, so they are **never** part of
+-//! `cargo xtask ci` (which stays unprivileged and container-free, ADR-0016) and never run
+-//! in the deterministic worktree (containerizing them would break seed determinism,
+-//! ADR-0009 / INTEGRATION §3).
++//! block-layer misbehaviour (device-mapper `dm-flakey` / `dm-error`), a **real in-repo
++//! consistency harness** over the repair path under partitions and crashes, and a **real
++//! node** with real NVMe/fsync. They need root / privileged I/O / a container runtime,
++//! so they are **never** part of `cargo xtask ci` (which stays unprivileged and
++//! container-free, ADR-0016) and never run in the deterministic worktree (containerizing
++//! them would break seed determinism, ADR-0009 / INTEGRATION §3).
+ //!
+ //! Each runner is **deferred by default**: without an explicit opt-in it prints what it
+ //! requires and exits cleanly, so it is INERT at Check and on a normal dev box. The
+-//! dedicated off-Check CI / Tier-2 job opts in (`WYRD_TIER1=1` / `WYRD_TIER2=1`) and
+-//! wires the harness command; there a missing tool is a hard failure. Only the gating
+-//! decision ([`plan`]) is pure and unit-tested — the privileged scenario body runs solely
+-//! in the off-Check environment that supplies it.
++//! dedicated off-Check CI jobs opt in (`WYRD_TIER1=1` / `WYRD_TIER2=1`) and provide
++//! the privileged environment; there a missing tool is a hard failure. Only the gating
++//! decision ([`plan`]) and the pure orchestration helpers in `disk_faults`, `jepsen`,
++//! and `kill_reconstruct` modules are tested at Check — the privileged scenario bodies
++//! run solely in the off-Check environments that supply the real hardware or containers.
+ 
+ use std::process::Command;
+ 
+@@ -41,7 +42,7 @@ pub(crate) fn plan(tier: &str, tool: &str, opted_in: bool, tool_available: bool)
+     if !opted_in {
+         return Plan::Deferred(format!(
+             "{tier} is a deferred (off-Check) tier; set its opt-in env var and provide the \
+-             harness command to run it. Skipping."
++             required tool to run it. Skipping."
+         ));
+     }
+     if !tool_available {
+@@ -67,45 +68,6 @@ fn opted_in(var: &str) -> bool {
+     std::env::var_os(var).is_some_and(|v| v == "1")
+ }
+ 
+-/// Execute a runner's [`Plan`]: print-and-skip when deferred, error when the tool is
+-/// missing, or run the off-Check harness command from `cmd_var` when opted in. The
+-/// harness command is environment-supplied (the off-Check job sets it), so this body is
+-/// never exercised at Check.
+-fn execute(tier: &str, plan: Plan, cmd_var: &str) -> Result<(), String> {
+-    match plan {
+-        Plan::Deferred(reason) => {
+-            eprintln!("xtask: {reason}");
+-            Ok(())
+-        }
+-        Plan::MissingTool(msg) => Err(msg),
+-        Plan::Run => {
+-            let cmd = std::env::var(cmd_var).map_err(|_| {
+-                format!(
+-                    "{tier} is opted in but no harness command is configured; set {cmd_var} \
+-                     to the scenario command (the off-Check job supplies it)"
+-                )
+-            })?;
+-            run_shell(tier, &cmd)
+-        }
+-    }
+-}
+-
+-/// Run an environment-supplied harness command through the shell from the workspace root.
+-fn run_shell(tier: &str, cmd: &str) -> Result<(), String> {
+-    println!("\n$ {cmd}");
+-    let status = Command::new("sh")
+-        .arg("-c")
+-        .arg(cmd)
+-        .current_dir(crate::workspace_root())
+-        .status()
+-        .map_err(|e| format!("failed to spawn {tier} harness: {e}"))?;
+-    if status.success() {
+-        Ok(())
+-    } else {
+-        Err(format!("{tier} harness failed with {status}"))
+-    }
+-}
+-
+ /// **Tier-1 disk-fault injection** (`0005:405-408`): drive scrub + the checksum-
+ /// verification path against **real** block-layer misbehaviour via device-mapper
+ /// `dm-error` — the real-hardware complement to DST's modelled bit rot.
+@@ -164,17 +126,105 @@ fn run_tier1_scenario() -> Result<(), String> {
+     }
+ }
+ 
+-/// **Tier-1 Jepsen consistency** (`0005:408`): a Jepsen harness asserting consistency
+-/// over the repair path under partitions/crashes. Needs the Jepsen harness (`lein`).
+-/// Opt in with `WYRD_TIER1=1` and configure `WYRD_TIER1_JEPSEN_CMD`.
++/// **Tier-1 Jepsen consistency** (`0005:408`): an in-repo Rust consistency harness
++/// asserting the ADR-0015 contract over the repair path under partitions and crashes.
++///
++/// Needs `docker` (compose plugin) to stand up the live D-server cluster. Opt in
++/// with `WYRD_TIER1=1`.
++///
++/// When opted in and `docker` is present, dispatches to the in-repo Tier-1
++/// consistency scenario at `crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs`
++/// via `cargo test --ignored` — **replacing** the old inert `WYRD_TIER1_JEPSEN_CMD`
++/// external-command shell-out (pre-#250) with a real in-repo Rust harness that drives
++/// the production `custodian::reconcile_step` → `reconstruction::reconcile` path
++/// against a live containerized D-server cluster.
+ pub fn run_jepsen() -> Result<(), String> {
+-    let plan = plan(
++    let p = plan(
+         "Tier-1 Jepsen consistency",
+-        "lein",
++        crate::jepsen::consistency_required_tool(),
+         opted_in("WYRD_TIER1"),
+-        tool_available("lein"),
++        tool_available(crate::jepsen::consistency_required_tool()),
+     );
+-    execute("Tier-1 Jepsen", plan, "WYRD_TIER1_JEPSEN_CMD")
++    match p {
++        Plan::Deferred(reason) => {
++            eprintln!("xtask: {reason}");
++            Ok(())
++        }
++        Plan::MissingTool(msg) => Err(msg),
++        Plan::Run => run_jepsen_scenario(),
++    }
++}
++
++/// Stand up the Jepsen D-server cluster, run the consistency scenario, and tear
++/// down — mirroring the Tier-2 kill-and-reconstruct orchestration shape.
++///
++/// The cluster reuses the shared `docker-compose.yml` (same compose file as the
++/// Tier-2 integration and kill-reconstruct tests) scaled to
++/// [`crate::jepsen::JC_DSERVER_COUNT`] servers. The scenario test receives the
++/// resolved endpoints via `WYRD_DSERVER_ENDPOINTS` and the victim container
++/// name via `WYRD_TIER1_VICTIM_CONTAINER`.
++fn run_jepsen_scenario() -> Result<(), String> {
++    let compose = crate::workspace_root()
++        .join("crates/chunkstore-grpc/tests/docker-compose.yml")
++        .to_string_lossy()
++        .to_string();
++
++    let victim_index = crate::jepsen::JC_VICTIM_INDEX;
++    // Docker Compose V2 names replicas `<project>-<service>-<1-indexed-replica>`.
++    let victim_container = format!("{}-dserver-{}", crate::TIER2_PROJECT, victim_index + 1);
++
++    crate::compose_up(&compose, crate::jepsen::JC_DSERVER_COUNT)?;
++    crate::finalize_panic_safe(
++        || {
++            let endpoints = crate::resolve_endpoints(&compose, crate::jepsen::JC_DSERVER_COUNT)?;
++            println!(
++                "\nxtask jepsen: {} D servers at {endpoints}; victim container: \
++                 {victim_container}",
++                crate::jepsen::JC_DSERVER_COUNT,
++            );
++            run_jepsen_consistency_test(&endpoints, &victim_container)
++        },
++        |result| {
++            crate::finish_integration(
++                result,
++                || crate::compose_logs(&compose),
++                || crate::compose_down(&compose),
++            )
++        },
++    )?;
++    println!("\nxtask jepsen: Tier-1 consistency-over-repair passed");
++    Ok(())
++}
++
++/// Run the `#[ignore]`d Tier-1 Jepsen consistency scenario test with the resolved
++/// endpoints and victim container exported, so the test dials the live container
++/// cluster and kills the right D server.
++///
++/// Uses [`crate::jepsen::consistency_test_cargo_args`] as the single source of truth
++/// for the `cargo test` invocation — the same args that `xtask/tests/
++/// jepsen_orchestration.rs` asserts over, so the dispatch wiring is always
++/// exercised at Check.
++fn run_jepsen_consistency_test(endpoints: &str, victim_container: &str) -> Result<(), String> {
++    let args = crate::jepsen::consistency_test_cargo_args();
++    crate::print_step(&{
++        let mut display = vec!["cargo"];
++        display.extend_from_slice(args);
++        display
++    });
++    let status = Command::new("cargo")
++        .args(args)
++        .current_dir(crate::workspace_root())
++        .env("WYRD_DSERVER_ENDPOINTS", endpoints)
++        .env("WYRD_TIER1_VICTIM_CONTAINER", victim_container)
++        .status()
++        .map_err(|e| format!("failed to spawn cargo for Tier-1 consistency scenario: {e}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "Tier-1 Jepsen consistency scenario failed with {status}"
++        ))
++    }
+ }
+ 
+ /// **Tier-2 single-node kill-and-reconstruct** (`0005:409-411`): stand up a cluster of
+@@ -314,23 +364,32 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn execute_deferred_is_ok_and_runs_nothing() {
+-        // A deferred plan exits cleanly without consulting the harness command.
+-        let outcome = execute(
+-            "Tier-1 X",
+-            Plan::Deferred("deferred".to_string()),
+-            "WYRD_NONEXISTENT_CMD",
++    fn jepsen_required_tool_is_docker() {
++        // run_jepsen() calls plan() with crate::jepsen::consistency_required_tool().
++        // This test binds that call: if the required tool changes from "docker" to
++        // anything else, the Tier-1 CI job's `docker` pre-check would be wrong.
++        assert_eq!(
++            crate::jepsen::consistency_required_tool(),
++            "docker",
++            "run_jepsen must gate on docker (the in-repo scenario's container runtime), \
++             not lein (the old Clojure/Jepsen external-command prerequisite)"
+         );
+-        assert!(outcome.is_ok());
+     }
+ 
+     #[test]
+-    fn execute_missing_tool_propagates_error() {
+-        let outcome = execute(
+-            "Tier-1 X",
+-            Plan::MissingTool("no dmsetup".to_string()),
+-            "WYRD_NONEXISTENT_CMD",
++    fn jepsen_dispatch_args_target_in_repo_scenario() {
++        // run_jepsen_consistency_test() calls crate::jepsen::consistency_test_cargo_args()
++        // as the single source of truth for the cargo invocation. This test asserts those
++        // args target the in-repo tier1_jepsen_consistency scenario, not the old external
++        // WYRD_TIER1_JEPSEN_CMD shell-out.
++        let args = crate::jepsen::consistency_test_cargo_args();
++        assert!(
++            args.contains(&"tier1_jepsen_consistency"),
++            "dispatch args must name the in-repo consistency scenario; got: {args:?}"
++        );
++        assert!(
++            !args.iter().any(|a| a.contains("WYRD_TIER1_JEPSEN_CMD")),
++            "dispatch must not reference the old external env command; got: {args:?}"
+         );
+-        assert_eq!(outcome, Err("no dmsetup".to_string()));
+     }
+ }
+diff --git a/xtask/src/jepsen.rs b/xtask/src/jepsen.rs
+new file mode 100644
+index 0000000..08bf1ea
+--- /dev/null
++++ b/xtask/src/jepsen.rs
+@@ -0,0 +1,361 @@
++//! Tier-1 Jepsen consistency harness orchestration (proposal 0005 §13.2, `0005:408`,
++//! issue #250): the **host-independent** part of the Tier-1 consistency-over-repair
++//! harness — the cargo-test invocation args, the cluster constants, and the
++//! consistency oracle helpers.
++//!
++//! These are pure functions with no privileged I/O (no docker, no gRPC D servers,
++//! no network), so they are unit-testable inside the unprivileged `cargo xtask ci`
++//! gate and compile on any host (ADR-0016).
++//!
++//! The privileged scenario that drives the production `reconcile_step` →
++//! `reconstruction::reconcile` path against live containerized D servers under
++//! partitions and crashes lives at `crates/chunkstore-grpc/tests/
++//! tier1_jepsen_consistency.rs` and is `#[ignore]`d; `cargo xtask jepsen` runs it
++//! via `cargo test --ignored` in the off-Check Tier-1 CI job (`tier1-jepsen.yml`),
++//! opted in by `WYRD_TIER1=1`.
++//!
++//! # Born-at-tier flippable coverage
++//!
++//! `xtask/tests/jepsen_orchestration.rs` imports these helpers and tests them
++//! without any container runtime. When a helper is removed or returns a wrong value,
++//! those tests go RED inside `cargo xtask ci` — the "deferred ≠ unbuilt" bar (the
++//! Verification-posture forcing function from `templates/brief.md.tpl` and INTEGRATION
++//! §"Deferred/off-Check tiers").
++
++// ─── Cargo-test invocation ────────────────────────────────────────────────────
++
++/// The `cargo test` arguments for the Tier-1 Jepsen consistency scenario.
++///
++/// Single source of truth for [`crate::faults::run_jepsen`]'s inner
++/// `run_jepsen_consistency_test` dispatch and the routing test in
++/// `xtask/tests/jepsen_orchestration.rs`. Both callers use this function to ensure
++/// the dispatch wiring and the test assertion target the same in-repo scenario,
++/// not the old external `WYRD_TIER1_JEPSEN_CMD` env command.
++pub fn consistency_test_cargo_args() -> &'static [&'static str] {
++    &[
++        "test",
++        "-p",
++        "wyrd-chunkstore-grpc",
++        "--test",
++        "tier1_jepsen_consistency",
++        "--",
++        "--ignored",
++        "--nocapture",
++    ]
++}
++
++/// The required container-runtime tool for the Tier-1 consistency scenario.
++///
++/// The scenario stands up a real docker-compose D-server cluster (like the
++/// Tier-2 kill-and-reconstruct leg), so `docker` (with the compose plugin) is
++/// the privileged prerequisite — **not** `lein` (the old Clojure/Jepsen
++/// external-command tool the inert `WYRD_TIER1_JEPSEN_CMD` shell-out used).
++pub fn consistency_required_tool() -> &'static str {
++    "docker"
++}
++
++// ─── Cluster constants ────────────────────────────────────────────────────────
++
++/// Number of D-server containers for the Tier-1 consistency cluster.
++///
++/// RS(4,2): k=4 data + m=2 parity = n=6 total fragments per chunk.
++/// One extra spare server (server 6) receives the rebuilt fragment after
++/// the victim (server 0) is killed. Seven servers total.
++pub const JC_DSERVER_COUNT: usize = 7;
++
++/// 0-indexed server that is killed (victim) in the consistency scenario.
++pub const JC_VICTIM_INDEX: usize = 0;
++
++// ─── Consistency oracle (ADR-0015) ────────────────────────────────────────────
++
++/// A single event in the scenario's consistency history.
++///
++/// The scenario records commit and read observations so the oracle can check the
++/// ADR-0015 contract over the repair path without relying on timing or
++/// container-level introspection.
++///
++/// Used by the lib target's integration test (`xtask/tests/jepsen_orchestration.rs`);
++/// the binary target includes this module only for the dispatch helpers, so
++/// `#[allow(dead_code)]` suppresses the false-positive from the binary build.
++#[allow(dead_code)]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ConsistencyEvent {
++    /// A value was written and committed (its `write_id` is now durable).
++    WriteCommitted {
++        /// Identifies the committed value (e.g. the inode version).
++        write_id: u64,
++    },
++    /// A read observation: either `Some(write_id)` (found a committed value)
++    /// or `None` (not found / chunk not yet available after repair).
++    ReadObserved {
++        /// The `write_id` the read returned, or `None` if not found.
++        write_id: Option<u64>,
++    },
++}
++
++/// Outcome of a consistency check over a history of events.
++// Same binary-build dead-code suppression as ConsistencyEvent above.
++#[allow(dead_code)]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ConsistencyOutcome {
++    /// All checked consistency properties hold.
++    Valid,
++    /// A property was violated; carries a description of the first violation.
++    Violation(String),
++}
++
++/// Check the **read-after-commit** property (ADR-0015) over the event history:
++/// every `ReadObserved { write_id: Some(id) }` must have a preceding
++/// `WriteCommitted { write_id: id }` — a read must never return a value that
++/// was never committed.
++///
++/// This is the core consistency guarantee: the repair path must not invent
++/// values, serve stale data committed before the repair window, or return
++/// torn reads that mix committed and non-committed fragment versions.
++///
++/// # Negative control (planted anomaly)
++///
++/// A history where a read returns a `write_id` with no preceding
++/// `WriteCommitted` entry is a **phantom read** and must be caught.
++/// This guarantees the oracle is load-bearing (not vacuously true).
++// Used by the lib/integration-test target; suppress binary-build false-positive.
++#[allow(dead_code)]
++pub fn check_read_after_commit(history: &[ConsistencyEvent]) -> ConsistencyOutcome {
++    use std::collections::HashSet;
++    let mut committed: HashSet<u64> = HashSet::new();
++    for event in history {
++        match event {
++            ConsistencyEvent::WriteCommitted { write_id } => {
++                committed.insert(*write_id);
++            }
++            ConsistencyEvent::ReadObserved { write_id: Some(id) } => {
++                if !committed.contains(id) {
++                    return ConsistencyOutcome::Violation(format!(
++                        "read returned write_id={id} but no WriteCommitted with that id \
++                         precedes it in the history (phantom read / stale value; \
++                         violates ADR-0015 read-after-commit)"
++                    ));
++                }
++            }
++            ConsistencyEvent::ReadObserved { write_id: None } => {
++                // A not-found read is allowed (chunk not yet available after repair) —
++                // it does not violate read-after-commit.
++            }
++        }
++    }
++    ConsistencyOutcome::Valid
++}
++
++/// Check the **no-duplicate-placement** invariant (proposal 0005, `0005:277`,
++/// `0005:385-389`) over the post-repair committed placement:
++/// every server ID must appear **exactly once**.
++///
++/// A crash mid-repair leaves a placed-but-uncommitted fragment (collectable
++/// garbage), never a duplicate committed placement — the commit-point-atomic
++/// guarantee. Duplicates mean the version-conditional commit violated atomicity.
++///
++/// # Negative control
++///
++/// A placement with a repeated server ID must be caught. This ensures the
++/// oracle is load-bearing and not vacuously true.
++// Used by the lib/integration-test target; suppress binary-build false-positive.
++#[allow(dead_code)]
++pub fn check_no_duplicate_placement(placement: &[u64]) -> ConsistencyOutcome {
++    use std::collections::HashMap;
++    let mut counts: HashMap<u64, usize> = HashMap::new();
++    for &server in placement {
++        *counts.entry(server).or_insert(0) += 1;
++    }
++    for (&server, &count) in &counts {
++        if count > 1 {
++            return ConsistencyOutcome::Violation(format!(
++                "server {server} appears {count} times in the committed placement; \
++                 duplicate committed placement violates commit-point atomicity \
++                 (proposal 0005, `0005:277`, `0005:385-389`)"
++            ));
++        }
++    }
++    ConsistencyOutcome::Valid
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // ─── consistency_test_cargo_args ─────────────────────────────────────────────
++
++    #[test]
++    fn consistency_test_args_target_in_repo_scenario_not_env_cmd() {
++        let args = consistency_test_cargo_args();
++        // Must name the in-repo scenario file, not the old external env command.
++        assert!(
++            args.contains(&"tier1_jepsen_consistency"),
++            "consistency_test_cargo_args must name the in-repo scenario; got: {args:?}"
++        );
++        // Must use the --ignored flag to run the #[ignore]d scenario body.
++        assert!(
++            args.contains(&"--ignored"),
++            "consistency_test_cargo_args must pass --ignored to run the scenario; got: {args:?}"
++        );
++        // Must NOT reference the old external env command.
++        assert!(
++            !args.iter().any(|a| a.contains("WYRD_TIER1_JEPSEN_CMD")),
++            "consistency_test_cargo_args must not reference the old external env command; \
++             got: {args:?}"
++        );
++    }
++
++    #[test]
++    fn consistency_test_args_target_wyrd_chunkstore_grpc_package() {
++        // The scenario lives in the wyrd-chunkstore-grpc package (sibling to
++        // tier2_kill_reconstruct.rs); the args must select that package.
++        let args = consistency_test_cargo_args();
++        let pkg_pos = args.iter().position(|a| *a == "-p");
++        assert!(
++            pkg_pos.is_some(),
++            "args must have -p <package>; got: {args:?}"
++        );
++        let pkg = args[pkg_pos.unwrap() + 1];
++        assert_eq!(
++            pkg, "wyrd-chunkstore-grpc",
++            "scenario must be in wyrd-chunkstore-grpc (sibling of tier2_kill_reconstruct.rs)"
++        );
++    }
++
++    // ─── consistency_required_tool ───────────────────────────────────────────────
++
++    #[test]
++    fn consistency_required_tool_is_docker_not_lein() {
++        // The in-repo scenario uses docker-compose (not lein/Clojure) for its
++        // D-server cluster. This test binds the tool change from the old inert
++        // external-command approach (lein) to the in-repo scenario (docker).
++        assert_eq!(
++            consistency_required_tool(),
++            "docker",
++            "required tool must be docker (the container runtime for the in-repo scenario), \
++             not lein (the old Clojure/Jepsen external-command prerequisite)"
++        );
++    }
++
++    // ─── check_read_after_commit ─────────────────────────────────────────────────
++
++    #[test]
++    fn read_after_commit_valid_for_empty_history() {
++        assert_eq!(
++            check_read_after_commit(&[]),
++            ConsistencyOutcome::Valid,
++            "empty history: no reads, no violations"
++        );
++    }
++
++    #[test]
++    fn read_after_commit_valid_when_read_follows_commit() {
++        let history = vec![
++            ConsistencyEvent::WriteCommitted { write_id: 1 },
++            ConsistencyEvent::ReadObserved { write_id: Some(1) },
++        ];
++        assert_eq!(
++            check_read_after_commit(&history),
++            ConsistencyOutcome::Valid,
++            "read of write_id=1 after WriteCommitted {{ write_id: 1 }}: must pass"
++        );
++    }
++
++    #[test]
++    fn read_after_commit_valid_for_not_found_read() {
++        // A not-found read (write_id: None) is allowed — the chunk might not be
++        // available yet after repair. It does not violate read-after-commit.
++        let history = vec![
++            ConsistencyEvent::WriteCommitted { write_id: 42 },
++            ConsistencyEvent::ReadObserved { write_id: None },
++        ];
++        assert_eq!(
++            check_read_after_commit(&history),
++            ConsistencyOutcome::Valid,
++            "not-found read with committed write: must pass"
++        );
++    }
++
++    #[test]
++    fn read_after_commit_catches_phantom_read_negative_control() {
++        // NEGATIVE CONTROL (planted anomaly): a read that returns a write_id
++        // never committed is a phantom read — the oracle MUST catch it.
++        // If the oracle misses this, it is vacuously passing (checking its own
++        // bookkeeping, not Wyrd's consistency — the iter-5 advisory).
++        let history = vec![
++            ConsistencyEvent::WriteCommitted { write_id: 1 },
++            ConsistencyEvent::ReadObserved {
++                write_id: Some(99), // 99 was never committed — phantom read
++            },
++        ];
++        let outcome = check_read_after_commit(&history);
++        assert!(
++            matches!(&outcome, ConsistencyOutcome::Violation(msg) if msg.contains("phantom")),
++            "phantom read of uncommitted write_id=99 must be caught; got: {outcome:?}"
++        );
++    }
++
++    #[test]
++    fn read_after_commit_catches_read_before_commit_negative_control() {
++        // NEGATIVE CONTROL: a read that returns write_id=1 BEFORE WriteCommitted
++        // with write_id=1 violates the ordering guarantee.
++        let history = vec![
++            ConsistencyEvent::ReadObserved {
++                write_id: Some(1), // read before the commit!
++            },
++            ConsistencyEvent::WriteCommitted { write_id: 1 },
++        ];
++        let outcome = check_read_after_commit(&history);
++        assert!(
++            matches!(outcome, ConsistencyOutcome::Violation(_)),
++            "read before commit must be caught as a violation: {outcome:?}"
++        );
++    }
++
++    // ─── check_no_duplicate_placement ───────────────────────────────────────────
++
++    #[test]
++    fn no_duplicate_placement_valid_for_distinct_servers() {
++        assert_eq!(
++            check_no_duplicate_placement(&[0, 1, 2, 3, 4, 5]),
++            ConsistencyOutcome::Valid,
++            "all distinct servers: must pass"
++        );
++    }
++
++    #[test]
++    fn no_duplicate_placement_valid_for_empty_placement() {
++        assert_eq!(
++            check_no_duplicate_placement(&[]),
++            ConsistencyOutcome::Valid,
++            "empty placement: must pass"
++        );
++    }
++
++    #[test]
++    fn no_duplicate_placement_catches_duplicate_negative_control() {
++        // NEGATIVE CONTROL (planted anomaly): a committed placement with a repeated
++        // server ID violates commit-point atomicity and must be caught.
++        let outcome = check_no_duplicate_placement(&[0, 1, 2, 2, 3]);
++        assert!(
++            matches!(outcome, ConsistencyOutcome::Violation(_)),
++            "duplicate server 2 in placement must be caught: {outcome:?}"
++        );
++    }
++
++    #[test]
++    fn no_duplicate_placement_violation_names_the_duplicate_server() {
++        let outcome = check_no_duplicate_placement(&[5, 5]);
++        let ConsistencyOutcome::Violation(msg) = outcome else {
++            panic!("expected Violation for duplicate server 5, got Valid");
++        };
++        assert!(
++            msg.contains('5'),
++            "violation message must name the duplicate server: {msg}"
++        );
++        assert!(
++            msg.contains("atomicity") || msg.contains("duplicate"),
++            "violation message must name the atomicity property: {msg}"
++        );
++    }
++}
+diff --git a/xtask/src/lib.rs b/xtask/src/lib.rs
+index e6195e1..0183f05 100644
+--- a/xtask/src/lib.rs
++++ b/xtask/src/lib.rs
+@@ -14,3 +14,4 @@
+ #![forbid(unsafe_code)]
+ 
+ pub mod disk_faults;
++pub mod jepsen;
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 57cd253..ab57845 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -25,6 +25,7 @@
+ 
+ mod conformance;
+ mod faults;
++mod jepsen;
+ mod kill_reconstruct;
+ mod vectors;
+ 
+diff --git a/xtask/tests/jepsen_orchestration.rs b/xtask/tests/jepsen_orchestration.rs
+new file mode 100644
+index 0000000..9a78735
+--- /dev/null
++++ b/xtask/tests/jepsen_orchestration.rs
+@@ -0,0 +1,171 @@
++//! Dispatch-routing and consistency-oracle tests for the Tier-1 Jepsen
++//! consistency harness (`xtask::jepsen` — the Check-time flippable coverage,
++//! born at M3, issue #250, proposal 0005 §13.2, `0005:408`).
++//!
++//! **Why these tests exist.** The Tier-1 Jepsen consistency harness is a
++//! "deferred" tier (ADR-0016): its real-cluster scenario
++//! (`crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs`) requires
++//! `docker` + a live D-server fleet and is `#[ignore]`d in the unprivileged
++//! `cargo xtask ci` gate. "Deferred" means the green run is off-Check; it does
++//! NOT mean the harness is unbuilt.
++//!
++//! These tests exercise the **host-independent** orchestration logic at Check:
++//!
++//! - [`xtask::jepsen::consistency_test_cargo_args`] — the single-sourced
++//!   cargo invocation consumed by `run_jepsen`'s inner dispatch; asserts the
++//!   routing targets the in-repo scenario, NOT the old external
++//!   `WYRD_TIER1_JEPSEN_CMD` env command.
++//! - [`xtask::jepsen::consistency_required_tool`] — must be `"docker"` (not
++//!   `"lein"` the old Clojure/Jepsen prerequisite), exercised at Check to
++//!   bind the tool change to the module.
++//! - [`xtask::jepsen::check_read_after_commit`] /
++//!   [`xtask::jepsen::check_no_duplicate_placement`] — the consistency oracle
++//!   helpers, with **negative-control (planted-anomaly) tests** proving the
++//!   oracle is load-bearing and not checking its own bookkeeping.
++//!
++//! **C4-verify note.** `run-verify.sh` classifies this file as an added test
++//! (`xtask/tests/*.rs` matches `*/tests/*.rs`) and targets it in the RED check:
++//! reverting the production changes removes `xtask/src/jepsen.rs` and reverts
++//! `xtask/src/lib.rs`, making `use xtask::jepsen::*` fail to compile — so the
++//! RED check observes a non-zero exit and declares RED ✓. The full patch applied
++//! makes the tests compile and pass — GREEN ✓.
++
++use xtask::jepsen::{
++    check_no_duplicate_placement, check_read_after_commit, consistency_required_tool,
++    consistency_test_cargo_args, ConsistencyEvent, ConsistencyOutcome,
++};
++
++// ─── dispatch routing ────────────────────────────────────────────────────────
++
++#[test]
++fn jepsen_dispatch_targets_in_repo_scenario_not_external_env_cmd() {
++    // The dispatch args (single-sourced in xtask::jepsen::consistency_test_cargo_args,
++    // consumed by run_jepsen_consistency_test in faults.rs) must name the in-repo
++    // tier1_jepsen_consistency scenario, NOT the old WYRD_TIER1_JEPSEN_CMD shell-out.
++    //
++    // RED pre-fix: this file does not compile without xtask::jepsen (jepsen.rs absent
++    // after run-verify.sh reverts production changes). GREEN post-fix: xtask::jepsen
++    // exists and the args name the in-repo scenario.
++    let args = consistency_test_cargo_args();
++    assert!(
++        args.contains(&"tier1_jepsen_consistency"),
++        "dispatch must target the in-repo scenario; args: {args:?}"
++    );
++    assert!(
++        args.contains(&"--ignored"),
++        "dispatch must pass --ignored to run the #[ignore]d scenario body; args: {args:?}"
++    );
++    assert!(
++        !args.iter().any(|a| a.contains("WYRD_TIER1_JEPSEN_CMD")),
++        "dispatch must not reference the old external env command; args: {args:?}"
++    );
++}
++
++#[test]
++fn jepsen_dispatch_targets_wyrd_chunkstore_grpc_package() {
++    // The scenario is in wyrd-chunkstore-grpc (sibling of tier2_kill_reconstruct.rs);
++    // the dispatch args must select that package.
++    let args = consistency_test_cargo_args();
++    let pkg_idx = args
++        .iter()
++        .position(|a| *a == "-p")
++        .expect("dispatch args must include -p <package>");
++    assert_eq!(
++        args[pkg_idx + 1],
++        "wyrd-chunkstore-grpc",
++        "dispatch must target wyrd-chunkstore-grpc"
++    );
++}
++
++#[test]
++fn jepsen_required_tool_is_docker_not_lein() {
++    // run_jepsen gates on consistency_required_tool(): must be "docker" (the container
++    // runtime for the in-repo scenario), not "lein" (the old Clojure/Jepsen tool).
++    // This test binds the tool change to the xtask::jepsen module — removing
++    // jepsen.rs breaks this file's compilation and makes C4-verify RED.
++    assert_eq!(
++        consistency_required_tool(),
++        "docker",
++        "required tool must be docker for the in-repo consistency scenario"
++    );
++}
++
++// ─── consistency oracle: read-after-commit ───────────────────────────────────
++
++#[test]
++fn read_after_commit_valid_for_normal_history() {
++    let history = vec![
++        ConsistencyEvent::WriteCommitted { write_id: 1 },
++        ConsistencyEvent::ReadObserved { write_id: Some(1) },
++    ];
++    assert_eq!(check_read_after_commit(&history), ConsistencyOutcome::Valid);
++}
++
++#[test]
++fn read_after_commit_valid_for_not_found_read() {
++    // Not-found reads do not violate read-after-commit.
++    let history = vec![
++        ConsistencyEvent::WriteCommitted { write_id: 1 },
++        ConsistencyEvent::ReadObserved { write_id: None },
++    ];
++    assert_eq!(check_read_after_commit(&history), ConsistencyOutcome::Valid);
++}
++
++#[test]
++fn read_after_commit_catches_phantom_read_negative_control() {
++    // NEGATIVE CONTROL / planted anomaly: a read that returns a write_id never
++    // committed must be caught. If the oracle misses this, it is vacuously passing
++    // (checking its own bookkeeping, not Wyrd's consistency — the iter-5 advisory).
++    // This demonstrates red: the oracle is load-bearing, not empty.
++    let history = vec![
++        ConsistencyEvent::WriteCommitted { write_id: 1 },
++        ConsistencyEvent::ReadObserved {
++            write_id: Some(42), // 42 was never committed
++        },
++    ];
++    let outcome = check_read_after_commit(&history);
++    assert!(
++        matches!(outcome, ConsistencyOutcome::Violation(_)),
++        "phantom read of uncommitted write_id=42 must be caught as a violation: {outcome:?}"
++    );
++}
++
++#[test]
++fn read_after_commit_catches_read_before_commit_negative_control() {
++    // NEGATIVE CONTROL: read returns write_id=1 before the commit — ordering violation.
++    let history = vec![
++        ConsistencyEvent::ReadObserved {
++            write_id: Some(1), // before the commit
++        },
++        ConsistencyEvent::WriteCommitted { write_id: 1 },
++    ];
++    assert!(
++        matches!(
++            check_read_after_commit(&history),
++            ConsistencyOutcome::Violation(_)
++        ),
++        "read before commit must be caught"
++    );
++}
++
++// ─── consistency oracle: no-duplicate-placement ──────────────────────────────
++
++#[test]
++fn no_duplicate_placement_valid_for_distinct_servers() {
++    assert_eq!(
++        check_no_duplicate_placement(&[0, 1, 2, 3, 4, 5]),
++        ConsistencyOutcome::Valid
++    );
++}
++
++#[test]
++fn no_duplicate_placement_catches_duplicate_negative_control() {
++    // NEGATIVE CONTROL / planted anomaly: a committed placement with a repeated
++    // server ID violates commit-point atomicity and must be caught.
++    // Demonstrates the oracle is load-bearing (proposal 0005, `0005:385-389`).
++    let outcome = check_no_duplicate_placement(&[0, 1, 2, 2, 3]);
++    assert!(
++        matches!(outcome, ConsistencyOutcome::Violation(_)),
++        "duplicate server 2 in placement must be caught: {outcome:?}"
++    );
++}

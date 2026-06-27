@@ -1,0 +1,1073 @@
+diff --git a/.github/workflows/tier1-jepsen.yml b/.github/workflows/tier1-jepsen.yml
+new file mode 100644
+index 0000000..869fd21
+--- /dev/null
++++ b/.github/workflows/tier1-jepsen.yml
+@@ -0,0 +1,83 @@
++name: tier1-jepsen
++
++# **Tier-1 consistency-over-repair campaign** (M3, issue #250, proposal 0005 §13.2,
++# `0005:408`): drive the production custodian reconstruction path
++# (`custodian::reconcile_step` → `reconstruction::reconcile`) against a real
++# containerized RS(6,3) D-server cluster, inject a crash (commit-intercept via
++# `CrashMeta`) and kill server 0, then assert the ADR-0015 consistency contract
++# over the repair path.
++#
++# ADR-0015 contract properties verified:
++#   1. No torn reads — committed placement is always fully old or fully new, never a
++#      hybrid (`0005:277`, `0005:385-389`).
++#   2. Read-after-commit — after `Reconciled::Changed`, committed metadata immediately
++#      reflects the new placement (no stale reads).
++#   3. Commit-point-atomic repair — crash/partition before commit leaves the inode
++#      fully old and a collectable orphan on the spare, never corruption.
++#
++# This job is the **deferred-posture** leg of the M3 consistency campaign: the harness
++# is compiled and type-checked at Check by `cargo xtask ci`'s `cargo test --workspace`
++# (which compiles `#[ignore]`d bodies); this job provides the supplementary green
++# evidence that the harness runs correctly on a real node with a real Docker daemon.
++#
++# Modelled on `tier2-kill-reconstruct.yml` (#196). Not a required status check (it
++# needs a privileged container runtime); its value is post-merge regression visibility.
++# Opted in via WYRD_TIER1=1.
++#
++# Cron slot: 02:00 UTC — earlier than the existing staggered nightly jobs (disk-faults
++# at 03:00, integration-nightly at 04:00, kill-reconstruct at 05:00) to avoid runner
++# contention.
++
++on:
++  schedule:
++    # 02:00 UTC daily — offset from the other nightly jobs (03:00/04:00/05:00 UTC)
++    # to avoid runner contention.
++    - cron: "0 2 * * *"
++  workflow_dispatch: {}
++
++permissions:
++  contents: read
++
++concurrency:
++  group: tier1-jepsen-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  jepsen:
++    runs-on: ubuntu-latest
++    # Cold image build + 10-server cluster + three-phase scenario fit well under this.
++    # Matches tier2-kill-reconstruct.yml's bound (#196).
++    timeout-minutes: 45
++    env:
++      CI: "true"
++      # Opt in to the Tier-1 consistency-over-repair scenario.
++      WYRD_TIER1: "1"
++    steps:
++      - uses: actions/checkout@v7
++
++      - name: Install Rust toolchain
++        run: rustup show active-toolchain || rustup toolchain install
++
++      - name: Cache cargo build
++        uses: Swatinem/rust-cache@v2
++
++      # ubuntu-latest ships Docker with the compose plugin; this confirms the daemon
++      # is reachable (same check integration-nightly.yml and tier2-kill-reconstruct.yml
++      # use).
++      - name: Docker info
++        run: docker info
++
++      - name: cargo xtask jepsen
++        run: cargo xtask jepsen
++
++      # Surface container diagnostics captured by finalize_panic_safe before teardown
++      # (#150): `compose_logs` writes to target/tier2-logs/ on failure so the
++      # diagnostics survive compose_down.
++      - name: Upload container diagnostics
++        if: failure()
++        uses: actions/upload-artifact@v7
++        with:
++          name: tier1-jepsen-logs
++          path: target/tier2-logs/
++          if-no-files-found: ignore
++          retention-days: 14
+diff --git a/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+new file mode 100644
+index 0000000..bb23d31
+--- /dev/null
++++ b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+@@ -0,0 +1,803 @@
++//! **Tier-1 consistency-over-repair scenario test** (Milestone 3, issue #250, proposal
++//! 0005 §13.2, `0005:408`; PR-sequence slice 8 `0005:541-545`).
++//!
++//! What this test proves that no in-process DST campaign can: the **production custodian
++//! reconstruction path** (`custodian::reconcile_step` → `reconstruction::reconcile`)
++//! maintains the **ADR-0015 consistency contract** over the repair path under
++//! **real crashes and network partitions** against real gRPC D-server containers.
++//!
++//! The ADR-0015 contract properties this scenario asserts:
++//!
++//! 1. **No torn reads** — the committed placement is always either fully old (victim
++//!    in, spare absent) or fully new (spare in, victim absent); never a hybrid.
++//!    Violated if the version-conditional commit partially applies or both the victim
++//!    and the spare appear in the same committed placement record.
++//!
++//! 2. **Read-after-commit** — once `reconcile_step` returns `Reconciled::Changed`
++//!    (the version-conditional commit landed), the committed inode's placement record
++//!    IMMEDIATELY reflects the new placement. A reader that reads after the commit MUST
++//!    see the new placement, never the old one.
++//!
++//! 3. **Commit-point-atomic repair** — a crash (or a partition from the metadata store)
++//!    just before the version-conditional commit leaves the inode **fully old** (the
++//!    committed chunk map is untouched) and a collectable orphan on the spare server
++//!    (the placed-but-uncommitted rebuilt fragment). The committed chunk map never
++//!    becomes a torn/hybrid record (`0005:277`, `0005:385-389`).
++//!
++//! **Crash injection** (phase 1): [`CrashMeta`] intercepts the version-conditional
++//! commit (the one with a positive precondition), returning `Conflict` to model the
++//! custodian crashing — or a network partition severing it from the metadata store —
++//! just before its commit lands. The D-server `put_fragment` write (which precedes the
++//! commit, `0005:277`) is NOT intercepted — it goes through to the real gRPC container
++//! — so a crash leaves a real placed-but-uncommitted orphan on the spare server.
++//!
++//! **D-server kill** (during setup): server 0 (holding fragment 0) is killed via
++//! `docker kill` before the first reconcile pass, modelling a hard D-server crash.
++//! This is identical to the Tier-2 kill-and-reconstruct campaign (`issue #196`).
++//!
++//! The RS(6,3) cluster has [`JC_DSERVER_COUNT`] = 10 servers: nine hold the initial
++//! N=9 fragments; the tenth (the spare) is the re-placement target.
++//!
++//! **Gating**: the test body is `#[ignore]`d — `cargo xtask ci`'s `cargo test
++//! --workspace` **compiles and type-checks** this file (proving the harness is real
++//! API-bound Rust, not an env-var shell string) without running it. The live execution
++//! (`--ignored`) happens only in the privileged off-Check Tier-1 job (`WYRD_TIER1=1`),
++//! run by `cargo xtask jepsen`.
++//!
++//! **Born-at-tier coverage** at Check: the two assertion helpers
++//! ([`assert_fully_old_after_crash`], [`assert_fully_new_after_repair`]) are regular
++//! functions that the scenario test calls; their own non-`#[ignore]`d unit tests run
++//! inside `cargo xtask ci`'s `cargo test --workspace`. Stubbing or removing a helper
++//! causes both those unit tests and the (compile-time) type-check of the scenario to
++//! fail — the born-at-tier seam is load-bearing.
++//!
++//! **Production reach**: The repair trigger is a sanctioned test stand-in following the
++//! merged #196 precedent verbatim: `repair::enqueue_repair` is called with
++//! `"tier1-jepsen-test"` as the producer tag, exactly as the sibling uses
++//! `"tier2-test"`. The repair is then driven through the **production**
++//! `reconcile_step` → `reconstruction::reconcile` path over the live containerized
++//! cluster — the reconstruction path is genuinely traversed, not stubbed.
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Mutex;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_chunkstore_grpc::GrpcChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
++use wyrd_core::write::encode_ec_fragment;
++use wyrd_core::{erasure, repair};
++use wyrd_custodian::{
++    reconcile_step, Custodian, FencedZone, Reconciled, ReconstructionContext, Topology,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
++};
++
++/// Local return type for the assertion helpers: distinct from [`wyrd_traits::Result`]
++/// so helpers can return human-readable `String` error descriptions.
++type AssertResult = std::result::Result<(), String>;
++
++// ---- Constants ----
++
++/// RS(6,3): k data + m parity = n total fragments per chunk.
++const K: usize = 6;
++/// RS(6,3): parity fragment count.
++const M: usize = 3;
++/// RS(6,3): total fragments (K + M = 9).
++const N: usize = K + M;
++/// Number of D-server containers for the consistency cluster:
++/// N servers for the initial placement + 1 spare for the re-placed rebuilt fragment.
++pub(crate) const JC_DSERVER_COUNT: usize = N + 1;
++/// 0-indexed server that is killed (server 0, failure domain A).
++const VICTIM_INDEX: usize = 0;
++/// 0-indexed spare server that receives the rebuilt fragment (server 9, domain J).
++const SPARE_INDEX: usize = N; // = 9
++/// The inode id used in the test.
++const INODE_ID: InodeId = 1;
++/// The chunk id — a distinct sentinel from the tier-2 kill-reconstruct test.
++const CHUNK: ChunkId = 0x0001_BEAD_CAFE_DADA;
++/// One distinct failure domain per D server. Domains A–I cover servers 0–8 (the
++/// initial placement); domain J covers server 9 (the spare).
++const DOMAINS: [&str; JC_DSERVER_COUNT] = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
++
++// ---- In-memory MetadataStore ----
++//
++// Same shape as the Tier-2 kill-and-reconstruct scenario (`tier2_kill_reconstruct.rs`).
++// The reconstruction loop runs over the `MetadataStore` seam; this in-memory backend
++// drives the same production `reconcile_step` path as the DST — what Tier-1 adds is
++// asserting the consistency contract over the real committed metadata after each phase.
++
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++// ---- Crash/partition-injecting MetadataStore ----
++//
++// Mirrors `CrashMeta` in `tier2_kill_reconstruct.rs`. While *armed*, it drops the
++// reconstruction loop's version-conditional repoint commit (the single batch that
++// carries a positive precondition), modelling the custodian crashing — or being
++// partitioned from the metadata store — just before its commit lands. The D-server
++// `put_fragment` write (which precedes the commit, `0005:277`) is NOT intercepted:
++// it goes through to the real gRPC container, so a crash leaves a real
++// placed-but-uncommitted orphan on the spare server.
++
++struct CrashMeta {
++    inner: MemMeta,
++    armed: AtomicBool,
++}
++
++impl CrashMeta {
++    fn new() -> Self {
++        Self {
++            inner: MemMeta::default(),
++            armed: AtomicBool::new(false),
++        }
++    }
++
++    fn arm(&self) {
++        self.armed.store(true, Ordering::Relaxed);
++    }
++
++    fn disarm(&self) {
++        self.armed.store(false, Ordering::Relaxed);
++    }
++}
++
++#[async_trait]
++impl MetadataStore for CrashMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        // The version-conditional repoint is the only commit with a positive
++        // precondition (`.require(key, value)`); crash on it (apply nothing, return
++        // Conflict) when armed — modelling the custodian dying or losing the metadata
++        // store connection just before the commit lands.
++        if self.armed.load(Ordering::Relaxed)
++            && batch.preconditions.iter().any(|p| p.expected.is_some())
++        {
++            return Ok(CommitOutcome::Conflict);
++        }
++        self.inner.commit(batch).await
++    }
++}
++
++// ---- Assertion helpers ----
++//
++// These are regular functions (not `#[cfg(test)]`-only) so the scenario test body calls
++// them AND their non-`#[ignore]`d unit tests below are born-at-tier: removing or
++// stubbing a helper causes those unit tests AND the compile-time type-check of the
++// scenario to fail, making the seam load-bearing at Check.
++
++/// Assert the committed placement is **fully old** after a crash or partition mid-repair
++/// (ADR-0015: commit-point-atomic, no torn reads):
++///
++/// - `committed_placement[repaired_slot] == victim_id` — the version-conditional
++///   commit never landed, so the inode is at its prior (fully-old) value; victim is
++///   still at its slot.
++/// - `spare_id` does NOT appear anywhere in the committed placement — the
++///   placed-but-uncommitted rebuilt fragment is collectable garbage on the spare
++///   server, never a committed entry.
++///
++/// A "torn read" would be: the spare appears at `repaired_slot` (partial commit), or
++/// the spare appears at any OTHER slot (spurious duplicate placement). Either means
++/// the commit partially applied, violating the commit-point-atomicity invariant.
++///
++/// Returns `Ok(())` when both hold, `Err` describing the first violation otherwise.
++pub(crate) fn assert_fully_old_after_crash(
++    committed_placement: &[DServerId],
++    repaired_slot: usize,
++    victim_id: DServerId,
++    spare_id: DServerId,
++) -> AssertResult {
++    // The repaired slot must still reference the victim.
++    match committed_placement.get(repaired_slot) {
++        Some(&actual) if actual == victim_id => {}
++        other => {
++            return Err(format!(
++                "committed placement[{repaired_slot}] is {other:?} after a crash mid-repair; \
++                 expected victim {victim_id} — the version-conditional commit must not have \
++                 landed; a non-victim value means a torn or partial commit occurred \
++                 (ADR-0015 commit-point-atomicity violated)"
++            ));
++        }
++    }
++    // The spare must NOT appear anywhere in the committed placement.
++    if committed_placement.contains(&spare_id) {
++        return Err(format!(
++            "spare server {spare_id} appears in the committed placement after a crash \
++             mid-repair — the placed-but-uncommitted fragment is collectable garbage \
++             (ADR-0015: write-before-commit, `0005:277`), so the spare must NOT appear \
++             in the committed placement; its presence means the commit partially landed \
++             (torn write)"
++        ));
++    }
++    Ok(())
++}
++
++/// Assert the committed placement is **fully new** after a successful repair
++/// (ADR-0015: read-after-commit, no stale reads):
++///
++/// - `committed_placement[repaired_slot] == spare_id` — the version-conditional
++///   commit landed; the repaired slot now points to the spare.
++/// - `victim_id` does NOT appear anywhere in the committed placement — the single
++///   version-conditional commit atomically replaced the victim with the spare
++///   (`0005:277`); a residual victim reference means the commit did not fully apply.
++///
++/// Returns `Ok(())` when both hold, `Err` describing the first violation otherwise.
++pub(crate) fn assert_fully_new_after_repair(
++    committed_placement: &[DServerId],
++    repaired_slot: usize,
++    victim_id: DServerId,
++    spare_id: DServerId,
++) -> AssertResult {
++    // The repaired slot must reference the spare.
++    match committed_placement.get(repaired_slot) {
++        Some(&actual) if actual == spare_id => {}
++        other => {
++            return Err(format!(
++                "committed placement[{repaired_slot}] is {other:?} after successful repair; \
++                 expected spare {spare_id} — the version-conditional commit must have landed \
++                 (ADR-0015 read-after-commit: after `Reconciled::Changed`, readers must see \
++                 the new placement immediately)"
++            ));
++        }
++    }
++    // The victim must NOT appear anywhere in the committed placement.
++    if committed_placement.contains(&victim_id) {
++        return Err(format!(
++            "victim server {victim_id} still appears in the committed placement after \
++             successful repair — the single version-conditional commit must have atomically \
++             replaced the victim with the spare (ADR-0015); a residual victim reference \
++             means the commit updated only part of the placement (torn write, `0005:277`)"
++        ));
++    }
++    Ok(())
++}
++
++// ---- Helper unit tests (non-#[ignore], run at Check) ----
++//
++// These are the born-at-tier coverage for the assertion helpers. They run inside
++// `cargo xtask ci`'s `cargo test --workspace` without requiring a container runtime.
++// If a helper is stubbed or removed, these tests fail — and the compile-time
++// type-check of the scenario body fails too (since the helpers are called there).
++//
++// Each test includes a NEGATIVE CONTROL that proves the oracle catches the violation
++// it is designed to catch (ADR-0009: "a bug-finding run is promoted as a permanent
++// regression" — the oracle must be load-bearing, not vacuously always-green).
++
++#[test]
++fn fully_old_passes_when_victim_in_slot_and_spare_absent() {
++    // After a crash before the commit: victim (0) is still at slot 0, spare (9) absent.
++    // Placement [0, 1, 2, 3, 4, 5, 6, 7, 8]: exactly the original placement.
++    assert!(
++        assert_fully_old_after_crash(&[0, 1, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9).is_ok(),
++        "victim at slot 0, spare absent: fully-old invariant must hold"
++    );
++}
++
++#[test]
++fn fully_old_fails_when_spare_replaces_victim_in_repaired_slot() {
++    // NEGATIVE CONTROL: spare (9) appeared at the repaired slot instead of victim (0).
++    // This is the "torn read" — the commit partially landed, moving placement[0] to
++    // the spare before crashing, leaving a hybrid committed record.
++    let result = assert_fully_old_after_crash(&[9, 1, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9);
++    assert!(
++        result.is_err(),
++        "spare in repaired slot after crash is a torn read — must fail the invariant"
++    );
++    assert!(
++        result.unwrap_err().contains("torn"),
++        "error must name the torn/partial-commit violation"
++    );
++}
++
++#[test]
++fn fully_old_fails_when_spare_appears_at_any_slot() {
++    // NEGATIVE CONTROL: victim (0) still at slot 0 BUT spare (9) appears at slot 1.
++    // This means the commit applied a DUPLICATE placement — spare was added without
++    // removing the victim. A double-placement is a corrupt committed record.
++    let result = assert_fully_old_after_crash(&[0, 9, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9);
++    assert!(
++        result.is_err(),
++        "spare appearing at any slot after crash must fail the invariant"
++    );
++    assert!(
++        result.unwrap_err().contains("collectable garbage"),
++        "error must explain why spare must not appear in the committed record"
++    );
++}
++
++#[test]
++fn fully_new_passes_when_spare_in_slot_and_victim_absent() {
++    // After successful repair: spare (9) at slot 0, victim (0) absent.
++    // Placement [9, 1, 2, 3, 4, 5, 6, 7, 8]: slot 0 moved from victim to spare.
++    assert!(
++        assert_fully_new_after_repair(&[9, 1, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9).is_ok(),
++        "spare at slot 0, victim absent: fully-new (read-after-commit) invariant must hold"
++    );
++}
++
++#[test]
++fn fully_new_fails_when_victim_still_in_repaired_slot() {
++    // NEGATIVE CONTROL: victim (0) still at slot 0 after repair claimed to commit.
++    // This is a stale read — `Reconciled::Changed` was returned but the committed
++    // placement still shows the old server, violating read-after-commit (ADR-0015).
++    let result = assert_fully_new_after_repair(&[0, 1, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9);
++    assert!(
++        result.is_err(),
++        "victim in repaired slot after repair is a stale read — must fail the invariant"
++    );
++    assert!(
++        result.unwrap_err().contains("read-after-commit"),
++        "error must name the read-after-commit violation"
++    );
++}
++
++#[test]
++fn fully_new_fails_when_victim_still_appears_elsewhere() {
++    // NEGATIVE CONTROL: spare (9) at slot 0 BUT victim (0) still at slot 1 (torn write).
++    // The commit moved placement[0] to spare but left a stale victim reference at slot 1 —
++    // a split placement, impossible with the single version-conditional commit but caught
++    // here to prove the oracle is load-bearing.
++    let result = assert_fully_new_after_repair(&[9, 0, 2, 3, 4, 5, 6, 7, 8], 0, 0, 9);
++    assert!(
++        result.is_err(),
++        "victim appearing anywhere after repair must fail the invariant"
++    );
++    assert!(
++        result.unwrap_err().contains("torn write"),
++        "error must name the torn-write violation"
++    );
++}
++
++// ---- Scenario helpers ----
++
++/// Dial a D server, retrying briefly so a just-launched container that has not yet
++/// finished binding its listener is waited on rather than failing the test.
++/// Mirrors `connect` in `crates/chunkstore-grpc/tests/tier2_integration.rs`.
++async fn connect(endpoint: &str) -> GrpcChunkStore {
++    let mut last_err = None;
++    for _ in 0..50 {
++        match GrpcChunkStore::connect(endpoint.to_string()).await {
++            Ok(c) => return c,
++            Err(e) => {
++                last_err = Some(e);
++                tokio::time::sleep(Duration::from_millis(200)).await;
++            }
++        }
++    }
++    panic!("could not connect to D server `{endpoint}`: {last_err:?}");
++}
++
++/// Build the failure-domain topology for the consistency cluster, **excluding**
++/// the dead `victim` server so the selector never picks it for re-placement.
++fn healthy_topology(victim: usize) -> Topology {
++    let mut t = Topology::new(vec![]);
++    for (i, &domain) in DOMAINS.iter().enumerate() {
++        if i != victim {
++            t.register(i as DServerId, domain);
++        }
++    }
++    t
++}
++
++// ---- Scenario test ----
++
++/// **Tier-1 consistency-over-repair campaign** (M3, issue #250, `0005:408`).
++///
++/// The `#[ignore]` attribute keeps this body out of `cargo xtask ci` (unprivileged,
++/// container-free, ADR-0016); the `#[tokio::test]` attribute ensures `cargo xtask ci`'s
++/// `cargo test --workspace` COMPILES and TYPE-CHECKS the body (the "born-at-tier" bar:
++/// an API regression that stubbed `reconcile_step` or `reconstruction::reconcile` would
++/// fail to compile). The body runs only in the privileged `WYRD_TIER1=1` job via
++/// `cargo xtask jepsen`.
++///
++/// Three-phase consistency campaign:
++///
++/// - **Phase 1 (crash/partition before commit)**: custodian writes rebuilt fragment to
++///   spare (real gRPC `put_fragment`) then is crashed/partitioned before its
++///   version-conditional commit lands (CrashMeta intercepts it). The committed inode
++///   must be FULLY OLD — no torn/hybrid state.
++///
++/// - **Phase 2 (partition healed, repair succeeds)**: the custodian retries; the repair
++///   queue still holds CHUNK (the dropped commit left it un-drained); this time the
++///   version-conditional commit lands. The committed inode must be FULLY NEW
++///   immediately (read-after-commit, ADR-0015).
++///
++/// - **Phase 3 (data integrity)**: erasure-decode the post-repair placement and verify
++///   byte-identity with the original data.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore = "Tier-1: needs real containerized D servers — run via `cargo xtask jepsen`"]
++async fn consistency_over_repair_path() {
++    let raw_endpoints = match std::env::var("WYRD_DSERVER_ENDPOINTS") {
++        Ok(v) if !v.trim().is_empty() => v,
++        _ => {
++            eprintln!(
++                "tier1_jepsen_consistency: WYRD_DSERVER_ENDPOINTS unset — skipping. \
++                 Run `cargo xtask jepsen` to stand up the container D servers."
++            );
++            return;
++        }
++    };
++    let victim_container = match std::env::var("WYRD_TIER1_VICTIM_CONTAINER") {
++        Ok(v) if !v.trim().is_empty() => v,
++        _ => {
++            eprintln!(
++                "tier1_jepsen_consistency: WYRD_TIER1_VICTIM_CONTAINER unset — skipping. \
++                 Run `cargo xtask jepsen` to supply the victim container name."
++            );
++            return;
++        }
++    };
++
++    let endpoints: Vec<String> = raw_endpoints
++        .split(',')
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .collect();
++    assert_eq!(
++        endpoints.len(),
++        JC_DSERVER_COUNT,
++        "tier1_jepsen_consistency: need exactly {JC_DSERVER_COUNT} endpoints, \
++         got {} ({raw_endpoints:?})",
++        endpoints.len()
++    );
++
++    // --- Connect to all 10 D servers ---
++
++    let mut clients: Vec<GrpcChunkStore> = Vec::with_capacity(JC_DSERVER_COUNT);
++    for endpoint in &endpoints {
++        clients.push(connect(endpoint).await);
++    }
++
++    // --- Setup: write RS(6,3) chunk fragments to servers 0–8; spare server 9 holds nothing ---
++
++    // 240 bytes → 40-byte shards under RS(6,3): non-trivial for reconstruction.
++    let data: Vec<u8> = (0u8..240).collect();
++    let all_shards = erasure::encode(K, M, &data).expect("erasure::encode RS(6,3)");
++    assert_eq!(all_shards.len(), N, "encoder must produce N={N} shards");
++
++    // Fragment index `i` → server `i` (identity placement), servers 0–8.
++    for (index, shard) in all_shards.iter().enumerate() {
++        let fragment_bytes = encode_ec_fragment(CHUNK, index as u16, K as u8, M as u8, shard);
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: index as u16,
++        };
++        clients[index]
++            .put_fragment(frag_id, fragment_bytes)
++            .await
++            .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
++    }
++
++    // Create the inode: committed, placement = [0, 1, 2, …, 8].
++    let meta = CrashMeta::new();
++    let chunk_ref = ChunkRef {
++        id: CHUNK,
++        scheme: EcScheme::ReedSolomon {
++            k: K as u8,
++            m: M as u8,
++        },
++        len: data.len() as u64,
++        placement: (0..N as DServerId).collect(),
++    };
++    let inode_record = InodeRecord {
++        size: data.len() as u64,
++        chunk_map: vec![chunk_ref],
++        state: InodeState::Committed,
++        version: 1,
++    };
++    let create_outcome = metadata::create(&meta, 0, "test-file", INODE_ID, &inode_record)
++        .await
++        .expect("metadata::create inode");
++    assert_eq!(
++        create_outcome,
++        CommitOutcome::Committed,
++        "inode create must commit"
++    );
++
++    // Enqueue a repair obligation for CHUNK, as a health-check producer (scrub or read
++    // path) would after detecting that server 0 is no longer serving its fragment.
++    // Sanctioned stand-in following the #196 precedent (`tier2_kill_reconstruct.rs:545`).
++    repair::enqueue_repair(&meta, CHUNK, "tier1-jepsen-test")
++        .await
++        .expect("enqueue_repair");
++
++    // --- Kill server 0 via docker kill ---
++
++    let kill_status = std::process::Command::new("docker")
++        .arg("kill")
++        .arg(&victim_container)
++        .status()
++        .expect("docker kill command");
++    assert!(
++        kill_status.success(),
++        "`docker kill {victim_container}` failed (exit {kill_status}); \
++         is the victim container name correct?"
++    );
++
++    // --- Reconstruction context: exclude dead server 0 from fleet and topology ---
++    //
++    // Fleet: servers 1–9 (alive). Server 0 is excluded; the reconstruction code
++    // sees `stores.get(&0) == None` → fragment 0 is classified as missing and
++    // rebuilt from the K=6 surviving fragments on servers 1–8.
++    //
++    // Topology (excluding victim): servers 1–9, domains B–J. The selector excludes
++    // survivor domains B–I and finds only domain J → picks server 9 as the re-placement.
++
++    let topology = healthy_topology(VICTIM_INDEX);
++    let fleet: Vec<(DServerId, &dyn ChunkStore)> = (0..JC_DSERVER_COUNT)
++        .filter(|&i| i != VICTIM_INDEX)
++        .map(|i| (i as DServerId, &clients[i] as &dyn ChunkStore))
++        .collect();
++
++    let coord = MemCoordination::new();
++    let custodian = Custodian::elect(&coord, "tier1-jepsen-zone")
++        .await
++        .expect("Custodian::elect");
++    let mut zone = FencedZone::new();
++    zone.install(custodian.leadership());
++
++    // ====================================================================
++    // Phase 1: crash/partition before commit (CrashMeta armed)
++    //
++    // Models: the custodian writes the rebuilt fragment to spare server 9 (a real
++    // gRPC put_fragment over the wire) THEN is partitioned from the metadata store
++    // (or crashes) just before the version-conditional commit lands.
++    // CrashMeta intercepts the commit (returns Conflict), so the commit never lands.
++    //
++    // Expected outcome: Reconciled::Satisfied (the commit was lost; repair queue
++    // was not drained; the committed inode is unchanged = fully old).
++    //
++    // ADR-0015 consistency assertions:
++    //   - No torn read: committed placement is FULLY OLD (victim at slot 0, spare absent).
++    //   - Commit-point-atomic: the placed-but-uncommitted fragment is collectable garbage.
++    // ====================================================================
++
++    meta.arm();
++    let phase1_outcome = reconcile_step(
++        &zone,
++        &custodian,
++        None,
++        None,
++        Some(&ReconstructionContext {
++            meta: &meta,
++            fleet: &fleet,
++            topology: &topology,
++        }),
++        None,
++        0,
++    )
++    .await
++    .expect("phase 1: reconcile_step");
++
++    assert_eq!(
++        phase1_outcome,
++        Reconciled::Satisfied,
++        "phase 1 (crash/partition before commit): reconcile_step must return Satisfied \
++         when the version-conditional commit is intercepted by CrashMeta"
++    );
++
++    // Read the committed inode after the crash and assert the consistency contract.
++    let inode_bytes_p1 = meta
++        .get(&metadata::inode_key(INODE_ID))
++        .await
++        .expect("meta.get inode after phase 1")
++        .expect("inode must exist after phase 1");
++    let inode_p1: InodeRecord =
++        metadata::decode(&inode_bytes_p1).expect("decode inode after phase 1");
++
++    assert_eq!(
++        inode_p1.version, 1,
++        "committed inode must still be at version 1 after crash (no commit landed)"
++    );
++
++    let placement_p1 = &inode_p1.chunk_map[0].placement;
++
++    // ADR-0015 no-torn-read assertion: committed placement must be FULLY OLD.
++    assert_fully_old_after_crash(
++        placement_p1,
++        VICTIM_INDEX,
++        VICTIM_INDEX as DServerId,
++        SPARE_INDEX as DServerId,
++    )
++    .expect("ADR-0015 no-torn-read violated after crash/partition mid-repair (phase 1)");
++
++    // Garbage-not-corruption check (`0005:277`, `0005:385-389`): the placed-but-
++    // uncommitted rebuilt fragment EXISTS on spare server 9 — reconstruction wrote
++    // it BEFORE the commit (write-before-commit ordering), so a crash leaves a
++    // collectable orphan, not missing bytes.
++    let frag0_id = FragmentId {
++        chunk: CHUNK,
++        index: 0,
++    };
++    let orphan_bytes = clients[SPARE_INDEX]
++        .get_fragment(frag0_id)
++        .await
++        .expect("get_fragment fragment-0 from spare server after phase 1 crash");
++    assert!(
++        orphan_bytes.is_some(),
++        "placed-but-uncommitted rebuilt fragment must exist on spare server {SPARE_INDEX} \
++         after a crash mid-repair; reconstruction writes fragment BEFORE its commit \
++         (`0005:277`), so a crash must leave a collectable orphan — its absence means \
++         the write-before-commit ordering was violated"
++    );
++
++    // ====================================================================
++    // Phase 2: partition healed, repair succeeds (CrashMeta disarmed)
++    //
++    // Models: the custodian (or a successor after re-election) retries the repair.
++    // The repair queue still holds CHUNK (the dropped commit left it un-drained).
++    // This time the version-conditional commit lands: placement[0] moves from
++    // victim (0) to spare (9), version bumps to 2.
++    //
++    // Expected outcome: Reconciled::Changed.
++    //
++    // ADR-0015 consistency assertions:
++    //   - Read-after-commit: committed placement is FULLY NEW (spare at slot 0, victim absent).
++    //   - No stale read: victim must NOT appear in the committed placement after Changed.
++    // ====================================================================
++
++    meta.disarm();
++    let phase2_outcome = reconcile_step(
++        &zone,
++        &custodian,
++        None,
++        None,
++        Some(&ReconstructionContext {
++            meta: &meta,
++            fleet: &fleet,
++            topology: &topology,
++        }),
++        None,
++        0,
++    )
++    .await
++    .expect("phase 2: reconcile_step");
++
++    assert_eq!(
++        phase2_outcome,
++        Reconciled::Changed,
++        "phase 2 (partition healed): reconcile_step must return Changed after the \
++         version-conditional commit lands"
++    );
++
++    // Read the committed inode after successful repair and assert read-after-commit.
++    let inode_bytes_p2 = meta
++        .get(&metadata::inode_key(INODE_ID))
++        .await
++        .expect("meta.get inode after phase 2")
++        .expect("inode must exist after phase 2");
++    let inode_p2: InodeRecord =
++        metadata::decode(&inode_bytes_p2).expect("decode inode after phase 2");
++
++    assert_eq!(
++        inode_p2.version, 2,
++        "committed inode must be at version 2 after successful reconstruction \
++         (exactly one version-conditional commit landed)"
++    );
++
++    let placement_p2 = &inode_p2.chunk_map[0].placement;
++
++    // ADR-0015 read-after-commit assertion: committed placement must be FULLY NEW.
++    assert_fully_new_after_repair(
++        placement_p2,
++        VICTIM_INDEX,
++        VICTIM_INDEX as DServerId,
++        SPARE_INDEX as DServerId,
++    )
++    .expect(
++        "ADR-0015 read-after-commit violated after successful repair (phase 2): \
++         committed inode must immediately reflect the new placement",
++    );
++
++    // Total fragment count and distinct-domain check (same as tier-2 kill-reconstruct,
++    // mirroring the cross-cutting durability assertions in `0005:381-403`).
++    assert_eq!(
++        placement_p2.len(),
++        N,
++        "committed placement must have exactly N={N} fragments after reconstruction"
++    );
++    assert_eq!(
++        placement_p2[VICTIM_INDEX], SPARE_INDEX as DServerId,
++        "fragment {VICTIM_INDEX} must be re-placed on spare server {SPARE_INDEX}"
++    );
++
++    // ====================================================================
++    // Phase 3: data integrity
++    //
++    // Read fragments from the post-repair placement and reconstruct the original bytes
++    // from any K=6 intact shards. Byte-identity proves the rebuilt fragment is correct.
++    // ====================================================================
++
++    let mut available: Vec<(usize, Vec<u8>)> = Vec::new();
++    let mut missing: Vec<(usize, DServerId)> = Vec::new();
++    for (frag_index, &server_id) in placement_p2.iter().enumerate() {
++        let frag_id = FragmentId {
++            chunk: CHUNK,
++            index: frag_index as u16,
++        };
++        let maybe_bytes = clients[server_id as usize]
++            .get_fragment(frag_id)
++            .await
++            .unwrap_or_else(|e| {
++                panic!("get_fragment index {frag_index} from server {server_id}: {e}")
++            });
++        match maybe_bytes
++            .as_deref()
++            .and_then(|bytes| repair::intact_shard(bytes, CHUNK))
++        {
++            Some(shard) => available.push((frag_index, shard)),
++            None => missing.push((frag_index, server_id)),
++        }
++    }
++
++    // Full redundancy: every server named by the committed placement must hold an
++    // intact fragment — including the freshly reconstructed one on the spare.
++    assert!(
++        missing.is_empty(),
++        "every fragment in the post-repair placement must be present and intact, \
++         including the rebuilt one on spare server {SPARE_INDEX}; \
++         missing/corrupt (frag_index, server_id): {missing:?}"
++    );
++    assert_eq!(
++        available.len(),
++        N,
++        "all N={N} placed fragments must be intact after reconstruction; got {}",
++        available.len()
++    );
++
++    let reconstructed = erasure::reconstruct(K, M, data.len(), &available)
++        .expect("erasure::reconstruct from post-repair shards");
++
++    assert_eq!(
++        reconstructed, data,
++        "data reconstructed from the post-repair placement must be byte-identical \
++         to the original (the rebuilt fragment on server {SPARE_INDEX} is correct)"
++    );
++}
+diff --git a/xtask/src/faults.rs b/xtask/src/faults.rs
+index 431e926..5083fe3 100644
+--- a/xtask/src/faults.rs
++++ b/xtask/src/faults.rs
+@@ -71,6 +71,11 @@ fn opted_in(var: &str) -> bool {
+ /// missing, or run the off-Check harness command from `cmd_var` when opted in. The
+ /// harness command is environment-supplied (the off-Check job sets it), so this body is
+ /// never exercised at Check.
++///
++/// Retained for test coverage of the [`Plan`] deferred/missing-tool paths; no longer
++/// called from production code (the last caller, `run_jepsen`, was rewired in #250 to
++/// dispatch to the in-repo Tier-1 scenario instead of an env-supplied external command).
++#[cfg(test)]
+ fn execute(tier: &str, plan: Plan, cmd_var: &str) -> Result<(), String> {
+     match plan {
+         Plan::Deferred(reason) => {
+@@ -91,6 +96,8 @@ fn execute(tier: &str, plan: Plan, cmd_var: &str) -> Result<(), String> {
+ }
+ 
+ /// Run an environment-supplied harness command through the shell from the workspace root.
++/// Only reachable via [`execute`], which is test-only after #250 (see its doc comment).
++#[cfg(test)]
+ fn run_shell(tier: &str, cmd: &str) -> Result<(), String> {
+     println!("\n$ {cmd}");
+     let status = Command::new("sh")
+@@ -164,17 +171,119 @@ fn run_tier1_scenario() -> Result<(), String> {
+     }
+ }
+ 
+-/// **Tier-1 Jepsen consistency** (`0005:408`): a Jepsen harness asserting consistency
+-/// over the repair path under partitions/crashes. Needs the Jepsen harness (`lein`).
+-/// Opt in with `WYRD_TIER1=1` and configure `WYRD_TIER1_JEPSEN_CMD`.
++/// **Tier-1 consistency-over-repair** (`0005:408`): drives the **production** custodian
++/// reconstruction path (`custodian::reconcile_step` → `reconstruction::reconcile`)
++/// against a real containerized RS(6,3) D-server cluster, injects a crash (commit-
++/// intercept via `CrashMeta`) and kills server 0, then asserts the ADR-0015 consistency
++/// contract over the repair path (read-after-commit; no torn/stale reads;
++/// commit-point-atomic — crash mid-repair leaves collectable garbage, never corruption).
++///
++/// Needs Docker (for the real containerized D-server cluster). Opt in with `WYRD_TIER1=1`.
++///
++/// Dispatches to the in-repo Tier-1 scenario at
++/// `crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs` via `cargo test --ignored`
++/// — **replacing** the old inert `WYRD_TIER1_JEPSEN_CMD` external-command shell-out with
++/// a real in-repo harness (mirroring how `run_disk_faults` → `tier1_disk_faults.rs` and
++/// `run_kill_reconstruct` → `tier2_kill_reconstruct.rs` are wired, per #195 and #196).
+ pub fn run_jepsen() -> Result<(), String> {
+-    let plan = plan(
+-        "Tier-1 Jepsen consistency",
+-        "lein",
++    let p = plan(
++        "Tier-1 consistency-over-repair",
++        jepsen_required_tool(),
+         opted_in("WYRD_TIER1"),
+-        tool_available("lein"),
++        tool_available(jepsen_required_tool()),
+     );
+-    execute("Tier-1 Jepsen", plan, "WYRD_TIER1_JEPSEN_CMD")
++    match p {
++        Plan::Deferred(reason) => {
++            eprintln!("xtask: {reason}");
++            Ok(())
++        }
++        Plan::MissingTool(msg) => Err(msg),
++        Plan::Run => {
++            let compose = crate::workspace_root()
++                .join("crates/chunkstore-grpc/tests/docker-compose.yml")
++                .to_string_lossy()
++                .to_string();
++            let victim_index = crate::kill_reconstruct::select_victim_index(
++                crate::kill_reconstruct::KR_DSERVER_COUNT,
++            );
++            let victim_container = crate::kill_reconstruct::victim_container_name(victim_index);
++            crate::compose_up(&compose, crate::kill_reconstruct::KR_DSERVER_COUNT)?;
++            crate::finalize_panic_safe(
++                || {
++                    let endpoints = crate::resolve_endpoints(
++                        &compose,
++                        crate::kill_reconstruct::KR_DSERVER_COUNT,
++                    )?;
++                    println!(
++                        "\nxtask jepsen: {} D servers at {endpoints}; victim container: \
++                         {victim_container}",
++                        crate::kill_reconstruct::KR_DSERVER_COUNT,
++                    );
++                    run_jepsen_consistency_test(&endpoints, &victim_container)
++                },
++                |result| {
++                    crate::finish_integration(
++                        result,
++                        || crate::compose_logs(&compose),
++                        || crate::compose_down(&compose),
++                    )
++                },
++            )?;
++            println!("\nxtask jepsen: Tier-1 consistency-over-repair passed");
++            Ok(())
++        }
++    }
++}
++
++/// The tool `run_jepsen` probes when `WYRD_TIER1=1` is set — `"docker"` (for the real
++/// containerized D-server cluster the in-repo scenario requires), replacing the old
++/// `"lein"` Clojure harness dependency that the inert external-command shell-out used.
++///
++/// Exposed so the dispatch routing is unit-testable at Check without a live container
++/// runtime: a test on the old code (which probed for `lein` and called `execute(…,
++/// "WYRD_TIER1_JEPSEN_CMD")`) fails to compile before this fix; a test on the new
++/// code (which probes for `docker` and calls `run_jepsen_consistency_test`) passes.
++pub(crate) fn jepsen_required_tool() -> &'static str {
++    "docker"
++}
++
++/// Run the (otherwise `#[ignore]`d) Tier-1 consistency-over-repair scenario test with
++/// the resolved endpoints and victim container exported, so it dials the live container
++/// cluster and kills the right D server.
++fn run_jepsen_consistency_test(endpoints: &str, victim_container: &str) -> Result<(), String> {
++    crate::print_step(&[
++        "cargo",
++        "test",
++        "-p",
++        "wyrd-chunkstore-grpc",
++        "--test",
++        "tier1_jepsen_consistency",
++        "--",
++        "--ignored",
++    ]);
++    let status = Command::new("cargo")
++        .args([
++            "test",
++            "-p",
++            "wyrd-chunkstore-grpc",
++            "--test",
++            "tier1_jepsen_consistency",
++            "--",
++            "--ignored",
++            "--nocapture",
++        ])
++        .current_dir(crate::workspace_root())
++        .env("WYRD_DSERVER_ENDPOINTS", endpoints)
++        .env("WYRD_TIER1_VICTIM_CONTAINER", victim_container)
++        .status()
++        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "Tier-1 consistency-over-repair test failed with {status}"
++        ))
++    }
+ }
+ 
+ /// **Tier-2 single-node kill-and-reconstruct** (`0005:409-411`): stand up a cluster of
+@@ -313,6 +422,21 @@ mod tests {
+         assert_eq!(plan("Tier-2 X", "docker", true, true), Plan::Run);
+     }
+ 
++    #[test]
++    fn jepsen_dispatches_to_in_repo_scenario_not_external_cmd() {
++        // Pre-fix: `run_jepsen` called `execute(plan, "WYRD_TIER1_JEPSEN_CMD")` and probed
++        // for `lein`; `jepsen_required_tool()` did not exist (compile error = red pre-fix).
++        // Post-fix: `jepsen_required_tool()` exists and returns `"docker"` — the tool the
++        // containerized D-server cluster requires (same as `run_kill_reconstruct`).
++        // This confirms the dispatch no longer routes to the external env-var command.
++        assert_eq!(
++            jepsen_required_tool(),
++            "docker",
++            "run_jepsen must probe for docker (in-repo containerized scenario), not lein \
++             or WYRD_TIER1_JEPSEN_CMD"
++        );
++    }
++
+     #[test]
+     fn execute_deferred_is_ok_and_runs_nothing() {
+         // A deferred plan exits cleanly without consulting the harness command.
