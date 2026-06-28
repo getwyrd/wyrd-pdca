@@ -18,6 +18,13 @@
 # gates it. Ship the test as its own file (crates/<c>/tests/<t>.rs) to earn the
 # full red->green.
 #
+# Non-production (manifest) classification (issue #165, v0.43.0): N/A for Wyrd. That
+# exit-77 UNVERIFIABLE branch is for repos whose patch must touch a non-behavioral
+# manifest the test can't move (a translation manifest / file-registration list, e.g.
+# po/POTFILES.{in,skip}). Wyrd is a pure-Rust workspace with no such manifests, so every
+# fix is a real red->green (or the co-located green-only above); there is nothing to
+# classify as UNVERIFIABLE here. Add the exit-77 path only if such a manifest ever appears.
+#
 # Isolation: runs in a dedicated `../wyrd-verify` git worktree off origin/main —
 # never the live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY override.
 #

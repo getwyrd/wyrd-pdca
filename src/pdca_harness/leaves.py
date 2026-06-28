@@ -379,37 +379,72 @@ def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
     )
 
 
-def _variant_applies(spec: dict, d: Path) -> bool:
-    """True iff this builder variant's ``when`` ({field, substring}) matches bundle ``d``'s
-    brief (issue #134) — modelled on :func:`_advisory_applies`. **Default-open**: a variant
-    with no condition, or whose field is absent/doesn't match, does NOT apply, so a missing
-    difficulty tag falls back to the default builder rather than silently reducing
-    capability."""
-    when = spec.get("when") or {}
+def _when_matches(when: dict | None, d: Path, *, default: bool) -> bool:
+    """The single ``when = {field, substring}`` gate predicate (issue #152): the substring is
+    matched case-insensitively against the named brief field. An empty/absent condition
+    yields ``default`` — the one thing the callers differ on: an advisory leaf with no
+    ``when`` runs (``default=True``), a builder variant with no ``when`` is opt-in
+    (``default=False``). Shared by :func:`_advisory_applies` (#64) and :func:`_variant_applies`
+    (#134), so the field/substring matching lives in exactly one place."""
+    when = when or {}
     needle = (when.get("substring") or "").lower()
     if not needle:
-        return False
+        return default
     return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
 
 
-def select_builder(d: Path, cfg: Config, n: int) -> LeafConfig:
-    """Pick the Do builder backend for bundle ``d`` on attempt ``n`` (issues #134/#135).
+def _variant_applies(spec: dict, d: Path) -> bool:
+    """True iff this builder variant's ``when`` matches bundle ``d``'s brief (issue #134).
+    **Default-open**: a variant with no condition (or an absent/non-matching field) does NOT
+    apply, so a missing difficulty tag falls back to the default builder rather than silently
+    reducing capability. Delegates to the shared :func:`_when_matches`."""
+    return _when_matches(spec.get("when"), d, default=False)
 
-    Two layers over the default ``[leaves.builder]``:
-      1. **Difficulty-routed variant (#134)** — the first ``[[leaves.builder_variant]]``
-         whose ``when`` matches the brief (e.g. difficulty=high) wins; default-open, so an
-         absent/unknown field keeps the default.
+
+def _routed_variant(d: Path, cfg: Config) -> dict | None:
+    """The first ``[[leaves.builder_variant]]`` whose ``when`` matches the brief (issue
+    #134), or ``None``."""
+    return next((spec for spec in cfg.builder_variants if _variant_applies(spec, d)), None)
+
+
+def _explicit_model_variant(d: Path, cfg: Config) -> dict | None:
+    """The builder variant the brief names by ``- **Do model:** <name>`` (issue #167), or
+    ``None``. An explicit per-bundle choice matches a variant's ``model`` key (case-folded)
+    and **overrides** the ``when`` routing — so a bundle can pin its Do backend directly,
+    no ``when`` gate required. A name matching no variant is a no-op (warned), falling back
+    to the ``when`` routing / default builder."""
+    if not cfg.builder_variants:  # nothing to match; skip the brief read (no variants ⇒ no-op)
+        return None
+    wanted = brief.do_model(d / "brief.md")
+    if not wanted:
+        return None
+    for spec in cfg.builder_variants:
+        if str(spec.get("model", "")).strip().lower() == wanted.lower():
+            return spec
+    print(f"leaves: brief 'Do model: {wanted}' matches no [[leaves.builder_variant]] "
+          "`model` — using the routed/default builder", file=sys.stderr)
+    return None
+
+
+def select_builder(d: Path, cfg: Config, n: int) -> LeafConfig:
+    """Pick the Do builder backend for bundle ``d`` on attempt ``n`` (issues #134/#135/#167).
+
+    Layers over the default ``[leaves.builder]`` (each later one wins):
+      1. **Variant pick** — the brief may name a backend **explicitly** via
+         ``- **Do model:** <name>`` (#167): the first ``[[leaves.builder_variant]]`` whose
+         ``model`` matches is used, overriding the ``when`` routing. Otherwise the first
+         variant whose ``when`` matches the brief wins (#134, e.g. difficulty=high).
+         Default-open: no explicit name and no ``when`` match keeps the default builder.
       2. **Escalation ladder (#135)** — the entry with the highest ``min_iteration`` ≤ ``n``
          **overrides the variant**, so a bundle that iterates escalates regardless of its
          self-reported difficulty (a hard bundle mis-rated "low" can't loop forever on an
          underpowered executor)."""
     builder = cfg.builder
-    for spec in cfg.builder_variants:  # 1. difficulty routing (first match wins)
-        if _variant_applies(spec, d):
-            builder = _leaf_from_spec(spec, cfg.builder)
-            break
+    spec = _explicit_model_variant(d, cfg) or _routed_variant(d, cfg)  # #167 then #134
+    if spec is not None:
+        builder = _leaf_from_spec(spec, cfg.builder)
     chosen = -1
-    for spec in cfg.builder_escalation:  # 2. escalation OVERRIDES the difficulty pick
+    for spec in cfg.builder_escalation:  # escalation OVERRIDES the variant pick (#135)
         threshold = int(spec.get("min_iteration", 0))
         if chosen < threshold <= n:
             chosen = threshold
@@ -619,6 +654,34 @@ def run_review(d: Path, cfg: Config) -> None:
     _stub_review(d, cfg)
 
 
+def _seed_sandbox_agents(cfg: Config, sandbox: Path) -> None:
+    """Copy the project's ``.claude/agents`` into the sandbox so a leaf running there can
+    resolve ``--agent <name>`` (issue #161).
+
+    Claude Code (>= 2.1.x) discovers project subagents by walking **up from the subprocess
+    cwd**. The reviewer/advisory leaves run in a temp sandbox cwd (the independence
+    contract below), which has no ``.claude/agents`` above it — so ``--agent reviewer``
+    fails and the review degrades to a §6 placeholder. Seeding the agent *definitions* into
+    the sandbox makes them resolvable while **preserving independence**: only the role
+    prompts are copied (never ``build-notes.md``), and the sandbox cwd + each agent's own
+    ``tools:`` still gate which files the leaf can read. **Best-effort**: a missing agents
+    dir, or a copy error (a dangling symlink / unreadable file under ``.claude/agents``),
+    degrades to a no-op — an unresolved ``--agent`` is then handled by the leaf's own
+    failure path (a §6 placeholder), never an aborted Check (issue #161 review).
+    """
+    src = cfg.root / ".claude" / "agents"
+    if not src.is_dir():
+        return
+    try:
+        # ignore_dangling_symlinks: a broken link doesn't stop the good agents seeding; the
+        # try/except: any other copy error degrades to a no-op rather than aborting Check.
+        shutil.copytree(src, sandbox / ".claude" / "agents",
+                        dirs_exist_ok=True, ignore_dangling_symlinks=True)
+    except (shutil.Error, OSError) as exc:
+        print(f"leaves: could not seed sandbox agents from {src} ({exc}); "
+              "`--agent` may not resolve", file=sys.stderr)
+
+
 def _run_review_sandboxed(d: Path, cfg: Config) -> None:
     """Run the reviewer in a temp dir holding ONLY the reviewer inputs.
 
@@ -632,6 +695,7 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             src = d / name
             if src.exists():
                 shutil.copy2(src, sandbox / name)
+        _seed_sandbox_agents(cfg, sandbox)  # so `--agent` resolves from the sandbox cwd (#161)
         # Ground citations on the brief's target checkout (#75): name it via $PDCA_TARGET
         # so the reviewer doesn't wander into unrelated checkouts, and grant read access
         # for the claude family (--add-dir). Independence holds — the target is the
@@ -750,14 +814,11 @@ def advisory_artifact(d: Path, leaf_id: str) -> Path:
 
 
 def _advisory_applies(spec: dict, d: Path) -> bool:
-    """True iff this advisory leaf should run for bundle ``d``. ``when`` ({field,
-    substring}) matches a brief field case-insensitively (like a gate target flag);
-    absent ⇒ always run."""
-    when = spec.get("when") or {}
-    needle = (when.get("substring") or "").lower()
-    if not needle:
-        return True
-    return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
+    """True iff this advisory leaf should run for bundle ``d``. Its ``when`` ({field,
+    substring}) matches a brief field case-insensitively; absent ⇒ always run. Delegates to
+    the shared :func:`_when_matches` (issue #152) — one predicate for both the advisory leaf
+    and the builder variant, no second implementation."""
+    return _when_matches(spec.get("when"), d, default=True)
 
 
 def _advisory_prompt(spec: dict, leaf_id: str) -> str:
@@ -798,6 +859,7 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         for name in REVIEWER_INPUTS:
             if (d / name).exists():
                 shutil.copy2(d / name, sandbox / name)
+        _seed_sandbox_agents(cfg, sandbox)  # so `--agent` resolves from the sandbox cwd (#161)
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
         extra = ["--add-dir", str(target)] if target and leaf.family == "claude" else None
@@ -951,7 +1013,10 @@ def run_act(cfg: Config, date: str) -> None:
 
 def _act_prompt(cfg: Config, date: str) -> str:
     entries = act_mod.index(cfg)
-    index_md = act_mod.render_index(entries, act_mod.patterns(entries))
+    act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
+    recs = act_mod.recurrences(cfg, entries)
+    index_md = act_mod.render_index(entries, act_mod.patterns(entries),
+                                    act_mod.load_ledger(cfg), recs)
     return (
         "You are the Act leaf — cross-cycle process review. Below is the read-only "
         "index of frozen cycles and recurring signals. With the human, decide which "
@@ -964,7 +1029,9 @@ def _act_prompt(cfg: Config, date: str) -> str:
 
 def _stub_act(cfg: Config, date: str) -> None:
     entries = act_mod.index(cfg)
-    text = act_mod.scaffold_entry(entries, act_mod.patterns(entries), date=date)
+    act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
+    recs = act_mod.recurrences(cfg, entries)
+    text = act_mod.scaffold_entry(entries, act_mod.patterns(entries), date=date, recs=recs)
     act_mod.append_entry(cfg, text)
 
 

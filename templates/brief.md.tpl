@@ -21,10 +21,10 @@
   widen it. Omit only for non-structural behavioural bug fixes (principles.md §1.1).>
 - **Repo + branch target:** <owner/repo> @ <branch>   (resolve here at Plan — do not leave to Do)
 - **Onto branch:** <remote>/<existing-pr-branch>   (optional — stack the fix as a commit onto an existing open PR's branch instead of opening a new PR; the fix is tested, committed, and pushed against THIS branch; docs 03)
-- **Depends on:** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; batch/lane scheduling waits until these bundles are COMPLETE before this one runs; docs 09)
-- **Depends on (merged):** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; stricter than Depends on: hold this bundle until each prereq's PR is MERGED, not merely COMPLETE. Use when this edits files a prereq also edits, so Do builds on the merged result instead of conflicting at merge; docs 09)
-- **Conflicts with:** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; never co-schedule these in the same concurrent wave, e.g. they edit a shared file; docs 09)
-- **Stacks on:** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; build THIS on top of the prereq's just-produced branch within the SAME flow run and publish a separate stacked PR (`gh --base <prereq-branch>`), so a file-overlapping chain completes in one run; the base is derived from the prereq, not written here; docs 09)
+- **Depends on:** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; the PRIMARY ordering field. A batch runs as dependency WAVES: this bundle lands in a later wave than its prereqs and builds on their accepted result — the wave driver folds each wave's accepted work onto the base the next builds on, so no human merge is needed between them; docs 09)
+- **Depends on (merged):** <id>[, <id>…]   (optional, DEPRECATED — in the wave model this is just `Depends on`: the wave fold already gives the dependent the prereq's accepted diff without waiting for a merge. Still parsed for back-compat; prefer `Depends on`; docs 09)
+- **Conflicts with:** <id>[, <id>…]   (optional — ids only on the value line, any trailing note is ignored; these edit a shared resource, so they are scheduled into DIFFERENT waves — never built blind on the same base; docs 09)
+- **Stacks on:** <id>[, <id>…]   (optional, DEPRECATED — in the wave model this is just `Depends on`: whole-wave stacking generalises the single-chain Stacks on (and fixes multi-parent). Still parsed for back-compat; prefer `Depends on`; docs 09)
 - **Ordering note:** <optional free text — WHY the scheduling fields above are set as they are (e.g. "depends-on-merged 12 because both edit cache.py"). Not machine-parsed; it documents the human's sequencing decision next to the bare-id fields.>
 - **Surfaces:** <where the change is observable — `gui` (touches the frontend / an E2E
   through the app is needed), `data` (backend/logic only), or `both`. Drives which
@@ -35,6 +35,10 @@
   that). low = a localized one-site change; high = a wide, cross-cutting change. Routes
   the Do backend and review depth (issues #133/#134). Optional; absent/unknown is the safe
   default — no review or capability is skipped on a missing tag.>
+- **Do model:** <optional — pin the Do backend explicitly to a `[[leaves.builder_variant]]`
+  `model` name (e.g. `frontier`), OVERRIDING the difficulty `when` routing. Use when a bundle
+  must run on a specific backend regardless of difficulty (e.g. keep a privacy-sensitive fix on
+  a local model). Absent ⇒ the difficulty routing / default builder; issue #167.>
 - **Scope:** <the defect to remove — one logical fix. MUST NOT name a probe/guard/helper
   (a capability check, `hasattr`, `try/except import`): naming a mechanism seats the fix
   shape for Do. Leave mechanism to Do; Do prefers removing the cause over guarding it
