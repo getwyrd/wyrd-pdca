@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from . import (act, brief, driver, flow, gates, merged, publish, queue, revalidate,
-               signoff, state)
+               revert, signoff, state, waves)
 from .config import Config
 
 
@@ -80,11 +80,18 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="list bundle states (cheap-first queue)")
     p_status.add_argument("issue_id", nargs="?")
 
+    p_waves = sub.add_parser("waves",
+                             help="show the computed dependency-wave plan for a batch (no build)")
+    p_waves.add_argument("issue_ids", nargs="*",
+                         help="ids to schedule; none → every in-flight briefed bundle")
+
     sub.add_parser("queue", help="the cheap-first sign-off burn-down (AWAITING_SIGNOFF)")
 
     p_gates = sub.add_parser("gates", help="run the deterministic Check gates (driver + CI share this)")
     p_gates.add_argument("issue_id", nargs="?")
     p_gates.add_argument("--working-tree", action="store_true", help="repo-scoped gates only (the CI merge re-gate)")
+    p_gates.add_argument("--promotions", action="store_true",
+                         help="list advisory checks clean for their promote_after cycles (#156)")
 
     p_reval = sub.add_parser("revalidate",
                              help="re-run gates on a COMPLETE bundle vs the current engine; write a dated stamp (never re-decides §9)")
@@ -100,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
     p_actlog.add_argument("--since", help="only consider cycles signed off on/after this ISO date")
     p_actlog.add_argument("--date", required=True, help="review date (ISO; Act is out-of-band so pass it)")
     p_actlog.add_argument("--append", action="store_true", help="append to process/act-log.md (default: print)")
+    p_actres = act_sub.add_parser("resolve",
+                                  help="mark a tracked recurring signal as a delta you applied (#149)")
+    p_actres.add_argument("signal", help="substring of the recurring signal to mark applied")
+    p_actres.add_argument("--location", default="", help="where the delta landed (path:line / rule)")
+    p_actres.add_argument("--date", help="applied date (ISO; default today)")
 
     p_signoff = sub.add_parser("signoff", help="record the human Check sign-off (§9)")
     p_signoff.add_argument("issue_id")
@@ -121,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
     p_publish.add_argument("--no-issue", action="store_true",
                            help="no tracker id yet: relax T4 to a flag, record id_pending (vs a magic #0000)")
     p_publish.add_argument("--by", default="", help="who published (recorded in publish.json)")
+
+    p_revert = sub.add_parser("revert",
+                              help="undo a published contribution: a revert PR if merged, else withdraw the PR (#158)")
+    p_revert.add_argument("issue_id")
+    p_revert.add_argument("--dry-run", action="store_true", help="print the git/gh plan without mutating anything")
+    p_revert.add_argument("--by", default="", help="who reverted (recorded in revert.json)")
 
     args = parser.parse_args(argv)
     # --rehearse (#87): a dry-run of the SAME control flow with stub leaves + stub gates
@@ -151,6 +169,8 @@ def main(argv: list[str] | None = None) -> int:
         return _flow(cfg, args)
     if args.cmd == "status":
         return _status(cfg, args.issue_id)
+    if args.cmd == "waves":
+        return _waves(cfg, args.issue_ids)
     if args.cmd == "queue":
         return _queue(cfg)
     if args.cmd == "gates":
@@ -164,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "publish":
         return publish.publish(cfg, args.issue_id, dry_run=args.dry_run,
                                open_pr=not args.no_pr, by=args.by, pending_id=args.no_issue)
+    if args.cmd == "revert":
+        return revert.revert(cfg, args.issue_id, dry_run=args.dry_run, by=args.by)
     return 2
 
 
@@ -304,6 +326,34 @@ def _status(cfg: Config, issue_id: str | None) -> int:
     return 0
 
 
+def _waves(cfg: Config, ids: list[str]) -> int:
+    """Print the computed dependency-wave plan for a batch — deterministic, no build
+    (#wave-model). With no ids, schedules every in-flight briefed bundle. An unschedulable
+    graph (cycle / unresolved dep) is reported, not run."""
+    if ids:
+        bundles = [cfg.bundle(i) for i in ids if (cfg.bundle(i) / "brief.md").exists()]
+    elif cfg.bundle_root.exists():
+        bundles = sorted((d for d in cfg.bundle_root.glob("issue_*")
+                          if d.is_dir() and (d / "brief.md").exists()
+                          and state.state(d) not in (state.COMPLETE, state.DISCONTINUED)),
+                         key=lambda p: p.name)
+    else:
+        bundles = []
+    if not bundles:
+        print("(no briefed bundles to schedule)")
+        return 0
+    try:
+        plan = waves.compute_waves(cfg, bundles)
+    except ValueError as exc:
+        print(f"unschedulable: {exc}", file=sys.stderr)
+        return 1
+    print(f"{len(bundles)} bundle(s) → {len(plan)} wave(s) ({cfg.wave_mode} mode; "
+          f"each wave builds on the prior's accepted work):")
+    for k, wave in enumerate(plan):
+        print(f"  wave {k}: " + ", ".join(d.name.removeprefix("issue_") for d in wave))
+    return 0
+
+
 def _publish_flag(d: Path) -> str:
     """A COMPLETE bundle's publish state (#97): a real publish writes publish.json with the
     PR url; absent ⇒ accepted-but-unpublished (dry-run / no-target / failed / not-yet-run),
@@ -314,10 +364,16 @@ def _publish_flag(d: Path) -> str:
             return "  [close: no PR]"
         return "  [unpublished]"
     try:
-        url = json.loads(pj.read_text(encoding="utf-8")).get("pr_url")
+        rec = json.loads(pj.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return "  [published]"
-    return f"  [PR {url}]" if url else "  [published]"
+    url, base = rec.get("pr_url"), rec.get("base")
+    if not url:
+        return "  [published]"
+    # A stacked PR (#wave-model / #123) targets the wave integration branch, not the base —
+    # show ↑<base> so the human knows to merge the stack bottom-up.
+    stacked = rec.get("mode") in ("stacked-pr", "stacked")
+    return f"  [PR {url}{f' ↑{base}' if stacked else ''}]"
 
 
 def _blocked_by(cfg: Config, d: Path) -> list[str]:
@@ -356,6 +412,8 @@ def _gates(cfg: Config, args: argparse.Namespace) -> int:
     The single-sourced entry point: the driver runs gates per bundle during Do,
     CI runs ``pdca gates --working-tree`` on the PR — same impl, same pdca.toml.
     """
+    if getattr(args, "promotions", False):
+        return _gates_promotions(cfg)
     if args.working_tree:
         result = gates.run_working_tree(cfg)
     else:
@@ -369,6 +427,21 @@ def _gates(cfg: Config, args: argparse.Namespace) -> int:
         result = gates.run_gates(d, cfg)
     print(gates.render_md(result))
     return 1 if result["overall"] == "fail" else 0
+
+
+def _gates_promotions(cfg: Config) -> int:
+    """List advisory checks that have earned promotion to gating (#156) — hint-only."""
+    cands = gates.promotion_candidates(cfg)
+    if not cands:
+        print("no advisory checks ready to promote "
+              "(none with `promote_after` clean across the threshold of recent cycles)")
+        return 0
+    print("Advisory checks that have earned promotion to gating "
+          "(flip `gating = true` in pdca.toml):")
+    for c in cands:
+        print(f"  - {c['id']}: {c['label']}  "
+              f"(passed ≥ {c['threshold']} most-recent frozen cycles)")
+    return 0
 
 
 def _revalidate(cfg: Config, args: argparse.Namespace) -> int:
@@ -400,13 +473,16 @@ def _act(cfg: Config, args: argparse.Namespace) -> int:
         return _act_index(cfg, args)
     if args.act_cmd == "log":
         return _act_log(cfg, args)
+    if args.act_cmd == "resolve":
+        return _act_resolve(cfg, args)
     return 2
 
 
 def _act_index(cfg: Config, args: argparse.Namespace) -> int:
     """Print the read-only Act bundle index across frozen cycles."""
     entries = act.index(cfg, since=args.since)
-    print(act.render_index(entries, act.patterns(entries)))
+    print(act.render_index(entries, act.patterns(entries),
+                           act.load_ledger(cfg), act.recurrences(cfg, entries)))
     return 0
 
 
@@ -421,13 +497,27 @@ def _act_log(cfg: Config, args: argparse.Namespace) -> int:
     if not entries:
         print("no frozen cycles to review (need COMPLETE bundles)", file=sys.stderr)
         return 1
-    text = act.scaffold_entry(entries, act.patterns(entries), date=args.date)
+    act.register_signals(cfg, entries, args.date)  # track recurring signals (#149)
+    text = act.scaffold_entry(entries, act.patterns(entries), date=args.date,
+                              recs=act.recurrences(cfg, entries))
     if args.append:
         log = act.append_entry(cfg, text)
         act.mark_reviewed(cfg)  # a manual Act review resets the flow cadence too (#109)
         print(f"appended entry to {log}")
     else:
         print(text)
+    return 0
+
+
+def _act_resolve(cfg: Config, args: argparse.Namespace) -> int:
+    """Mark a tracked recurring signal as a process-delta the human applied (#149)."""
+    date = args.date or datetime.date.today().isoformat()
+    raw = act.resolve(cfg, args.signal, args.location, date)
+    if raw is None:
+        print(f"act resolve: no open ledger signal matching '{args.signal}' — run "
+              f"`pdca act log` to register recurring signals first", file=sys.stderr)
+        return 1
+    print(f"marked applied ({date}): {raw}")
     return 0
 
 
