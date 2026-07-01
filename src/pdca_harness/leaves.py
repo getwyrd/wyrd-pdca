@@ -308,9 +308,50 @@ def do_plan_batch(cfg: Config, csv: str | None = None, ids: list[str] | None = N
     for iid in ids or []:
         sources.seed(cfg, cfg.bundle(iid))  # seed notes.json + sources/ per bundle (#65/#102)
     if cfg.planner.mode == "command":
+        # On the CSV/default path the planner CHOOSES the ids mid-session, so the per-bundle
+        # seed above never ran for them. Snapshot which bundles ALREADY HAD a brief so we can
+        # flag any briefed THIS session that the seed never reached — including a brief.md
+        # added to a pre-existing UNPLANNED dir, which a dir-name snapshot would miss (#190).
+        before = set() if ids else {d.name for d in cfg.bundle_root.glob("issue_*")
+                                    if (d / "brief.md").exists()}
         _invoke(cfg.planner, cfg.root, _plan_batch_prompt(cfg, csv, ids))
+        if ids is None:
+            _warn_unseeded_briefs(cfg, before)
         return
     _stub_plan_batch(cfg, ids)
+
+
+def _warn_unseeded_briefs(cfg: Config, before: set[str]) -> None:
+    """After a CSV/default batch Plan, flag issues briefed THIS session whose Plan sources were
+    never seeded (#190).
+
+    On the id-seeded path each bundle's notes/sources are fetched first; on the CSV/default
+    path the planner picks the ids *mid-session*, so that per-bundle seed never runs — those
+    briefs rest on the CSV row alone, missing the reporter thread / attached repro. ``before``
+    is the set of bundles that already carried a ``brief.md`` before this session (NOT just the
+    existing dir names — an ``issue_<id>`` dir can pre-exist UNPLANNED and gain its brief now),
+    so a bundle is freshly briefed iff it has a brief that ``before`` lacked. We never auto-run
+    the seeders unattended (a tracker scraper is human-in-the-loop — a browser, a login), so
+    surface it as a VISIBLE sub-step: name the ids and tell the human to seed + refine before
+    the work is driven. No-op when no Plan source is configured (the CSV/docs are then the only
+    source) or every fresh brief already carries notes.json / a sources/ dir."""
+    if not (cfg.notes_cmd or cfg.plan_sources):
+        return
+    unseeded = sorted(
+        d.name.removeprefix("issue_")
+        for d in cfg.bundle_root.glob("issue_*")
+        if d.name not in before and (d / "brief.md").exists()
+        and not (d / "notes.json").exists() and not (d / "sources").is_dir())
+    if not unseeded:
+        return
+    print(
+        f"\nplan: {len(unseeded)} issue(s) briefed this session WITHOUT seeded tracker notes "
+        f"({', '.join(unseeded)}) — the planner chose them mid-session, so they rest on the CSV "
+        f"row alone (no reporter discussion, attached repro, or 'fixed in' hints). Seed their "
+        f"notes/sources (your configured Plan source is human-in-the-loop — a browser / login) "
+        f"and refine the briefs before driving them; don't let the thin briefs flow on "
+        f"unreviewed (#190).",
+        file=sys.stderr)
 
 
 def _plan_batch_prompt(cfg: Config, csv: str | None, ids: list[str] | None = None) -> str:
@@ -544,7 +585,14 @@ def _build_prompt(d: Path) -> str:
         "is headless, a test that imports a heavy module (a GUI toolkit, etc.) AT LOAD "
         "can crash it (and recur every iterate-do) — keep the unit under test "
         "import-light by extracting the logic into an import-free module and testing "
-        "that. Make the patch commit-ready for the TARGET repo: run the project's "
+        "that, which must still drive the PRODUCTION code, not a copy. If the behaviour "
+        "is IRREDUCIBLY GUI/display/IO-bound and no honest headless test can exercise "
+        "production, do NOT fabricate a stand-in / mock / parallel re-implementation that "
+        "passes vacuously — ship patch.diff, explain in build-notes WHY it isn't "
+        "headless-testable plus concrete manual-validation steps, and ship NO test rather "
+        "than a fake one (the honest 'unverifiable' result surfaces a NEEDS-HUMAN item in "
+        "§6 for the human to validate at sign-off). Make the patch commit-ready for the "
+        "TARGET repo: run the project's "
         "configured formatter / commit hooks before declaring done — the publish commit "
         "runs the target's own hooks (formatter/linters), which no PDCA gate models, so a patch the target's "
         "commit hook would reject is not done even if every gate is green. Do NOT push, "
@@ -586,8 +634,9 @@ def reviewer_input_paths(d: Path) -> list[Path]:
 _REVIEW_PROMPT = (
     "You are the Check reviewer — advisory, artifact-only, decorrelated from the "
     "builder. You have ONLY patch.diff, brief.md and check-gates.json in this "
-    "directory (build-notes.md is deliberately withheld). Write check-review.md. "
-    "It MUST contain a complete verdict table — one row for EVERY element of the "
+    "directory (build-notes.md is deliberately withheld). Write check-review.md: open it "
+    "with a one-line outline of the task under review (the bug to fix / functionality to "
+    "implement), then a complete verdict table — one row for EVERY element of the "
     "5/5/1 matrix, in order:\n"
     + "\n".join(f"  {elem} — {label}" for elem, label, _kind, _oracle in gates.canonical_elements())
     + "\nFormat it as a Markdown table `| Item | Verdict | Basis |`, the Item column "
@@ -598,7 +647,12 @@ _REVIEW_PROMPT = (
     "especially for NEEDS-HUMAN rows. Emit NEEDS-HUMAN for the always-human items (validation "
     "fitness-to-purpose, contested root-cause, ambiguous scope) — each NEEDS-HUMAN "
     "row becomes a §6 item the human must clear. Do not omit a row; use N/A with a "
-    "reason when an element does not apply. "
+    "reason when an element does not apply. For a visual / manual-repro NEEDS-HUMAN row, "
+    "verify what you can yourself — where feasible, exercise the change with the patch "
+    "applied at $PDCA_TARGET (run the relevant test, or start/drive the app if the runner "
+    "allows), observe, and report; only where it genuinely can't be driven, hand the human "
+    "concrete runnable steps, not a bare 'needs manual check'. If a verdict turns on an "
+    "investigation, run it and show the result directly — don't ask whether to investigate. "
     "Ground every cited path:line on the target source at $PDCA_TARGET (read-only); "
     "if $PDCA_TARGET is unset, ground against patch.diff alone — do NOT search other "
     "checkouts on the machine. If $PDCA_TARGET is SET yet stale or unreadable (its base "
@@ -1062,18 +1116,36 @@ def _publish_prompt(d: Path, cfg: Config) -> str:
         "the contribution as id_pending for the human to fill the id in later. "
         if trailer else ""
     )
+    # Only build the tracker link for a REAL ticket id — the bare ticket NUMBER (Mantis/GitHub
+    # are numeric). A slug bundle (a fork issue, e.g. `820-build-toolchain-coverage`), a
+    # `--no-issue` / id_pending placeholder (e.g. `PEND`), or any non-numeric id has no real
+    # ticket, so `issue_url_pattern.format(id=…)` would yield a broken link — omit it then,
+    # mirroring the trailer's id_pending handling (#192/#196). A non-numeric tracker simply
+    # won't auto-link: the safe failure (no broken URL; the bare id still shows).
+    real_ticket = issue_id.isdigit()
+    issue_url = (cfg.issue_url_pattern.format(id=issue_id)
+                 if cfg.issue_url_pattern and real_ticket else "")
+    link_clause = (
+        f" Hyperlink the tracker ticket as a Markdown link to {issue_url} (link the id — "
+        "not just the bare number) so a reader can click through to the report."
+        if issue_url else ""
+    )
     return (
         "You are the Publish leaf — the closing work of Check. The fix for issue "
         f"{issue_id} is ACCEPTED; with the human, write TWO contribution artifacts in "
         f"{d}, following the project's contributor rules (docs/INTEGRATION.md §4). "
         f"Target: {target}. Read {d}/brief.md + {d}/build-notes.md + {d}/patch.diff for "
         "content; cite the target source with `git -C <checkout>` (never `cd <checkout> "
-        "&& git`).\n"
+        f"&& git`). Also read {d}/SUMMARY.md §10 ('Act candidates'): fold any 'PR "
+        "description must include …' (or commit-scoped) note into the artifact you write "
+        "before drafting; a 'tracker-comment must include …' item is NOT yours (you write "
+        "only commit-msg.txt + pr-description.md) — leave it (#177).\n"
         f"1) {d}/commit-msg.txt — a summary ≤70 chars, then a blank line, then the body "
         f"wrapped ≤80; reference any other commit by its FULL hash. {trailer_line}\n"
-        f"2) {d}/pr-description.md — lead with a plain-language Summary + What to look at "
-        f"(for non-implementors), then Root cause / Fix, then a Verification claim→evidence "
-        f"trail citing path:lines on the target branch; no internal jargon (see {pr_tpl}).\n"
+        f"2) {d}/pr-description.md — open the Summary with the bug's USER-VISIBLE effect "
+        "(what the user experiences), then the one-line change + What to look at (for "
+        f"non-implementors), then Root cause / Fix, then a Verification claim→evidence "
+        f"trail citing path:lines on the target branch; no internal jargon (see {pr_tpl}).{link_clause}\n"
         "Write ONLY those two files. Do NOT push, branch, or open a PR — the driver's "
         "`pdca publish` does the branch/apply/commit/push/draft-PR after you finish."
     )

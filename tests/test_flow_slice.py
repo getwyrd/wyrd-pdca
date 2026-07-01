@@ -225,6 +225,31 @@ class FlowSlice(unittest.TestCase):
         # the re-opened bundle re-planned, rebuilt, and preserved its first attempt
         self.assertTrue((self.cfg.bundle("BATCH1") / "iteration-v1").is_dir())
 
+    def test_iterate_plan_reopens_immediately_iterate_do_deferred(self) -> None:
+        # #174: in the batch sweep (apply_now=False), an iterate-plan re-open is applied
+        # IMMEDIATELY (archive → UNPLANNED, no rebuild) so the next pass's Plan pre-pass
+        # re-plans it BEFORE the deferred iterate-do bundles rebuild. An iterate-do stays
+        # deferred (ITERATE_DO, no archive/rebuild) so it can't interrupt the queue review.
+        dp = self.cfg.bundle("IPLAN")
+        self.assertTrue(flow._plan_if_unplanned(self.cfg, dp, None))
+        self.assertEqual(driver.run_issue(dp, self.cfg), state.AWAITING_SIGNOFF)
+        (dp / leaves.SIGNOFF_DECISION).write_text(
+            "iterate-plan\nneeds a different approach\n", encoding="utf-8")
+        self.assertEqual(flow._apply_decision(
+            self.cfg, dp, by="t", today="2026-06-04", apply_now=False), "iterate-plan")
+        self.assertEqual(state.state(dp), state.UNPLANNED)   # re-opened immediately
+        self.assertTrue((dp / "iteration-v1").is_dir())      # attempt archived
+
+        dd = self.cfg.bundle("IDO")
+        self.assertTrue(flow._plan_if_unplanned(self.cfg, dd, None))
+        self.assertEqual(driver.run_issue(dd, self.cfg), state.AWAITING_SIGNOFF)
+        (dd / leaves.SIGNOFF_DECISION).write_text(
+            "iterate-do\nfix the off-by-one\n", encoding="utf-8")
+        self.assertEqual(flow._apply_decision(
+            self.cfg, dd, by="t", today="2026-06-04", apply_now=False), "iterate-do")
+        self.assertEqual(state.state(dd), state.ITERATE_DO)  # deferred, NOT yet rebuilt
+        self.assertFalse((dd / "iteration-v1").is_dir())     # no archive/rebuild on the spot
+
     def test_batch_signoff_chunks_into_sessions(self) -> None:
         # The cheap-first queue is signed off in ONE session per chunk of
         # SIGNOFF_BATCH_SIZE (=5): six halted bundles → sessions of 5 then 1, all
@@ -313,6 +338,23 @@ class FlowSlice(unittest.TestCase):
         results = flow.flow_batch(self.cfg, today="2026-06-04")
         self.assertEqual(set(results), {"BATCH1", "BATCH2", "RESUME"})
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
+
+    def test_batch_holds_a_stale_dep_bundle_without_aborting(self) -> None:
+        # #191: a leftover in-flight bundle with a stale `Depends on: GHOST` must NOT abort the
+        # whole resume sweep — it is held (left in-flight), and the rest of the batch still runs.
+        bad = self.cfg.bundle("BADDEP")
+        leaves.do_plan(bad, self.cfg)                        # pre-briefed leftover (PLANNED)
+        bp = bad / "brief.md"
+        bp.write_text(bp.read_text(encoding="utf-8") + "- **Depends on:** GHOST\n",
+                      encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            results = flow.flow_batch(self.cfg, today="2026-06-04")
+        self.assertEqual(set(results), {"BATCH1", "BATCH2"})            # BADDEP held, not driven
+        self.assertTrue(all(s == state.COMPLETE for s in results.values()))
+        self.assertEqual(state.state(bad), state.PLANNED)              # left in-flight for a re-run
+        self.assertIn("issue_BADDEP held this run", err.getvalue())
+        self.assertIn("GHOST", err.getvalue())
 
     def test_batch_leaves_complete_bundle_alone_on_rerun(self) -> None:
         # First run completes BATCH1/BATCH2. A second run re-briefs them (stub) but
@@ -832,7 +874,7 @@ class DeclaredOrdering(unittest.TestCase):
 
         def spy(d: Path, cfg: Config):
             if d.name not in order:
-                order.append(d.name)
+                order.append(d.name)  # first touch = the Do beat, in dispatch order
             return real(d, cfg)
 
         driver.advance = spy
@@ -901,7 +943,7 @@ class DeclaredOrdering(unittest.TestCase):
 
         def spy(d: Path, cfg: Config):
             if d.name not in order:
-                order.append(d.name)  # first touch = the Do beat, in dispatch order
+                order.append(d.name)
             return real(d, cfg)
 
         driver.advance = spy
@@ -1357,6 +1399,125 @@ class ActCadence(unittest.TestCase):
         before = self._log().read_text(encoding="utf-8")
         flow.flow(self.cfg, "R4", do_act=True, today="2026-06-04")   # only 1 since → below cadence
         self.assertEqual(self._log().read_text(encoding="utf-8"), before)  # no new Act entry
+
+
+class RunnableMergeGate(unittest.TestCase):
+    """`_runnable` keeps the #107 merge-gate for an *out-of-batch* `Depends on (merged)`
+    prereq (#186): the wave fold carries only in-batch prereqs into the next base, so an
+    out-of-batch one must be genuinely MERGED — COMPLETE-but-PR-open is not enough."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = _stub_config(self.tmp)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _brief(self, iid: str, body_extra: str = "") -> Path:
+        d = self.cfg.bundle(iid)
+        d.mkdir(parents=True)
+        (d / "brief.md").write_text(
+            f"- **Slug:** {iid.lower()}\n- **Repo + branch target:** org/repo @ main\n"
+            + body_extra, encoding="utf-8")
+        return d
+
+    def _complete(self, iid: str) -> Path:
+        d = self._brief(iid)
+        (d / "patch.diff").write_text("diff --git a/x b/x\n", encoding="utf-8")
+        (d / "check-gates.json").write_text("{}", encoding="utf-8")
+        shutil.copyfile(TEMPLATES / "SUMMARY.md.tpl", d / "SUMMARY.md")
+        signoff.record(d / "SUMMARY.md", action="accept", by="T", date="2026-06-05")
+        self.assertEqual(state.state(d), state.COMPLETE)
+        return d
+
+    def test_out_of_batch_depends_on_merged_waits_until_merged(self) -> None:
+        # B `Depends on (merged): X`, X from a PRIOR run (not in this batch). Nothing here
+        # carries X's diff into the base, so X must be MERGED, not merely COMPLETE (#186).
+        b = self._brief("B", "- **Depends on (merged):** X\n")
+        with mock.patch("pdca_harness.flow.merged.is_merged", return_value=False) as m:
+            self.assertEqual(flow._runnable(self.cfg, [b], {b.name}), [])   # X's PR open → defer
+        m.assert_called_once_with(self.cfg, "X")
+        with mock.patch("pdca_harness.flow.merged.is_merged", return_value=True):
+            self.assertEqual(flow._runnable(self.cfg, [b], {b.name}), [b])  # X merged → runnable
+
+    def test_in_batch_depends_on_merged_rides_the_fold_without_gh(self) -> None:
+        # An IN-BATCH `Depends on (merged)` prereq is carried by the fold once COMPLETE — no
+        # `gh`/merge check (the regression #186 must not over-correct an in-batch dep into).
+        p = self._complete("P")
+        b = self._brief("B", "- **Depends on (merged):** P\n")
+        with mock.patch("pdca_harness.flow.merged.is_merged") as m:
+            runnable = flow._runnable(self.cfg, [b], {b.name, p.name})
+        m.assert_not_called()
+        self.assertEqual(runnable, [b])
+
+    def test_out_of_batch_plain_depends_on_keeps_complete_bar(self) -> None:
+        # A plain out-of-batch `Depends on` keeps the COMPLETE-on-disk bar (#171) — no merge
+        # check; only the `(merged)` variant carries the stricter gate.
+        self._complete("PRIOR")
+        b = self._brief("B", "- **Depends on:** PRIOR\n")
+        with mock.patch("pdca_harness.flow.merged.is_merged") as m:
+            self.assertEqual(flow._runnable(self.cfg, [b], {b.name}), [b])
+        m.assert_not_called()
+
+
+class PlanBatchUnseededWarning(unittest.TestCase):
+    """`do_plan_batch` surfaces a VISIBLE warning (#190) when the CSV/default planner briefs an
+    id mid-session without seeded tracker notes — it never lets a CSV-row-only brief flow on
+    silently. (The seeders are never auto-run unattended; the human seeds + refines.)"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = _stub_config(self.tmp)
+        self.cfg.planner = LeafConfig(mode="command", argv=["true"], interactive=True)
+        self.cfg.notes_cmd = "fetch-notes"            # a Plan source IS configured
+        self.cfg.bundle_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _planner_writes(self, *, notes: bool):
+        def _fake(*_a, **_k):                          # simulate the planner choosing an id
+            d = self.cfg.bundle("CHOSEN")
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "brief.md").write_text("- **Slug:** chosen\n", encoding="utf-8")
+            if notes:
+                (d / "notes.json").write_text("{}", encoding="utf-8")
+        return _fake
+
+    def _run_csv_plan(self) -> str:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            leaves.do_plan_batch(self.cfg, csv="export.csv")   # ids=None → the CSV path
+        return err.getvalue()
+
+    def test_warns_when_csv_planner_briefs_without_notes(self) -> None:
+        with mock.patch("pdca_harness.leaves._invoke",
+                        side_effect=self._planner_writes(notes=False)):
+            msg = self._run_csv_plan()
+        self.assertIn("WITHOUT seeded tracker notes", msg)
+        self.assertIn("CHOSEN", msg)
+
+    def test_warns_for_a_brief_added_to_a_preexisting_unplanned_dir(self) -> None:
+        # An `issue_<id>` dir can already exist UNPLANNED (no brief); the planner adds brief.md
+        # to it mid-session. That's still a NEW brief without notes — must warn (we snapshot
+        # which dirs HAD a brief, not just dir names; Codex review on #198).
+        self.cfg.bundle("CHOSEN").mkdir(parents=True, exist_ok=True)   # pre-existing empty dir
+        with mock.patch("pdca_harness.leaves._invoke",
+                        side_effect=self._planner_writes(notes=False)):
+            msg = self._run_csv_plan()
+        self.assertIn("WITHOUT seeded tracker notes", msg)
+        self.assertIn("CHOSEN", msg)
+
+    def test_no_warning_when_the_brief_carries_notes(self) -> None:
+        with mock.patch("pdca_harness.leaves._invoke",
+                        side_effect=self._planner_writes(notes=True)):
+            self.assertNotIn("WITHOUT seeded tracker notes", self._run_csv_plan())
+
+    def test_no_warning_when_no_plan_source_configured(self) -> None:
+        self.cfg.notes_cmd = ""                        # no notes_cmd, no plan.sources
+        with mock.patch("pdca_harness.leaves._invoke",
+                        side_effect=self._planner_writes(notes=False)):
+            self.assertNotIn("WITHOUT seeded tracker notes", self._run_csv_plan())
 
 
 if __name__ == "__main__":

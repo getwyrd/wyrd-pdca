@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from pdca_harness import gates, publish, signoff, state
+from pdca_harness import gates, leaves, publish, signoff, state
 from pdca_harness.config import Config, LeafConfig
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
@@ -86,6 +86,40 @@ class PublishSlice(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_publish_prompt_directs_the_leaf_to_read_summary_section10(self) -> None:
+        # #177: the per-invocation publish prompt must point the leaf at SUMMARY.md §10 so it
+        # folds reviewer "PR description must include …" Act-candidate notes into the PR body.
+        d = _bundle(self.cfg, "P10", brief_body=_FIX_BRIEF, accepted=True)
+        prompt = leaves._publish_prompt(d, self.cfg)
+        self.assertIn("SUMMARY.md", prompt)
+        self.assertIn("§10", prompt)
+
+    def test_publish_prompt_hyperlinks_tracker_when_pattern_set(self) -> None:
+        # #266: with [tracker].issue_url_pattern set, the publish prompt instructs the leaf
+        # to hyperlink the resolved ticket URL (not just the bare id); absent ⇒ no link clause.
+        d = _bundle(self.cfg, "266", brief_body=_FIX_BRIEF, accepted=True)   # a numeric ticket id
+        self.cfg.issue_url_pattern = "https://tracker/view.php?id={id}"
+        prompt = leaves._publish_prompt(d, self.cfg)
+        self.assertIn("https://tracker/view.php?id=266", prompt)
+        self.assertIn("Hyperlink the tracker ticket", prompt)
+        self.cfg.issue_url_pattern = ""
+        self.assertNotIn("Hyperlink the tracker ticket", leaves._publish_prompt(d, self.cfg))
+
+    def test_publish_prompt_omits_link_for_a_slug_or_pending_bundle(self) -> None:
+        # #192/#196: a slug bundle (fork issue), a `--no-issue`/id_pending placeholder, or any
+        # non-numeric id has no real ticket number, so the pattern would format a broken link —
+        # omit the clause even with issue_url_pattern set (the bare-number trailer is gated the
+        # same way). Only a real ticket NUMBER links.
+        self.cfg.issue_url_pattern = "https://tracker/view.php?id={id}"
+        for iid in ("820-build-toolchain-coverage", "PEND"):     # slug, then a pending placeholder
+            d = _bundle(self.cfg, iid, brief_body=_FIX_BRIEF, accepted=True)
+            prompt = leaves._publish_prompt(d, self.cfg)
+            self.assertNotIn("Hyperlink the tracker ticket", prompt)        # no link clause
+            self.assertNotIn(f"view.php?id={iid}", prompt)                  # no broken URL
+        # …but a real numeric ticket still gets the link.
+        num = _bundle(self.cfg, "13865", brief_body=_FIX_BRIEF, accepted=True)
+        self.assertIn("https://tracker/view.php?id=13865", leaves._publish_prompt(num, self.cfg))
 
     def test_dry_run_plans_commands_and_writes_artifacts(self) -> None:
         d = _bundle(self.cfg, "PUB", brief_body=_FIX_BRIEF, accepted=True)
@@ -333,10 +367,9 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("pending-id", err.getvalue().lower())
 
-    def test_stacked_pr_targets_the_parent_branch(self) -> None:
-        # #123: a `Stacks on:` dependent cuts its branch off the parent's PUBLISHED branch
-        # and targets the PR at it (a separate stacked PR); the base is derived from the
-        # parent's publish.json, never hand-written into the brief.
+    def _stacked_dry_run(self, *, base_remote: str) -> str:
+        # A `Stacks on:` dependent whose parent has a published branch — dry-run publish.
+        self.cfg.base_remote = base_remote
         parent = self.cfg.bundle("PARENT")
         parent.mkdir(parents=True)
         (parent / "publish.json").write_text(json.dumps({"branch": "fix/PARENT-my-fix"}),
@@ -346,11 +379,26 @@ class PublishSlice(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             rc = publish.publish(self.cfg, "DEP", dry_run=True, by="T", today="2026-06-05")
-        out = buf.getvalue()
         self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_fork_stacked_pr_targets_upstream_base_with_cumulative_diff(self) -> None:
+        # #185: a fork's parent/integration branch lives on origin (the fork) and can't be a
+        # `gh --base` (which must be an UPSTREAM branch). So a fork stacked PR cuts its branch
+        # off the parent (carrying the cumulative diff) but opens against the upstream base.
+        out = self._stacked_dry_run(base_remote="upstream")
         self.assertIn("checkout -B fix/DEP-my-fix origin/fix/PARENT-my-fix", out)  # off parent
-        self.assertIn("--base fix/PARENT-my-fix", out)                             # PR base = parent
-        self.assertIn("stacked draft PR", out)
+        self.assertIn("--base main", out)                          # PR base = upstream base, not the fork branch
+        self.assertNotIn("--base fix/PARENT-my-fix", out)          # NOT the fork integration/parent branch
+        self.assertIn("cumulative diff", out)
+
+    def test_own_repo_stacked_pr_chains_onto_the_parent_branch(self) -> None:
+        # Own-repo (base on origin): the parent/integration branch IS an upstream branch, so a
+        # clean, increment-only stacked PR `--base`s onto it (#123 / #185).
+        out = self._stacked_dry_run(base_remote="origin")
+        self.assertIn("checkout -B fix/DEP-my-fix origin/fix/PARENT-my-fix", out)  # off parent
+        self.assertIn("--base fix/PARENT-my-fix", out)             # PR base = parent branch
+        self.assertNotIn("cumulative diff", out)
 
     def test_stacked_pr_without_published_parent_errors(self) -> None:
         # The dependent can't stack until its parent has published a branch — a standalone

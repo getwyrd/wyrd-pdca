@@ -24,8 +24,8 @@ import sys
 import threading
 from pathlib import Path
 
-from . import (act, driver, gates, integrate, lane, leaves, merge, publish, queue,
-               signoff, state, waves)
+from . import (act, brief, driver, gates, integrate, lane, leaves, merge, merged,
+               publish, queue, signoff, state, waves)
 from .config import Config
 
 
@@ -75,11 +75,13 @@ def _apply_decision(
     applied, ``None`` if no decision / unrecordable, or ``"blocked"`` if an accept was
     refused because §6 NEEDS-HUMAN is still open. Pure deterministic code — no leaf.
 
-    ``apply_now`` advances the bundle immediately (single-issue ``flow``); the batch
-    sweep passes ``apply_now=False`` so an ``iterate-do`` / ``iterate-plan`` does NOT
-    rebuild on the spot — the human first reviews the whole sign-off queue, and the
-    next pass's build-all applies every iteration together. (``accept`` is final at
-    ``record`` regardless — ``state`` becomes COMPLETE without a re-drive.)
+    ``apply_now`` advances the bundle immediately (single-issue ``flow``). The batch
+    sweep passes ``apply_now=False`` so an ``iterate-do`` does NOT rebuild on the spot —
+    the human reviews the whole cheap-first queue first, and the next pass's build-all
+    rebuilds. An ``iterate-plan`` re-open is applied **even then** (it only archives →
+    UNPLANNED — no rebuild), so the next pass's serial Plan pre-pass re-plans it BEFORE
+    those deferred rebuilds, not a pass later (issue #174). (``accept`` is final at
+    ``record`` — ``state`` becomes COMPLETE without a re-drive.)
     """
     action = leaves.signoff_decision(d)
     if not action:
@@ -105,8 +107,12 @@ def _apply_decision(
     signoff.record(d / "SUMMARY.md", action=action, by=by or cfg.author or "unknown",
                    date=today, delta=rationale)
     (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
-    if apply_now:
-        driver.run_issue(d, cfg)  # apply the transition: COMPLETE | ITERATE_* → re-loop
+    # Apply now for single-issue flow; in the batch sweep apply an ``iterate-plan`` re-open
+    # too — it only archives → UNPLANNED (no rebuild), so it can't interrupt the cheap-first
+    # queue review, and the next pass's Plan pre-pass then re-plans it BEFORE the deferred
+    # iterate-do rebuilds (issue #174). ``iterate-do`` (a headless rebuild) stays deferred.
+    if apply_now or action == "iterate-plan":
+        driver.run_issue(d, cfg)  # COMPLETE | ITERATE_* → re-loop (iterate-plan: archive → UNPLANNED)
     return action
 
 
@@ -328,22 +334,54 @@ def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str) -> None:
 # Shared multi-bundle driver: compute waves → per wave (drive → cheap-first sign-off →
 # publish → fold onto the integration branch the next wave builds on) → Act once (docs 09).
 # ----------------------------------------------------------------------------
-def _runnable(cfg: Config, wave: list[Path]) -> list[Path]:
-    """Drop a wave bundle whose declared prerequisite never reached COMPLETE — e.g. one
-    DISCONTINUED in an earlier wave. Such a dependent can't build on a base missing its
-    prerequisite's change, so it is skipped loudly; since it never completes, its own
-    dependents fall out of later waves the same way (the skip cascades)."""
+def _runnable(cfg: Config, wave: list[Path], batch_names: set[str]) -> list[Path]:
+    """Drop a wave bundle whose declared prerequisite isn't ready to build on top of.
+
+    A prerequisite **in this run's batch** is carried into the dependent's base by the wave
+    fold once it reaches COMPLETE (it sits in an earlier wave), so COMPLETE is the bar — e.g.
+    a prereq DISCONTINUED earlier never gets there, and its dependent is skipped loudly. A
+    prerequisite **outside this batch** (a prior run's) is gated on its on-disk COMPLETE state
+    (archived `completed/` too, #171) — **except** an out-of-batch ``Depends on (merged)``
+    prereq, which keeps its stricter #107 merge-gate (#186): nothing in *this* run carries an
+    out-of-batch prereq's diff into the base, and COMPLETE means only "a draft PR was opened",
+    so a dependent built on a COMPLETE-but-unmerged base would miss the prerequisite. It must
+    wait until the PR is genuinely merged (``merged.is_merged``) — a later ``pdca flow`` run
+    then picks it up. A skipped bundle never completes, so its own dependents fall out of later
+    waves the same way (the skip cascades)."""
     runnable: list[Path] = []
     for d in wave:
         bp = d / "brief.md"
-        unmet = [dep for dep in (waves.declared_deps(bp) if bp.exists() else [])
-                 if state.state(cfg.bundle(dep)) != state.COMPLETE]
+        merged_deps = set(brief.depends_on_merged(bp)) if bp.exists() else set()
+        unmet: list[str] = []
+        for dep in (waves.declared_deps(bp) if bp.exists() else []):
+            out_of_batch = cfg.bundle(dep).name not in batch_names
+            if out_of_batch and dep in merged_deps:
+                if not merged.is_merged(cfg, dep):  # PR not yet merged — wait, don't build (#186)
+                    unmet.append(dep)
+            elif state.state(cfg.find_bundle(dep)) != state.COMPLETE:  # archived prereq too (#171)
+                unmet.append(dep)
         if unmet:
-            print(f"flow: {d.name} skipped — prerequisite(s) not COMPLETE "
+            print(f"flow: {d.name} skipped — prerequisite(s) not ready "
                   f"({', '.join(unmet)}); not built on a base missing them.", file=sys.stderr)
         else:
             runnable.append(d)
     return runnable
+
+
+def _point_at_integration(integ: dict[tuple[str, str], str], runnable: list[Path]) -> None:
+    """Reconcile each runnable bundle's stack base with THIS run's integration state (#187).
+
+    ``integ`` maps each integrated target to its run-scoped integration branch. A bundle is
+    pointed at the branch for **its own** ``(repo, base)`` target only — never a sibling
+    target's, which is absent on that repo or carries unrelated patches. A bundle whose target
+    wasn't integrated this run has any **stale** stack base (left by a prior/resumed run)
+    cleared, so it builds off its own target base rather than an old integration branch."""
+    for d in runnable:
+        branch = integ.get(publish._resolve_target(d)[:2])
+        if branch:
+            publish.write_stack_base(d, branch)
+        else:
+            publish.clear_stack_base(d)
 
 
 def _audit_wave_overlap(wave: list[Path]) -> None:
@@ -421,18 +459,19 @@ def _drive_and_act(
     """
     wave_list = waves.compute_waves(cfg, bundles)  # validates (raises) + levels the batch
     last = len(wave_list) - 1
+    batch_names = {b.name for b in bundles}  # in-batch prereqs ride the fold; #186 gates the rest
     published: set[str] = set()
     accepted: list[Path] = []        # cumulative COMPLETE bundles, wave then name order
-    integ_branch: str | None = None  # the live integration branch a later wave stacks on
+    integ: dict[tuple[str, str], str] = {}  # per-target (repo, base) → integration branch (#187)
     for k, wave in enumerate(wave_list):
-        runnable = _runnable(cfg, wave)
+        runnable = _runnable(cfg, wave, batch_names)
         if not runnable:
             continue
-        # A later wave stacks on the prior waves' folded work: point each bundle's Do
-        # worktree + stacked PR at the integration branch (read via _stack_base_branch).
-        if integ_branch:
-            for d in runnable:
-                publish.write_stack_base(d, integ_branch)
+        # Reconcile each runnable bundle's stack base with this run's integration state:
+        # point it at its OWN (repo, base) target's branch, or clear a stale marker a
+        # prior/resumed run left so it builds off its own base (#187). Unconditional — the
+        # stale-clear must run even before any wave has folded (integ still empty).
+        _point_at_integration(integ, runnable)
         _drive_wave(cfg, runnable, by=by, today=today, max_passes=max_passes)
         complete = [d for d in sorted(runnable, key=lambda p: p.name)
                     if state.state(d) == state.COMPLETE]
@@ -455,22 +494,24 @@ def _drive_and_act(
                     print(f"flow: wave {k} did not merge; STOPPING — later waves not run.",
                           file=sys.stderr)
                     break
-            else:  # default: stack — fold onto the integration branch
+            else:  # default: stack — fold onto a per-target integration branch
                 try:
-                    branch, wt = integrate.fold(cfg, accepted, dry_run=dry)
+                    folded = integrate.fold(cfg, accepted, dry_run=dry)
                 except integrate.IntegrationError as exc:
                     print(f"flow: wave {k} did not integrate ({exc}); STOPPING — later "
                           f"waves not run.", file=sys.stderr)
                     break
-                if branch and not dry:
-                    integ_branch = branch
-                    # Optional re-gate (#wave-model): validate the folded combination over
-                    # the integration tip before the next wave builds on it; red ⇒ STOP.
-                    if cfg.regate_between_waves and wt is not None and \
-                            gates.run_integration(cfg, wt).get("overall") == "fail":
-                        print(f"flow: wave {k} integration re-gate FAILED — the combination "
-                              f"is red though each fix was green alone; STOPPING (later "
-                              f"waves not run).", file=sys.stderr)
+                if folded and not dry:
+                    integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
+                    # Optional re-gate (#wave-model): validate EACH folded combination over
+                    # its integration tip before the next wave builds on it; any red ⇒ STOP.
+                    if cfg.regate_between_waves and any(
+                            wt is not None
+                            and gates.run_integration(cfg, wt).get("overall") == "fail"
+                            for _tgt, (_branch, wt) in folded.items()):
+                        print(f"flow: wave {k} integration re-gate FAILED — a combination is "
+                              f"red though each fix was green alone; STOPPING (later waves "
+                              f"not run).", file=sys.stderr)
                         break
 
     results = {d.name.replace("issue_", ""): state.state(d) for d in bundles}
@@ -517,6 +558,18 @@ def flow_batch(
     if not bundles:
         print("flow: nothing to do — no in-flight briefs (all COMPLETE or none authored; "
               "brief new issues to add work).", file=sys.stderr)
+        return {}
+    # Resume tolerance (#191): the sweep pulls in EVERY in-flight bundle, so a stale /
+    # misconfigured `Depends on` in an unrelated leftover must not abort the whole run. Hold
+    # (skip this run, leave in-flight) any bundle with an unresolvable dependency or in a
+    # cycle — plus its in-batch dependents — and drive the schedulable remainder.
+    bundles, held = waves.partition_schedulable(cfg, bundles)
+    for name, reason in sorted(held.items()):
+        print(f"flow: {name} held this run — {reason}; left in-flight (resolve it, then "
+              f"re-run).", file=sys.stderr)
+    if not bundles:
+        print("flow: nothing schedulable — every in-flight bundle is held on an unresolved "
+              "dependency or a cycle.", file=sys.stderr)
         return {}
     return _drive_and_act(cfg, bundles, do_publish=do_publish, do_act=do_act, by=by,
                           today=today, max_passes=max_passes)

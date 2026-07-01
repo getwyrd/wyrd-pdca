@@ -93,6 +93,10 @@ class Config:
     # prior fork behavior for a config lacking the key.
     base_remote: str = "upstream"
     issue_trailer: str = "Fixes #{id}"  # commit/PR trailer; "" → none enforced
+    # Optional issue-URL template (``.format(id=)``) so the publisher HYPERLINKS the tracker
+    # ticket in the PR body, not just the bare id (e.g. Mantis ".../view.php?id={id}",
+    # GitHub ".../issues/{id}"). "" ⇒ no link (the bare trailer, as today).
+    issue_url_pattern: str = ""
     repo_checkouts: dict[str, str] = field(default_factory=dict)  # repo_spec → local path
     gates_checks: list[dict] = field(default_factory=list)
     # Optional advisory reviewer leaves (issue #64): an OPEN list of extra, role-distinct
@@ -172,6 +176,24 @@ class Config:
     def bundle(self, issue_id: str) -> Path:
         """The per-cycle bundle directory for an issue id."""
         return self.bundle_root / f"issue_{issue_id}"
+
+    def find_bundle(self, issue_id: str) -> Path:
+        """Resolve an EXISTING bundle dir for dependency / state **reads** (issue #171).
+
+        The active ``results/issue_<id>`` if it exists, else the archived
+        ``results/completed/issue_<id>`` if it exists, else the active path. A prerequisite
+        finished and moved to ``completed/`` (a manual archive convention) still satisfies a
+        dependent's ``Depends on`` — the dep resolver looks at ``bundle()`` only and would
+        otherwise miss it and abort the batch — while a genuinely-missing id resolves to its
+        canonical active path and reads as ``UNPLANNED``, preserving the misconfigured-brief
+        guard. Use ``bundle()`` to create / locate the *active* bundle; use this only to
+        resolve a *dependency* by id.
+        """
+        active = self.bundle(issue_id)
+        if active.exists():
+            return active
+        archived = self.bundle_root / "completed" / f"issue_{issue_id}"
+        return archived if archived.exists() else active
 
     def close_class(self, disposition: str) -> str:
         """The close class matching ``disposition``, or "" if it is not a close hint.
@@ -290,6 +312,7 @@ class Config:
             feature_branch_pattern=publisher_cfg.get("feature_branch_pattern", "enhancement/{id}-{slug}"),
             base_remote=publisher_cfg.get("base_remote", "upstream"),
             issue_trailer=tracker.get("issue_trailer", "Fixes #{id}"),
+            issue_url_pattern=tracker.get("issue_url_pattern", ""),
             repo_checkouts=dict(publisher_cfg.get("checkouts", {})),
             gate_target_default=gates.get("target_default", ""),
             gate_target_match=dict(gates.get("target_match", {})),
