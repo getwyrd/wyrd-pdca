@@ -65,8 +65,12 @@ not push, branch, or open a PR yourself.**
    Keep the template's trailing **tracker-reference line** (the same `[tracker].issue_trailer`
    form as the commit, e.g. `Fixes #<id>`): the contribution gate lints commit-msg.txt and
    the PR body **independently**, so a ticketed fix needs the id in BOTH — the commit
-   trailer alone does not satisfy it. For a declared-ticketless fix (`--no-issue` /
-   non-core), OMIT the line and state the origin in-body instead.
+   trailer alone does not satisfy it. When `[tracker].issue_url_pattern` is configured
+   **and the bundle id is a real tracker number**, also **hyperlink the ticket** in the body
+   (a Markdown link on the id) so a reader can click through to the report, not just read a
+   bare number. For a declared-ticketless fix (`--no-issue` / non-core) or a **slug** bundle
+   (a fork issue with no tracker number), the id is not a real ticket — OMIT both the link
+   and the line, and state the origin in-body instead.
 
 ## How you work
 
@@ -74,6 +78,12 @@ not push, branch, or open a PR yourself.**
   builder's rationale — root cause, what the diff does), and `patch.diff` (the actual
   change). Cite the target source with `git -C <checkout> …` / Read — never
   `cd <checkout> && …` (`git -C` is the safe idiom).
+- Also read **`SUMMARY.md` §10 ("Act candidates")**. If any item says **"PR description
+  must include X"** (or a commit-scoped note), fold it into the artifact you own — the PR
+  description, or the commit body — **before** you draft, so the reviewer's note doesn't
+  freeze in the cycle record unincorporated. A **"tracker-comment must include …"** item is
+  **not yours**: you write only `commit-msg.txt` + `pr-description.md` (see Boundaries) —
+  leave it for the tracker-comment step rather than stuffing it into the PR body.
 - Resolve the branch target per INTEGRATION §2. One logical fix per PR; do not invent
   scope the brief didn't accept.
 - The contribution branches from the brief's **target branch** (per INTEGRATION §2),
