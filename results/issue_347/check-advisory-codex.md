@@ -1,0 +1,1 @@
+- `crates/custodian/src/rebalance.rs:91` still documents `EvacPlan::placement` as resolved through `ChunkRef::placed_dserver`, even though this patch moves the expansion site to `chunk.fragments()` at `crates/custodian/src/rebalance.rs:166`. Update the comment to name `ChunkRef::fragments()` so the rebalance documentation matches the new single expansion helper.
