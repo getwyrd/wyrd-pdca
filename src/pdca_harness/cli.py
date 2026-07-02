@@ -15,8 +15,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import (act, brief, driver, flow, gates, merged, publish, queue, revalidate,
-               revert, signoff, state, waves)
+from . import (act, brief, doctor, drift, driver, flow, gates, merged, publish, queue,
+               registry, revalidate, revert, signoff, state, waves)
 from .config import Config
 
 
@@ -93,10 +93,24 @@ def main(argv: list[str] | None = None) -> int:
     p_gates.add_argument("--promotions", action="store_true",
                          help="list advisory checks clean for their promote_after cycles (#156)")
 
+    # Reverse registry-consistency (issue #205) — a bundle-scoped gate cmd. Reads the
+    # bundle from its arg or $PDCA_BUNDLE (set by the gate runner), so a [[gates.checks]]
+    # entry is simply `cmd = "<cli> registry-check"`.
+    p_reg = sub.add_parser("registry-check",
+                           help="fail a patch that adds a manifest line for a path it doesn't touch (#205)")
+    p_reg.add_argument("issue_id", nargs="?")
+
     p_reval = sub.add_parser("revalidate",
                              help="re-run gates on a COMPLETE bundle vs the current engine; write a dated stamp (never re-decides §9)")
     p_reval.add_argument("issue_id")
     p_reval.add_argument("--date", help="ISO date for the stamp (default: today)")
+
+    # Drift sweep (issue #206) — flag published bundles whose patch no longer applies to the
+    # current upstream base. Report-only; never re-decides §9.
+    p_drift = sub.add_parser("drift",
+                             help="flag COMPLETE-with-open-PR bundles whose patch no longer applies to the current base (#206)")
+    p_drift.add_argument("--no-fetch", action="store_true",
+                         help="skip `git fetch` (check against already-fetched base refs)")
 
     # Act tooling as one command group (#89): `act index` / `act log`.
     p_act = sub.add_parser("act", help="cross-cycle Act tooling (index / log)")
@@ -133,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     p_publish.add_argument("--no-issue", action="store_true",
                            help="no tracker id yet: relax T4 to a flag, record id_pending (vs a magic #0000)")
     p_publish.add_argument("--by", default="", help="who published (recorded in publish.json)")
+
+    p_doctor = sub.add_parser("doctor",
+                              help="report every prerequisite (OK/MISSING/UNAUTH/WARN + fix hint); changes nothing")
+    p_doctor.add_argument("--strict", action="store_true",
+                          help="exit non-zero on ANY non-OK row (CI)")
 
     p_revert = sub.add_parser("revert",
                               help="undo a published contribution: a revert PR if merged, else withdraw the PR (#158)")
@@ -175,8 +194,12 @@ def main(argv: list[str] | None = None) -> int:
         return _queue(cfg)
     if args.cmd == "gates":
         return _gates(cfg, args)
+    if args.cmd == "registry-check":
+        return _registry_check(cfg, args)
     if args.cmd == "revalidate":
         return _revalidate(cfg, args)
+    if args.cmd == "drift":
+        return _drift(cfg, args)
     if args.cmd == "act":
         return _act(cfg, args)
     if args.cmd == "signoff":
@@ -184,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "publish":
         return publish.publish(cfg, args.issue_id, dry_run=args.dry_run,
                                open_pr=not args.no_pr, by=args.by, pending_id=args.no_issue)
+    if args.cmd == "doctor":
+        return doctor.run(cfg, strict=args.strict)
     if args.cmd == "revert":
         return revert.revert(cfg, args.issue_id, dry_run=args.dry_run, by=args.by)
     return 2
@@ -263,8 +288,12 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
             print("flow needs one or more issue ids, or --from-csv to plan a batch from "
                   "a tracker export", file=sys.stderr)
             return 2
-        return _report_batch(flow.flow_batch(
-            cfg, csv=args.from_csv, do_publish=do_publish, do_act=do_act, by=args.by))
+        try:
+            return _report_batch(flow.flow_batch(
+                cfg, csv=args.from_csv, do_publish=do_publish, do_act=do_act, by=args.by))
+        except flow.PreflightError as exc:
+            print(f"flow: {exc}", file=sys.stderr)
+            return 1
 
     if len(ids) == 1:  # single sequential cycle (auto-plans if unbriefed)
         iid = ids[0]
@@ -284,9 +313,13 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
         return 0 if final in (state.COMPLETE, state.AWAITING_SIGNOFF) else 1
 
     # Several ids: batch — auto-plan unbriefed, drive concurrently, cheap-first sign-off.
-    return _report_batch(flow.flow_ids(
-        cfg, ids, plan_missing=True, csv=args.from_csv,
-        do_publish=do_publish, do_act=do_act, by=args.by))
+    try:
+        return _report_batch(flow.flow_ids(
+            cfg, ids, plan_missing=True, csv=args.from_csv,
+            do_publish=do_publish, do_act=do_act, by=args.by))
+    except flow.PreflightError as exc:
+        print(f"flow: {exc}", file=sys.stderr)
+        return 1
 
 
 def _report_batch(results: dict[str, str]) -> int:
@@ -442,6 +475,51 @@ def _gates_promotions(cfg: Config) -> int:
         print(f"  - {c['id']}: {c['label']}  "
               f"(passed ≥ {c['threshold']} most-recent frozen cycles)")
     return 0
+
+
+def _drift(cfg: Config, args: argparse.Namespace) -> int:
+    """Drift sweep (#206): report published bundles whose patch no longer applies to the
+    current upstream base. Report-only — always exits 0 (never re-decides §9)."""
+    rows = drift.sweep(cfg, fetch=not getattr(args, "no_fetch", False))
+    if not rows:
+        print("drift: no published COMPLETE bundles to check.")
+        return 0
+    stale = [r for r in rows if r["status"] == "needs-rebase"]
+    errors = [r for r in rows if r["status"] == "error"]
+    for r in stale:
+        print(f"  needs-rebase  {r['bundle']}  (vs {r['base']})  {r['pr_url']}")
+        print(f"      {r['detail']}")
+    for r in errors:
+        print(f"  unknown       {r['bundle']}  (vs {r['base']})  {r['detail']}")
+    ok = len(rows) - len(stale) - len(errors)
+    print(f"\ndrift: {len(rows)} checked · {ok} apply-clean · "
+          f"{len(stale)} needs-rebase · {len(errors)} unknown")
+    return 0
+
+
+def _registry_check(cfg: Config, args: argparse.Namespace) -> int:
+    """Reverse registry-consistency gate (#205): fail iff the bundle's patch adds a line to a
+    configured manifest for a path the patch doesn't touch. The bundle is the ``issue_id``
+    arg or ``$PDCA_BUNDLE`` (set by the gate runner). Not-configured / no-patch ⇒ pass
+    (default-open, like an unconfigured gate)."""
+    files = cfg.registry_consistency.get("files") or []
+    if not files:
+        return 0  # no registry files declared → nothing to enforce
+    if args.issue_id:
+        d = cfg.bundle(args.issue_id)
+    elif os.environ.get("PDCA_BUNDLE"):
+        d = Path(os.environ["PDCA_BUNDLE"])
+    else:
+        print("registry-check needs an issue id or $PDCA_BUNDLE", file=sys.stderr)
+        return 2
+    patch = d / "patch.diff"
+    if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
+        return 0  # no patch to inspect (close/no-fix bundle)
+    pattern = cfg.registry_consistency.get("pattern", "")
+    violations = registry.find_violations(patch.read_text(encoding="utf-8"), files, pattern)
+    for v in violations:
+        print(v)
+    return 1 if violations else 0
 
 
 def _revalidate(cfg: Config, args: argparse.Namespace) -> int:

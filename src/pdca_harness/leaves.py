@@ -45,7 +45,9 @@ from pathlib import Path
 
 from . import act as act_mod
 from . import brief
+from . import families
 from . import gates
+from . import guard
 from . import progress
 from . import sources
 from . import worktree
@@ -84,6 +86,51 @@ class LeafError(subprocess.CalledProcessError):
 
 
 
+def _role_injection(
+    cfg: Config | None, leaf: LeafConfig, profile: families.FamilyProfile,
+) -> tuple[list[str], str]:
+    """How the leaf's role prompt (``leaf.agent``) reaches the model: extra argv
+    (``role_injection == "flag"`` — the CLI resolves ``.claude/agents/<name>.md``
+    itself) or a prompt prefix (``"inline"`` — the file's body, frontmatter
+    stripped, prepended to the task prompt). Only active when the leaf names an
+    ``agent`` (backward compatibility: existing configs bake ``--agent`` into
+    argv and set no ``agent`` key). Best-effort: an unreadable role file degrades
+    to no injection, never a crashed leaf."""
+    if not leaf.agent or cfg is None:
+        return [], ""
+    if profile.role_injection == "flag":
+        if profile.agent_flag and profile.agent_flag not in leaf.argv:
+            return [profile.agent_flag, leaf.agent], ""
+        return [], ""
+    if profile.role_injection == "inline":
+        path = cfg.root / ".claude" / "agents" / f"{leaf.agent}.md"
+        try:
+            body = families.strip_frontmatter(path.read_text(encoding="utf-8")).strip()
+        except OSError as exc:
+            print(f"leaves: role prompt {path} unreadable ({exc}) — proceeding "
+                  "without it", file=sys.stderr)
+            return [], ""
+        return [], (body + "\n\n---\n\n") if body else ""
+    return [], ""
+
+
+def _mapped_argv(leaf: LeafConfig, profile: families.FamilyProfile,
+                 argv: list[str]) -> list[str]:
+    """argv additions from the opt-in per-leaf ``model`` / ``effort`` keys, mapped
+    through the family profile. Explicit argv is the escape hatch and always wins:
+    a flag already present in ``argv`` is never added twice."""
+    extra: list[str] = []
+    if leaf.model and profile.model_flag and profile.model_flag not in argv:
+        extra += [profile.model_flag, leaf.model]
+    if leaf.effort and profile.effort_argv:
+        rendered = [a.format(effort=leaf.effort) for a in profile.effort_argv]
+        # The dedup probe: a "--effort"-style flag, or the key of a "-c key=value" pair.
+        probe = rendered[0] if rendered[0].startswith("--") else rendered[-1].split("=", 1)[0]
+        if not any(probe in a for a in argv):
+            extra += rendered
+    return extra
+
+
 def _invoke(
     leaf: LeafConfig,
     workdir: Path,
@@ -94,6 +141,7 @@ def _invoke(
     stream_json: bool = False,
     env: dict | None = None,
     extra_argv: list[str] | None = None,
+    cfg: Config | None = None,
 ) -> None:
     """Run the leaf's configured command in ``workdir``, feeding it ``prompt``.
 
@@ -105,12 +153,18 @@ def _invoke(
 
     ``label`` / ``status`` decorate the headless heartbeat (which leaf, and a live
     snapshot of its work — see :func:`progress.bundle_activity`). ``stream_json``
-    (Tier 3) asks for the live tool-use stream: for a headless **claude** leaf it adds
-    ``--output-format stream-json --verbose`` and the heartbeat shows the tool the
-    leaf is using right now. Ignored for non-claude families (e.g. a codex reviewer),
-    which don't speak that format.
+    (Tier 3) asks for the live tool-use stream when the leaf's family profile has
+    one (``profile.stream_argv``, e.g. claude's ``--output-format stream-json``);
+    families without a stream format ignore it. ``cfg`` enables the profile-driven
+    extras (role injection, model/effort mapping, ``[families.*]`` overrides);
+    ``None`` falls back to the built-in profile for the leaf's family.
     """
-    argv = list(leaf.argv) + list(extra_argv or [])
+    profile = families.resolve(leaf.family, cfg.families if cfg else None)
+    role_argv, prompt_prefix = _role_injection(cfg, leaf, profile)
+    argv = list(leaf.argv) + role_argv
+    argv += _mapped_argv(leaf, profile, argv)
+    argv += list(extra_argv or [])
+    prompt = prompt_prefix + prompt
     run_env = {**os.environ, **env} if env else None
     if leaf.interactive:
         subprocess.run(argv + [prompt], cwd=workdir, env=run_env)
@@ -118,15 +172,19 @@ def _invoke(
     # Headless: feed the prompt on stdin (a trailing positional would be swallowed
     # by a variadic --allowedTools) and tick a heartbeat, since `claude -p` prints
     # nothing until it finishes (minutes) and would otherwise look hung.
-    use_stream = stream_json and leaf.family == "claude"
+    # progress.py's stream reader speaks only the claude stream-json format today;
+    # a family declaring a different stream_format runs stream-less until a parser
+    # for it registers (the profile field reserves the slot).
+    use_stream = (stream_json and bool(profile.stream_argv)
+                  and profile.stream_format == "claude-stream-json")
     if use_stream:
-        argv += ["--output-format", "stream-json", "--verbose"]
+        argv += list(profile.stream_argv)
     rc, output, produced = progress.run_with_heartbeat(
         argv, cwd=workdir, input_text=prompt, label=label, status=status,
         stream_json=use_stream, env=run_env)
     if rc != 0:
         # Only the stream path gives a real "did a session start" signal. Without it
-        # (a non-claude leaf) we cannot tell invocation-death from a substantive
+        # (a stream-less family) we cannot tell invocation-death from a substantive
         # failure, so report produced=True → not transient, not retried — preserving
         # the prior immediate-placeholder behavior for non-stream leaves.
         raise LeafError(rc, argv, output=output, produced=produced or not use_stream)
@@ -221,7 +279,7 @@ def do_plan(d: Path, cfg: Config, csv: str | None = None) -> None:
     d.mkdir(parents=True, exist_ok=True)
     sources.seed(cfg, d)  # seed notes.json + sources/ from the configured providers (#65/#102)
     if cfg.planner.mode == "command":
-        _invoke(cfg.planner, cfg.root, _plan_prompt(cfg, csv, d))
+        _invoke(cfg.planner, cfg.root, _plan_prompt(cfg, csv, d), cfg=cfg)
         return
     _stub_plan(d, cfg)
 
@@ -314,7 +372,7 @@ def do_plan_batch(cfg: Config, csv: str | None = None, ids: list[str] | None = N
         # added to a pre-existing UNPLANNED dir, which a dir-name snapshot would miss (#190).
         before = set() if ids else {d.name for d in cfg.bundle_root.glob("issue_*")
                                     if (d / "brief.md").exists()}
-        _invoke(cfg.planner, cfg.root, _plan_batch_prompt(cfg, csv, ids))
+        _invoke(cfg.planner, cfg.root, _plan_batch_prompt(cfg, csv, ids), cfg=cfg)
         if ids is None:
             _warn_unseeded_briefs(cfg, before)
         return
@@ -417,6 +475,12 @@ def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
         family=spec.get("family", default.family),
         argv=list(spec.get("argv") or default.argv),
         interactive=bool(spec.get("interactive", default.interactive)),
+        agent=spec.get("agent", default.agent),
+        # NB: a variant spec's `model` key is the #167 SELECTOR name (matched by the
+        # brief's `Do model:`), not a CLI model id — so the profile-mapped CLI model
+        # is inherited from the default leaf only; a variant sets its model via argv.
+        model=default.model,
+        effort=spec.get("effort", default.effort),
     )
 
 
@@ -531,30 +595,37 @@ def do_build(d: Path, cfg: Config) -> None:
         # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
         # primary checkout is never mutated. Best-effort: None ⇒ edit in place, as before.
         wt = worktree.ensure(d, cfg)
-        if wt and builder.family == "claude":
-            # The claude builder discovers its `builder` subagent AND the builder_guard
+        profile = cfg.profile(builder)
+        if wt and profile.cwd_discovery:
+            # A cwd-discovery family (claude) finds its subagents AND the builder_guard
             # PreToolUse hook by walking up from its cwd, so cwd MUST stay the harness root
             # (.claude/agents + .claude/settings live there). Confining its cwd to the
             # worktree would hide both — `--agent builder` would not resolve and the
             # STOP-discipline guard would not load. It is grounded in the worktree via
-            # --add-dir + the prompt instead (as in #94), not by cwd. (Family is the
-            # SELECTED builder's, so an escalated/variant claude backend gets this too.)
-            workdir, env, extra = cfg.root, {"PDCA_WORKTREE": str(wt)}, ["--add-dir", str(wt)]
+            # the profile's grounding flag + the prompt instead (as in #94), not by cwd.
+            # (The profile is the SELECTED builder's, so an escalated/variant claude
+            # backend gets this too.)
+            extra = [profile.grounding_flag, str(wt)] if profile.grounding_flag else None
+            workdir, env = cfg.root, {"PDCA_WORKTREE": str(wt)}
         elif wt:
-            # A non-claude command builder (a local agentic CLI) has no --add-dir / agent
-            # machinery, so CONFINE it by running it *in* the worktree (cwd): otherwise it
-            # is launched from the harness root with nothing stopping it from writing the
-            # host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
+            # Other command builders (codex, a local agentic CLI) have no cwd-walking agent
+            # machinery, so CONFINE them by running *in* the worktree (cwd): otherwise the
+            # leaf is launched from the harness root with nothing stopping it from writing
+            # the host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
             workdir, env, extra = wt, {"PDCA_WORKTREE": str(wt)}, None
         else:
             workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
+        if not profile.native_guard:
+            # A family without its own PreToolUse STOP hook gets the driver's `gh`
+            # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
+            env = guard.shim_env(cfg, env)
         # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
         _invoke(
             builder, workdir, _build_prompt(d),
             label=f"Do {d.name}",
             status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
             stream_json=True,  # Tier 3: show the builder's live tool-use
-            env=env, extra_argv=extra,
+            env=env, extra_argv=extra, cfg=cfg,
         )
         return
     _stub_build(d, cfg)
@@ -749,14 +820,18 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             src = d / name
             if src.exists():
                 shutil.copy2(src, sandbox / name)
-        _seed_sandbox_agents(cfg, sandbox)  # so `--agent` resolves from the sandbox cwd (#161)
+        profile = cfg.profile(cfg.reviewer)
+        # Seed unconditionally: flag families need it to resolve `--agent` (#161);
+        # for inline families it is harmless (role prompts only, never build-notes).
+        _seed_sandbox_agents(cfg, sandbox)
         # Ground citations on the brief's target checkout (#75): name it via $PDCA_TARGET
         # so the reviewer doesn't wander into unrelated checkouts, and grant read access
-        # for the claude family (--add-dir). Independence holds — the target is the
-        # upstream source, not build-notes.md.
+        # via the family's grounding flag (claude: --add-dir). Independence holds — the
+        # target is the upstream source, not build-notes.md.
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
-        extra_argv = ["--add-dir", str(target)] if target and cfg.reviewer.family == "claude" else None
+        extra_argv = ([profile.grounding_flag, str(target)]
+                      if target and profile.grounding_flag else None)
         error_log = d / "check-review.error.log"
         # A transient (no-output) reviewer failure is retried with backoff before it
         # degrades to a §6 placeholder; the failed attempts' stderr lands in error_log.
@@ -765,8 +840,8 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             error_log=error_log,
             label=f"Check review {d.name}",
             status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
-            stream_json=True,  # Tier 3 (no-op unless the reviewer family is claude)
-            env=env, extra_argv=extra_argv,
+            stream_json=True,  # Tier 3 (no-op unless the reviewer family has a stream)
+            env=env, extra_argv=extra_argv, cfg=cfg,
         )
         if err is not None:
             transient = getattr(err, "transient", False)
@@ -889,16 +964,81 @@ def _advisory_prompt(spec: dict, leaf_id: str) -> str:
     )
 
 
+def _resolved_builder_family(d: Path) -> str:
+    """The family of the builder that actually ran, read from the last ``loop-telemetry.json``
+    attempt (issue #200 — the entry :func:`_record_loop_attempt` wrote in Do). This is the
+    *resolved* fact, so it holds whichever way the backend was chosen — an explicit
+    ``Do model`` (#167), difficulty routing (#134) or escalation (#135). Best-effort: an
+    absent / garbled file ⇒ ``""`` (unknown), never a crash."""
+    path = d / "loop-telemetry.json"
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        attempts = data.get("attempts") if isinstance(data, dict) else None
+        if attempts:
+            return str(attempts[-1].get("family", "") or "")
+    except (ValueError, OSError, AttributeError, IndexError):
+        pass
+    return ""
+
+
+def _decorrelation_note(d: Path, msg: str) -> None:
+    """Record an advisory-selection lapse (issue #200) as a §6 item. Written as a
+    check-advisory-*.md so :func:`assemble.assemble_summary` folds its NEEDS-HUMAN line into
+    §6 like any advisory finding — a human sees that decorrelation didn't hold for the bundle."""
+    advisory_artifact(d, "decorrelation").write_text(
+        "# Advisory review — decorrelation\n\n- NEEDS-HUMAN — " + msg + "\n", encoding="utf-8")
+
+
+def _select_advisory(specs: list[dict], d: Path, cfg: Config) -> list[dict]:
+    """Apply the advisory-selection policy (issue #200) to the already-``when``-filtered
+    ``specs``. Default (``mode`` unset) returns them unchanged — every applicable leaf runs
+    (#64). Under ``mode = "vendor-complement"`` the list is a VENDOR POOL: return the single
+    leaf whose ``family`` differs from the builder that ran, so a Codex-built bundle gets a
+    Claude advisory and vice-versa, automatically. If no different-vendor leaf exists (or the
+    builder family is unknown) fall back to the first applicable leaf rather than skip review
+    — a same-vendor review still beats none — and record the lapse in §6."""
+    if cfg.advisory_selection.get("mode") != "vendor-complement":
+        return specs
+    advisory_artifact(d, "decorrelation").unlink(missing_ok=True)  # a prior attempt's note
+    if not specs:
+        return specs
+    builder_family = _resolved_builder_family(d)
+    if builder_family:
+        # A complement must declare a KNOWN family that differs — a leaf with a blank/absent
+        # `family` is an unknown vendor (possibly the builder's own), never a guaranteed
+        # complement, so it falls through to the same-vendor §6 note rather than masquerading
+        # as decorrelated (a #64 config never had to set `family`).
+        complement = next(
+            (s for s in specs
+             if (fam := s.get("family", "").strip().lower()) and fam != builder_family.lower()),
+            None)
+        if complement is not None:
+            return [complement]
+        reason = (f"the builder ran family '{builder_family}' and no configured advisory "
+                  "declares a different (non-empty) family")
+    else:
+        reason = "the builder family that ran is unknown (no loop-telemetry.json)"
+    chosen = specs[0]
+    _decorrelation_note(
+        d, f"advisory reviewer '{chosen.get('id') or 'advisory'}' could not be decorrelated "
+           f"from the builder — {reason}; it ran same-vendor. Confirm the review's "
+           "independence by hand, or add a different-`family` [[leaves.advisory]] entry.")
+    return [chosen]
+
+
 def run_advisory_leaves(d: Path, cfg: Config) -> None:
-    """Run each configured advisory reviewer that applies (issue #64). Each writes
+    """Run each configured advisory reviewer that applies (issue #64), after the
+    advisory-selection policy narrows the list (issue #200). Each writes
     check-advisory-<id>.md; failures degrade to a §6 NEEDS-HUMAN placeholder, never crash
     the cycle (advisory, like the main reviewer)."""
-    for spec in cfg.advisory_leaves:
+    applicable = [spec for spec in cfg.advisory_leaves if _advisory_applies(spec, d)]
+    for spec in _select_advisory(applicable, d, cfg):
         leaf_id = spec.get("id") or "advisory"
-        if not _advisory_applies(spec, d):
-            continue
         leaf = LeafConfig(mode=spec.get("mode", "stub"), family=spec.get("family", ""),
-                          argv=list(spec.get("argv", [])))
+                          argv=list(spec.get("argv", [])), agent=spec.get("agent", ""),
+                          model=spec.get("model", ""), effort=spec.get("effort", ""))
         if leaf.mode == "command":
             _run_advisory_sandboxed(d, cfg, leaf, spec, leaf_id)
         else:
@@ -913,10 +1053,14 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         for name in REVIEWER_INPUTS:
             if (d / name).exists():
                 shutil.copy2(d / name, sandbox / name)
-        _seed_sandbox_agents(cfg, sandbox)  # so `--agent` resolves from the sandbox cwd (#161)
+        profile = cfg.profile(leaf)
+        # Seed unconditionally: flag families need it to resolve `--agent` (#161);
+        # for inline families it is harmless (role prompts only, never build-notes).
+        _seed_sandbox_agents(cfg, sandbox)
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
-        extra = ["--add-dir", str(target)] if target and leaf.family == "claude" else None
+        extra = ([profile.grounding_flag, str(target)]
+                 if target and profile.grounding_flag else None)
         out = sandbox / f"check-advisory-{leaf_id}.md"
         error_log = d / f"check-advisory-{leaf_id}.error.log"
         err = _invoke_leaf_resilient(
@@ -924,7 +1068,7 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
             error_log=error_log,
             label=f"Advisory {leaf_id} {d.name}",
             status=lambda: progress.bundle_activity(sandbox, (out.name,)),
-            stream_json=True, env=env, extra_argv=extra)
+            stream_json=True, env=env, extra_argv=extra, cfg=cfg)
         if err is not None:  # advisory must never crash the cycle
             transient = getattr(err, "transient", False)
             _advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
@@ -962,7 +1106,7 @@ def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *, transient: bool
 # ----------------------------------------------------------------------------
 def run_signoff(d: Path, cfg: Config) -> None:
     if cfg.signoff.mode == "command":
-        _invoke(cfg.signoff, cfg.root, _signoff_prompt(d))
+        _invoke(cfg.signoff, cfg.root, _signoff_prompt(d), cfg=cfg)
         return
     _stub_signoff(d, cfg)
 
@@ -1003,7 +1147,7 @@ def run_signoff_batch(cfg: Config, bundles: list[Path]) -> None:
     if not bundles:
         return
     if cfg.signoff.mode == "command":
-        _invoke(cfg.signoff, cfg.root, _signoff_batch_prompt(bundles))
+        _invoke(cfg.signoff, cfg.root, _signoff_batch_prompt(bundles), cfg=cfg)
         return
     for d in bundles:
         _stub_signoff(d, cfg)
@@ -1057,7 +1201,7 @@ def signoff_rationale(d: Path) -> str:
 # ----------------------------------------------------------------------------
 def run_act(cfg: Config, date: str) -> None:
     if cfg.act.mode == "command":
-        _invoke(cfg.act, cfg.root, _act_prompt(cfg, date))
+        _invoke(cfg.act, cfg.root, _act_prompt(cfg, date), cfg=cfg)
     else:
         _stub_act(cfg, date)
     # Reset the cadence marker (issue #109) whenever the Act beat runs — even if a
@@ -1096,7 +1240,7 @@ def _stub_act(cfg: Config, date: str) -> None:
 # ----------------------------------------------------------------------------
 def run_publish(d: Path, cfg: Config) -> None:
     if cfg.publisher.mode == "command":
-        _invoke(cfg.publisher, cfg.root, _publish_prompt(d, cfg))
+        _invoke(cfg.publisher, cfg.root, _publish_prompt(d, cfg), cfg=cfg)
         return
     _stub_publish(d, cfg)
 

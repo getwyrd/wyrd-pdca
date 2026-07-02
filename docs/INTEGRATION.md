@@ -99,10 +99,16 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 | T4 contribution | ADR-0003 §1 (DCO), `require-issue`, `adr-immutability`; commit/PR conventions (§8) | `cargo xtask` gates + GitHub CI | `./engine/xtask.sh ci` (re-gate) + host CI | [built — host-enforced] |
 | T5 judgment | reviewer contract below | Check reviewer + sign-off | (model) | [planned] |
 
-- **Reviewer family (cross-vendor, ≠ builder):** codex — config `AGENTS.md` (decorrelated
-  path); `.claude/agents/reviewer.md` is the same-vendor fallback (execute-only scope).
-- **Builder family:** claude — `.claude/agents/builder.md`, ready-mark blocked by the
-  `.claude/hooks/builder_guard.py` PreToolUse hook.
+- **Reviewer family (cross-vendor, ≠ builder):** codex — config `AGENTS.md`
+  (decorrelated path); `.claude/agents/reviewer.md` is a same-vendor fallback with
+  execute-only tool scope (no write to the fix).
+- **Builder family:** claude — `.claude/agents/builder.md` [built], with the
+  ready-mark block enforced by the `.claude/hooks/builder_guard.py` PreToolUse hook.
+- **Vendor profiles:** every family-specific behavior (streaming, extra-dir grounding,
+  role-prompt injection, STOP-guard mechanism) is data in `pdca_harness.families`,
+  overridable via `pdca.toml [families.<name>]` — swapping or adding a vendor is a
+  config edit, not a driver change. A non-claude builder gets the STOP discipline
+  from the driver's `gh` PATH shim (same `builder_guard.py` rules as the claude hook).
 - **Project-defined human-only items** (reviewer emits NEEDS-HUMAN by design): any **ADR /
   spec / proposal** change (architecture-board / founding-maintainer authority per
   GOVERNANCE, not a model's to accept); any change to the **normative on-disk format**

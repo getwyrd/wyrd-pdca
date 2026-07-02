@@ -43,12 +43,22 @@ class LeafConfig:
     ``mode == "command"`` runs ``argv`` as a subprocess in the bundle directory.
     ``interactive`` hands the terminal to the human (a seeded REPL, no ``-p``); a
     headless leaf (``interactive == False``) runs autonomously and writes a doc.
+
+    ``agent`` (optional) names the role-prompt file (``.claude/agents/<agent>.md``);
+    how it reaches the model is the family profile's ``role_injection`` — the
+    claude family passes ``--agent <name>``, inline families get the file's body
+    prepended to the task prompt. ``model`` / ``effort`` (optional) are mapped
+    through the profile's ``model_flag`` / ``effort_argv``; flags already present
+    in ``argv`` remain the explicit escape hatch and always win.
     """
 
     mode: str = "stub"
     family: str = ""
     argv: list[str] = field(default_factory=list)
     interactive: bool = False
+    agent: str = ""
+    model: str = ""
+    effort: str = ""
 
 
 # ----------------------------------------------------------------------------
@@ -99,6 +109,16 @@ class Config:
     issue_url_pattern: str = ""
     repo_checkouts: dict[str, str] = field(default_factory=dict)  # repo_spec → local path
     gates_checks: list[dict] = field(default_factory=list)
+    # Reverse registry-consistency (issue #205): [gates.registry_consistency] naming an
+    # instance's manifest files ({files=[...], pattern="<regex, group 1 = path>"}). The
+    # `registry-check` subcommand (wired as a bundle-scoped gate) fails a patch that adds a
+    # line to one of these files for a path the same patch doesn't touch. Empty ⇒ no check.
+    registry_consistency: dict = field(default_factory=dict)
+    # Instance-owned gate-toolchain bootstrap (issue #207): [install].extra_bootstrap in
+    # pdca.toml. One idempotent command scripts/bootstrap-tools.sh runs after the harness-
+    # universal + leaf tiers, so the generic template ships no project toolchain (a Rust
+    # instance drops in rustup here, a Python one its pip extras). "" ⇒ nothing.
+    install_extra_bootstrap: str = ""
     # Optional advisory reviewer leaves (issue #64): an OPEN list of extra, role-distinct
     # advisory reviewers ([[leaves.advisory]] in pdca.toml), so an instance adds N of them
     # (e.g. a correctness/cleanup code-review lens) with no driver change. Each:
@@ -107,6 +127,14 @@ class Config:
     # a leaf on a brief field (e.g. a "Review depth" field), the way gate targets do — empty
     # ⇒ always run.
     advisory_leaves: list[dict] = field(default_factory=list)
+    # Advisory-selection policy (issue #200): [leaves.advisory_selection] in pdca.toml.
+    # Empty / ``mode`` unset ⇒ every applicable advisory leaf runs (the #64 default). Under
+    # ``mode = "vendor-complement"`` the advisory list is treated as a VENDOR POOL and the
+    # driver runs the single leaf whose ``family`` differs from the builder that actually ran
+    # (read from loop-telemetry.json), so a Codex-built bundle gets a Claude reviewer and
+    # vice-versa with no per-brief edits — the cross-vendor decorrelation Check relies on
+    # (INTEGRATION §4), made automatic. No different-vendor leaf ⇒ same-vendor fallback + §6.
+    advisory_selection: dict = field(default_factory=dict)
     # Builder escalation ladder (issue #135): an OPEN list of stronger Do backends keyed
     # on the attempt number ([[leaves.builder_escalation]] in pdca.toml). Each:
     # {min_iteration, family, mode, argv}. On iterate, do_build picks the entry with the
@@ -145,6 +173,12 @@ class Config:
     # checkout directly, as before). Best-effort: a target that isn't a worktree-capable
     # git checkout silently falls back to in-place.
     worktree: bool = True
+    # Per-lane resource preflight (issue #213): [driver].lane_preflight, a shell command run
+    # ONCE before a lanes>1 fan-out ({lanes} interpolated); a non-zero exit aborts the run
+    # before any lane spawns, so a batch never runs against missing per-lane resources (and
+    # the REQUIRED per_lane [[doctor.checks]] are also run). "" ⇒ only the doctor rows (or
+    # nothing). Serial (lanes<=1) runs never preflight.
+    lane_preflight: str = ""
     # Wave-based batch sequencing (#wave-model). A batch handed to `flow` runs as an
     # ordered sequence of dependency waves; `wave_mode` selects how each wave's accepted
     # work reaches the next: "stack" (default) folds it onto a run-scoped integration
@@ -172,6 +206,19 @@ class Config:
     # built-in default covers the common tracker vocabulary.
     close_dispositions: list[str] = field(
         default_factory=lambda: list(DEFAULT_CLOSE_DISPOSITIONS))
+    # Family-profile overrides ([families.<name>] in pdca.toml): per-vendor CLI
+    # capabilities as data — see pdca_harness.families. Raw tables; resolved lazily
+    # via :meth:`profile` so built-ins apply and unknown names fall back to generic.
+    families: dict[str, dict] = field(default_factory=dict)
+    # Instance-declared doctor rows ([[doctor.checks]]): {id, cmd, hint, required}.
+    # `pdca doctor` runs each cmd (exit 0 = OK) after its config-derived checks, the
+    # same declare-in-config pattern as [[gates.checks]].
+    doctor_checks: list[dict] = field(default_factory=list)
+
+    def profile(self, leaf: LeafConfig):
+        """The resolved :class:`~pdca_harness.families.FamilyProfile` for ``leaf``."""
+        from . import families as _families  # local import: keep config import-light
+        return _families.resolve(leaf.family, self.families)
 
     def bundle(self, issue_id: str) -> Path:
         """The per-cycle bundle directory for an issue id."""
@@ -222,6 +269,8 @@ class Config:
         gates = data.get("gates", {})
         gates_checks = list(gates.get("checks", []))
         gates_runner = gates.get("runner", "")
+        registry_consistency = dict(gates.get("registry_consistency", {}))
+        install_extra_bootstrap = data.get("install", {}).get("extra_bootstrap", "")
         # Additive target flags: label → {field, substring}. A bare string is shorthand
         # for the "Repo + branch target" field (so flags and the primary axis can share it).
         gate_target_flags = {
@@ -246,6 +295,9 @@ class Config:
                 family=d.get("family", ""),
                 argv=list(d.get("argv", [])),
                 interactive=bool(d.get("interactive", False)),
+                agent=d.get("agent", ""),
+                model=d.get("model", ""),
+                effort=d.get("effort", ""),
             )
 
         # Advisory reviewer leaves (issue #64) — an open list under [[leaves.advisory]].
@@ -254,6 +306,8 @@ class Config:
             {**spec, "mode": mode_override or spec.get("mode", "stub")}
             for spec in leaves.get("advisory", [])
         ]
+        # Advisory-selection policy (issue #200) — how the driver picks from that list.
+        advisory_selection = dict(leaves.get("advisory_selection", {}))
 
         # Builder escalation ladder (issue #135) — stronger Do backends keyed on attempt
         # number. PDCA_LEAVES_MODE forces their mode too (CI / offline determinism); ""
@@ -286,6 +340,7 @@ class Config:
             lanes = int(os.environ["PDCA_LANES"])
         lanes = max(1, lanes)
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
+        lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
         wave_mode = driver_cfg.get("wave_mode", "stack")  # #wave-model: stack | merge
         merge_method = driver_cfg.get("merge_method", "merge")  # merge | squash | rebase
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
@@ -325,17 +380,24 @@ class Config:
             act=leaf("act"),
             author=data.get("project", {}).get("author", ""),
             gates_checks=gates_checks,
+            registry_consistency=registry_consistency,
+            install_extra_bootstrap=install_extra_bootstrap,
             advisory_leaves=advisory_leaves,
+            advisory_selection=advisory_selection,
             builder_escalation=builder_escalation,
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             lanes=lanes,
             worktree=worktree,
+            lane_preflight=lane_preflight,
             wave_mode=wave_mode,
             merge_method=merge_method,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             close_dispositions=close_dispositions,
+            families={k.strip().lower(): dict(v)
+                      for k, v in data.get("families", {}).items()},
+            doctor_checks=list(data.get("doctor", {}).get("checks", [])),
         )
 
 
