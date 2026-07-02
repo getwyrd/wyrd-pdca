@@ -13,7 +13,10 @@
 # This Makefile scopes to what is genuinely per-platform — bootstrap — plus the dev
 # self-test. On Windows use scripts/install.ps1 (GNU make isn't standard there).
 #
-#   make install    create .venv and install the console script (pip install -e .)
+#   make install    bootstrap ALL required tools (git, gh, rustup->cargo/rustc,
+#                    claude, codex) then create .venv + install the console script.
+#                    Idempotent; see scripts/bootstrap-tools.sh. `make install-check`
+#                    reports tool status without installing anything.
 #   make setup      one-time: grant Claude read of the workspace (permissions)
 #   make            full self-test: offline guards + a real driver cycle on stub leaves
 #   make check      fast: driver tests only, offline (~1s)
@@ -23,7 +26,7 @@ export PYTHONPATH := src
 PDCA := $(PYTHON) -m pdca_harness.cli
 
 .DEFAULT_GOAL := test
-.PHONY: test check install setup
+.PHONY: test check install install-check setup
 
 # One-time permission setup so the interactive leaves don't prompt: grant Claude
 # read of the whole workspace. Writes the machine-local .claude/settings.local.json
@@ -37,16 +40,20 @@ open('.claude/settings.local.json', 'w'), indent=2)"
 	@echo "(folder TRUST is separate — it lives in the GLOBAL ~/.claude.json, not here:"
 	@echo " the first interactive '<cli> flow' asks once to TRUST this project — accept it.)"
 
-# --- install the console script (venv) -------------------------------------
-# Name-agnostic: the console script is named per pyproject [project.scripts]
-# (the cli_name copier choice), so depend on a sentinel, not a fixed script path.
+# --- install ALL required tools + the console script (venv) -----------------
+# Delegates to scripts/bootstrap-tools.sh (idempotent): installs git, gh,
+# rustup->cargo/rustc, claude and codex when missing, then the venv + console
+# script. Name-agnostic: depend on a sentinel, not a fixed script path.
 install: .venv/.installed
 	@printf '\nInstalled. Run the cycle with the console script (see pyproject [project.scripts]) on .venv/bin/.\n'
 
-.venv/.installed: pyproject.toml
-	$(PYTHON) -m venv .venv
-	.venv/bin/pip install -q -e .
+.venv/.installed: pyproject.toml scripts/bootstrap-tools.sh
+	PYTHON=$(PYTHON) ./scripts/bootstrap-tools.sh
 	@touch $@
+
+# Report each required tool's status without installing anything.
+install-check:
+	@PYTHON=$(PYTHON) ./scripts/bootstrap-tools.sh --check
 
 # --- self-test -------------------------------------------------------------
 # Depends on `check` so the cheap guards fail fast before the cycle.

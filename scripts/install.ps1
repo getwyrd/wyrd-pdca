@@ -1,17 +1,21 @@
 # Windows bootstrap for the PDCA harness (issue #85) — the equivalent of `make
-# install` + `make setup` for hosts where GNU make isn't standard. Creates a venv,
-# installs the console script (pip install -e .), and writes the Claude read-permission
-# overlay. After this, run the cycle through the console script: `<cli> flow <id> …`
-# (named per pyproject [project.scripts]).
+# install` + `make setup` for hosts where GNU make isn't standard. Delegates to
+# scripts/bootstrap-tools.ps1 (installs git, gh, rustup->cargo/rustc, claude and
+# codex when missing, then the venv + console script), then writes the Claude
+# read-permission overlay. After this, run the cycle through the console script:
+# `<cli> flow <id> …` (named per pyproject [project.scripts]).
 #
 # Usage (from the project root):  pwsh -File scripts/install.ps1
+#                                 pwsh -File scripts/install.ps1 -Check   # report tools, install nothing
+param([switch]$Check)
 $ErrorActionPreference = "Stop"
 
-$python = if ($env:PYTHON) { $env:PYTHON } else { "python" }
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Host "Creating .venv and installing the console script (pip install -e .)…"
-& $python -m venv .venv
-& .\.venv\Scripts\pip.exe install -q -e .
+Write-Host "Bootstrapping required tools + the console script (scripts/bootstrap-tools.ps1)…"
+& (Join-Path $here "bootstrap-tools.ps1") -Check:$Check
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($Check) { exit 0 }   # --check reports status only; skip the permissions write
 
 # Permissions overlay: grant Claude read of the whole workspace (the parent dir) + a
 # temp dir, so the interactive leaves don't prompt per file. Machine-local, gitignored.
