@@ -29,6 +29,106 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-01 — cycles considered: issue_268, issue_287, issue_288, issue_330, issue_346, issue_356
+
+> Considers the six cycles that froze since the 2026-06-25 review (the index's 30 minus the 24
+> covered through 2026-06-25). issue_115 (ACCEPTED, 2026-06-20) and issue_153 (discontinued,
+> 2026-06-21) remain absent from the frozen index → still out of scope, carried. No contribution
+> disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle.** Fitness-to-purpose in all six;
+  T5 judgment in #268/#346/#356; C5 causal adequacy where a root cause is contested. These are
+  the always-human classes (INTEGRATION.md §4) — the recurring-signal digest (3× T5, 2× V, 2× C5)
+  is that structural constant, not a new pattern. **No delta warranted** — consistent with all five
+  prior reviews.
+- **The `Verification posture` delta is taking effect — record as evidence, no new delta.** #268
+  carries `Verification posture: Flippable regression at Check — the test drives a real tonic …`
+  (`results/issue_268/brief.md`) and #288 carries `Verification posture: Flippable regression at
+  Check …` (`results/issue_288/brief.md`). None of the six raised a *surprise* C2/C4 NEEDS-HUMAN;
+  where a fidelity question existed (#356's `dserver % n` fan-out models the real fleet only for
+  dense ids) it landed as a *pre-declared* V item, not a C2/C4 surprise. Working as designed.
+- **NEW (one cycle, #330) — the Do/advisory sandbox did not load the toolchain env, so the gate
+  and one advisory leaf failed as ENVIRONMENT artifacts, not patch defects.** `~/.cargo/bin` was
+  off `PATH` in a fresh session (`results/issue_330/build-notes.md` "Toolchain setup"), so `C4-ci`
+  failed as `./engine/xtask.sh: line 30: exec: cargo: not found` and the `codex` advisory leaf
+  failed as `[Errno 2] No such file or directory: 'codex'` (`check-advisory-codex.error.log`). The
+  other five cycles gated green — this is isolated to #330's session, not systemic. Two observations,
+  both **evidence not delta**: (a) the **leaf-failure surfacing improved** — where #195 (2026-06-25)
+  had a reviewer leaf fail *silently*, #330 now surfaces the failed advisory leaf as a §6 NEEDS-HUMAN
+  row + a "NOT COMPLETED" artifact + an error log; the harness bump v0.43→v0.45 (PR #73) landed
+  between batches, so the prior review's harness-robustness watch-item shows real progress. (b) The
+  **reviewer skill already generalized correctly** — it treated the `cargo: not found` gate fail as a
+  "toolchain/target-state caveat, not a patch defect" and wrote NEEDS-HUMAN, not a blocking C4 FAIL
+  (`results/issue_330/check-review.md` grounding note) — the 2026-06-22 stale-/unreadable-target
+  caveat covered this class without a new rule. The residual root cause (leaf env-loading; a gate
+  that conflates "couldn't execute (env)" with "ran and failed") is **harness machinery**, routes
+  upstream — not a PDCA spec/ruleset/gate/skill change.
+- **Two single-cycle §10 items, neither recurring — each routes as a follow-up, not a process
+  delta.** #268: author the ADR amendment/companion for the new `BlockReadFault` seam category
+  (seam-doc shipped this cycle; the ADR is the human's to author separately). #356: an M3 enhancement
+  — when dynamic discovery lands, route the fan-out by a real D-server-id→store map instead of
+  `dserver % n` (opaque/sparse ids alias under modulo) + an in-range guard at the M2/M3 boundary.
+  Both are one-offs; neither recurs across cycles, so neither meets the bar for a spec/ruleset/gate/
+  skill change.
+
+## Process deltas
+
+- **None warranted this review.** The recurring NEEDS-HUMAN classes (V/C5/T5) are always-human by
+  design; the `Verification posture` delta is carried in the briefs and taking effect; and the one
+  new finding (#330's toolchain/env-loading gap) is **not** a PDCA spec/ruleset/gate/skill change —
+  its fix is harness machinery (leaf env-loading + an EXEC-ERROR-vs-FAIL gate status) upstream of
+  this repo, the leaf-failure surfacing it exposed is already improving via the v0.45 bump, and the
+  reviewer skill already generalized the "target-state caveat, not a patch defect" rule to cover it.
+  A forced PDCA delta here would be worse than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Harness/driver robustness (upstream template) — leaf sandboxes do not load the toolchain env, so
+  gates and command-mode leaves fail as environment artifacts (#330).** `~/.cargo/bin` off `PATH`
+  (and `codex` not on `PATH`) turned a real red→green into a `cargo: not found` C4-ci fail + a
+  `codex not found` advisory-leaf fail. This is the recurrence that promotes the 2026-06-25
+  harness-robustness item from "watch" toward action. Two upstream asks: (1) harden leaf env-loading
+  so command-mode leaves + `engine/xtask.sh` inherit the operator's toolchain env (source the
+  profile / pass through `PATH`); (2) let the gate distinguish "could not execute (env)" from "ran
+  and failed" (an EXEC_ERROR status) so `check-gates.json overall` isn't a bare `fail` a reviewer must
+  hand-classify. Harness machinery (`src/pdca_harness/**` / leaf orchestration + `pdca.toml` gate
+  schema) → routes **upstream to the template**. → owner: Eduard; next step: open a harness/
+  template-feedback issue when bumping the harness; record the id next review.
+- **Tracker (Wyrd, #268 §10) — author the ADR amendment/companion for the new `BlockReadFault` seam
+  category** (ADR-0010 / telemetry ADR-0011). The seam-doc shipped this cycle; the ADR is
+  architecture-board authority, authored separately by the human (Do correctly did NOT author one).
+  → owner: Eduard; next step: file against getwyrd/wyrd (milestone M3); record id next review.
+- **Tracker (Wyrd, #356 §10) — M3 enhancement, fan-out routing by real id→store map.** When dynamic
+  discovery lands, replace `route_dserver`'s `dserver % stores.len()` with a real D-server-id→store
+  map and add an in-range guard at the M2/M3 boundary, so a discovery-fleet placement naming an
+  opaque/sparse/gapped id (e.g. `10, 20, 30`, already selectable per
+  `crates/server/tests/failure_domain_registration.rs`) is never silently mis-routed under modulo.
+  Not a bug in this slice (the brief blesses `dserver % n` as illustrative for the contiguous M2
+  fan-out). → owner: Eduard; next step: file against getwyrd/wyrd (M3 / discovery); record id next review.
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21) still
+  have not had an Act review and remain absent from this index. → next Act review, if still in scope.
+- Prior reviews' routed items to confirm at the next review: the Wyrd `cargo doc` / rustdoc-deny gate
+  step and the `tier1-disk-faults.yml` sudo fix (2026-06-25); the upstream reviewer-leaf-robustness
+  item (2026-06-25) — **partial progress observed** via the v0.45 bump's improved leaf-failure
+  surfacing (#330), residual is the env-loading root cause routed above; harness#120 target-pin /
+  #121 reviewer-Basis; getwyrd/wyrd#242/#243 design issues + doc #244.
+
+## How effectiveness will be judged
+
+- WATCH the next ~5 cycles for a **recurrence of a toolchain-absent / env-loading gate or leaf
+  failure**: if it recurs after the upstream leaf-env-loading fix lands, the route was right; if it
+  recurs before, the routed harness item is overdue. A second silent-vs-surfaced leaf failure would
+  confirm the v0.45 surfacing improvement held.
+- The two routed Wyrd items (#268 ADR amendment; #356 fan-out id-map) and the upstream harness
+  env-loading item should appear as tracker/issue ids (or an explicit "still deferred") at the next
+  review — follow-ups stay auditable.
+- The routed-work-becomes-merged-PDCA-cycle loop should continue (as #195/#196/#197/#198 did).
+
 # Act review — 2026-06-25 — cycles considered: issue_195, issue_196, issue_204, issue_207, issue_251
 
 > Considers the five frozen cycles that had not yet had an Act review (the index's 24 minus
