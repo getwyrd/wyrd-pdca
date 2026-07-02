@@ -25,8 +25,24 @@ import threading
 from pathlib import Path
 
 from . import (act, brief, driver, gates, integrate, lane, leaves, merge, merged,
-               publish, queue, signoff, state, waves)
+               preflight, publish, queue, signoff, state, waves)
 from .config import Config
+
+
+class PreflightError(RuntimeError):
+    """A ``lanes > 1`` fan-out was refused because a declared per-lane preflight failed
+    (issue #213) — the resources a lane's gates need aren't present, so the batch is not
+    driven (it would only produce false-red bundles)."""
+
+
+def _wave_pools(cfg: Config, runnable: list[Path]) -> bool:
+    """True iff driving this wave's ``runnable`` bundles fans out across lanes — ``lanes > 1``
+    AND more than one runnable bundle (``_beat_sweep`` takes the serial path, setting no
+    ``$PDCA_LANE``, for a single bundle). Keyed on the RESOLVED runnable set, not the raw
+    wave: a wave ``_runnable`` filters down to one bundle (e.g. one blocked on an unmerged
+    out-of-batch prereq) never pools, so it must not trip the preflight (issue #213 / PR #214
+    / PR #215 reviews)."""
+    return cfg.lanes > 1 and len(runnable) > 1
 
 
 def _isolate(d: Path, what: str, fn):
@@ -301,6 +317,7 @@ def _run_beat_round_pooled(
                 while not conflicts[d.name].isdisjoint(inflight):
                     cond.wait()
                 inflight.add(d.name)
+            changed = False  # if _advance_one raises, the finally must not UnboundLocalError
             try:
                 changed = _advance_one(cfg, d)
             finally:
@@ -463,10 +480,27 @@ def _drive_and_act(
     published: set[str] = set()
     accepted: list[Path] = []        # cumulative COMPLETE bundles, wave then name order
     integ: dict[tuple[str, str], str] = {}  # per-target (repo, base) → integration branch (#187)
+    preflighted = False              # per-lane preflight runs at most once, before the first pool
     for k, wave in enumerate(wave_list):
         runnable = _runnable(cfg, wave, batch_names)
         if not runnable:
             continue
+        # Per-lane resource preflight (issue #213): the FIRST wave that will actually pool —
+        # lanes>1 AND >1 *runnable* bundle (a wave _runnable filters down to one bundle, e.g.
+        # one blocked on an unmerged out-of-batch prereq, takes the serial path and sets no
+        # $PDCA_LANE) — verifies the instance's declared per-lane resources before it fans
+        # out, and aborts the run if they're missing rather than produce false-red bundles.
+        # Gating on the resolved runnable set (not the raw wave) avoids false-gating a wave
+        # that never pools (PR #214 / #215 reviews); runs at most once.
+        if not preflighted and _wave_pools(cfg, runnable):
+            preflighted = True
+            ok, msgs = preflight.lane_preflight(cfg)
+            if not ok:
+                for m in msgs:
+                    print(f"  {m}", file=sys.stderr)
+                raise PreflightError(
+                    f"lane preflight failed for a lanes={cfg.lanes} batch — not fanning out "
+                    "(fix the per-lane resources above, then re-run)")
         # Reconcile each runnable bundle's stack base with this run's integration state:
         # point it at its OWN (repo, base) target's branch, or clear a stale marker a
         # prior/resumed run left so it builds off its own base (#187). Unconditional — the
