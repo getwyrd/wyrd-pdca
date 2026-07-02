@@ -88,6 +88,8 @@ PATCH_REL="$BUNDLE/patch.diff"
 PATCH="$(cd "$(dirname "$PATCH_REL")" && pwd)/$(basename "$PATCH_REL")"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/ensure-cargo.sh
+. "$here/../lib/ensure-cargo.sh"   # defines ensure_cargo; called below, before any cargo use
 WYRD_REPO="${WYRD_REPO:-"$(cd "$here/../../../wyrd" 2>/dev/null && pwd || true)"}"
 VERIFY="$(_verify_dir)"
 VERIFY_BRANCH="$(_verify_branch)"
@@ -137,6 +139,11 @@ if [ "${#TEST_ARGS[@]}" -eq 0 ]; then
   echo "run-verify.sh: patch touches no Wyrd crate (docs/CI only) — nothing to verify per-fix; the C4-ci gate covers it." >&2
   exit 0
 fi
+
+# Cargo is genuinely needed from here on — resolve it even under a bare PATH (CI/cron/the
+# driver's subprocess). Placed AFTER the docs-only early-exit so a no-crate patch never
+# requires a toolchain. See engine/lib/ensure-cargo.sh.
+ensure_cargo || exit $?
 
 run_test() { ( cd "$VERIFY" && cargo test --quiet "${TEST_ARGS[@]}" ); }
 

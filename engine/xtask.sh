@@ -26,5 +26,11 @@ if [[ -z "$wyrd_repo" || ! -f "$wyrd_repo/Cargo.toml" ]]; then
   exit 2
 fi
 
+# Resolve cargo even when launched without ~/.cargo/bin on PATH (CI, cron, the driver's
+# non-interactive subprocess). See engine/lib/ensure-cargo.sh.
+# shellcheck source=lib/ensure-cargo.sh
+. "$here/lib/ensure-cargo.sh"
+ensure_cargo || exit $?
+
 cd "$wyrd_repo"
 exec cargo xtask "$@"
