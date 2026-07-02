@@ -1,0 +1,286 @@
+diff --git a/crates/custodian/src/scrub.rs b/crates/custodian/src/scrub.rs
+index 66027a9..dfa7c3a 100644
+--- a/crates/custodian/src/scrub.rs
++++ b/crates/custodian/src/scrub.rs
+@@ -5,16 +5,24 @@
+ //!
+ //! Scrub catches **bit rot before the data is needed** — the proactive mirror of the
+ //! read path's read-time checksum verification (`0005:262-266`, the read path in
+-//! `crates/core/src/read.rs`). One pass walks each D server
+-//! ([`ChunkStore::list_fragments`]) and, for each fragment a **committed** chunk map
+-//! references, fetches its bytes and **verifies its self-describing checksum against
+-//! the chunk map** ([`wyrd_core::repair::fragment_intact`]). On a mismatch the
+-//! fragment is treated as lost — **excluded** (never fed to a decoder) — and its
+-//! chunk is **enqueued for reconstruction** on the one shared, durable repair queue
+-//! ([`wyrd_core::repair::enqueue_repair`]) that the read path also feeds
++//! `crates/core/src/read.rs`). One pass walks the reference set — every
++//! `(dserver, fragment)` a **committed** chunk map's placement record names
++//! (`referenced_fragments`) — and, for each one, fetches its bytes **directly from
++//! its placed D server** ([`ChunkStore::get_fragment`]) rather than only whatever that
++//! server's own listing happens to return (issue #330: a fragment that is simply
++//! *absent* from the store is otherwise never observed, because nothing ever asks the
++//! store for exactly that id). A fetched fragment's self-describing checksum is
++//! verified against the chunk map ([`wyrd_core::repair::fragment_intact`]); a fetch
++//! that instead comes back empty means the placed D server holds **no bytes at all**
++//! for a fragment the chunk map places there. Both a checksum mismatch and a placed-
++//! but-absent fragment are treated as **lost** — excluded (never fed to a decoder) —
++//! and the chunk is **enqueued for reconstruction** on the one shared, durable repair
++//! queue ([`wyrd_core::repair::enqueue_repair`]) that the read path also feeds
+ //! (`0005:174-176`). The load-bearing invariant, whose violation is **silent
+-//! corruption**: a checksum-failing fragment is **never absorbed silently** — it
+-//! always becomes a durable repair obligation (`0005:262-267`).
++//! corruption**: for every referenced fragment, corruption AND absence are **never
++//! absorbed silently** — each always becomes a durable repair obligation
++//! (`0005:262-267`; issue #330's invariant: a committed reference is either
++//! present-and-intact or a durable repair obligation, with no third, silent outcome).
+ //!
+ //! Scope: scrub only **produces** repair obligations. It never dequeues, rebuilds, or
+ //! deletes — gathering any-`k`, recomputing, re-placing, and the version-conditional
+@@ -26,6 +34,8 @@
+ //! `core` (which owns the on-disk-format reader), so `custodian` gains no
+ //! chunk-format dependency and no new on-disk-format knowledge.
+ 
++use std::collections::HashMap;
++
+ use wyrd_core::repair;
+ use wyrd_traits::{ChunkStore, DServerId, FragmentId, MetadataStore, Result};
+ 
+@@ -52,18 +62,37 @@ pub struct ScrubContext<'a> {
+ /// Returns [`Reconciled::Changed`] if any chunk was enqueued for reconstruction,
+ /// [`Reconciled::Satisfied`] otherwise.
+ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Result<Reconciled> {
+-    // The reference set: every fragment a *committed* chunk map points at. Scrub
+-    // verifies exactly these — an orphan / pending-garbage fragment is GC's concern,
+-    // not a corruption finding (the same set GC uses as its safety gate).
++    // The reference set: every fragment a *committed* chunk map points at, keyed by
++    // the D server its placement record names. This is the SAME set GC uses as its
++    // safety gate (`crate::gc::referenced_fragments`) — an orphan / pending-garbage
++    // fragment is never in it, so it can never be a scrub finding. Nor is a fragment
++    // belonging to an in-flight (not-yet-committed) write: the four-phase write
++    // protocol commits the chunk map only after *every* fragment has acked
++    // (`crates/core/src/write.rs:220`), so a committed reference's bytes are always
++    // supposed to already exist — a fragment in this set genuinely missing from its
++    // placed D server is a loss, never a benign race.
+     let referenced = referenced_fragments(ctx.meta).await?;
+ 
++    // Group the reference set by placed D server so the pass is driven by WHAT IS
++    // REFERENCED, not by what a store's own `list_fragments()` happens to enumerate
++    // (issue #330). Walking `list_fragments()` alone can only ever find a
++    // present-but-corrupt fragment — a fragment simply ABSENT from the store never
++    // appears in its listing, so it was never visited at all and the missing-fragment
++    // case silently fell through the `Ok(None)` "vanished between the walk and the
++    // fetch" arm. Asking each placed D server directly for exactly the fragments the
++    // chunk map says it holds closes that gap: a `get_fragment` that comes back
++    // `Ok(None)` now means exactly what it says — no bytes for a fragment placed here.
++    let mut by_dserver: HashMap<DServerId, Vec<FragmentId>> = HashMap::new();
++    for &(dserver, frag) in &referenced {
++        by_dserver.entry(dserver).or_default().push(frag);
++    }
++
+     let mut changed = false;
+     for &(dserver, store) in ctx.fleet {
+-        for frag in store.list_fragments().await? {
+-            // Only fragments a committed chunk map references are scrubbed.
+-            if !referenced.contains(&(dserver, frag)) {
+-                continue;
+-            }
++        let Some(frags) = by_dserver.get(&dserver) else {
++            continue;
++        };
++        for &frag in frags {
+             // Fetch the bytes named by the chunk map, then decide what the fetch told
+             // us. A backend that does not verify on read (an in-memory fake) hands
+             // back the raw bytes for scrub's own `fragment_intact` to check; a
+@@ -86,10 +115,22 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+                         changed = true;
+                     }
+                 }
+-                // A fragment that vanished between the walk and the fetch is a loss
+-                // for GC/reconstruction to notice, not a checksum finding — skip it
+-                // rather than raise a false positive.
+-                Ok(None) => continue,
++                // MISSING (issue #330): the placed D server holds NO bytes for a
++                // fragment the committed chunk map references there. This is not a
++                // checksum finding (there is nothing to check) but it is the same
++                // durable-loss category as corruption — the Invariant to restore is
++                // that a referenced fragment is either present-and-intact or a durable
++                // repair obligation, never silently absorbed either way. False
++                // positives are guarded structurally: `referenced` only holds
++                // COMMITTED chunk-map placements (an in-flight write's provisional map
++                // is excluded), and GC's own safety gate never reclaims anything in
++                // this same set — so an `Ok(None)` here can only mean genuine loss,
++                // not a pending-GC or in-flight-write race.
++                Ok(None) => {
++                    emit_missing(dserver, frag);
++                    repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
++                    changed = true;
++                }
+                 // The store REJECTED the fetch. Distinguish a **corruption** fault
+                 // (the bytes failed their self-describing integrity check — a
+                 // verifying backend's way of reporting bit rot / a misplaced
+@@ -98,7 +139,10 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+                 // repair obligation as the mismatch above, and scrub must record it
+                 // and CONTINUE past it — never abort the whole pass over one rotten
+                 // fragment. A transient fault carries no such signal: propagate it so
+-                // the retry policy, not scrub, decides.
++                // the retry policy, not scrub, decides. (A wholly unreachable /
++                // partitioned D server — every fragment on it faulting transiently —
++                // is deliberately out of scope here: that needs desired-state /
++                // topology awareness, a separate detector.)
+                 Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
+                     emit_scrubbed(dserver, frag);
+                     emit_corruption(dserver, frag);
+@@ -146,3 +190,19 @@ fn emit_corruption(dserver: DServerId, frag: FragmentId) {
+         "scrub detected bit rot: fragment excluded, chunk enqueued for reconstruction",
+     );
+ }
++
++/// Emit **scrub-detected absence** (issue #330) on the same durability-plane seam: a
++/// referenced fragment whose placed D server holds no bytes for it at all, now
++/// enqueued for reconstruction — the same durable obligation corruption produces, for
++/// the "placed but simply missing" loss category.
++fn emit_missing(dserver: DServerId, frag: FragmentId) {
++    tracing::info!(monotonic_counter.scrub_missing_detected = 1_u64);
++    tracing::info!(
++        target: "wyrd.custodian.scrub.audit",
++        action = "missing",
++        dserver,
++        chunk = %frag.chunk,
++        index = frag.index,
++        "scrub detected a placed fragment absent from its D server: chunk enqueued for reconstruction",
++    );
++}
+diff --git a/crates/custodian/tests/scrub.rs b/crates/custodian/tests/scrub.rs
+index 3920937..16c7ce2 100644
+--- a/crates/custodian/tests/scrub.rs
++++ b/crates/custodian/tests/scrub.rs
+@@ -871,3 +871,103 @@ async fn detects_corruption_in_a_full_rs_6_3_placement() {
+         }
+     }
+ }
++
++// ---- issue #330: a placed-but-ABSENT fragment is also a durable repair obligation ----
++//
++// Pre-fix, scrub only ever discovered a fragment by walking whatever a D server's
++// `list_fragments()` happened to return; a fragment that is simply MISSING from the
++// store never appears in that listing, so it was never visited at all — the `Ok(None)`
++// fetch arm of the old loop only fired for a fragment that vanished mid-pass, and even
++// then it just `continue`d with no obligation produced (`crates/custodian/src/scrub.rs`,
++// pre-fix ~`:89-92`). This is the central, flippable leg for #330: revert
++// `scrub::reconcile`'s missing-fragment arm (`crates/custodian/src/scrub.rs`, the
++// `Ok(None) => { emit_missing(...); repair::enqueue_repair(...); changed = true; }` arm)
++// back to `Ok(None) => continue` and this test's assertions fire (`Reconciled::Satisfied`
++// / an empty repair queue instead of the durable obligation).
++#[tokio::test]
++async fn detects_a_missing_placed_fragment_and_enqueues_for_reconstruction() {
++    enable_metric_callsites();
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // A committed chunk map places (chunk, 0) on d0 — but d0 never received any bytes
++    // for it at all (simply absent, not corrupt: no `put_fragment` call for this id).
++    let chunk: ChunkId = 0x330A;
++    commit_reference(&meta, 1, "missing", chunk, 0).await;
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "a placed-but-absent referenced fragment is detected and a repair obligation is produced"
++    );
++    assert_eq!(
++        repair::queued_repairs(&meta).await.unwrap(),
++        vec![chunk],
++        "exactly the chunk with the missing fragment is queued for reconstruction — the \
++         same shared durable repair queue a corrupt fragment produces (0005:174-176)"
++    );
++}
++
++// ---- issue #330 (false-positive guardrail): an in-flight (uncommitted) write's
++//      referenced-but-not-yet-placed fragment must NEVER be flagged as a loss ----
++#[tokio::test]
++async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
++    enable_metric_callsites();
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++
++    // A PENDING (not yet committed) inode whose chunk map places a fragment on d0 that
++    // d0 does not (yet) hold — the shape of an in-flight write mid-fan-out. Because the
++    // inode never reached `InodeState::Committed`, scrub's reference set
++    // (`crate::gc::referenced_fragments`) must exclude it entirely, so this can never
++    // be mistaken for a missing-fragment loss.
++    let chunk: ChunkId = 0x330C;
++    let record = InodeRecord {
++        size: 16,
++        chunk_map: vec![ChunkRef {
++            id: chunk,
++            scheme: EcScheme::None,
++            len: 16,
++            placement: vec![0],
++        }],
++        state: InodeState::Pending,
++        version: 1,
++    };
++    let outcome = metadata::create(&meta, ROOT, "in-flight", 1, &record)
++        .await
++        .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let ctx = ScrubContext {
++        meta: &meta,
++        fleet: &fleet,
++    };
++
++    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Satisfied,
++        "a pending (uncommitted) write's provisional chunk map is never in scrub's \
++         reference set, so its not-yet-placed fragment is never a false-positive finding"
++    );
++    assert!(
++        repair::queued_repairs(&meta).await.unwrap().is_empty(),
++        "no repair obligation for an in-flight write's fragment"
++    );
++}
+diff --git a/crates/traits/src/lib.rs b/crates/traits/src/lib.rs
+index 7c70ad1..efa725d 100644
+--- a/crates/traits/src/lib.rs
++++ b/crates/traits/src/lib.rs
+@@ -251,11 +251,16 @@ pub trait ChunkStore: Send + Sync {
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>>;
+ 
+     /// Enumerate every fragment this store currently holds. Order is
+-    /// unspecified. The maintenance plane's **scrub** loop (M3, proposal 0005)
+-    /// walks this to diff a D server's actual contents against the committed
+-    /// chunk map — orphans GC should reclaim, absences reconstruction should
+-    /// rebuild. Added additively for M3; it neither moves bytes nor interprets
+-    /// them beyond their addressing.
++    /// unspecified. The maintenance plane's **GC** loop (M3, proposal 0005) walks
++    /// this to diff a D server's actual contents against the committed chunk map
++    /// and reclaim orphans (`crates/custodian/src/gc.rs`). The **scrub** loop
++    /// (M3, proposal 0005; missing-fragment detection issue #330) instead drives
++    /// off the committed reference set directly, fetching each placed fragment by
++    /// id via [`ChunkStore::get_fragment`] — a listing alone can only surface a
++    /// fragment's presence, never prove a specific one is genuinely absent,
++    /// since an absent fragment by definition never appears in it. Added
++    /// additively for M3; it neither moves bytes nor interprets them beyond
++    /// their addressing.
+     async fn list_fragments(&self) -> Result<Vec<FragmentId>>;
+ 
+     /// Remove the bytes stored for `id`. **Idempotent**: deleting a fragment the
