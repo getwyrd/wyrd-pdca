@@ -1,0 +1,1 @@
+- NEEDS-HUMAN — `Cargo.toml:86` adds `tikv-client = "0.4"` and the submitted lockfile includes its native TLS/OpenSSL transitive tree; this needs the ADR-0003 dependency/license/advisory adjudication called out in the brief, and the feature-on compile path in my temp-applied check failed before Rust code on `openssl-sys` because `pkg-config`/OpenSSL discovery was unavailable.
