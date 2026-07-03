@@ -42,9 +42,21 @@
   **scoped per lane** under in-driver concurrency (`-l<slot>` suffix from `$PDCA_LANE`), so
   `--lanes N` runs without two lanes colliding on a checkout or a branch — the active gate
   set (`C4-ci`, `C4-verify`) is multi-lane-safe.
-- **Per-area branch map:** everything targets **`main`**. Wyrd is early and has **no
-  maintenance branches** today (no `maintenance/*`, no master-vs-maintenance split) — say
-  so rather than invent one; add a map here if/when a release branch is cut.
+- **Per-area branch map:** single-slice fixes and standalone features target **`main`**
+  directly. Wyrd has **no maintenance branches** (no `maintenance/*`, no
+  master-vs-maintenance split) — don't invent one. **A multi-slice milestone stacks on a
+  shared integration branch** instead (the generic rule is fork-discipline.md §3):
+  **Milestone 4** (proposal 0007's PR sequence — issues #252, #253, …) targets
+  **`feat/m4-production-metadata-backend`** (cut off `main`); each M4 slice branches off
+  *that* branch and PRs *into* it, and the integration branch merges to `main` in one PR
+  when M4 completes. So an M4 bundle's brief **"Repo + branch target" is
+  `getwyrd/wyrd @ feat/m4-production-metadata-backend`, not `@ main`** — that is the base
+  the publisher opens the slice PR against. (Caveat: the per-fix `C4-verify` gate
+  currently validates against a hardcoded `origin/main`; for a *later* stacked slice whose
+  integration base has diverged from `main` — once an earlier M4 slice has merged into it —
+  that gate base should follow the integration branch. A known follow-up
+  (getwyrd/wyrd-pdca#91); harmless for the first slice, where the integration branch still
+  equals `main`.) Add another integration branch here when a future milestone needs the same.
 - **Override convention:** a maintainer's explicit base-branch request on the PR wins
   (per `GOVERNANCE.md` decision-making); otherwise `main`.
 - **Cross-version cherry-pick rules:** none today (single line). If back-porting starts,

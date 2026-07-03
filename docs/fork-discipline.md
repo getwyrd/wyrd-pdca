@@ -61,6 +61,14 @@ branch). For a project with **parallel maintenance lines**, the targeting matter
   line; only genuinely new features target the development/`main` line. A fix sent to
   the dev line alone doesn't reach released users. *(instance: the per-area branch map
   — INTEGRATION.md §2.)*
+- **A multi-slice feature or milestone stacks on a shared *integration branch*, not a
+  pile of independent PRs to the dev line.** Cut one integration branch off the dev line;
+  each slice branches off *it* and PRs *into it*; the integration branch merges wider to
+  the dev line as one coherent unit once the milestone is complete. A slice's **base — and
+  therefore its validation/gate base — is that integration branch, not the dev line**, so
+  the brief's branch-target names the integration branch and the publisher opens the slice
+  PR against it. *(instance: the integration-branch name + which issues stack on it —
+  INTEGRATION.md §2.)*
 - **A maintainer's explicit base-branch request on the PR overrides the default.**
 - **Cross-version cherry-pick is a *correctness* check, not a conflict check.**
   "Applies cleanly" is **not** "remains correct": verify a cherry-picked fix against the
