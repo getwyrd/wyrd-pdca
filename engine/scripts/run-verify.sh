@@ -25,8 +25,12 @@
 # fix is a real red->green (or the co-located green-only above); there is nothing to
 # classify as UNVERIFIABLE here. Add the exit-77 path only if such a manifest ever appears.
 #
-# Isolation: runs in a dedicated `../wyrd-verify` git worktree off origin/main —
-# never the live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY override.
+# Isolation: runs in a dedicated `../wyrd-verify` git worktree off the bundle's base —
+# `origin/main` by default, or the integration branch the brief targets, so a stacked
+# milestone slice validates against its OWN base, not main (#91). The base is single-
+# sourced from the brief's "Repo + branch target" field (the same value publish cuts the
+# PR from), so C4-verify applies the patch on the same tree the PR opens against. Never the
+# live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY / $WYRD_VERIFY_BASE override.
 #
 # Lane-safe (docs 09 §parallel lanes): under in-driver concurrency the driver pins each
 # worker to a slot and exports $PDCA_LANE (0..N-1); a serial run leaves it unset. The
@@ -79,6 +83,35 @@ _pkg_from_added_cargo() {
   ' "$2"
 }
 
+# The base branch named in the bundle's brief "Repo + branch target: <repo> @ <base>"
+# field, or "" if absent. Mirrors publish._clean_ref EXACTLY (a markdown backtick span
+# wins over the first token) so C4-verify resolves the SAME base publish cuts the PR from
+# — a stacked milestone slice's integration branch, not a hardcoded main (#91). Pure brief
+# parse; ALWAYS returns 0 so `set -e`/pipefail never aborts a bare `$(_brief_base)` (#88).
+_brief_base() {
+  local bp="${BUNDLE:-}/brief.md" line raw tok
+  { [ -n "${BUNDLE:-}" ] && [ -f "$bp" ]; } || return 0
+  line="$(grep -iE 'repo \+ branch' "$bp" | head -1 || true)"
+  raw="${line#*@}"; [ "$raw" = "$line" ] && return 0     # no '@' → no base named
+  if [[ "$raw" == *'`'*'`'* ]]; then                     # backtick code span wins
+    tok="${raw#*\`}"; tok="${tok%%\`*}"
+  else
+    raw="${raw#"${raw%%[![:space:]]*}"}"; tok="${raw%%[[:space:]]*}"   # else first token
+  fi
+  tok="${tok#\`}"; tok="${tok%\`}"; tok="${tok%%[,.;:]}"
+  printf '%s' "$tok"
+}
+
+# The remote-tracking base ref the patch must apply against, resolving the precedence:
+#   $WYRD_VERIFY_BASE (explicit override) > brief target base > origin/main (#91).
+# No git access (existence is checked at the call site), so it doubles as the --print-base
+# unit hook.
+_resolve_base_ref() {
+  if [ -n "${WYRD_VERIFY_BASE:-}" ]; then printf '%s' "$WYRD_VERIFY_BASE"; return 0; fi
+  local b; b="$(_brief_base)"
+  if [ -n "$b" ]; then printf 'origin/%s' "$b"; else printf 'origin/main'; fi
+}
+
 # --classify <patch>: emit `ADDED_TEST <f>` per discriminator test and `CRATE <dir>`
 # per affected crate dir (deduped, in order). No worktree, no cargo — for engine/tests.
 if [ "${1:-}" = "--classify" ]; then
@@ -100,6 +133,14 @@ if [ "${1:-}" = "--pkg-name" ]; then
   exit 0
 fi
 
+# --print-base: print the resolved verify base ref for the bundle + exit (test hook, #91).
+# Pure (env + brief parse, no git); the runtime additionally checks the ref exists.
+if [ "${1:-}" = "--print-base" ]; then
+  BUNDLE="${PDCA_BUNDLE:?--print-base needs \$PDCA_BUNDLE}"
+  _resolve_base_ref; echo
+  exit 0
+fi
+
 BUNDLE="${PDCA_BUNDLE:?run-verify.sh is bundle-scoped — \$PDCA_BUNDLE must be set}"
 PATCH_REL="$BUNDLE/patch.diff"
 [ -f "$PATCH_REL" ] || { echo "run-verify.sh: no patch.diff in $BUNDLE" >&2; exit 1; }
@@ -117,13 +158,20 @@ if [ -z "$WYRD_REPO" ] || [ ! -f "$WYRD_REPO/Cargo.toml" ]; then
   exit 2
 fi
 
-# --- dedicated verification worktree, clean at origin/main every run --------------
+# --- resolve the base (origin/main, or the brief's integration branch for a stacked
+#     slice; #91) and prepare a dedicated worktree clean at that base every run ----------
 git -C "$WYRD_REPO" fetch -q origin 2>/dev/null || true
 git -C "$WYRD_REPO" worktree prune
-if [ ! -e "$VERIFY/Cargo.toml" ]; then
-  git -C "$WYRD_REPO" worktree add -q -B "$VERIFY_BRANCH" "$VERIFY" origin/main
+BASE_REF="$(_resolve_base_ref)"
+if ! git -C "$WYRD_REPO" rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+  echo "run-verify.sh: base '$BASE_REF' not found on origin — falling back to origin/main;" >&2
+  echo "               C4-verify may be unreliable for a stacked slice (#91)." >&2
+  BASE_REF="origin/main"
 fi
-git -C "$VERIFY" reset -q --hard origin/main
+if [ ! -e "$VERIFY/Cargo.toml" ]; then
+  git -C "$WYRD_REPO" worktree add -q -B "$VERIFY_BRANCH" "$VERIFY" "$BASE_REF"
+fi
+git -C "$VERIFY" reset -q --hard "$BASE_REF"   # re-points an existing worktree if the base changed
 git -C "$VERIFY" clean -fdq
 VERIFY="$(cd "$VERIFY" && pwd)"
 
@@ -183,7 +231,7 @@ run_test() { ( cd "$VERIFY" && cargo test --quiet "${TEST_ARGS[@]}" ); }
 
 # --- GREEN: with the fix applied, the test passes --------------------------------
 if ! git -C "$VERIFY" apply "$PATCH" 2>/dev/null; then
-  echo "run-verify.sh: patch.diff does not apply on origin/main — the bundle is stale; rebase Do." >&2
+  echo "run-verify.sh: patch.diff does not apply on $BASE_REF — the bundle is stale; rebase Do." >&2
   exit 1
 fi
 echo "run-verify.sh: GREEN — cargo test ${TEST_ARGS[*]} (fix applied)" >&2
@@ -205,7 +253,7 @@ if [ "${#ADDED_TESTS[@]}" -eq 0 ] || [ "$GREEN_ONLY" = 1 ]; then
   exit 0
 fi
 
-git -C "$VERIFY" reset -q --hard origin/main
+git -C "$VERIFY" reset -q --hard "$BASE_REF"
 git -C "$VERIFY" clean -fdq
 git -C "$VERIFY" apply "$PATCH"
 for f in "${ALL[@]}"; do

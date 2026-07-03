@@ -122,4 +122,35 @@ check "WYRD_VERIFY override + lane -> custom dir, lane-scoped branch" \
   $'VERIFY custom-verify\nBRANCH pdca-verify-l1' \
   "$(PDCA_LANE=1 WYRD_VERIFY=/tmp/custom-verify "$RV" --print-isolation)"
 
+# 8. base resolution (#91): the verify base follows the brief's "Repo + branch target",
+#    so a stacked milestone slice validates against ITS integration branch — not a
+#    hardcoded origin/main. Precedence: $WYRD_VERIFY_BASE > brief base > origin/main.
+mkbrief() { mkdir -p "$1"; printf '%s\n' "$2" > "$1/brief.md"; }
+
+mkbrief "$TMP/b_main"  '- **Repo + branch target:** getwyrd/wyrd @ main'
+check "brief base=main -> origin/main (historical default)" \
+  "origin/main" \
+  "$(PDCA_BUNDLE="$TMP/b_main" "$RV" --print-base)"
+
+mkbrief "$TMP/b_m4" '- **Repo + branch target:** getwyrd/wyrd @ `feat/m4-production-metadata-backend`'
+check "brief base=integration branch -> origin/<branch> (#91)" \
+  "origin/feat/m4-production-metadata-backend" \
+  "$(PDCA_BUNDLE="$TMP/b_m4" "$RV" --print-base)"
+
+# the _clean_ref quirk publish uses: a backticked branch in trailing prose wins over the
+# plain token — run-verify MUST match publish so both cut from the SAME base.
+mkbrief "$TMP/b_paren" '- **Repo + branch target:** getwyrd/wyrd @ main (feature branch `feat/x-slice`)'
+check "backtick span wins (matches publish._clean_ref) -> origin/feat/x-slice" \
+  "origin/feat/x-slice" \
+  "$(PDCA_BUNDLE="$TMP/b_paren" "$RV" --print-base)"
+
+mkbrief "$TMP/b_none" $'- **Kind:** bug\n- **Slug:** something'
+check "no branch target field -> origin/main default" \
+  "origin/main" \
+  "$(PDCA_BUNDLE="$TMP/b_none" "$RV" --print-base)"
+
+check "WYRD_VERIFY_BASE override wins over the brief" \
+  "origin/release-1.2" \
+  "$(PDCA_BUNDLE="$TMP/b_m4" WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
+
 [ "$fail" -eq 0 ] && { echo "test_run_verify.sh: all passed"; exit 0; } || { echo "test_run_verify.sh: FAILURES"; exit 1; }
