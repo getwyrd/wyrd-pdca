@@ -67,6 +67,17 @@ _is_test_file() { case "$1" in */tests/*.rs | tests/*.rs) return 0 ;; *) return 
 # (empty for root-level docs/CI files) maps to its cargo package.
 _crate_dir()    { case "$1" in crates/*/*) echo "crates/$(echo "$1" | cut -d/ -f2)" ;; xtask/*) echo "xtask" ;; *) echo "" ;; esac; }
 _in()           { local x="$1"; shift; local e; for e in "$@"; do [ "$e" = "$x" ] && return 0; done; return 1; }
+# The cargo package name from the patch's ADDED `<crate>/Cargo.toml` (a net-new crate the
+# patch introduces — there is no pre-patch Cargo.toml to read). Pure patch parsing, "" if
+# none — the fallback _pkg_name uses when a test's crate isn't in the worktree yet (#88).
+_pkg_from_added_cargo() {
+  awk -v want="$1/Cargo.toml" '
+    /^\+\+\+ b\// { cur=$0; sub(/^\+\+\+ b\//, "", cur); next }
+    cur==want && /^\+name[[:space:]]*=[[:space:]]*"/ {
+      s=$0; sub(/^\+name[[:space:]]*=[[:space:]]*"/, "", s); sub(/".*/, "", s); print s; exit
+    }
+  ' "$2"
+}
 
 # --classify <patch>: emit `ADDED_TEST <f>` per discriminator test and `CRATE <dir>`
 # per affected crate dir (deduped, in order). No worktree, no cargo — for engine/tests.
@@ -79,6 +90,13 @@ if [ "${1:-}" = "--classify" ]; then
     [ -n "${_seen[$c]:-}" ] && continue
     echo "CRATE $c"; _seen["$c"]=1
   done < <(_all_files "$cp")
+  exit 0
+fi
+
+# --pkg-name <crate> <patch>: the package name resolved from the patch's added Cargo.toml
+# (the net-new-crate path of _pkg_name). No worktree, no cargo — for engine/tests (#88).
+if [ "${1:-}" = "--pkg-name" ]; then
+  _pkg_from_added_cargo "${2:?--pkg-name needs a crate dir}" "${3:?--pkg-name needs a patch path}"
   exit 0
 fi
 
@@ -109,7 +127,19 @@ git -C "$VERIFY" reset -q --hard origin/main
 git -C "$VERIFY" clean -fdq
 VERIFY="$(cd "$VERIFY" && pwd)"
 
-_pkg_name() { local c="$1"; [ -f "$VERIFY/$c/Cargo.toml" ] && sed -n 's/^name *= *"\(.*\)".*/\1/p' "$VERIFY/$c/Cargo.toml" | head -1; }
+# Cargo package name for crate dir `c`: from the worktree's Cargo.toml (an existing crate)
+# or, for a crate the PATCH itself adds (net-new — no pre-patch Cargo.toml), from the added
+# Cargo.toml carried in patch.diff. ALWAYS returns 0 (empty output ⇒ unresolved) so `set -e`
+# never aborts a bare `pkg="$(_pkg_name ...)"` assignment (issue #88).
+_pkg_name() {
+  local c="$1"
+  if [ -f "$VERIFY/$c/Cargo.toml" ]; then
+    sed -n 's/^name *= *"\(.*\)".*/\1/p' "$VERIFY/$c/Cargo.toml" | head -1
+    return 0
+  fi
+  _pkg_from_added_cargo "$c" "$PATCH"   # net-new crate: name from the patch's added Cargo.toml
+  return 0
+}
 
 mapfile -t ALL   < <(_all_files "$PATCH" | sort -u)
 mapfile -t ADDED < <(_added_files "$PATCH" | sort -u)
@@ -119,11 +149,15 @@ for f in "${ADDED[@]:-}"; do [ -n "$f" ] && _is_test_file "$f" && ADDED_TESTS+=(
 # --- map changed files -> the cargo test targets to run --------------------------
 declare -A SEEN_PKG=()
 TEST_ARGS=()
+GREEN_ONLY=0
 if [ "${#ADDED_TESTS[@]}" -gt 0 ]; then
   for t in "${ADDED_TESTS[@]}"; do
     c="$(_crate_dir "$t")"; [ -n "$c" ] || continue
     pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
     TEST_ARGS+=("-p" "$pkg" "--test" "$(basename "$t" .rs)"); SEEN_PKG["$pkg"]=1
+    # A crate the patch itself CREATES has no pre-patch state, so its test is born green —
+    # there is no per-fix RED to isolate (like a co-located test). Run green-only (#88).
+    [ -f "$VERIFY/$c/Cargo.toml" ] || GREEN_ONLY=1
   done
 fi
 # Fallback / co-located: scope to the affected packages and run their tests.
@@ -159,10 +193,15 @@ if ! run_test; then
 fi
 
 # --- RED: revert the production change, keep the added test, the test must fail ----
-if [ "${#ADDED_TESTS[@]}" -eq 0 ]; then
-  echo "run-verify.sh: PASS (green-only) — test is co-located with the fix (no separate */tests/*.rs)," >&2
-  echo "               so the per-fix RED can't be isolated; C4-ci gates the whole tree. Ship the test" >&2
-  echo "               as its own file to earn the full red->green." >&2
+if [ "${#ADDED_TESTS[@]}" -eq 0 ] || [ "$GREEN_ONLY" = 1 ]; then
+  if [ "$GREEN_ONLY" = 1 ]; then
+    echo "run-verify.sh: PASS (green-only) — the test lives in a crate this patch CREATES, so it has" >&2
+    echo "               no pre-patch state to isolate a RED against; C4-ci gates the whole tree (#88)." >&2
+  else
+    echo "run-verify.sh: PASS (green-only) — test is co-located with the fix (no separate */tests/*.rs)," >&2
+    echo "               so the per-fix RED can't be isolated; C4-ci gates the whole tree. Ship the test" >&2
+    echo "               as its own file to earn the full red->green." >&2
+  fi
   exit 0
 fi
 
