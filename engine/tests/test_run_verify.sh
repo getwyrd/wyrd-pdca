@@ -61,6 +61,31 @@ diff --git a/README.md b/README.md
 EOF
 check "docs-only -> empty classification" "" "$("$RV" --classify "$TMP/docs.diff")"
 
+# 3b. A crate the patch INTRODUCES: --pkg-name resolves its package name from the added
+# Cargo.toml (a net-new crate has no pre-patch Cargo.toml to read). Regression for #88 —
+# before the fix this path tripped `set -e` and killed the gate silently (exit 1).
+cat > "$TMP/newcrate.diff" <<'EOF'
+diff --git a/crates/metadata-tikv/Cargo.toml b/crates/metadata-tikv/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/crates/metadata-tikv/Cargo.toml
+@@ -0,0 +1,2 @@
++[package]
++name = "wyrd-metadata-tikv"
+diff --git a/crates/metadata-tikv/tests/conformance.rs b/crates/metadata-tikv/tests/conformance.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/metadata-tikv/tests/conformance.rs
+@@ -0,0 +1 @@
++#[test] fn t() {}
+EOF
+check "net-new crate -> --pkg-name resolves it from the patch (#88)" \
+  "wyrd-metadata-tikv" \
+  "$("$RV" --pkg-name crates/metadata-tikv "$TMP/newcrate.diff")"
+check "net-new crate -> --classify still emits ADDED_TEST + CRATE" \
+  $'ADDED_TEST crates/metadata-tikv/tests/conformance.rs\nCRATE crates/metadata-tikv' \
+  "$("$RV" --classify "$TMP/newcrate.diff")"
+
 # 4. an added NON-test file (e.g. a Dockerfile) is not a discriminator.
 cat > "$TMP/addnontest.diff" <<'EOF'
 diff --git a/crates/chunkstore-grpc/tests/dserver/Dockerfile b/crates/chunkstore-grpc/tests/dserver/Dockerfile
