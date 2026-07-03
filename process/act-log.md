@@ -29,6 +29,56 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-03 — cycles considered: issue_252, issue_253
+
+> A targeted entry, not a periodic sweep: it records one cross-cycle insight surfaced by the
+> post-merge Codex review of the M4.1/M4.2 slices (getwyrd/wyrd#421, #422). No contribution
+> disposition is re-decided; #422's gap is fixed in getwyrd/wyrd#423.
+
+## What the cycles' records exposed
+
+- **A brief's embedded "Verified backend facts" can launder a wrong assumption into ground
+  truth — worse than no fact at all.** #253's brief (`results/issue_253/brief.md`) carried a
+  *Verified backend facts* block to spare Do re-deriving tikv-client behaviour. One fact —
+  "a pessimistic `put`/`delete` buffers locally, no write-conflict" — was **wrong**
+  (tikv-client 0.4.0's `put`/`delete` eagerly `pessimistic_lock(...)` before buffering). Do
+  took it as settled, wrote `commit()`'s put/delete arms to return `Err` on that basis, **and
+  the contention test it wrote inherited the same blind spot** — the race exercised only the
+  `get_for_update`/`commit` path, never a put-only conflict. Every gate was green (the
+  endpoint-gated TiKV tests skip under `C4-*`, and the live-TiKV run only covered the modelled
+  path), so the defect surfaced only at the post-merge Codex review (P2 on #422 → fixed in
+  #423, which adds `put_only_write_race` and proves red→green on live TiKV). The failure mode
+  is specific to the *authority* of a "Verified" label: it **suppresses** Do's own source
+  check and shapes the regression test to the wrong model, so the test cannot catch it. This
+  differs from an ordinary spec error — the planner's confidence became Do's ground truth with
+  no re-derivation step in between.
+
+## Process deltas
+
+- Spec template / planner: any **"verified fact" a brief embeds must carry its source** (the
+  dependency `path:line`, or a reproducible one-line check) OR be marked *assumption — confirm
+  at build*. An **uncited** "verified" fact is a claim Do must re-check, not ground truth — the
+  label must never substitute for the citation.   (`templates/brief.md.tpl` — require a source
+  on any facts/assumptions a brief asserts; `.claude/agents/planner.md`)
+- Test-design (Do) + reviewer: a property/contention test must exercise **each code path that
+  implements the property**, not one representative case — here a conflict via the *put* path,
+  not only via the *precondition* path. Reviewer flags when a deferred-green test's covered
+  paths are **narrower than** the code paths implementing the claimed property.
+  (`.claude/agents/reviewer.md`; `AGENTS.md`)
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- The concrete code gap is already fixed: **getwyrd/wyrd#423** (draft, onto the M4 branch),
+  addressing the P2 on #422. By decision, the #253 brief is **left as-authored** — the wrong
+  fact stays in the frozen record, and this entry is the correction of record.   → owner: Eduard.
+
+## How effectiveness will be judged
+
+- The next M4 slices (#254–#258) all touch this backend: their briefs' embedded backend facts
+  should carry citations, and their property tests should enumerate per-path cases. Watch the
+  next ~5 cycles for a recurrence of "a confidently-stated brief fact shaped both the code and
+  the very test meant to catch it."
+
 # Act review — 2026-07-01 — cycles considered: issue_268, issue_287, issue_288, issue_330, issue_346, issue_356
 
 > Considers the six cycles that froze since the 2026-06-25 review (the index's 30 minus the 24
