@@ -54,9 +54,9 @@
   the publisher opens the slice PR against. (Caveat: the per-fix `C4-verify` gate
   currently validates against a hardcoded `origin/main`; for a *later* stacked slice whose
   integration base has diverged from `main` — once an earlier M4 slice has merged into it —
-  that gate base should follow the integration branch. A known follow-up; harmless for the
-  first slice, where the integration branch still equals `main`.) Add another integration
-  branch here when a future milestone needs the same.
+  that gate base should follow the integration branch. A known follow-up
+  (getwyrd/wyrd-pdca#91); harmless for the first slice, where the integration branch still
+  equals `main`.) Add another integration branch here when a future milestone needs the same.
 - **Override convention:** a maintainer's explicit base-branch request on the PR wins
   (per `GOVERNANCE.md` decision-making); otherwise `main`.
 - **Cross-version cherry-pick rules:** none today (single line). If back-porting starts,
