@@ -12,9 +12,24 @@ code); a model is invoked only at the five **leaves**. See
 
 ## Prerequisites
 
-- The **Claude CLI** (`claude`) installed and authenticated (for a live `flow`).
-- Python 3.11+.
-- Whatever tools your gates need (see `pdca.toml` `[[gates.checks]]`).
+`make install-check` (or `pdca doctor` once installed) reports the harness-universal
+tools and the configured leaf CLIs and prints the exact fix for anything missing. (Your gate
+toolchain is only checked if you declare it — see the last bullet.)
+
+- **Python 3.11+** — the driver is stdlib-only (`tomllib`).
+- **git** and **make** — per-cycle worktree isolation, and the bootstrap / front-door target
+  runner (on Windows use `scripts/install.ps1` instead of `make`).
+- a **pip-capable venv** (`python3-venv`; a clean Debian/Ubuntu lacks `ensurepip`) — `make
+  install` provisions it via `apt`, or falls back to `get-pip.py` (needs `curl`).
+- **[gh](https://github.com/cli/cli)**, authenticated (`gh auth login`) — draft-PR
+  publish/merge and the tracker scrape.
+- the **leaf-backend CLI(s)** you wire in `pdca.toml` `[leaves.*]` — e.g. `claude` and/or
+  `codex` — for a *live* `flow`; the `--rehearse` / stub slice needs none. `make install`
+  auto-installs a backend with an official installer (currently `claude`); for others (e.g.
+  `codex`) it reports the CLI as missing with a hint, and you install it yourself.
+- whatever your **gates** shell out to (`pdca.toml` `[[gates.checks]]`) — provision it via
+  `[install].extra_bootstrap` (survives `copier update`). Note `make install-check` doesn't run
+  that command; declare the tools as `[[doctor.checks]]` rows so `pdca doctor` verifies them.
 
 ## Install + run
 
@@ -77,6 +92,7 @@ Run the cycle through `pdca` (the console script). `make` is bootstrap-only.
 | `pdca status` / `queue` | List bundle states / the cheap-first sign-off burn-down. |
 | `pdca publish <id> [--dry-run]` | Re-publish an accepted bundle as a draft PR (the flow does this on accept). |
 | `pdca signoff <id> --accept` | Record the human Check sign-off (refused while §6 NEEDS-HUMAN is open). |
+| `pdca try <id>` | Launch the patched build from the bundle's worktree so you can hands-on test it during Check (needs `[manual_test].cmd` + `[driver].worktree`). |
 | `pdca act index` / `act log --date <d>` | Cross-cycle Act tooling. |
 | `make` / `make check` | Self-test (full / fast offline). |
 | `make install` / `make setup` | Bootstrap: console script in `.venv/` / Claude read-permissions. |
