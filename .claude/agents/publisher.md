@@ -65,12 +65,16 @@ not push, branch, or open a PR yourself.**
    Keep the template's trailing **tracker-reference line** (the same `[tracker].issue_trailer`
    form as the commit, e.g. `Fixes #<id>`): the contribution gate lints commit-msg.txt and
    the PR body **independently**, so a ticketed fix needs the id in BOTH — the commit
-   trailer alone does not satisfy it. When `[tracker].issue_url_pattern` is configured
-   **and the bundle id is a real tracker number**, also **hyperlink the ticket** in the body
-   (a Markdown link on the id) so a reader can click through to the report, not just read a
-   bare number. For a declared-ticketless fix (`--no-issue` / non-core) or a **slug** bundle
-   (a fork issue with no tracker number), the id is not a real ticket — OMIT both the link
-   and the line, and state the origin in-body instead.
+   trailer alone does not satisfy it. This closing-keyword line MUST be a **bare** `Fixes
+   #<id>` (the project's configured `[tracker].issue_trailer` form) — **never a Markdown link
+   on the id**. GitHub's auto-close parser only recognises a plain `#<id>`, so `Fixes
+   [#<id>](url)` silently fails to close the issue on merge (the id sits inside `[...]`, not
+   after the keyword). When `[tracker].issue_url_pattern` is configured **and the bundle id is
+   a real tracker number** and a clickable reference is wanted, add it on a **separate** line
+   (e.g. `Tracker: [#<id>](url)`), leaving the `Fixes #<id>` line bare. For a declared-
+   ticketless fix (`--no-issue` / non-core) or a **slug** bundle (a fork issue with no tracker
+   number), the id is not a real ticket — OMIT both the reference and the line, and state the
+   origin in-body instead.
 
 ## How you work
 
