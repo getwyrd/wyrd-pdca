@@ -29,6 +29,129 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-04 — cycles considered: issue_252, issue_253, issue_254, issue_285, issue_286, issue_290, issue_347, issue_348, issue_349, issue_350, issue_419
+
+> Considers the eleven cycles that froze since the 2026-07-01 review. Six of them
+> (285/286/290/347/349/350) were swept into the ledger on 2026-07-02 (`.act-reviewed` 30→36,
+> commit `1cafaec` — "no act-log.md entry yet; pending an act-log delta"); the newest five
+> (252/253/254/348/419) were swept into the working-tree ledger since. **This entry is that
+> deferred narrative**, over all eleven. issue_115 (ACCEPTED) and issue_153 (discontinued)
+> remain absent from the frozen index → still out of scope, carried. No disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **The toolchain-absent gate failure recurred (4×: #330, #348, #350, #252) — AND its 2026-07-01
+  upstream route has already been acted on. Record as evidence + one residual provisioning gap.**
+  The dominant recurring signal (ledger + digest "3× C4 … FAILED — cargo: not found") is that the
+  Do/gate subprocess inherited a bare `PATH` without `~/.cargo/bin`, so `C4-ci` false-failed as
+  `exec: cargo: not found` (#348 `check-gates.json:37`; #330), the `cc`→`zig cc` shim rejected a
+  bench-only native-C dep (#350), and cargo-deny/cargo-machete/pkg-config/libssl-dev were absent
+  (#350, #252). Crucially the harness fix this chain **routed upstream on 2026-07-01 has landed** —
+  `d3f0452 chore(engine): resolve cargo under a bare PATH for the gate subprocess` adds
+  `engine/lib/ensure-cargo.sh` (sources rustup's env when cargo is off `PATH`), which `engine/xtask.sh`
+  + `run-verify.sh` call before first cargo use. So the `cargo: not found` root cause is **closed**;
+  the reviewer skill again correctly read every such fail as a "toolchain/target-state caveat, not a
+  patch defect," not a blocking C4 FAIL (#348/#350 §6). The **residual** is host *provisioning* for the
+  M4 TiKV leg (docker + pkg-config + libssl-dev), which the doctor never preflighted — the one item
+  that meets the process-delta bar this review (below).
+- **The `Verification posture` field is doing its job across the whole M4/TiKV chain (252/253/254) —
+  record as evidence, no new delta.** Every M4 slice's red is **endpoint-gated** (skips without
+  `WYRD_TIKV_PD_ENDPOINTS`/docker TiKV), so `C4-verify` "fails" as a *designed, non-gating* artifact —
+  and in all three it surfaced as a **pre-declared** sign-off item, explicitly "NOT a real regression …
+  do not read it as a blocking verification failure" (#254 §6 C4; #253 §6 C4; #252 §6 T3), tracked to
+  the #146 deferred-posture sign-off convention and now to the #91 C4-verify base caveat. This is
+  exactly the surprise-C2/C4 → declared-item conversion the 2026-06-21/06-22 deltas exist to produce.
+  Working as designed — **no delta**.
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle.** Fitness-to-purpose in all eleven; T5
+  judgment in 252/253/254/348/349/350/419; C5 in 349/419. These are the always-human classes
+  (INTEGRATION.md §4) — the digest (3× T5, 2× C5, 2× V, 2× "decision owed: confirm") is that
+  structural constant, not a new pattern. **No delta warranted** — consistent with all prior reviews.
+- **NEW (design/governance, #419+#254) — an executable conformance pin was frozen into the SHARED,
+  multi-backend suite before the decision it encodes was ratified.** #419 lands
+  `contract_read_after_commit` / `contract_scan_is_consistent_cut` into
+  `crates/metadata-conformance/src/lib.rs`, encoding #261's read-consistency semantics — but #261 is
+  **open/unratified** (proposal 0015 still lists it under §Open questions, no ADR; #419 §6 V), and #254
+  *inherits the frozen suite unchanged* for TiKV. Whether a shared, governing, multi-backend pin may be
+  frozen ahead of the governed decision is a genuine architecture/governance question, not a code fix —
+  routes as a design issue (below), not a process delta.
+- **Worktree isolation silently fell back to in-place, mutating the human's primary checkout (#252) —
+  harness machinery, partially addressed upstream, residual routes.** `publish._clean_ref` preferred a
+  backticked span over the first token, so a brief base of "main (feature branch `feat/…`)" resolved to
+  the feature branch → nonexistent ref → silent in-place fallback (Do + C4 ran in `../wyrd`), with no
+  per-gate record of which tree ran and no persisted test stdout to attribute the exit-101 red (#252
+  §10 ×4). The recent **milestone integration-branch convention** work (`65be7a2`, `16804fd` #91,
+  `9789ff8` #93 — run-verify base now follows the brief's integration branch) addresses the base-resolution
+  axis; the residual (fail-CLOSED instead of silent in-place; the `_clean_ref` token-vs-parenthetical
+  parser; persisting gate stdout) is `src/pdca_harness/**` machinery → routes upstream.
+- **Single-cycle §10 nits, none recurring — noted, not deltas.** #285 rs(k,0) hard-read-error fitness
+  (in ledger, one-off V); #253 stale "conformance suite" log line at `xtask/src/main.rs:183`; #254
+  `SCAN_CAP` product-visibility + caller-side audit-signal calls; #350 unfenced `pub backfill::reconcile`
+  entrypoint; #290 dropped read-path preallocation. Each is 1×; none meets the spec/ruleset/gate/skill bar.
+
+## Process deltas
+
+- **Instance config (this repo): two active `pdca doctor` prerequisite rows for the M4 TiKV leg** —
+  `docker info` and `pkg-config --exists openssl` (both `level = "WARN"`, group `engine`). The M4 chain
+  (252/253/254, with #256/#258 still to come) repeatedly needs Docker + pkg-config + libssl-dev for the
+  on-demand `cargo xtask tikv-conformance` path (tikv-client 0.4 → native-tls → openssl-sys), and #252
+  §10 explicitly asked to add both to `pdca doctor`; absent them, the runner even mis-retried a
+  deterministic OpenSSL build failure 5× as "TiKV may still be bootstrapping." These are INSTANCE
+  prerequisites (this repo's config values), not harness machinery, so they land here — as WARN, since
+  the default feature-off `cargo xtask ci` needs neither.   (`pdca.toml` — new active `[[doctor.checks]]`
+  rows after the commented examples, ~`pdca.toml:446-465`) — tracked as **getwyrd/wyrd-pdca#96**
+  (also covers adding the same prerequisites to the CI workflow that runs the TiKV leg).
+- **No spec-template / ruleset / gate / agent-skill delta warranted.** The `cargo: not found` root cause
+  is closed upstream (`ensure-cargo.sh`); the `Verification posture` field converts the M4 endpoint-gated
+  reds to declared items as designed; the always-human classes are structural. A forced change would be
+  worse than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Design issue (governance, #419/#254/#261) — may an executable conformance pin be frozen into the
+  SHARED multi-backend suite before its decision is ratified into a governed doc?** #419 froze #261's
+  read-consistency semantics into `crates/metadata-conformance/src/lib.rs` (inherited unchanged by #254's
+  TiKV backend) while #261 is still open and proposal 0015 lists it under §Open questions. This needs a
+  governance/architecture decision (ratify #261 first? allow provisional pins with a marker? gate shared
+  pins on ratification?), not a code change. → **FILED getwyrd/wyrd#426** (milestone M4 — Production
+  metadata backend, 2026-07-04); do NOT author a brief here — governance decision first.
+- **Harness/driver issue (upstream template) — worktree isolation must fail CLOSED, not silently fall
+  back to in-place (#252).** Residual after the #90/#91/#93 integration-branch-convention work: (a)
+  `publish._clean_ref` should take the token before a parenthetical, not a backticked span, so a base of
+  "main (feature branch `feat/…`)" resolves to `main`; (b) a nonexistent/unresolvable base must abort the
+  beat, never short-circuit to mutating the operator's primary checkout; (c) persist each gate's test
+  stdout into the bundle and record which tree each gate ran in. `src/pdca_harness/**` + publish parser →
+  routes **upstream to the template**. → **FILED eduralph/pdca-harness#235** (2026-07-04).
+- **Harness/driver issue (upstream, #350) — the Wyrd gate host should not be a `zig cc`-shimmed /
+  ephemeral toolchain.** `cc`→`zig cc` (`~/.local/bin/cc` → a `/tmp/pyzig` venv) made C4-ci false-fail on
+  a bench-only native-C dep, and cargo-deny/cargo-machete were absent; with a real `cc` + the two CLIs the
+  gate passes (regenerated via `pdca gates 350`). Companion to the closed `ensure-cargo.sh` fix: provision
+  the gate host with a real `cc` and the deny/machete CLIs (or scope `--all-targets` off bench-only C
+  deps). → **FILED eduralph/pdca-harness#236** (2026-07-04).
+- **Tracker (Wyrd, one-off §10 nits) — file if/when the owning file is next touched:** #253 stale log
+  line `xtask/src/main.rs:183` (says "conformance suite" though `contention` also runs now); #350 unfenced
+  `pub backfill::reconcile`; #290 read-path preallocation follow-up. Minor; not standalone-issue-worthy
+  unless they recur. → owner: Eduard; fold in on next touch.
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21) still have
+  not had an Act review and remain absent from this index. → next Act review, if still in scope.
+- Prior reviews' routed items to confirm at the next review: the Wyrd `cargo doc`/rustdoc-deny gate step
+  and `tier1-disk-faults.yml` sudo fix (2026-06-25); the upstream leaf-env-loading item — **closed** by
+  `d3f0452` (`ensure-cargo.sh`); harness#120 target-pin / #121 reviewer-Basis; getwyrd/wyrd#242/#243
+  design issues + doc #244; #268 ADR-0010 `BlockReadFault` amendment; #356 fan-out id-map enhancement.
+
+## How effectiveness will be judged
+
+- WATCH the next ~5 cycles for **any recurrence of a toolchain-absent / provisioning gate failure** after
+  `ensure-cargo.sh` + the two new doctor rows: if `cargo: not found` recurs, the upstream fix regressed;
+  if a *TiKV-leg* provisioning miss recurs, the doctor rows should now have preflight-warned it (so the
+  miss is operator error, not a silent trap). A silent in-place fallback recurring makes the fail-closed
+  harness route overdue.
+- The design issue (#419/#261 shared-conformance-pin governance) and the two upstream harness items should
+  appear as a scheduled discussion / tracker ids (or explicit "still deferred") at the next review.
+- The routed-work-becomes-merged-PDCA-cycle loop should continue.
+
 # Act review — 2026-07-03 — cycles considered: issue_252, issue_253
 
 > A targeted entry, not a periodic sweep: it records one cross-cycle insight surfaced by the
