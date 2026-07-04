@@ -485,17 +485,22 @@ def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
 
 
 def _when_matches(when: dict | None, d: Path, *, default: bool) -> bool:
-    """The single ``when = {field, substring}`` gate predicate (issue #152): the substring is
-    matched case-insensitively against the named brief field. An empty/absent condition
+    """The ``when = {field, substring}`` gate predicate (issue #152): the substring is
+    matched case-insensitively against the named brief field. ``substring`` may be a single
+    string **or a list of strings** — a list matches if **any** element is a substring, so one
+    gate can span vocabulary variants (e.g. ``["high", "hard"]``). An empty/absent condition
     yields ``default`` — the one thing the callers differ on: an advisory leaf with no
     ``when`` runs (``default=True``), a builder variant with no ``when`` is opt-in
     (``default=False``). Shared by :func:`_advisory_applies` (#64) and :func:`_variant_applies`
     (#134), so the field/substring matching lives in exactly one place."""
     when = when or {}
-    needle = (when.get("substring") or "").lower()
-    if not needle:
+    sub = when.get("substring")
+    needles = [sub] if isinstance(sub, str) else list(sub or [])
+    needles = [str(n).lower() for n in needles if str(n)]
+    if not needles:
         return default
-    return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
+    hay = brief.field(d / "brief.md", when.get("field", "")).lower()
+    return any(n in hay for n in needles)
 
 
 def _variant_applies(spec: dict, d: Path) -> bool:

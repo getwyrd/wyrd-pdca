@@ -119,6 +119,19 @@ class DifficultyRouting(unittest.TestCase):
         self.assertTrue(leaves._when_matches({}, d, default=True))
         self.assertTrue(leaves._when_matches(None, d, default=True))
 
+    def test_when_substring_accepts_a_list_matching_any(self) -> None:
+        # A `substring` list matches if ANY element is a substring — one gate spans
+        # vocabulary variants (e.g. a brief that says "hard" instead of "high").
+        d_high = self._bundle("high")
+        listed = {"field": "difficulty", "substring": ["high", "hard"]}
+        self.assertTrue(leaves._when_matches(listed, d_high, default=False))
+        self.assertTrue(leaves._when_matches(listed, self._bundle("hard"), default=False))
+        self.assertFalse(leaves._when_matches(listed, self._bundle("low"), default=False))
+        # An empty list is treated as "no condition" → the caller's default.
+        empty = {"field": "difficulty", "substring": []}
+        self.assertFalse(leaves._when_matches(empty, d_high, default=False))
+        self.assertTrue(leaves._when_matches(empty, d_high, default=True))
+
     def test_both_gates_delegate_to_the_shared_predicate(self) -> None:
         # _variant_applies and _advisory_applies are now thin wrappers over _when_matches
         # (no second implementation of when-matching, #152): same match, different default
