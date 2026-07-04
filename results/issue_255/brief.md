@@ -1,0 +1,46 @@
+# Brief (pointer) — issue #255 / m4.4-server-backend-selection
+
+> Plan artifact = a pointer. Wyrd plans through its own governed artifacts (INTEGRATION
+> §6): the accepted **proposal 0015** carries the M4 plan and its slice-4 definition of
+> done. This brief POINTS at it and carries the driver-parsed fields; it does not restate
+> the plan. Do reads proposal 0015 slice 4 as the authoritative spec.
+
+- **Slug:** m4.4-server-backend-selection
+- **Planning artifact:** `docs/design/proposals/accepted/0015-milestone-4-production-metadata-backend-revised.md` (accepted; supersedes 0007) — authoritative sections: **§"Composition, not refactor — the thesis, with the honest count"** (the ~7-site count, the three concrete couplings), **§"Crate touch-points"** (the `server` bullet), and **§"Suggested PR sequence" slice 4** (this slice's DoD). Supporting: **ADR-0014** (redb is dev/eval-only, stays the default), **ADR-0016** (`server` is the crate that wires concretes), **ADR-0008** (the pluggable-backend thesis this slice proves). Cite these, not this brief, for the "what/why".
+- **Defect / goal:** `server` hard-codes `RedbMetadataStore` as its metadata backend (`crates/server/src/cli.rs`); there is no way for an operator to select redb (dev) vs TiKV (prod) by config, and the local paths run under `pollster::block_on`, where a `tokio`-bound TiKV client cannot run. This slice performs **the M4 composition change** that lets the backend be chosen by configuration — proving the `MetadataStore` trait did not leak (swap is composition in `server`, not a refactor).
+- **Success criterion:** `server` runs identically on redb (dev) and TiKV (prod) chosen **by config**, achieved by a **composition change confined to `crates/server`** (BINDING: this slice's diff outside the `metadata-tikv` crate is confined to `server` — `core`/`custodian`/`traits` byte-for-byte untouched by THIS change. Note: `core` already carries `wyrd-metadata-redb` under `[dev-dependencies]` for one restart-regression test — that is pre-existing and dev-only, NOT production redb dependence, per proposal 0015:346-347; the binding claim is "untouched by this diff", not "no redb dep exists anywhere"). Three couplings are removed: the ~7 `cli.rs` helpers are parameterized over `M: MetadataStore` behind a **redb | tikv** config selector; the local paths run on the `tokio` runtime the cluster paths already use; and `alloc_inode` gains **bounded retry-with-backoff** instead of its unbounded `Conflict`-spin. Mechanism names (config enum, selector shape, backoff schedule) are ILLUSTRATIVE — Do's call. **Check-verifiable (binding, at C4-verify):** the parameterized `server` compiles and its redb path passes a red→green regression (roundtrip via the generic helpers on the redb backend; `alloc_inode` returns a bounded error against a perpetual-`Conflict` store rather than spinning). **Deferred (off-Check):** the TiKV-backend green is **NOT** part of `cargo xtask ci` — the `tikv` feature is off by default, so `metadata-tikv` compiles as an empty skeleton and `ci` never touches the `tikv-client` tree (`metadata-tikv/Cargo.toml:11-20`; `xtask/src/main.rs:157` "Not part of run_ci"). It is proven **on-demand** by `cargo xtask tikv-conformance` (brings up `deploy/tikv-single-node` docker, sets `WYRD_TIKV_PD_ENDPOINTS`, rebuilds `--features tikv`, runs the shared conformance suite; host needs `pkg-config`+`libssl-dev`). There is **no automated CI exercising TiKV yet** — that is independent open follow-up #420, NOT a prerequisite of this slice. So at Check the binding evidence is the **redb** path via `cargo xtask ci`; the TiKV proof is a maintainer-run `cargo xtask tikv-conformance`. The tikv selection arm in `server` is itself `#[cfg(feature="tikv")]`-gated, so it is compiled OUT of the default Check build — its compile+run belongs to the `--features tikv` / tikv-conformance job.
+- **Repo + branch target:** getwyrd/wyrd @ `feat/m4-production-metadata-backend`   (the M4 integration branch, INTEGRATION §2; the publisher opens the slice PR against it — do NOT target `main`. Do cuts the slice branch `feat/m4.4-server-backend-selection` off it.)
+- **Depends on:** 253, 254
+- **Conflicts with:**
+- **Scope:** the backend-selection composition change in `server` — parameterize the `cli.rs` metadata helpers over `M: MetadataStore`, add the redb|tikv config selector, move the local paths onto `tokio`, bound `alloc_inode`'s retries with backoff. redb stays the dev default (ADR-0014). The tikv arm sits behind an **OFF-by-default `server` `tikv` feature** that forwards to `metadata-tikv`'s `tikv` feature (mirror `metadata-tikv/Cargo.toml:11-20`), so the default build and `cargo deny` graph are UNCHANGED and `cargo xtask ci` stays green with no TiKV. Bounding `alloc_inode` introduces a new exhaustion error path — thread it through its callers. Preserve existing DST-test determinism (the server `dst_*` tests drive the store via their own `pollster::block_on` and do not route through `cli.rs`'s runtime; reuse the existing `cli.rs:290/518` tokio-runtime pattern). / **out of scope:** the `metadata-tikv` crate's own `commit`/`scan`/prefix-scan implementation (M4.2 #253, M4.3 #254); **both items of #420** — the automated nightly TiKV CI workflow (item 1) AND the `deny.toml` allowlist / tikv-tree deny-audit (item 2). Item 2 is **DEFERRED to #420 by decision** (human, 2026-07-04), even though #420 names M4.4 as its "natural trigger": keeping `tikv` off by default means `cargo deny` in `cargo xtask ci` excludes the feature-off tikv tree, so `ci` stays green without it, and the tree was already adjudicated/approved at #252's sign-off (ADR-0003). This slice therefore does NOT touch `deny.toml`; the `deploy/` TiKV/PD + etcd production stack (M4.5 #256); Jepsen/Tier-1/Tier-2 campaigns (M4.6 #257); DST second-implementation pin (M4.7 #258); any change to the `MetadataStore` trait or its `core`/`custodian` consumers; NamespaceStore-on-TiKV (#265, M10).
+- **Difficulty:** high   (blast-radius: ~7 helper sites in `cli.rs` re-typed over a generic `M: MetadataStore`, plus a new config selector, plus restructuring the local execution paths from `pollster::block_on` onto a `tokio` runtime, plus the `alloc_inode` change — cross-cutting within `server` and touching both the local-disk and static-endpoints cluster paths. Confined to one crate, but a wide diff for a reviewer to hold in view. Rated up per the "when unsure, up" default.)
+- **Do model:** opus-xhigh   (explicit pin — overrides the difficulty=high auto-route to plain `opus`; starts Do on `opus` with the maxed thinking budget, `MAX_THINKING_TOKENS=31999`. #167)
+- **Test file:** `crates/server/tests/backend_selection.rs` (new) — asserts (a) the redb backend is selected by config and a roundtrip succeeds through the now-generic `cli.rs` helpers; (b) `alloc_inode` against a mock `MetadataStore` that always returns `Conflict` returns a bounded error rather than looping forever (today's unbounded loop makes this red — hang/timeout; the fix makes it green). The mock is only constructible once the helpers are generic over `M: MetadataStore`, so the test also load-bears the parameterization seam.
+- **Citations expected:** Do must cite `path:line` on `feat/m4-production-metadata-backend` for every change (the ~7 `RedbMetadataStore` sites: `cli.rs:25,333,361,364,371,464,478,508`; the `block_on`/runtime sites `cli.rs:19,157,211,293,338`; `alloc_inode` `cli.rs:371-387`) AND the Planning artifact section that governs each.
+- **Disposition hint:** likely-fix
+
+## Ordering note
+
+Not a batch here (single bundle), but the M4 slice sequence is load-bearing. This slice
+is **slice 4** of proposal 0015. `Depends on: 253, 254` (M4.2 atomic commit, M4.3 prefix
+scan): the redb-path composition + `alloc_inode` backoff can be built and Check-verified
+against redb with only M4.1's skeleton on the integration branch (the redb path never needs
+the tikv arm, which is `#[cfg]`-gated off by default). The TiKV **proof** — `cargo xtask
+tikv-conformance` under `--features tikv` — exercises `TikvMetadataStore`'s real
+`commit`/`scan`, which are themselves `#[cfg(feature="tikv")]`-gated and land in #253/#254;
+VERIFIED already present on `feat/m4-production-metadata-backend`
+(`metadata-tikv/src/lib.rs:236-272`), so the tikv arm compiles under `--features tikv` today.
+#420 has TWO items with DIFFERENT relationships to this slice (verified against #420's body):
+**item 1** (nightly TiKV CI workflow) is downstream and independent — not a prerequisite.
+**item 2** (bring the `tikv` tree into `cargo deny`'s audited graph via `deny.toml`) —
+though #420 names M4.4 as its "natural trigger… no later than that slice" — is **DEFERRED to
+#420 by human decision (2026-07-04)**: this slice keeps `tikv` off by default, so `cargo deny`
+in `cargo xtask ci` still excludes the feature-off tikv tree and `ci` stays green without any
+`deny.toml` change, and the tree was already adjudicated/approved at #252's sign-off (ADR-0003).
+Do MUST NOT edit `deny.toml`. M4.5–M4.7 (#256/#257/#258) are downstream and out of scope.
+
+## STOP discipline
+
+Draft only until Check sign-off. A draft PR MAY be opened against
+`feat/m4-production-metadata-backend` for CI; the PR MUST NOT be marked ready before
+sign-off accepts.
