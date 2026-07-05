@@ -77,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     p_flow.add_argument("--no-act", action="store_true", help="skip the Act leaf (Act runs by default after COMPLETE)")
     p_flow.add_argument("--by", default="", help="who signed off (recorded in §9)")
     p_flow.add_argument("--lanes", type=int, help="unattended Do+Check worker-pool size (docs 09; overrides [driver].lanes / PDCA_LANES)")
+    p_flow.add_argument("--max-passes", type=int, help="max Do↔sign-off passes per wave before it stops and reports any bundle still iterating (overrides [driver].max_passes / PDCA_MAX_PASSES)")
 
     p_status = sub.add_parser("status", help="list bundle states (cheap-first queue)")
     p_status.add_argument("issue_id", nargs="?")
@@ -288,6 +289,8 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
     """
     if getattr(args, "lanes", None) is not None:
         cfg.lanes = max(1, args.lanes)
+    if getattr(args, "max_passes", None) is not None:
+        cfg.max_passes = max(1, args.max_passes)
     ids = list(args.issue_ids)
 
     # --from-briefs: seed any missing bundle from DIR/<id>.md before driving.
