@@ -29,6 +29,141 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-04 (cont.) — cycles considered: issue_255, issue_256, issue_258, issue_364, issue_365, issue_366
+
+> The six cycles that froze after the earlier 2026-07-04 entry (which covered 252/253/254/285/286/
+> 290/347/348/349/350/419). These six are the **M4 "first-deployment" chain**: #255 server redb/TiKV
+> config selection, #256 small-multi-node deploy topology, #258 the DST second-impl pin, #364 the S3
+> gateway floor, #365 the etcd Coordination backend, #366 the custodian/reconstruction rebuild that
+> consumes #365. This entry does not re-open the earlier same-day deltas/routes. issue_115 (ACCEPTED)
+> and issue_153 (discontinued) remain absent from the frozen index → carried, out of scope. No
+> contribution disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **NEW & RECURRING (actionable) — `run-verify.sh` / the non-gating `C4-verify` gate cannot run a
+  crate that needs a bespoke test environment, so it reports a *bogus* "RED with fix applied" FAIL
+  (2× this batch: #258 madsim, #366 new-crate rename — and #366 records it "recurring since iter-3").**
+  `run-verify.sh` runs a plain `cargo test`. When the bundle's test only exists under a special
+  invocation, that runner sees zero tests / fails to build and emits a red the patch did not cause:
+  #258's DST tests are `#![cfg(madsim)]` (`concurrency.rs:34`) and compile to nothing without
+  `--cfg madsim` (which only `cargo xtask dst` sets), so `C4-verify` false-failed while the **gating**
+  `C4-ci` ran the same suite green under `--cfg madsim`×50 seeds (`SUMMARY.md:47-65`; both advisories
+  reproduced green by hand with `RUSTFLAGS='--cfg madsim'`); #366's `git mv` into a new crate broke
+  `run-verify`'s pathspec so it "cannot handle new-crate renames … forced accepting a reasoned rather
+  than observed red." In every case the gating `C4-ci` carried the real red→green and the reviewer
+  skill correctly read the `C4-verify` fail as a **posture/tooling mismatch, not a patch defect** (the
+  2026-06-22 stale-/unreadable-target caveat generalised to cover it) — so nothing wrong shipped. But
+  this is now a recurring **harness** limitation that repeatedly denies madsim-gated / crate-renaming
+  bundles an automated green-with-fix and leans the whole verdict on `C4-ci` + hand runs. `run-verify.sh`
+  is harness machinery (`src/pdca_harness/**`) → routes **upstream**; the recurrence promotes it from
+  a one-off §10 nit to a filed item (below). Not a PDCA spec/ruleset/gate/skill delta.
+- **The DST / simulator "second-implementation" fidelity question is the always-human #264 axis — now
+  recurring across #258 AND #365, working as a *pre-declared* sign-off item, no delta.** Both slices
+  pin a trait by building a deterministic **model** as the second implementation — #258 a
+  `SimTikvMetadataStore` (pessimistic-lock-at-prewrite, `support/mod.rs:404-462`), #365 a
+  madsim-etcd-client simulator — and in both the C5/T5 crux is identical: is the deterministic
+  simulator proof an accepted stand-in for real distributed correctness (2PC/TSO interleavings; real
+  etcd), or must a real-backend green precede shipping? This is the explicitly-open #264 judgment the
+  briefs *pre-declare* (0015:798-801), so it lands as a ratification item, not a surprise C5/T5 — the
+  `Verification posture` + `Production reach` fields doing their job on the fidelity axis. Always-human
+  (INTEGRATION.md §4) — **no delta**.
+- **The off-Check live-deployment green converges on #367 (the first-deployment gate) across four of
+  the six (#256, #364, #365, #366) — Verification posture working as designed; #367 is the tracked
+  convergence dependency, not a delta.** Each slice builds a piece whose *live* proof (docker bring-up
+  #256; public-TLS S3 listener #364; real-etcd conformance #365; live Prometheus/OTLP exporter #366) is
+  deliberately deferred to the #367 day-one runbook gate. All surfaced as **pre-declared** V items, none
+  as surprise C2/C4. Confirmed #367 is OPEN ("Define the first-deployment gate — the blueprint's day-one
+  runbook, executable end to end"). This is exactly the deferred-≠-unbuilt conversion the fields exist to
+  produce (each names what IS exercised at Check — redb CI path, in-process read-back, plaintext loopback,
+  the docker-compose `config` parse). **No delta** — carried as the #367 convergence watch.
+- **A new pre-1.0 production dependency needing the ADR-0003 audit recurs — #365's `etcd-client 0.14`
+  echoes the `tikv-client 0.4` chain (252/253/255).** `store.rs:207` dials `Client::connect(endpoints,
+  None)` (no TLS/auth) and `etcd-client` enters the production feature graph (`Cargo.toml:101`); like
+  tikv-client it owes the ADR-0003 three-test audit + `deny.toml` allowlist + a TLS/auth posture before
+  production exposure. This is the standing always-human governance item at each M4-backend sign-off, not
+  a process pattern to fix — routes as a tracked follow-up (below), no delta.
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle.** Fitness-to-purpose in all six; T5 in
+  256/258/364/365/366; C5 in 258/365/366. The always-human classes (INTEGRATION.md §4) — the structural
+  constant, not a new pattern. **No delta warranted** — consistent with every prior review.
+- **Single-cycle §10 nits, none recurring — routed, not deltas.** #256 gateway/custodian process-role
+  tracking issue (confirm/file) + `SMALL_MULTI_NODE_ENDPOINTS` D-server-port readiness gap (a
+  crash-looping `dserver*` still prints success) + the `xtask` self-scan / D-server-count sizing calls;
+  #364 no in-tree `wyrd s3` client / smoke harness (live sign-off fell back to the in-suite real-SDK
+  test because `aws` CLI was absent). Each is 1×; none meets the spec/ruleset/gate/skill bar.
+
+## Process deltas
+
+- **No spec-template / ruleset / gate / agent-skill delta warranted this review.** The `Verification
+  posture` + `Production reach` fields are converting the M4 chain's deferred greens and the DST/etcd
+  simulator-fidelity questions into pre-declared sign-off items as designed; the always-human classes
+  (V/C5/T5) are structural; the one new recurring finding (`run-verify.sh` bespoke-env / rename
+  limitation) is **harness machinery** upstream of this repo, not a PDCA spec/ruleset/gate/skill change.
+  A forced delta here would be worse than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Harness/driver issue (upstream template) — `run-verify.sh` (C4-verify) must handle bespoke-env
+  crates and crate renames instead of emitting a bogus "RED with fix applied" (#258, #366; #366 says
+  recurring since iter-3).** Give the per-fix runner a per-repo/per-crate **run hook** (a parameter or
+  alternate validation script) so a `--cfg madsim` / `cargo xtask dst` bundle earns a real automated
+  green-with-fix, and teach it the **`git mv`-into-new-crate** case so a renamed test path does not break
+  its pathspec. Until then, madsim-gated and crate-renaming bundles rest entirely on the gating `C4-ci` +
+  a hand run. `src/pdca_harness/**` → routes **upstream to the template**. → owner: Eduard; next step:
+  file against eduralph/pdca-harness when bumping the harness; record the id next review.
+- **Tracker (Wyrd, #256) — confirm-or-file the gateway/custodian process-role tracking issue.** The
+  brief flags this role as likely UNTRACKED and asks Act to confirm it exists (believed to, unconfirmed);
+  a tracker search here did not surface it. → owner: Eduard; next step: search getwyrd/wyrd and file
+  (milestone M4) if absent; record id next review.
+- **Tracker (Wyrd, #256 §10) — small-multi-node smoke check false-greens on a crashed D server.**
+  `SMALL_MULTI_NODE_ENDPOINTS` (`xtask/src/main.rs`) waits only on etcd/PD/TiKV, not the D-server ports,
+  so a crash-looping `dserver*` still prints success; add the D-server ports to the readiness wait. →
+  owner: Eduard; next step: file against getwyrd/wyrd (M4 deploy); record id next review.
+- **Tracker (Wyrd, #364 §10) — no in-tree S3 client / smoke-test harness.** Live sign-off had to fall
+  back to the in-suite real-SDK test because the `aws` CLI was absent and no `wyrd s3` client subcommand
+  exists, so a signed PUT/GET/DELETE over the wire could not be driven by hand — a gap #367's day-one
+  runbook will need closed. → owner: Eduard; next step: file against getwyrd/wyrd (M4 S3); record id next
+  review.
+- **Tracker/governance (Wyrd, #365 §10) — `etcd-client 0.14` ADR-0003 audit + TLS/auth posture.**
+  Accepted as this slice's posture but owed before production etcd exposure: the ADR-0003 three-test
+  audit + `deny.toml` allowlist + real TLS/auth over `Client::connect(endpoints, None)` (`store.rs:207`).
+  Companion to the standing `tikv-client 0.4` audit (INTEGRATION §4). → owner: Eduard; next step: file
+  against getwyrd/wyrd (M4); record id next review.
+- **#367 runbook qualifications carried from #366 §10 (into the #367 gate, not a delta):** the day-one
+  runbook must state that `reconstruction_data_loss` does NOT fire on node death until #365 membership
+  lands (watch `reconstruction_unreachable` as the dead-node proxy), and that which gauge signals a kill
+  is capacity-conditional (spare capacity → `under_replicated` rise→zero; bare exactly-n → lands on
+  `reconstruction_repair_blocked`). → owner: Eduard; fold into #367 when authored.
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21) still
+  have not had an Act review and remain absent from this index. → next Act review, if still in scope.
+- From the earlier 2026-07-04 entry: the design issue **getwyrd/wyrd#426** (may an executable
+  conformance pin be frozen into the SHARED multi-backend suite before its decision is ratified — the
+  #419/#254/#261 axis) and the two upstream harness items **eduralph/pdca-harness#235** (fail-closed
+  worktree isolation) / **#236** (zig-cc-shimmed gate host) should show progress next review.
+- **#367** (first-deployment gate, OPEN) is the convergence point for the deferred live greens of
+  #256/#364/#365/#366 — confirm it lands (or is explicitly still deferred) at the next review.
+- Prior reviews' carried items: `pdca doctor` docker+openssl rows (getwyrd/wyrd-pdca#96); the closed
+  `ensure-cargo.sh` cargo-not-found fix; harness#120/#121; getwyrd/wyrd#242/#243 + doc #244; #268
+  ADR-0010 `BlockReadFault` amendment; #356 fan-out id-map enhancement.
+
+## How effectiveness will be judged
+
+- WATCH the next ~5 cycles for **another `run-verify.sh` bogus-red** on a bespoke-env crate (madsim,
+  `cargo xtask dst`, feature-gated) or a crate rename: if it recurs after the upstream run-hook lands,
+  the route was right; if it recurs before, the routed harness item is overdue. A third occurrence
+  (after #258/#366) confirms the promotion from watch to action was warranted.
+- The four deferred live greens should converge on a real **#367** run — the next review should see
+  #256/#364/#365/#366's off-Check observations either landed at #367 or explicitly still deferred, so the
+  deferral chain stays auditable rather than silently dropping.
+- The DST/etcd simulator-fidelity axis (#264) should keep landing as a *pre-declared* ratification item,
+  not a surprise C5/T5; if a future second-impl slice raises it as a surprise, the `Production reach`
+  field needs a fidelity sub-field.
+- The routed follow-ups (upstream run-hook; the four Wyrd tracker items) should appear as tracker/issue
+  ids (or an explicit "still deferred") at the next review.
+
 # Act review — 2026-07-04 — cycles considered: issue_252, issue_253, issue_254, issue_285, issue_286, issue_290, issue_347, issue_348, issue_349, issue_350, issue_419
 
 > Considers the eleven cycles that froze since the 2026-07-01 review. Six of them
