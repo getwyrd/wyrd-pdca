@@ -111,11 +111,24 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 | T4 contribution | ADR-0003 §1 (DCO), `require-issue`, `adr-immutability`; commit/PR conventions (§8) | `cargo xtask` gates + GitHub CI | `./engine/xtask.sh ci` (re-gate) + host CI | [built — host-enforced] |
 | T5 judgment | reviewer contract below | Check reviewer + sign-off | (model) | [planned] |
 
-- **Reviewer family (cross-vendor, ≠ builder):** codex — config `AGENTS.md`
-  (decorrelated path); `.claude/agents/reviewer.md` is a same-vendor fallback with
-  execute-only tool scope (no write to the fix).
-- **Builder family:** claude — `.claude/agents/builder.md` [built], with the
-  ready-mark block enforced by the `.claude/hooks/builder_guard.py` PreToolUse hook.
+- **Reviewer family (cross-vendor, ≠ builder):** codex — canonical role body
+  `agents/reviewer.md`, inlined for a codex reviewer / resolved via `--agent reviewer` for a
+  claude one (`.claude/agents/reviewer.md` renders only when the reviewer family is claude).
+  `AGENTS.md` now carries general codex **project context** (STOP discipline, boundaries),
+  not the reviewer role.
+- **Builder family:** claude — canonical role body `agents/builder.md`; the
+  Claude wrapper `.claude/agents/builder.md` (with the ready-mark block enforced by the
+  `.claude/hooks/builder_guard.py` PreToolUse hook) is materialized only when the builder
+  family is claude. A codex builder runs `codex exec --sandbox workspace-write`, confined to
+  the worktree cwd.
+- **Interactive family:** claude — the human-in-the-loop leaves (Plan,
+  Sign-off, Publish, Act) run a seeded `claude --agent <name>` REPL or a `codex` TUI, chosen
+  by `interactive_family`. A codex publisher gets the same `gh` STOP-shim the builder does
+  (it has no PreToolUse hook), so it can't `gh pr ready`/`merge`.
+- **Role prompts (vendor-neutral source):** each leaf's instructions live once in
+  `agents/<name>.md`. Claude leaves also get `.claude/agents/<name>.md` (frontmatter wrapper
+  that includes that body, so `--agent` resolves); non-Claude (inline) leaves read the
+  `agents/` body directly. Only Claude leaves carry a `.claude/agents/` file.
 - **Vendor profiles:** every family-specific behavior (streaming, extra-dir grounding,
   role-prompt injection, STOP-guard mechanism) is data in `pdca_harness.families`,
   overridable via `pdca.toml [families.<name>]` — swapping or adding a vendor is a
@@ -170,8 +183,9 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 | Tracker read | `gh` CLI | `gh issue view <id>` (ad hoc; no scraper needed) | [host tool] |
 | Driver | `src/pdca_harness/` | `pdca run <id>` / `pdca flow <id>` | [built — stub leaves; wire `command` for real runs] |
 | Act tooling (L4) | `src/pdca_harness/act.py` | `pdca act index`, `pdca act log --date <d>` | [built] |
-| Reviewer config | `AGENTS.md` + `.claude/agents/reviewer.md` | (model leaf) | [built — contract; wire command mode] |
-| Builder subagent | `.claude/agents/builder.md` + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
+| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca gates [<id>] [--working-tree]` | [built — stub fallback; fill checks] |
+| Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex, `.claude/agents/reviewer.md` is the Claude packaging) | (model leaf) | [built — contract; wire command mode] |
+| Builder role prompt | `agents/builder.md` (canonical body); `.claude/agents/builder.md` (Claude wrapper) + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
 
 ## 10. Maintainer and governance
 - **Who reviews:** Eduard Ralph (founding maintainer during bootstrap, per

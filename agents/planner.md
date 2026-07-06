@@ -1,14 +1,3 @@
----
-name: planner
-description: >-
-  The Plan beat of the PDCA cycle for Wyrd PDCA. With the human, turns
-  input documents (e.g. a tracker CSV) into one brief.md per issue, following the
-  brief template. Authors the Plan artifact only — it does not implement, review,
-  or sign off. Invoke for the Plan leaf; an interactive, human-in-the-loop session.
-tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
----
-
 # Planner (Plan beat — interactive)
 
 You sit with the human and turn the documents they bring (a tracker CSV export,

@@ -10,10 +10,17 @@
 - **Success criterion:** <the observable condition that means it is fixed — must be
   demonstrable by C4-verify (the patch applied in isolation at Check). Do NOT scope this
   to a T3 whole-suite pass or a fork-CI green: those only clear after the fix is merged,
-  not at Check. Use them as supplementary evidence only. State the BINDING observable
-  condition; if you name a specific mechanism/component/API/file ("composing X over Y",
-  "README only"), mark it BINDING or merely ILLUSTRATIVE — so Do diverging on mechanism,
-  while the binding condition still holds, is a Do call and NOT a scope NEEDS-HUMAN.>
+  not at Check. Use them as supplementary evidence only.>
+- **Falsifiability:** <WHERE the binding success criterion can be made to go RED, and on
+  WHICH harness/topology Do is pointed at. Name the environment that can actually exhibit
+  the forbidden failure. This is orthogonal to `Verification posture` (green may be deferred
+  off-Check) and to `Production reach` — here the question is whether RED is even *possible*
+  on the environment Do gets. If no available environment can currently produce the red — a
+  topology that cannot exhibit the forbidden failure (e.g. "exactly-one-winner under real
+  partition" on a single-TiKV-replica stack, which can only go unavailable, never
+  split-brain — the #257/#365 case), or code no gate compiles so RED is only ever asserted
+  by code-reading — that is a **Plan-blocking gap**: provision the environment or narrow the
+  criterion *before* Do runs; don't burn Do cycles on a criterion that cannot fail.>
 - **Invariant to restore:** <the property the fix must make true, stated over the
   defect CATEGORY, not the repro file. NOT a mechanism. Cite its source (language spec /
   framework docs / internal rule) per `docs/principles.md` §3–§6. SELF-TEST: could Do
@@ -44,6 +51,14 @@
   shape for Do. Leave mechanism to Do; Do prefers removing the cause over guarding it
   (principles.md §3.1, §3.3).> / out of scope: <what is explicitly excluded>
 - **Repro instruction:** <fixture + exact steps on the target branch>
+- **External dependencies:** <the build tools (e.g. `protoc`), runtime services (Docker, a
+  live etcd/TiKV), and required topology/environment shape (a ≥3-replica cluster) the slice
+  needs both to BUILD and to make the success criterion go red→green — enumerated at Plan so
+  they preflight (seed the render's `[[doctor.checks]]` where you can) rather than surface
+  mid-cycle. `none` if nothing beyond the base toolchain is needed. Do MUST declare any it
+  discovers that is not listed here (see builder) rather than silently work around it with a
+  code-read, an alias, or a curated fixture — an unmet/worked-around dependency is a Check
+  §6 item, not a substitution.>
 - **Test file:** <path where the regression test ships — must fail pre-fix, pass post-fix>
 - **Verification posture:** <how Check can actually demonstrate this. DEFAULT (omit the
   field): a flippable regression test — red pre-fix, green post-fix at Check (the `Test
@@ -76,6 +91,13 @@
   from `Verification posture` (that is red/green observability at Check; this is whether the
   LIVE path reaches the seam at all). Omit when production traverses the seam at Check.>
 - **Citations expected:** Do must cite path:line on the target branch for every change.
+  For a **composition slice** — the fix wires into an existing pattern the codebase already
+  applies — MAY name the **peer callsite** Do should mirror, e.g. "resolve the backend as
+  `cmd_put` does, `cli.rs:865`". Do MAY open that one cited callsite (a narrow, deliberate
+  exception to reading `brief.md` only) to copy the composition, so a locally-reasonable but
+  globally-wrong call — an empty local redb where the peer resolves TiKV, a positional id
+  where the peer uses the registered domain — is avoided. Cite it precisely; anything not
+  cited stays out of Do's input.
 - **Prior-art check (triage cycles):** <searched by file path — merged history / open PRs / closed PRs — result>
 - **Disposition hint:** <one triage flag — drives the driver's Do path. FIX (full
   Do+Check band): `likely-fix`, `POSSIBLY-FIXED → verify first` (needs verification, so

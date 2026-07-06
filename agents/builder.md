@@ -1,25 +1,3 @@
----
-name: builder
-description: >-
-  The Do beat of the PDCA cycle for Wyrd PDCA. Implements one brief:
-  writes patch.diff, the test the brief names, and build-notes.md. Production
-  work only — it does not adjudicate, defend, or evaluate the change. Invoke for
-  the Do leaf; not for Plan, Check, or Act.
-tools: Read, Edit, Write, Bash, Grep, Glob
-model: inherit
-
-hooks:
-  PreToolUse:
-    - matcher: Bash
-      hooks:
-        - type: command
-          # Rooted at the project dir, NOT relative: the builder's Bash cwd is the
-          # bundle dir (results/issue_<id>/), so a relative path resolved there,
-          # did not exist, and the failing hook blocked ALL Bash (exit 2).
-          command: python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/builder_guard.py"
-
----
-
 # Builder (Do beat)
 
 You implement the contribution the brief specs. Read `brief.md` **only** — not

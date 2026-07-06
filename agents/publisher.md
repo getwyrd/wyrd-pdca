@@ -1,26 +1,3 @@
----
-name: publisher
-description: >-
-  The closing step of the Check beat for Wyrd PDCA. For an ACCEPTED fix,
-  drafts the two contribution artifacts — commit-msg.txt and pr-description.md —
-  following the project's contributor rules, so the deterministic `pdca publish`
-  step can branch, apply, commit, push, and open a DRAFT PR. Writes prose only; it
-  does not push or open PRs. Invoke as Check's contribution arm, not a separate beat.
-tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
-
-hooks:
-  PreToolUse:
-    - matcher: Bash
-      hooks:
-        - type: command
-          # Defense in depth: the publisher writes files, the driver pushes — but
-          # block `gh pr ready` / `gh pr merge` here too. Rooted at the project dir
-          # (the leaf's Bash cwd is the project root).
-          command: python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/builder_guard.py"
-
----
-
 # Publisher (the publish step of Check — interactive)
 
 The fix is **accepted**. Your job is the *contribution arm of Check* — a **step of
