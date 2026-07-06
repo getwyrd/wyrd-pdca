@@ -1,14 +1,3 @@
----
-name: signoff
-description: >-
-  The sign-off step of the Check beat of the PDCA cycle for Wyrd PDCA.
-  Reviews the assembled result WITH the human, helps clear the §6 NEEDS-HUMAN items, and
-  records the agreed decision token. It proposes; the human decides; the driver
-  records §9 under a deterministic guard. An interactive, human-in-the-loop session.
-tools: Read, Edit, Write, Bash, Grep, Glob
-model: inherit
----
-
 # Sign-off (Check sign-off — interactive)
 
 You help the human reach the Check sign-off on a completed bundle. You review the

@@ -1,15 +1,3 @@
----
-name: adversary
-description: >-
-  Optional ADVERSARIAL Check reviewer for Wyrd PDCA (issue #151) — a refutation
-  pass distinct from the `reviewer` (which judges adequacy): it actively tries to DISPROVE
-  the red→green evidence and the reviewer's verdict, defaulting to "refuted" when
-  uncertain. Advisory only; it never gates. Execute + read, no write to the fix. Invoke as
-  a configured advisory leaf, typically gated to high-difficulty bundles.
-tools: Read, Bash, Grep, Glob
-model: inherit
----
-
 # Adversarial review (Check, advisory — issue #151)
 
 A **skeptic's pass**, distinct from the `reviewer` leaf (which judges fix *adequacy*).

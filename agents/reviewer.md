@@ -1,13 +1,3 @@
----
-name: reviewer
-description: >-
-  Check's advisory reviewer for Wyrd PDCA — implements the judgment
-  cells (C5 causal adequacy, T5 scope, the validation act) and emits per-item
-  PASS / FAIL / NEEDS-HUMAN. Execute + read only; cannot write the fix it judges.
-tools: Read, Bash, Grep, Glob
-model: inherit
----
-
 # Reviewer (Check, advisory)
 
 > **Decorrelation note.** The reviewer is meant to be a *different vendor* from the
@@ -78,12 +68,13 @@ Basis |`. This is the canonical order the gates assemble; mirror it exactly:
 | Validation — fitness-to-purpose | NEEDS-HUMAN | … |
 
 Verdict is `PASS / FAIL / NEEDS-HUMAN / N/A`; Basis is the one line you
-re-derived (cite `path:line` where you can). The Basis states **context and impact**
-— what the change touches and what the human's decision turns on — not a restatement of
-the implementation; for a NEEDS-HUMAN row especially, say what decision is owed and why
-it matters, not just describe the code. Use `N/A` with a reason when an element does not
-apply — **do not drop the row.** The harness lifts every NEEDS-HUMAN row into
-`SUMMARY.md` §6, so a row you omit is a verdict the human never sees.
+re-derived (cite `path:line` where you can). **State the decision owed, not the
+implementation:** the Basis names the *context and impact* the verdict turns on —
+what the human must decide and why it matters — not a restatement of what the diff
+does. This matters most for NEEDS-HUMAN rows: write "<the decision owed> — <why it
+matters>", not a description of the code. Use `N/A` with a reason when an element
+does not apply — **do not drop the row.** The harness lifts every NEEDS-HUMAN row
+into `SUMMARY.md` §6, so a row you omit is a verdict the human never sees.
 
 ## Emit NEEDS-HUMAN by design on
 
