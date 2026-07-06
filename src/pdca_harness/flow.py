@@ -184,11 +184,16 @@ def flow(
     do_act: bool = False,
     by: str = "",
     today: str | None = None,
-    max_iters: int = 10,
+    max_iters: int | None = None,
 ) -> str:
-    """Drive one issue through the whole cycle; return its final state."""
+    """Drive one issue through the whole cycle; return its final state.
+
+    ``max_iters`` defaults to ``cfg.max_passes``; if the cap is hit with the bundle still
+    iterating it is reported (never silently dropped), as in the batch driver."""
     d = cfg.bundle(issue_id)
     today = today or datetime.date.today().isoformat()
+    if max_iters is None:
+        max_iters = cfg.max_passes
 
     for _ in range(max_iters):
         if not _plan_if_unplanned(cfg, d, csv):
@@ -200,6 +205,7 @@ def flow(
         if state.state(d) == state.COMPLETE:
             break
 
+    _warn_abandoned([d], max_iters)  # no-op unless the cap left it mid-iteration
     final = state.state(d)
     if do_publish and final == state.COMPLETE:
         # Closing step of Check. Dry-run when the publisher leaf is stubbed (offline
@@ -419,6 +425,25 @@ def _audit_wave_overlap(wave: list[Path]) -> None:
                       f"conflict; review before merge.", file=sys.stderr)
 
 
+def _warn_abandoned(wave: list[Path], max_passes: int) -> list[Path]:
+    """Loudly report any bundle a wave left un-terminal — its next iteration was NOT driven
+    and it was NOT published — with a resume hint, so the ``max_passes`` cap never *silently*
+    drops a bundle mid-iteration (the bug this guards: an ``iterate-do`` recorded on the last
+    allowed pass is otherwise never rebuilt, and the caller publishes the accepted siblings
+    around it with no signal). No-op when every bundle reached a terminal state. Returns the
+    stuck bundles so the caller's run summary reflects them."""
+    stuck = [d for d in wave
+             if state.state(d) in (state.ITERATE_DO, state.ITERATE_PLAN, state.AWAITING_SIGNOFF)]
+    if stuck:
+        labels = ", ".join(sorted(d.name for d in stuck))
+        ids = " ".join(sorted(d.name.replace("issue_", "") for d in stuck))
+        print(f"flow: ⚠ hit the {max_passes}-pass cap with {labels} still iterating — their "
+              f"next iteration was NOT driven and they were NOT published. Raise "
+              f"[driver].max_passes (or --max-passes) and resume: pdca flow {ids}",
+              file=sys.stderr)
+    return stuck
+
+
 def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
                 max_passes: int = 10) -> None:
     """Drive ONE wave's bundles to all-terminal (COMPLETE / DISCONTINUED) with iteration,
@@ -427,7 +452,8 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
     (beat-synchronised, isolated), then a chunked sign-off whose decisions are recorded
     (``apply_now=False``) so an iterate-do doesn't rebuild mid-review — looping until the
     wave makes no progress (an iterate-plan re-open #105 still counts as progress) or every
-    bundle is terminal."""
+    bundle is terminal. If the ``max_passes`` budget is exhausted with a bundle still
+    iterating, it is reported (never silently dropped) via :func:`_warn_abandoned`."""
     names = {b.name for b in wave}
     for _ in range(max_passes):
         before = [state.state(d) for d in wave]
@@ -435,6 +461,7 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
         pending = [e.bundle for e in queue.awaiting_signoff(cfg) if e.bundle.name in names]
         if not pending:
             if [state.state(d) for d in wave] == before:
+                _warn_abandoned(wave, max_passes)  # no-op if all terminal
                 return  # genuinely stuck (all terminal / planner declined an UNPLANNED)
             continue    # progress (e.g. an iterate-plan re-open) — give it another pass
         for chunk in _chunks(pending, SIGNOFF_BATCH_SIZE):
@@ -449,6 +476,10 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
                     cfg, d, by=by, today=today, apply_now=False))
         if all(state.state(d) in (state.COMPLETE, state.DISCONTINUED) for d in wave):
             return
+    # Pass budget exhausted with the wave not all-terminal: a bundle left at ITERATE_* here
+    # has its next iteration deferred to a pass that never comes, and the caller publishes
+    # only COMPLETE bundles — so surface it loudly rather than dropping it silently.
+    _warn_abandoned(wave, max_passes)
 
 
 def _drive_and_act(
@@ -566,7 +597,7 @@ def flow_batch(
     do_act: bool = False,
     by: str = "",
     today: str | None = None,
-    max_passes: int = 10,
+    max_passes: int | None = None,
 ) -> dict[str, str]:
     """Plan many → drive every in-flight bundle to sign-off → publish → Act once. **Resumable.**
 
@@ -575,9 +606,11 @@ def flow_batch(
     re-running ``flow --from-csv`` picks up where it left off instead of failing on
     "no new briefs". COMPLETE bundles (done), DISCONTINUED ones (abandoned) and UNPLANNED
     ones (no brief — e.g. an issue the planner chose to skip) are left alone. Returns
-    ``{issue_id: state}``.
+    ``{issue_id: state}``. ``max_passes`` defaults to ``cfg.max_passes``.
     """
     today = today or datetime.date.today().isoformat()
+    if max_passes is None:
+        max_passes = cfg.max_passes
 
     leaves.do_plan_batch(cfg, csv)
     # Resume set: every bundle with a brief that isn't finished. UNPLANNED (skipped /
@@ -622,7 +655,7 @@ def flow_ids(
     do_act: bool = False,
     by: str = "",
     today: str | None = None,
-    max_passes: int = 10,
+    max_passes: int | None = None,
 ) -> dict[str, str]:
     """Drive specific bundles by id through the FULL cycle to Act.
 
@@ -632,9 +665,11 @@ def flow_ids(
     session (``do_plan_batch`` over those ids, reading each bundle's ``notes.json``), making
     this the id-seeded analogue of ``flow_batch``. Ids still UNPLANNED after the pre-pass
     (planner skipped them) and terminal ids (COMPLETE / DISCONTINUED) are left alone.
-    Returns ``{issue_id: state}``.
+    Returns ``{issue_id: state}``. ``max_passes`` defaults to ``cfg.max_passes``.
     """
     today = today or datetime.date.today().isoformat()
+    if max_passes is None:
+        max_passes = cfg.max_passes
 
     # Optional Plan pre-pass (#65): brief the UNPLANNED ids in one shared session, before
     # the drive set is filtered, so the un-briefed ones become drivable. A csv enables it too.

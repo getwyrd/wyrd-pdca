@@ -174,6 +174,12 @@ class Config:
     # Do+Check band. ``1`` (the default) keeps the driver strictly serial. ``[driver].lanes``
     # in pdca.toml; ``PDCA_LANES`` overrides for a single run (like ``PDCA_BUNDLE_ROOT``).
     lanes: int = 1
+    # Max Do↔sign-off passes a single wave runs before it STOPS and loudly reports any
+    # bundle still iterating (rather than silently dropping it and publishing the rest).
+    # The cap bounds a non-converging bundle; a bundle that legitimately needs more
+    # iterations is resumed with ``pdca flow <id>`` or by raising this. ``[driver].max_passes``
+    # in pdca.toml; ``PDCA_MAX_PASSES`` overrides for a single run (like ``PDCA_LANES``).
+    max_passes: int = 20
     # Worktree isolation (issue #94): run a cycle's Do/Check in a dedicated git worktree
     # off the target's base, so the host's primary checkout is never mutated in place.
     # On by default; ``[driver].worktree = false`` disables (then Do/Check edit the
@@ -348,6 +354,12 @@ class Config:
         if os.environ.get("PDCA_LANES"):
             lanes = int(os.environ["PDCA_LANES"])
         lanes = max(1, lanes)
+        # Per-wave iteration cap. PDCA_MAX_PASSES overrides [driver].max_passes for one run.
+        # Floor of 1; a bundle still iterating when it's hit is reported, not dropped.
+        max_passes = int(driver_cfg.get("max_passes", 20))
+        if os.environ.get("PDCA_MAX_PASSES"):
+            max_passes = int(os.environ["PDCA_MAX_PASSES"])
+        max_passes = max(1, max_passes)
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
         wave_mode = driver_cfg.get("wave_mode", "stack")  # #wave-model: stack | merge
@@ -398,6 +410,7 @@ class Config:
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             lanes=lanes,
+            max_passes=max_passes,
             worktree=worktree,
             lane_preflight=lane_preflight,
             wave_mode=wave_mode,
