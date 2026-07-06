@@ -1,0 +1,1 @@
+- No advisory findings. I found no patch-introduced correctness bugs or reuse / simplification / efficiency issues that merit a human sign-off item.

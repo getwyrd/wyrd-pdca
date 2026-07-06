@@ -1,0 +1,493 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6e80ce2..b4f5c8d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3772,6 +3772,7 @@ dependencies = [
+  "wyrd-coordination-mem",
+  "wyrd-core",
+  "wyrd-custodian",
++ "wyrd-metadata-conformance",
+  "wyrd-metadata-redb",
+  "wyrd-testkit",
+  "wyrd-traits",
+diff --git a/crates/dst/Cargo.toml b/crates/dst/Cargo.toml
+index 6d24e4a..3391006 100644
+--- a/crates/dst/Cargo.toml
++++ b/crates/dst/Cargo.toml
+@@ -21,6 +21,10 @@ madsim.workspace = true
+ wyrd-core.workspace = true
+ wyrd-traits.workspace = true
+ wyrd-metadata-redb.workspace = true
++# The shared MetadataStore trait-contract suite (M4.1), driven under the simulator
++# over BOTH backends — redb and the simulated-TiKV model in `tests/support/mod.rs`
++# — so the trait is pinned by two implementations (ADR-0006; proposal 0015 M4.7).
++wyrd-metadata-conformance.workspace = true
+ wyrd-chunkstore-fs.workspace = true
+ tempfile.workspace = true
+ # M2.6 network DST (tests/network.rs): the real gRPC ChunkStore over madsim's
+diff --git a/crates/dst/tests/concurrency.rs b/crates/dst/tests/concurrency.rs
+index 18fc8a4..8399db8 100644
+--- a/crates/dst/tests/concurrency.rs
++++ b/crates/dst/tests/concurrency.rs
+@@ -1,9 +1,33 @@
+ //! Commit-protocol concurrency tests on madsim's deterministic, single-threaded
+-//! scheduler (ADR-0009). madsim interleaves the spawned writer tasks at their
+-//! `.await` boundaries from the run seed; each `commit()` is internally
+-//! synchronous (one redb write transaction, no await inside), so the only
+-//! question the scheduler decides is *which* writer commits first — and the
+-//! version compare-and-set guarantees exactly one does, under every interleaving.
++//! scheduler (ADR-0009), driven through **both** `MetadataStore` implementations —
++//! the deterministic redb backend and the deterministic **simulated-TiKV model**
++//! (`support::SimTikvMetadataStore`) — so the identical exactly-one-winner property
++//! pins the trait by two implementations (ADR-0006; proposal 0015 §"Pinning the
++//! trait with the second implementation", accepted
++//! `docs/design/proposals/accepted/0015-milestone-4-production-metadata-backend-revised.md:546-555`).
++//!
++//! madsim interleaves the spawned writer tasks at their `.await` boundaries from the
++//! run seed. **What decides "which writer wins" — and how large the schedule space
++//! is — differs by backend, and pinning the trait with a second implementation is
++//! exactly what surfaces that:**
++//!
++//! * on **redb**, each `commit()` is one synchronous write transaction — indivisible,
++//!   so the scheduler only chooses the *order* of whole commits and the version
++//!   compare-and-set trivially admits exactly one;
++//! * on **TiKV**, a `commit()` is a 2PC that **awaits on network I/O mid-flight**, so
++//!   the scheduler can interleave a second writer *inside* a commit — a strictly
++//!   larger schedule space than redb's. The simulated-TiKV model renders that await
++//!   boundary explicitly; the version compare-and-set *still* yields exactly one
++//!   winner because the decision is taken at an atomic prewrite lock-grab, not spread
++//!   across the await (proposal 0015 lines 549-555).
++//!
++//! So determinism here rests on madsim's seed-reproducible scheduler, **not** on the
++//! old redb-shaped claim that "each `commit()` is internally synchronous, no await
++//! inside, so the only question is which writer commits first" — which is untrue of a
++//! TiKV commit that awaits on network I/O mid-flight. The two seed-pinned tests below
++//! (`sim_tikv_reaches_mid_commit_interleaving_and_one_wins` and its demonstrated-red
++//! twin) prove the corrected reasoning: the mid-commit interleaving is genuinely
++//! reached, and exactly one writer still wins across it.
+ //!
+ //! Requires `--cfg madsim` (set by `cargo xtask dst`); without it this file
+ //! compiles to nothing, so a normal `cargo test` neither builds nor runs it.
+@@ -15,7 +39,11 @@ use wyrd_chunkstore_fs::FsChunkStore;
+ use wyrd_core::metadata::EcScheme;
+ use wyrd_core::{read, write};
+ use wyrd_metadata_redb::RedbMetadataStore;
+-use wyrd_traits::CommitOutcome;
++use wyrd_traits::{CommitOutcome, MetadataStore};
++
++#[path = "support/mod.rs"]
++mod support;
++use support::{Fidelity, Observations, SimTikvMetadataStore};
+ 
+ const CHUNK: usize = 4;
+ const LEASE_EXPIRY: u64 = 6_000;
+@@ -23,6 +51,12 @@ const LEASE_EXPIRY: u64 = 6_000;
+ // fragments per chunk), not just M0 single-fragment replication (M1.6).
+ const RS: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
+ 
++/// A committed, reproduces-forever seed (ADR-0009; proposal 0015 lines 539, 660):
++/// the two seed-pinned tests below build the runtime with this fixed seed, so they
++/// replay the *same* interleaving on every run, on every machine. Value spells
++/// "M4.7" (`b"M4.7"` big-endian) — a mnemonic, not a magic constant.
++const PINNED_INTERLEAVING_SEED: u64 = 0x4D34_2E37;
++
+ /// A unique, deterministic chunk-id generator starting just above `base`.
+ fn ids_from(base: u128) -> impl FnMut() -> u128 {
+     let mut n = base;
+@@ -32,10 +66,17 @@ fn ids_from(base: u128) -> impl FnMut() -> u128 {
+     }
+ }
+ 
+-#[madsim::test]
+-async fn exactly_one_concurrent_writer_wins() {
++/// The shared exactly-one-winner property, written against the `MetadataStore`
++/// **trait** so redb and the simulated-TiKV model run the byte-identical race
++/// ("shared, not forked" — proposal 0015 lines 548, 656). Four writers read the same
++/// prior version, stage independently, then race to commit the version-conditional
++/// CAS; exactly one must win and the version must bump exactly once, under whatever
++/// interleaving the seed picks.
++async fn exactly_one_writer_wins_over<M>(meta: Arc<M>)
++where
++    M: MetadataStore + 'static,
++{
+     let dir = tempfile::tempdir().expect("temp dir");
+-    let meta = Arc::new(RedbMetadataStore::in_memory().expect("redb"));
+     let chunks = Arc::new(FsChunkStore::open(dir.path()).expect("fs store"));
+ 
+     // An existing object at version 1.
+@@ -92,3 +133,75 @@ async fn exactly_one_concurrent_writer_wins() {
+     let bytes = read::read_path(&*meta, &*chunks, 0, "obj").await.unwrap();
+     assert_eq!(bytes.as_deref(), Some(&b"contended"[..]));
+ }
++
++/// Exactly-one-winner over the **deterministic redb backend** (the Tier-0 spine,
++/// unchanged — proposal 0015 lines 489-499).
++#[madsim::test]
++async fn exactly_one_concurrent_writer_wins_redb() {
++    let meta = Arc::new(RedbMetadataStore::in_memory().expect("redb"));
++    exactly_one_writer_wins_over(meta).await;
++}
++
++/// Exactly-one-winner over the **second implementation** — the simulated-TiKV model,
++/// whose commit awaits on (simulated) network I/O mid-flight. The identical property
++/// body drives it, pinning the trait by two implementations (ADR-0006).
++#[madsim::test]
++async fn exactly_one_concurrent_writer_wins_sim_tikv() {
++    let meta = Arc::new(SimTikvMetadataStore::new());
++    exactly_one_writer_wins_over(meta).await;
++}
++
++/// Run the four-writer race over the simulated-TiKV model at the fixed
++/// [`PINNED_INTERLEAVING_SEED`] and return what the store observed. The inner
++/// assertions (exactly one winner, version bumped once) hold for **both**
++/// fidelities — only the *reachability of the mid-commit interleaving* differs.
++fn run_pinned_race(fidelity: Fidelity) -> Observations {
++    let rt = madsim::runtime::Runtime::with_seed_and_config(
++        PINNED_INTERLEAVING_SEED,
++        madsim::Config::default(),
++    );
++    rt.block_on(async move {
++        let meta = Arc::new(SimTikvMetadataStore::with_fidelity(fidelity));
++        exactly_one_writer_wins_over(Arc::clone(&meta)).await;
++        meta.observations()
++    })
++}
++
++/// The corrected interleaving coverage (proposal 0015 lines 549-555): a
++/// **committed, reproduces-forever seed** proving the two things the old redb-shaped
++/// rationale conflated — (1) the mid-commit `.await` boundary is genuinely reached (a
++/// writer's prewrite observes another writer *mid-commit*, a schedule redb's
++/// indivisible commit cannot produce) and (2) the version CAS still yields exactly
++/// one winner under that interleaving (asserted inside `run_pinned_race`).
++#[test]
++fn sim_tikv_reaches_mid_commit_interleaving_and_one_wins() {
++    let obs = run_pinned_race(Fidelity::AwaitInsideCommit);
++    assert!(
++        obs.mid_commit_lock_conflicts >= 1,
++        "the await-inside-commit model must reach a schedule where a writer's \
++         prewrite observes another writer mid-commit (else the exactly-one-winner \
++         coverage is vacuous); saw {} mid-commit observations",
++        obs.mid_commit_lock_conflicts,
++    );
++}
++
++/// The demonstrated-red twin (cf. `crates/metadata-conformance/tests/demonstrated_red.rs`):
++/// the **synchronous, redb-shaped** commit — "no await inside" — is a correct store
++/// (exactly one winner, so `run_pinned_race`'s inner assertions still pass) but, being
++/// indivisible, can NEVER reach the mid-commit interleaving. Same seed, same race: the
++/// observation count stays 0, so the `>= 1` assertion the await model satisfies panics
++/// here. That is what makes the interleaving coverage load-bearing rather than a
++/// tautology — and it is exactly the redb-shaped assumption the module header used to
++/// state as the ground of determinism.
++#[test]
++#[should_panic(expected = "observes another writer mid-commit")]
++fn synchronous_redb_shaped_commit_never_reaches_the_interleaving() {
++    let obs = run_pinned_race(Fidelity::SynchronousRedbShaped);
++    assert!(
++        obs.mid_commit_lock_conflicts >= 1,
++        "the await-inside-commit model must reach a schedule where a writer's \
++         prewrite observes another writer mid-commit (else the exactly-one-winner \
++         coverage is vacuous); saw {} mid-commit observations",
++        obs.mid_commit_lock_conflicts,
++    );
++}
+diff --git a/crates/dst/tests/conformance.rs b/crates/dst/tests/conformance.rs
+new file mode 100644
+index 0000000..48b08c6
+--- /dev/null
++++ b/crates/dst/tests/conformance.rs
+@@ -0,0 +1,44 @@
++//! The **shared** `MetadataStore` trait-contract suite, run inside the deterministic
++//! simulator over **both** implementations — the deterministic redb backend and the
++//! deterministic simulated-TiKV model (`support::SimTikvMetadataStore`) — so the
++//! identical property suite pins the trait by two implementations (ADR-0006;
++//! proposal 0015 §"Pinning the trait with the second implementation" and
++//! §"Definition of done", accepted
++//! `docs/design/proposals/accepted/0015-milestone-4-production-metadata-backend-revised.md:546-555,655-657`).
++//!
++//! The assertions are the *same* `wyrd_metadata_conformance::run_all` clauses redb
++//! and TiKV already share out-of-simulator
++//! (`crates/metadata-redb/tests/conformance.rs`,
++//! `crates/metadata-tikv/tests/conformance.rs`); here they run under madsim's
++//! seed-reproducible scheduler (ADR-0009), where the simulated-TiKV model's
++//! await-inside-commit shape is exercised. "Shared, not forked" (proposal 0015 lines
++//! 548, 656): the clauses redb passes are the clauses the second implementation
++//! passes — neither backend gets its own copy.
++//!
++//! Requires `--cfg madsim` (set by `cargo xtask dst`); without it this file compiles
++//! to nothing, so a normal `cargo test` neither builds nor runs it.
++#![cfg(madsim)]
++
++use wyrd_metadata_redb::RedbMetadataStore;
++
++#[path = "support/mod.rs"]
++mod support;
++use support::SimTikvMetadataStore;
++
++/// The deterministic redb backend passes every shared contract clause under the
++/// simulator (Tier-0 spine, unchanged — proposal 0015 lines 489-499).
++#[madsim::test]
++async fn redb_backend_passes_shared_contract() {
++    wyrd_metadata_conformance::run_all(|_tag| async {
++        RedbMetadataStore::in_memory().expect("redb in-memory store")
++    })
++    .await;
++}
++
++/// The second implementation — the deterministic simulated-TiKV model, with its
++/// await-inside-commit shape — passes the **identical** shared contract clauses,
++/// pinning the trait by two implementations (ADR-0006).
++#[madsim::test]
++async fn sim_tikv_backend_passes_shared_contract() {
++    wyrd_metadata_conformance::run_all(|_tag| async { SimTikvMetadataStore::new() }).await;
++}
+diff --git a/crates/dst/tests/support/mod.rs b/crates/dst/tests/support/mod.rs
+new file mode 100644
+index 0000000..90210c6
+--- /dev/null
++++ b/crates/dst/tests/support/mod.rs
+@@ -0,0 +1,244 @@
++//! A **deterministic simulated-TiKV** `MetadataStore` — the *second* implementation
++//! the DST tier drives, so the trait is pinned by two implementations (ADR-0006;
++//! proposal 0015 §"Pinning the trait with the second implementation", accepted
++//! `docs/design/proposals/accepted/0015-milestone-4-production-metadata-backend-revised.md:546-555`).
++//!
++//! This is **not** a real or containerized TiKV — putting one inside DST is
++//! explicitly rejected (proposal 0015 lines 484-499, 600-603; ADR-0009 forbids a
++//! real environment for correctness DST already covers). It is a small, in-memory,
++//! seed-reproducible *model* that renders the one thing a redb store does not: a
++//! commit that **awaits on network I/O mid-flight** (a 2PC/TSO round-trip), so
++//! madsim can interleave a second writer *inside* a commit. The version
++//! compare-and-set still yields exactly one winner because the decisive step — the
++//! pessimistic prewrite lock-grab — is atomic, not spread across the await
++//! (proposal 0015 lines 549-555).
++//!
++//! It lives under `tests/` (dev/test scope only, never shipped, never a real
++//! backend) — the same discipline the shared conformance suite's violating stores
++//! follow (`crates/metadata-conformance/tests/demonstrated_red.rs`). Because it is
++//! test-scope and uses only *instance* state (never a `static`), it is outside the
++//! ADR-0035 global-mutable-state gate (which scans `src/` only) and cannot leak
++//! observations across seeds/threads.
++//!
++//! ## Fidelity is an open design point (issue #264 / proposal 0015 lines 798-801)
++//!
++//! How faithfully a simulated-TiKV must model 2PC/TSO interleavings — vs a
++//! trait-level contract harness — to keep "exactly one wins" coverage honest is an
++//! explicitly open M4 design point. This model proposes the **pessimistic-lock at an
++//! atomic prewrite** level of fidelity and demonstrates it reaches the target
++//! interleaving; the human ratifies that choice at sign-off.
++
++#![allow(dead_code)]
++
++use std::collections::{BTreeMap, HashSet};
++use std::sync::Mutex;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_traits::{CommitOutcome, MetadataStore, Precondition, Result, WriteBatch};
++
++/// How faithfully the model renders a commit's async shape.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Fidelity {
++    /// The faithful model: a commit spans network round-trips (a TSO/begin hop and a
++    /// commit hop) with a real `.await` **inside** it, exactly as a TiKV 2PC does.
++    /// The winner is decided at an atomic *prewrite* lock-grab, so exactly-one-winner
++    /// survives the mid-commit interleaving the await boundary makes reachable.
++    AwaitInsideCommit,
++    /// The redb-shaped assumption the old `concurrency.rs` header encoded: a commit is
++    /// one indivisible step, "no await inside". Still a correct store (exactly one
++    /// winner), but structurally **unable** to reach a mid-commit interleaving — kept
++    /// only to demonstrate that the await boundary is what makes that schedule
++    /// reachable (the demonstrated-red twin).
++    SynchronousRedbShaped,
++}
++
++/// Per-simulation observation of the interleavings actually exercised. Instance
++/// state (never a `static`) so it lives inside madsim's simulated world and cannot
++/// leak across seeds/threads (ADR-0035).
++#[derive(Debug, Default, Clone, Copy)]
++pub struct Observations {
++    /// Commits that, at their atomic prewrite, found a key already **locked by an
++    /// in-flight (not-yet-committed) commit** — i.e. observed another writer
++    /// *mid-commit*, the schedule an indivisible (synchronous) commit can never
++    /// produce.
++    pub mid_commit_lock_conflicts: u64,
++    /// High-water mark of commits simultaneously past prewrite and awaiting their
++    /// commit hop — the depth of the in-flight window the await boundary opens.
++    pub max_inflight: u64,
++}
++
++#[derive(Default)]
++struct Inner {
++    /// The committed key/value state.
++    truth: BTreeMap<Vec<u8>, Bytes>,
++    /// Keys currently locked by an in-flight commit (pessimistic prewrite locks).
++    /// Only ever probed with `contains`/`insert`/`remove` — never iterated — so it
++    /// introduces no ordering nondeterminism.
++    locks: HashSet<Vec<u8>>,
++    /// Number of commits currently past prewrite and awaiting their commit hop.
++    inflight: u64,
++    obs: Observations,
++}
++
++/// A deterministic simulated-TiKV `MetadataStore` (see module docs).
++pub struct SimTikvMetadataStore {
++    inner: Mutex<Inner>,
++    fidelity: Fidelity,
++}
++
++impl SimTikvMetadataStore {
++    /// A fresh, empty store with the faithful await-inside-commit fidelity.
++    pub fn new() -> Self {
++        Self::with_fidelity(Fidelity::AwaitInsideCommit)
++    }
++
++    /// A fresh, empty store at the given [`Fidelity`].
++    pub fn with_fidelity(fidelity: Fidelity) -> Self {
++        Self {
++            inner: Mutex::new(Inner::default()),
++            fidelity,
++        }
++    }
++
++    /// A snapshot of what this store observed during the run.
++    pub fn observations(&self) -> Observations {
++        self.inner.lock().unwrap().obs
++    }
++}
++
++impl Default for SimTikvMetadataStore {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// One simulated network round-trip. A fixed, non-zero madsim timer, so every
++/// writer yields the scheduler at the same virtual instant — the interleaving
++/// point. `sleep` always returns `Pending` first, so this is a real await boundary
++/// madsim can schedule across (unlike a redb write transaction).
++async fn network_hop() {
++    madsim::time::sleep(Duration::from_millis(1)).await;
++}
++
++/// Whether every precondition holds against the committed truth (`None` = require
++/// absent, `Some(v)` = require exact value) — the byte-compare the trait specifies.
++fn preconditions_hold(truth: &BTreeMap<Vec<u8>, Bytes>, preconditions: &[Precondition]) -> bool {
++    preconditions
++        .iter()
++        .all(|pre| truth.get(&pre.key).cloned() == pre.expected)
++}
++
++/// The keys a commit touches — every precondition, put, and delete key — the set a
++/// pessimistic transaction locks (TiKV's `get_for_update` over the read+write set).
++fn write_set(batch: &WriteBatch) -> Vec<Vec<u8>> {
++    let mut keys: Vec<Vec<u8>> = Vec::new();
++    keys.extend(batch.preconditions.iter().map(|pre| pre.key.clone()));
++    keys.extend(batch.puts.iter().map(|(k, _)| k.clone()));
++    keys.extend(batch.deletes.iter().cloned());
++    keys.sort();
++    keys.dedup();
++    keys
++}
++
++/// Apply a batch's mutations to the committed truth (deletes then puts).
++fn apply(truth: &mut BTreeMap<Vec<u8>, Bytes>, batch: &WriteBatch) {
++    for key in &batch.deletes {
++        truth.remove(key);
++    }
++    for (key, value) in &batch.puts {
++        truth.insert(key.clone(), value.clone());
++    }
++}
++
++impl SimTikvMetadataStore {
++    /// The redb-shaped model: check-and-apply in one indivisible step, no await
++    /// inside — so no second writer can ever be observed mid-commit.
++    fn commit_synchronous(&self, batch: &WriteBatch) -> CommitOutcome {
++        let mut inner = self.inner.lock().unwrap();
++        if !preconditions_hold(&inner.truth, &batch.preconditions) {
++            return CommitOutcome::Conflict;
++        }
++        apply(&mut inner.truth, batch);
++        CommitOutcome::Committed
++    }
++
++    /// The faithful model: begin (TSO) hop, an **atomic** prewrite that grabs the
++    /// pessimistic locks and checks preconditions, the **mid-commit** await, then an
++    /// atomic apply that releases the locks. The winner is decided at prewrite, so
++    /// exactly one writer wins even though a commit spans two await boundaries.
++    async fn commit_await_inside(&self, batch: &WriteBatch) -> CommitOutcome {
++        let keys = write_set(batch);
++
++        // Phase 1 — begin / TSO: a network hop. Every concurrent writer yields here.
++        network_hop().await;
++
++        // Phase 2 — prewrite: the ATOMIC decision point (one critical section, no
++        // await). Grab pessimistic locks on the write set, then check preconditions.
++        {
++            let mut inner = self.inner.lock().unwrap();
++            // Write-write conflict: a key is already locked by an in-flight commit,
++            // so we are observing that writer *mid-commit* — past its prewrite, not
++            // yet applied. This is precisely the schedule a synchronous, indivisible
++            // commit can never produce.
++            if keys.iter().any(|k| inner.locks.contains(k)) {
++                inner.obs.mid_commit_lock_conflicts += 1;
++                return CommitOutcome::Conflict;
++            }
++            if !preconditions_hold(&inner.truth, &batch.preconditions) {
++                return CommitOutcome::Conflict;
++            }
++            for key in &keys {
++                inner.locks.insert(key.clone());
++            }
++            inner.inflight += 1;
++            inner.obs.max_inflight = inner.obs.max_inflight.max(inner.inflight);
++        }
++
++        // Phase 3 — the mid-commit await: the commit RPC round-trip. Another writer
++        // runs here; this is the boundary the redb-shaped "no await inside" denied.
++        network_hop().await;
++
++        // Phase 4 — commit: apply and release the locks (atomic, no await).
++        {
++            let mut inner = self.inner.lock().unwrap();
++            apply(&mut inner.truth, batch);
++            for key in &keys {
++                inner.locks.remove(key);
++            }
++            inner.inflight -= 1;
++        }
++        CommitOutcome::Committed
++    }
++}
++
++#[async_trait]
++impl MetadataStore for SimTikvMetadataStore {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        if self.fidelity == Fidelity::AwaitInsideCommit {
++            network_hop().await; // a snapshot read is a network round-trip too.
++        }
++        Ok(self.inner.lock().unwrap().truth.get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        if self.fidelity == Fidelity::AwaitInsideCommit {
++            network_hop().await;
++        }
++        let inner = self.inner.lock().unwrap();
++        Ok(inner
++            .truth
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        Ok(match self.fidelity {
++            Fidelity::SynchronousRedbShaped => self.commit_synchronous(&batch),
++            Fidelity::AwaitInsideCommit => self.commit_await_inside(&batch).await,
++        })
++    }
++}
