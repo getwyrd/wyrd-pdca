@@ -1,0 +1,27 @@
+# Check review — issue 257 / m4.6-tier1-jepsen-tier2
+
+**Task under review:** extend the realism-ladder **Tier-1 (integration + Jepsen)** and
+**Tier-2** test lines across the redb→TiKV **metadata backend swap** (M4.6, proposal 0015
+PR item 6) — a real-TiKV fault seam in `testkit` (`MetaFault`/`SeededMetaFaults`), three
+off-Check `xtask` runners (`meta-integration`/`meta-jepsen`/`meta-tier2`) with a **pure
+`meta_dispatch` routing** decision, new metadata-swap tier test targets in
+`crates/metadata-tikv/tests/`, and a DST-promoted seed (`crates/dst/tests/tikv_surfaced_regressions.rs`)
+for the compounding loop — all behind the **unchanged** `MetadataStore` trait.
+
+Grounded on target `/home/eddie/wyrd/wyrd.pdca-wt-l0` (patch applied there:
+`meta_dispatch` at `xtask/src/faults.rs:599`, `SeededMetaFaults::quorum_safe_max` at
+`crates/testkit/src/lib.rs:397`, trait intact at `crates/traits/src/lib.rs:338`).
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | Plan-pointer brief to accepted proposal 0015 slice-6; deliverables (testkit seam, 3 xtask runners, tier targets, DST seed) match the enumerated scope and the Check-observable flippable (`brief.md:52-56`). Nothing to decide. |
+| C2 Reproduction (red pre-fix) | NEEDS-HUMAN | Net-new feature slice: no pre-existing bug to reproduce. Load-bearing tier red is **privileged-off-Check** by pre-declared posture (`brief.md:57-60,101-112`); the on-Check red (negating `meta_dispatch`/`quorum_safe_max`) was **not** auto-captured — `check-gates.json` C4-verify reports "test PASSES without the fix" (reverting source breaks compile, no clean red). I confirmed by inspection the assertions are load-bearing (`faults.rs:917` pins `package=="wyrd-metadata-tikv"` & test names; `testkit lib.rs:620` pins `⌊(n-1)/2⌋`). Decision owed: accept the pre-declared deferred-red posture and the privileged Tier job as the red witness. |
+| C3 Change | PASS | Diff implements the seam + runners + pure dispatch + tier targets + DST seed; blast radius stays in `testkit`/`xtask`/`*/tests` + `Cargo.lock`/`Cargo.toml`; `traits`/`core`/`custodian`/backend untouched as the brief requires (`brief.md:88-91,129`). APIs used exist (`RedbMetadataStore::in_memory` `metadata-redb:36`, `TikvMetadataStore::connect/with_namespace` `metadata-tikv:435,446`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | **Gating** whole-tree `cargo xtask ci` gate = PASS (tree compiles; the new non-ignored pure unit + dispatch tests run green). Non-gating per-fix red→green gate = FAIL, but pre-declared for this posture (feature slice; live tier green needs a privileged Docker host + #256 stack, `WYRD_TIER1/2`). Decision owed: privileged Tier job confirms live Tier-1/Tier-2/Jepsen green; human accepts that the on-Check red was established by reviewer inspection, not by `run-verify`. |
+| C5 Causal adequacy | PASS | Symptom-guard smell-test applied: the `#[ignore]`+`WYRD_TIKV_PD_ENDPOINTS`/`#[cfg(feature="tikv")]` skips are the **design-mandated tier-gating pattern** (mirroring existing `tier1_*`/`tier2_*` guards, `brief.md:149-152`), not a capability probe papering over a load-time side effect — does not fire. The fix **closes the coverage gap** (pre-M4 tiers proved the chunkstore path; this adds the metadata-swap legs) rather than guarding a symptom (`brief.md:23-34`). |
+| T1 Structure | PASS | Tier tests in each crate's `tests/`, testkit seam in `mod tests`, xtask dispatch test in `xtask/src/faults.rs mod tests` (`:917`) — mirrors the existing `jepsen_dispatch` precedent (`faults.rs:179`). |
+| T2 Shape | PASS | Assertions are behavioral, not tautological: exactly-one-winner + all-or-nothing (integration/jepsen tests), `quorum_safe_max` values + majority-survivor property (`testkit:620`), routing package/test identity the runner actually consumes via `run_meta_scenario_test` (`faults.rs`). Gated + clean-skip like siblings. |
+| T3 Runtime | PASS | On-Check pure tests green via the passing `cargo xtask ci` gate; madsim seed test compiles under dst dev-deps (`crates/dst/Cargo.toml` carries madsim/redb/traits/testkit/bytes/async-trait). Live tier runtime is off-Check by design. |
+| T4 Contribution | PASS | Net-additive coverage of the metadata swap; no existing tier test deleted or weakened; the unchanged trait is the atomicity surface exercised (`brief.md:129-132`). |
+| T5 Judgment | NEEDS-HUMAN | Confirm-at-build items the brief flags: the Jepsen leg routes to an **in-repo Rust scenario** (`tier1_jepsen_metadata`) not external Jepsen/Elle (`brief.md:184-188`), and the realism-ladder vs code-taxonomy naming clash (`brief.md:178-183`). Decision owed: confirm the in-repo Jepsen-harness shape and single-zone clause-2 framing are the intended fidelity for this slice. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | The binding success (live Tier-1 integration + Jepsen + Tier-2 green on real TiKV **and** ≥1 real-cluster discovery promoted to a **committed** DST seed) is demonstrable only in the privileged Tier job with #256's `deploy/` stack; seed `PROMOTED_SEED=17` (`dst/tests/tikv_surfaced_regressions.rs`) models await-inside-commit but its provenance (real discovery vs documented known-gap) is a sign-off call (`brief.md:154-177`). Decision owed: human confirms #256/#365 staging + reduced-bar (static endpoints), that #329/#404-409 checker substrate stays a noted dependency (not folded in), and whether the seeded-regression DoD is met. |

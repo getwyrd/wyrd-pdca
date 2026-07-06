@@ -1,0 +1,591 @@
+diff --git a/crates/custodian/src/lib.rs b/crates/custodian/src/lib.rs
+index 45c66a5..7aa3102 100644
+--- a/crates/custodian/src/lib.rs
++++ b/crates/custodian/src/lib.rs
+@@ -27,6 +27,7 @@ pub mod leadership;
+ pub mod rebalance;
+ pub mod reconciliation;
+ pub mod reconstruction;
++pub mod role;
+ pub mod scrub;
+ pub mod telemetry;
+ 
+@@ -40,6 +41,7 @@ pub use leadership::{Custodian, FenceError, FencedZone};
+ pub use rebalance::RebalanceContext;
+ pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
+ pub use reconstruction::{repair_priority, ReconstructionContext};
++pub use role::CustodianRole;
+ pub use scrub::ScrubContext;
+ pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
+ 
+diff --git a/crates/custodian/src/reconstruction.rs b/crates/custodian/src/reconstruction.rs
+index 4981024..93f8594 100644
+--- a/crates/custodian/src/reconstruction.rs
++++ b/crates/custodian/src/reconstruction.rs
+@@ -500,8 +500,20 @@ fn emit_queue_depth(depth: usize) {
+ /// Emit the **under-replicated chunk count** (`0005:326-329`): the chunks this pass
+ /// found below their scheme's fragment count — the metric whose silent non-zero value
+ /// is the durability failure the request plane hides.
++///
++/// This is a **gauge**, not a monotonic counter: it is a *level* — the number of chunks
++/// currently under-replicated, as of this pass — so it RISES when a loss is injected and
++/// RETURNS TO ZERO once repair restores redundancy. That rise-then-zero shape is the
++/// day-one durability signal (observability-floor proposal 0010; architecture §7.4 step
++/// 4: kill a D server, watch the under-replicated count rise then settle to zero) and it
++/// must be observable through the **real export surface** a deployment scrapes
++/// ([`crate::DurabilityTelemetry::gather_prometheus`]). A monotonic counter cannot express
++/// it: through an accumulating Prometheus registry, `add(1)` then `add(0)` stays pinned at
++/// 1 and never returns to zero — so a counter here reads back as a permanently-degraded
++/// zone even after repair. A gauge set to the current level reads back 1 then 0, which is
++/// the signal (`0005:400-403`, ADR-0011/0012).
+ fn emit_under_replicated(count: usize) {
+-    tracing::info!(monotonic_counter.reconstruction_under_replicated = count as u64);
++    tracing::info!(gauge.reconstruction_under_replicated = count as u64);
+ }
+ 
+ /// Emit a **dispatched reconstruction** plus the **time-to-repair** sample (`0005:330`):
+diff --git a/crates/custodian/src/role.rs b/crates/custodian/src/role.rs
+new file mode 100644
+index 0000000..f9940c9
+--- /dev/null
++++ b/crates/custodian/src/role.rs
+@@ -0,0 +1,118 @@
++//! The **runnable custodian role** — the wiring that turns the library durability
++//! plane into a *running process signal* (observability-floor proposal 0010
++//! §"Scope boundary" items 1–2; the keystone slice: item 1 installs the telemetry
++//! handle at role entry, item 2 runs the leader-elected loop through it).
++//!
++//! The M3 custodian shipped the loops (`reconciliation.rs`, `reconstruction.rs`, …)
++//! and the backend-agnostic telemetry seam ([`DurabilityTelemetry`], `telemetry.rs`)
++//! as a **library** (Option A, `reconstruction.rs:66-68`): a running control point
++//! *hands* the loops their inputs, but nothing binds the telemetry handle to the loop,
++//! so the durability metrics a pass emits reach no export surface unless a caller wires
++//! one up by hand. That is precisely the sim-only gap 0010 names: the day-one signal
++//! ("kill a D server → the under-replicated count rises, then returns to zero") is only
++//! ever observed through a bespoke test capture, never the real
++//! [`DurabilityTelemetry::gather_prometheus`] surface a deployment scrapes.
++//!
++//! [`CustodianRole`] closes that gap with the smallest honest wiring: it **owns** a
++//! telemetry handle (item 1) and runs the fenced [`reconcile_step`] control point with
++//! that handle's `tracing` → OpenTelemetry metrics bridge installed as the dispatch for
++//! the pass (item 2), so every durability-plane metric the loops emit lands in *this
++//! role's* provider and is observable through its export surface. It installs the bridge
++//! **scoped** (per pass, via [`WithSubscriber`]) rather than as a global default — the
++//! ADR-0035 rule forbids DST-reachable global mutable state, and the process-global
++//! `set_global_default` install belongs to the binary entry point (the server-crate
++//! slice), not this library seam.
++//!
++//! Deliberately **out of scope of the keystone** (0010's later slices, each its own
++//! bundle): the continuous run loop + leadership lifecycle (campaign, renew, step down),
++//! the `--log-level` / `RUST_LOG` `EnvFilter` + structured-stderr logging layer (item 3),
++//! the `tonic-health` readiness probe (item 7), and the `wyrd custodian` binary wiring in
++//! the `server` crate (item 2's deployment half). This seam is what those slices build on:
++//! they compose their layers onto the same telemetry handle and drive the same
++//! [`CustodianRole::reconcile_pass`].
++
++use tracing::instrument::WithSubscriber;
++use tracing::Dispatch;
++use tracing_subscriber::prelude::*;
++use tracing_subscriber::Registry;
++
++use crate::gc::GcContext;
++use crate::leadership::{Custodian, FencedZone};
++use crate::rebalance::RebalanceContext;
++use crate::reconciliation::{reconcile_step, ReconcileError, Reconciled};
++use crate::reconstruction::ReconstructionContext;
++use crate::scrub::ScrubContext;
++use crate::telemetry::DurabilityTelemetry;
++
++/// A running custodian role: it owns the durability-plane [`DurabilityTelemetry`] handle
++/// and drives the fenced reconciliation loop with that handle's metrics bridge installed,
++/// so the durability metrics a pass emits are captured by this role's provider and
++/// observable through its export surface ([`DurabilityTelemetry::gather_prometheus`] /
++/// OTLP). This is the wiring items 1–2 of proposal 0010 deliver — the library durability
++/// plane made real by a role that installs it at entry and runs the loop *through* it,
++/// rather than leaving the durability signal reachable only from ad-hoc test assembly.
++pub struct CustodianRole {
++    telemetry: DurabilityTelemetry,
++    /// The role's `tracing` dispatch, built **once** at construction over this role's
++    /// telemetry provider, so every pass records into the same instruments (and one
++    /// callsite-interest registration covers the whole role's lifetime). Cheap to clone
++    /// (an `Arc`); installed scoped per pass, never as a global default (ADR-0035).
++    dispatch: Dispatch,
++}
++
++impl CustodianRole {
++    /// Wire a role over `telemetry` — the durability-plane handle installed at role entry
++    /// (item 1). The handle's export surface(s) were chosen by the caller's
++    /// [`ExporterConfig`](crate::telemetry::ExporterConfig) (no backend hardcoded here,
++    /// ADR-0012); this role only routes the loops' emission into it.
++    pub fn new(telemetry: DurabilityTelemetry) -> Self {
++        let dispatch = Dispatch::new(Registry::default().with(telemetry.metrics_layer()));
++        Self {
++            telemetry,
++            dispatch,
++        }
++    }
++
++    /// This role's durability-plane telemetry handle — the read-back / export surface a
++    /// scrape endpoint (item 7, a later slice) exposes, and the in-process
++    /// [`DurabilityTelemetry::gather_prometheus`] the day-one signal is asserted through.
++    pub fn telemetry(&self) -> &DurabilityTelemetry {
++        &self.telemetry
++    }
++
++    /// Run **one** fenced reconciliation pass with this role's telemetry bridge installed
++    /// as the `tracing` dispatch for the pass (item 2). It delegates to the real
++    /// [`reconcile_step`] fenced control point — the *same* code path the M3 property
++    /// campaign drives, never a parallel entry (the anti-#141 guard) — and adds only the
++    /// telemetry wiring, so the durability metrics the loops emit
++    /// (`reconstruction_under_replicated`, queue depth, …) are captured by
++    /// [`Self::telemetry`] and observable through its export surface.
++    ///
++    /// The maintenance inputs select which loops the pass dispatches, exactly as
++    /// [`reconcile_step`] documents. A continuous run loop over this method (plus the
++    /// leadership lifecycle) is the deployment slice's concern, deferred (see the module
++    /// docs).
++    #[allow(clippy::too_many_arguments)]
++    pub async fn reconcile_pass(
++        &self,
++        zone: &FencedZone,
++        custodian: &Custodian,
++        gc: Option<&GcContext<'_>>,
++        scrub: Option<&ScrubContext<'_>>,
++        reconstruction: Option<&ReconstructionContext<'_>>,
++        rebalance: Option<&RebalanceContext<'_>>,
++        now_millis: u64,
++    ) -> Result<Reconciled, ReconcileError> {
++        reconcile_step(
++            zone,
++            custodian,
++            gc,
++            scrub,
++            reconstruction,
++            rebalance,
++            now_millis,
++        )
++        .with_subscriber(self.dispatch.clone())
++        .await
++    }
++}
+diff --git a/crates/custodian/tests/reconstruction_telemetry.rs b/crates/custodian/tests/reconstruction_telemetry.rs
+new file mode 100644
+index 0000000..a0650fd
+--- /dev/null
++++ b/crates/custodian/tests/reconstruction_telemetry.rs
+@@ -0,0 +1,393 @@
++//! **The day-one durability signal, observed through the wired custodian role.**
++//! (Observability-floor proposal 0010 §"Scope boundary" items 1–2 + §"DST and tests";
++//! architecture §7.4 single-zone day-one step 4; ADR-0011/0012.)
++//!
++//! The M3 reconstruction suite (`reconstruction.rs`) proves the durability metrics are
++//! *present* on the [`DurabilityTelemetry`] surface, and the DST campaign (property 6,
++//! `dst/tests/custodian.rs`) proves the under-replicated count rises-then-returns-to-zero
++//! — but only through a bespoke per-event capture layer that reads each emitted *value*.
++//! Neither exercises the binding day-one signal 0010 names: after an injected fragment
++//! loss, the under-replicated count RISES and then RETURNS TO ZERO **as read back off the
++//! real export surface a deployment scrapes** ([`DurabilityTelemetry::gather_prometheus`]),
++//! through the **wired, runnable custodian role** ([`CustodianRole`]) — not the library
++//! alone, and not a hand-assembled subscriber.
++//!
++//! This closes that gap. It builds a role over a Prometheus telemetry handle, runs two
++//! fenced reconciliation passes through [`CustodianRole::reconcile_pass`] (which installs
++//! the handle's `tracing`→OpenTelemetry bridge for the pass), and reads the
++//! `reconstruction_under_replicated` **gauge** back off `gather_prometheus`:
++//!   * pass 1 — the killed fragment leaves the chunk under-replicated → the gauge reads **1**;
++//!   * pass 2 — reconstruction restored redundancy → the gauge reads **0**.
++//!
++//! Why a gauge is load-bearing (recorded in build-notes): the under-replicated count is a
++//! *level*, and only a gauge returns to zero through an accumulating Prometheus registry.
++//! A monotonic counter (`add(1)` then `add(0)`) stays pinned at 1 forever — so through
++//! `gather_prometheus` it reads a permanently-degraded zone even after repair, and the
++//! "returns to zero" assertion below is RED. `reconstruction::emit_under_replicated` emits
++//! a `gauge.` field, which reads back 1 then 0 — the day-one signal.
++//!
++//! Its own test binary (as `gc_telemetry.rs` documents): `tracing` caches per-callsite
++//! *interest* in process-global state, so the reconstruction callsites must not be raced
++//! by a no-subscriber sibling test — a separate binary is a separate process.
++
++use std::collections::HashMap;
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord};
++use wyrd_core::placement::Topology;
++use wyrd_core::repair;
++use wyrd_core::write::write_new_object_placed;
++use wyrd_custodian::{
++    Custodian, CustodianRole, DurabilityTelemetry, ExporterConfig, FencedZone, Reconciled,
++    ReconstructionContext,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
++    PlacementChunkStore, Result, WriteBatch,
++};
++
++// ---- in-memory trait stores (backend-agnostic; the loop is proven over the seams) ----
++
++/// A trivial in-memory metadata store.
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<HashMap<Vec<u8>, Bytes>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
++/// stored fragment bytes (so their checksums verify and the rebuilt shard round-trips).
++#[derive(Default)]
++struct MemDServer {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++/// A **placement-aware** fleet over several [`MemDServer`]s: it routes `_at` calls to the
++/// D server the placement record names, so the write fan-out resolves each fragment from
++/// its recorded location — the seam a custodian re-placement flips.
++struct Fleet<'a> {
++    servers: Vec<(DServerId, &'a MemDServer)>,
++}
++
++impl<'a> Fleet<'a> {
++    fn store(&self, dserver: DServerId) -> Option<&'a MemDServer> {
++        self.servers
++            .iter()
++            .find(|(id, _)| *id == dserver)
++            .map(|(_, s)| *s)
++    }
++}
++
++#[async_trait]
++impl ChunkStore for Fleet<'_> {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        if let Some(store) = self.store(DServerId::from(id.index)) {
++            store.put_fragment(id, fragment).await?;
++        }
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        for (_, store) in &self.servers {
++            if let Some(bytes) = store.get_fragment(id).await? {
++                return Ok(Some(bytes));
++            }
++        }
++        Ok(None)
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        let mut all = Vec::new();
++        for (_, store) in &self.servers {
++            all.extend(store.list_fragments().await?);
++        }
++        Ok(all)
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        for (_, store) in &self.servers {
++            store.delete_fragment(id).await?;
++        }
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++#[async_trait]
++impl PlacementChunkStore for Fleet<'_> {
++    async fn get_fragment_at(&self, dserver: DServerId, id: FragmentId) -> Result<Option<Bytes>> {
++        match self.store(dserver) {
++            Some(store) => store.get_fragment(id).await,
++            None => Ok(None),
++        }
++    }
++
++    async fn put_fragment_at(
++        &self,
++        dserver: DServerId,
++        id: FragmentId,
++        fragment: Bytes,
++    ) -> Result<()> {
++        if let Some(store) = self.store(dserver) {
++            store.put_fragment(id, fragment).await?;
++        }
++        Ok(())
++    }
++}
++
++// ---- helpers ----
++
++const ROOT: InodeId = 0;
++const INODE: InodeId = 1;
++const CHUNK: ChunkId = 0xC0FFEE;
++
++fn frag(index: u16) -> FragmentId {
++    FragmentId {
++        chunk: CHUNK,
++        index,
++    }
++}
++
++/// A four-domain topology A..D (servers 0..3).
++fn four_domains() -> Topology {
++    let mut t = Topology::default();
++    t.register(0, "A")
++        .register(1, "B")
++        .register(2, "C")
++        .register(3, "D");
++    t
++}
++
++async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
++    let leader = Custodian::elect(coord, "zone-reconstruction")
++        .await
++        .unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    (zone, leader)
++}
++
++async fn read_inode(meta: &MemMeta) -> InodeRecord {
++    let bytes = meta
++        .get(&metadata::inode_key(INODE))
++        .await
++        .unwrap()
++        .expect("inode present");
++    metadata::decode(&bytes).unwrap()
++}
++
++/// Write one RS(2,1) chunk via the real write path — n = 3 fragments placed on servers
++/// 0,1,2 (domains A,B,C). Returns the original object bytes.
++async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) {
++    let data = b"reconstruct this erasure-coded chunk, every byte of it".to_vec();
++    let topo = four_domains();
++    let outcome = write_new_object_placed(
++        meta,
++        fleet,
++        ROOT,
++        "obj",
++        INODE,
++        &data,
++        data.len(),
++        EcScheme::ReedSolomon { k: 2, m: 1 },
++        &topo,
++        0,
++        1_000,
++        || CHUNK,
++    )
++    .await
++    .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++    assert_eq!(
++        read_inode(meta).await.chunk_map[0].placement,
++        vec![0, 1, 2],
++        "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
++    );
++}
++
++/// The value of the named **gauge** read back off the Prometheus surface — the single
++/// sample the durability plane emits for it (one scope label-set, no per-chunk labels).
++/// A gauge never emitted is absent from the surface → `None`. Robust to the exporter's
++/// scope-label decoration and to whitespace: it parses the metric family name off each
++/// non-comment line and returns the last matching sample's value.
++fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
++    exposed
++        .lines()
++        .filter(|line| !line.starts_with('#'))
++        .filter_map(|line| {
++            let mut fields = line.split_whitespace();
++            let key = fields.next()?;
++            let value = fields.next()?;
++            let metric = key.split('{').next().unwrap_or(key);
++            if metric == name {
++                value.parse::<f64>().ok()
++            } else {
++                None
++            }
++        })
++        .next_back()
++}
++
++// ---- the day-one signal: kill a D server → under-replicated rises to 1, then to 0 ----
++
++#[tokio::test]
++async fn under_replicated_gauge_rises_then_returns_to_zero_via_gather_prometheus() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2, d3) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    let fleet = Fleet {
++        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
++    };
++
++    write_rs_2_1(&meta, &fleet).await;
++
++    // KILL D server 1 (domain B): its fragment is lost, so the chunk is now
++    // under-replicated. A health report enqueues the chunk on the shared repair queue —
++    // exactly the architecture §7.4 day-one step-4 fault (kill a D server).
++    d1.delete_fragment(frag(1)).await.unwrap();
++    repair::enqueue_repair(&meta, CHUNK, "health")
++        .await
++        .unwrap();
++
++    // Reconstruction sees only the HEALTHY fleet/topology (server 1 is gone): survivors on
++    // domains A,C; the rebuilt fragment lands on the one free domain, D (server 3).
++    let mut healthy_topo = Topology::default();
++    healthy_topo
++        .register(0, "A")
++        .register(2, "C")
++        .register(3, "D");
++    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (2, &d2), (3, &d3)];
++    let ctx = ReconstructionContext {
++        meta: &meta,
++        fleet: &healthy_fleet,
++        topology: &healthy_topo,
++    };
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord).await;
++
++    // THE WIRED, RUNNABLE ROLE: a custodian role over a backend-agnostic Prometheus
++    // telemetry handle (ADR-0012), installed at role entry (item 1) and driving the fenced
++    // loop through it (item 2). The durability signal is read back off the role's OWN
++    // export surface — not a hand-assembled subscriber.
++    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let role = CustodianRole::new(telemetry);
++
++    // PASS 1 — under-replicated: the count RISES. Read it back off the export surface.
++    let outcome = role
++        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Changed,
++        "the under-replicated chunk was reconstructed"
++    );
++    role.telemetry().flush().unwrap();
++    let after_loss = role
++        .telemetry()
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert_eq!(
++        gauge_value(&after_loss, "reconstruction_under_replicated"),
++        Some(1.0),
++        "after the injected loss the under-replicated gauge reads 1 off gather_prometheus; \
++         got:\n{after_loss}"
++    );
++
++    // PASS 2 — repaired: the obligation is drained, so the count RETURNS TO ZERO. This is
++    // the leg a monotonic counter cannot express — an accumulating counter stays at 1.
++    let outcome = role
++        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
++        .await
++        .unwrap();
++    assert_eq!(
++        outcome,
++        Reconciled::Satisfied,
++        "the chunk is at full redundancy — nothing left to reconstruct"
++    );
++    assert!(
++        repair::queued_repairs(&meta).await.unwrap().is_empty(),
++        "the repair obligation was drained by the reconstruction commit"
++    );
++    role.telemetry().flush().unwrap();
++    let after_repair = role
++        .telemetry()
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    assert_eq!(
++        gauge_value(&after_repair, "reconstruction_under_replicated"),
++        Some(0.0),
++        "once repair restores redundancy the under-replicated gauge returns to 0 off \
++         gather_prometheus — the day-one signal (0010; architecture §7.4 step 4); \
++         got:\n{after_repair}"
++    );
++}
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index b514487..1e2f967 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -1020,7 +1020,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
+         .unwrap();
+     assert_eq!(outcome, Reconciled::Changed);
+     assert_eq!(
+-        rise.values("monotonic_counter.reconstruction_under_replicated"),
++        rise.values("gauge.reconstruction_under_replicated"),
+         vec![1],
+         "the under-replicated count rises to 1 after the injected loss"
+     );
+@@ -1043,7 +1043,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
+         .unwrap();
+     assert_eq!(outcome, Reconciled::Satisfied);
+     assert_eq!(
+-        settle.values("monotonic_counter.reconstruction_under_replicated"),
++        settle.values("gauge.reconstruction_under_replicated"),
+         vec![0],
+         "the under-replicated count returns to zero once repair completes"
+     );
