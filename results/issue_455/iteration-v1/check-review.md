@@ -1,0 +1,15 @@
+Review of issue 455 / e2e-closed-write-path: add an in-process closed-loop proof that a gateway-written object in a shared metadata store becomes a custodian-visible repair obligation and round-trips after D-server loss.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The owed behavior is explicit: shared-store gateway PUT, real loopback D-servers, custodian non-zero obligation, gauge rise-to-zero, and byte-identical GET are the acceptance context (`brief.md:24`). |
+| C2 Reproduction (red pre-fix) | FAIL | The human must decide whether to accept absence-only red: the brief requires a demonstrated load-bearing red (`brief.md:37`), but the patch states red as no prior joined test (`crates/server/tests/closed_write_path.rs:38`). |
+| C3 Change | PASS | The changed surface is the requested new integration test file and it drives gateway write, custodian reconstruction, gauge assertions, and GET in one scenario (`crates/server/tests/closed_write_path.rs:161`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | The verification owed cannot be independently reproduced here: `./engine/xtask.sh ci` and `engine/scripts/run-verify.sh` are absent, and direct `cargo test -p wyrd-server --test closed_write_path` fails at loopback bind with `PermissionDenied` (`crates/server/tests/closed_write_path.rs:75`). |
+| C5 Causal adequacy | NEEDS-HUMAN | Decide whether manually enqueueing the repair obligation still proves the root contract: the gateway writes placement, but the test injects the health repair queue entry before custodian observation (`crates/server/tests/closed_write_path.rs:290`). |
+| T1 Structure | PASS | The implementation stays scoped to the requested server integration test instead of broadening production wiring (`crates/server/tests/closed_write_path.rs:1`). |
+| T2 Shape | NEEDS-HUMAN | Decide whether a directly-held `Gateway::put_object` satisfies the required gateway S3 PUT surface, since the test bypasses the HTTP/AWS SDK wire path while using the same gateway core (`crates/server/tests/closed_write_path.rs:202`). |
+| T3 Runtime | NEEDS-HUMAN | Runtime behavior remains unobserved in this host: the test needs loopback gRPC servers, and this sandbox rejects the bind before the scenario can run (`crates/server/tests/closed_write_path.rs:75`). |
+| T4 Contribution | PASS | If runnable, the test contributes the missing cross-crate regression by composing gateway write, redb reopen, custodian sweep, repair persistence, and final readback (`crates/server/tests/closed_write_path.rs:306`). |
+| T5 Judgment | NEEDS-HUMAN | Prior-art by affected path is mechanically empty in local git history, but closed/rejected PR history is not available here, so the duplicate-work decision is not fully discharged (`crates/server/tests/closed_write_path.rs:1`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human sign-off must decide whether this in-process redb/loopback proof is fit for the production-risk claim while live TiKV/Docker/Prometheus demonstration remains explicitly off-Check (`brief.md:93`). |

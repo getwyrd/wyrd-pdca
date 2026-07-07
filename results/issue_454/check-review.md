@@ -1,0 +1,15 @@
+Reviewing issue 454: wire `wyrd s3` to compose configured metadata, coordination, and chunk backends so gateway PUT/GET can use cluster D-server fanout instead of a private local chunk store.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief defines a falsifiable cluster-composition slice: configured redb/mem/fanout S3 PUT/GET must keep local chunks empty and land fragments on loopback D-servers (`brief.md:11`). |
+| C2 Reproduction (red pre-fix) | PASS | In an archived pre-patch HEAD with only the new test added, `cargo test -p wyrd-server --test s3_gateway_cluster --no-run` fails on missing `serve_s3_role`, so the old surface cannot satisfy the criterion (`crates/server/tests/s3_gateway_cluster.rs:39`). |
+| C3 Change | PASS | The patch routes `cmd_s3` through parsed backend selection and endpoint fanout, so the decision is whether this composition is the intended product behavior rather than a local-only gateway (`crates/server/src/cli.rs:1224`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | The red compile failure and post-fix no-run build passed, but this host denies loopback binds, so the human must decide whether CI/runtime evidence discharges the real gRPC S3 red→green (`crates/server/tests/s3_gateway_cluster.rs:54`). |
+| C5 Causal adequacy | PASS | The fix removes the hardcoded gateway backend cause by composing the selected stores directly, with no symptom-guard capability probe added (`crates/server/src/cli.rs:1298`). |
+| T1 Structure | PASS | The implementation keeps the composition boundary in `cli.rs` and exposes a testable role helper without changing the backend traits, limiting the architectural impact (`crates/server/src/cli.rs:1289`). |
+| T2 Shape | PASS | The two-axis dispatch covers redb/mem by default and feature-gated tikv/etcd arms; `cargo check -p wyrd-server --features tikv,etcd` passed, so the required combinations compile (`crates/server/src/cli.rs:1352`). |
+| T3 Runtime | NEEDS-HUMAN | The loopback runtime path could not be exercised in this sandbox because binding `127.0.0.1:0` returns `PermissionDenied`; human must rely on a runner that permits sockets (`crates/server/tests/s3_gateway_cluster.rs:115`). |
+| T4 Contribution | NEEDS-HUMAN | Local merged history by affected paths shows prior S3/deploy work but no duplicate gateway-backend wiring; closed/rejected remote work was not mechanically available here, so human prior-art sign-off remains owed (`deploy/small-multi-node/docker-compose.yml:34`). |
+| T5 Judgment | PASS | The patch stays within the briefed scope: code wiring, loopback test, and small-multi-node gateway config, while explicitly leaving the live 9-D-server TiKV/etcd demonstration to #455 (`deploy/small-multi-node/docker-compose.yml:40`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether compile-tested tikv/etcd arms plus an unrun local loopback test are sufficient for this advisory slice, because the live stack remains deferred and this host could not run socket tests (`deploy/small-multi-node/docker-compose.yml:393`). |

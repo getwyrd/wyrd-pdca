@@ -1,0 +1,403 @@
+diff --git a/crates/server/tests/closed_write_path.rs b/crates/server/tests/closed_write_path.rs
+new file mode 100644
+index 0000000..1993632
+--- /dev/null
++++ b/crates/server/tests/closed_write_path.rs
+@@ -0,0 +1,397 @@
++//! Issue #455: **close the write→durability loop** — join the gateway's write path to
++//! the custodian's repair path over ONE shared cluster metadata store.
++//!
++//! `s3_gateway_cluster.rs` (#454) proves a gateway S3 PUT fans chunks to real loopback
++//! D-servers and a GET reads them back; `custodian_day_one.rs` (#450) proves the
++//! under-replicated backlog gauge rises-then-returns-to-zero through the deployable
++//! custodian role — but it **hand-writes** the object via
++//! `wyrd_core::write::write_new_object_placed` (`crates/core/src/write.rs:333`), never via
++//! a gateway PUT. Neither test proves the other's halves compose: a custodian opened over
++//! a store nothing wrote would see zero repair work, the exact "empty store" symptom the
++//! issue names.
++//!
++//! This test drives the join over real loopback gRPC D-servers and ONE shared redb store:
++//!
++//! 1. a **real gateway S3 PUT** (`wyrd_server::Gateway::put_object`, `crates/server/src/lib.rs:147`
++//!    — the SAME composition core `serve_s3_role`/`cmd_s3` drive, `crates/server/src/cli.rs:1303`,
++//!    `crates/server/src/cli.rs:1207`; picking the "directly-held `Gateway`" wiring the brief's
++//!    peer citation names, mirroring `crates/server/tests/e2e.rs:13-25`) writes an RS(2,1) object,
++//!    fanning its fragments across real, networked loopback D-servers
++//!    (`wyrd_chunkstore_grpc::FanoutChunkStore<GrpcChunkStore>`, `crates/server/src/cli.rs:1118`);
++//! 2. the redb writer handle is DROPPED (releasing redb's exclusive OS file lock,
++//!    `crates/server/src/cli.rs:589-590`) before a custodian reopens the SAME `data_dir/meta.redb`
++//!    file the gateway just committed to — mirroring `custodian_day_one.rs`'s own
++//!    drop-then-reopen pattern (`gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path`);
++//! 3. ONE of the four real D-servers holding a fragment is genuinely KILLED (its gRPC server
++//!    task aborted and awaited, so the listening port is actually closed — a real transport
++//!    failure, not a fake);
++//! 4. the deployable custodian role (`wyrd_server::custodian::CustodianService`, driven through
++//!    `run_reconstruction_over_backend`, `crates/server/src/cli.rs:758`, over the exact fleet-assembly
++//!    seam `connect_fleet`, `crates/server/src/custodian.rs:143`, and `require_aligned_topology`,
++//!    `crates/server/src/cli.rs:807` — which reads AROUND the killed D-server rather than aborting
++//!    fleet assembly) opens that SAME store and observes the gateway-written object as a
++//!    **non-zero repair obligation** (the load-bearing join assertion); a second pass shows the
++//!    gauge returned to zero; and
++//! 5. a fresh gateway GET over the SAME store reads the object back **byte-identical**,
++//!    reconstructed from the D-server fragments (including the one the custodian re-placed).
++//!
++//! RED before the join is proven: no test drives a gateway PUT into a store a custodian then
++//! sweeps (the brief's Repro instruction). GREEN once this test passes.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use tokio_stream::wrappers::TcpListenerStream;
++use tonic::transport::Server;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, GrpcChunkStore};
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::EcScheme;
++use wyrd_core::read;
++use wyrd_core::repair;
++use wyrd_custodian::{Custodian, FencedZone};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::cli::{
++    connect_fanout, open_cluster_meta, require_aligned_topology, run_reconstruction_over_backend,
++    MetadataBackend,
++};
++use wyrd_server::custodian::{connect_fleet, CustodianService, DServerConnector};
++use wyrd_server::Gateway;
++use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
++use wyrd_traits::{BoxError, ChunkStore};
++
++const KEY: &str = "closed-loop/object";
++
++/// Stand up one D-server service over a fresh `FsChunkStore`, bound to an ephemeral
++/// loopback port, and return its dialable endpoint. Identical to the helper
++/// `s3_gateway_cluster.rs` and `gateway_cluster.rs` already use: real tonic transport,
++/// real HTTP/2 framing, no in-memory double.
++async fn spawn_dserver() -> (String, tempfile::TempDir, tokio::task::JoinHandle<()>) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let store = FsChunkStore::open(dir.path()).expect("open store");
++    let service = ChunkStoreService::new(store);
++
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind loopback");
++    let addr = listener.local_addr().expect("local addr");
++
++    let server = tokio::spawn(async move {
++        Server::builder()
++            .add_service(ChunkStoreServer::new(service))
++            .serve_with_incoming(TcpListenerStream::new(listener))
++            .await
++            .expect("serve");
++    });
++
++    (format!("http://{addr}"), dir, server)
++}
++
++/// The custodian's real gRPC dial seam, mirroring `cli.rs`'s private `GrpcDServerConnector`
++/// (`crates/server/src/cli.rs:838-852`) — the one concrete-transport call `connect_fleet`
++/// makes. Re-declared here (that type is not exported) so this test drives `connect_fleet`
++/// over REAL gRPC, not an in-memory fake, exercising the same fleet-assembly seam
++/// `custodian_day_one.rs`'s `connect_fleet_starts_degraded_around_a_startup_down_peer_and_repairs`
++/// covers with a fake connector.
++struct RealDServerConnector;
++
++#[async_trait]
++impl DServerConnector for RealDServerConnector {
++    async fn connect(
++        &self,
++        endpoint: &str,
++        timeout: Duration,
++    ) -> Result<Arc<dyn ChunkStore>, BoxError> {
++        let client = GrpcChunkStore::connect_with_timeout(endpoint.to_string(), timeout).await?;
++        Ok(Arc::new(client) as Arc<dyn ChunkStore>)
++    }
++}
++
++/// Install a permissive global `tracing` default **once**, exactly as
++/// `custodian_day_one.rs::enable_metric_callsites` does, so the durability metric
++/// callsites never latch `Interest::never` under the parallel test harness.
++fn enable_metric_callsites() {
++    use std::sync::Once;
++    static INIT: Once = Once::new();
++    INIT.call_once(|| {
++        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++    });
++}
++
++async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
++    let leader = Custodian::elect(coord, "zone-reconstruction")
++        .await
++        .unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    (zone, leader)
++}
++
++/// The value of the named **gauge** read back off the Prometheus surface — the last
++/// matching sample. Identical to `custodian_day_one.rs::gauge_value`.
++fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
++    exposed
++        .lines()
++        .filter(|line| !line.starts_with('#'))
++        .filter_map(|line| {
++            let mut fields = line.split_whitespace();
++            let key = fields.next()?;
++            let value = fields.next()?;
++            let metric = key.split('{').next().unwrap_or(key);
++            if metric == name {
++                value.parse::<f64>().ok()
++            } else {
++                None
++            }
++        })
++        .next_back()
++}
++
++/// Read the role's `reconstruction_under_replicated` gauge back off its own export surface.
++fn under_replicated(service: &CustodianService) -> Option<f64> {
++    service.telemetry().flush().unwrap();
++    let exposed = service
++        .telemetry()
++        .gather_prometheus()
++        .expect("Prometheus surface configured");
++    gauge_value(&exposed, "reconstruction_under_replicated")
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn gateway_put_is_a_custodian_visible_repair_obligation_and_round_trips() {
++    enable_metric_callsites();
++
++    // Four real, networked loopback D-servers — domains A,B,C used by the RS(2,1) write's
++    // identity placement (fragment index i -> D-server i), D held in reserve (never written
++    // for this chunk) as the free capacity the custodian's repair rebuilds into, mirroring
++    // `custodian_day_one.rs`'s own `four_domains()` spare-domain setup.
++    let (endpoint_a, dir_a, server_a) = spawn_dserver().await;
++    let (endpoint_b, _dir_b, server_b) = spawn_dserver().await;
++    let (endpoint_c, dir_c, server_c) = spawn_dserver().await;
++    let (endpoint_d, dir_d, server_d) = spawn_dserver().await;
++    let endpoints = vec![
++        endpoint_a.clone(),
++        endpoint_b.clone(),
++        endpoint_c.clone(),
++        endpoint_d.clone(),
++    ];
++
++    // Two independent gateway fan-outs dialed while ALL FOUR servers are reachable: one for
++    // the write, one held aside for the post-repair GET. `connect_fanout` dials every listed
++    // endpoint up front and errors on an unreachable one (`crates/server/src/cli.rs:1118-1130`),
++    // so the read-side fan-out must be established now, before server B is killed below — its
++    // channel to B is simply never invoked again once repair moves that fragment off B.
++    let write_fanout = connect_fanout(&endpoints)
++        .await
++        .expect("connect the gateway's write fan-out (all four D servers alive)");
++    let read_fanout = connect_fanout(&endpoints)
++        .await
++        .expect("connect the gateway's read fan-out (all four D servers alive)");
++
++    // The SHARED cluster metadata store: the custodian reopens this SAME `data_dir/meta.redb`
++    // file below.
++    let data_dir = tempfile::tempdir().expect("data dir");
++    let data_dir_path = data_dir.path().to_str().unwrap().to_string();
++
++    let object: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
++
++    {
++        // The REAL gateway S3 PUT composition core, scoped so the redb writer handle is
++        // DROPPED before the custodian reopens the file (redb's exclusive OS lock).
++        let meta = open_cluster_meta(&data_dir_path).expect("open the shared cluster redb");
++        let gateway = Gateway::new(meta, write_fanout, MemCoordination::new())
++            .with_durability(EcScheme::ReedSolomon { k: 2, m: 1 });
++        gateway
++            .recover()
++            .await
++            .expect("recover id allocators (fresh store: a no-op)");
++        gateway
++            .put_object(KEY, &object)
++            .await
++            .expect("the gateway S3 PUT must be accepted");
++    } // <- gateway (and its redb handle) dropped here; the exclusive lock is released.
++
++    // KILL D-server 1 (domain B) — the architecture §7.4 day-one fault — a REAL transport
++    // failure, applied AFTER the write (so the PUT actually placed a fragment there) but
++    // BEFORE the custodian ever dials it: abort its gRPC server task and await the teardown
++    // so the listening port is actually closed (a fresh dial gets a real connection-refused,
++    // not a stale-but-still-answering connection — tonic/hyper serve a connection already
++    // accepted on its OWN spawned task, so aborting only the accept-loop task would otherwise
++    // leave an existing client connection answering RPCs indefinitely).
++    server_b.abort();
++    let _ = server_b.await;
++
++    // The custodian's fleet: dial all four configured D-servers through the exact production
++    // fleet-assembly seam (`connect_fleet` + `require_aligned_topology`,
++    // `crates/server/src/custodian.rs:143`, `crates/server/src/cli.rs:807`) — operator-supplied
++    // ids/domains, never fabricated from endpoint order. D-server 1 is unreachable (killed
++    // above): `connect_fleet` reads AROUND a startup-unreachable peer rather than aborting
++    // fleet assembly (`crates/server/src/custodian.rs:135-142`), exactly the "custodian
++    // (re)started during the incident" case `custodian_day_one.rs`'s
++    // `connect_fleet_starts_degraded_around_a_startup_down_peer_and_repairs` covers.
++    let ids = vec![0u64, 1, 2, 3];
++    let domains = vec![
++        "A".to_string(),
++        "B".to_string(),
++        "C".to_string(),
++        "D".to_string(),
++    ];
++    let configured = connect_fleet(
++        &RealDServerConnector,
++        &endpoints,
++        &ids,
++        &domains,
++        Duration::from_secs(2),
++        require_aligned_topology,
++    )
++    .await
++    .expect("connect_fleet starts degraded around the killed D-server rather than aborting");
++    assert_eq!(
++        configured.iter().map(|d| d.id).collect::<Vec<_>>(),
++        vec![0, 2, 3],
++        "the killed D-server 1 (domain B) is skipped; the role comes up on the reachable subset"
++    );
++
++    // Resolve the committed chunk id and assert the SHARED PLACEMENT CONTRACT directly: the
++    // gateway's identity placement (no explicit domain selector call in `Gateway::put_object`,
++    // `crates/server/src/lib.rs:147-155`) lands the RS(2,1) fragments on D-servers 0,1,2 — the
++    // EXACT DServerId space the custodian's fleet above is configured over (ids 0,1,2,3). Then
++    // enqueue the repair obligation exactly as a D-server health report would
++    // (`custodian_day_one.rs`'s "a health report enqueues the chunk on the shared repair
++    // queue").
++    let chunk_id = {
++        let meta = RedbMetadataStore::open(data_dir.path().join("meta.redb"))
++            .expect("reopen the shared redb (the gateway's writer handle was already dropped)");
++        let inode_id = read::resolve(&meta, 0, KEY)
++            .await
++            .expect("resolve")
++            .expect("the gateway PUT committed the object");
++        let inode = read::read_inode(&meta, inode_id)
++            .await
++            .expect("read inode")
++            .expect("inode present");
++        assert_eq!(
++            inode.chunk_map.len(),
++            1,
++            "the payload fits in one chunk at the gateway's default chunk size"
++        );
++        assert_eq!(
++            inode.chunk_map[0].placement,
++            vec![0u64, 1, 2],
++            "the gateway's identity placement must land the RS(2,1) fragments on D-servers \
++             0,1,2 (domains A,B,C) — the SAME DServerId space the custodian's fleet is \
++             configured over; this is the shared placement contract ADR-0008 promises. A \
++             mismatch here (the load-bearing join assertion) is exactly the failure mode the \
++             issue names: a custodian computing repair obligations over placement the gateway \
++             never wrote."
++        );
++        let chunk_id = inode.chunk_map[0].id;
++        repair::enqueue_repair(&meta, chunk_id, "health")
++            .await
++            .expect("enqueue the repair obligation (models a D-server health report)");
++        chunk_id
++    }; // <- redb handle dropped again; released for the custodian below.
++
++    // PASS 1 — the custodian, opened over the SAME store the gateway PUT wrote, must compute
++    // the killed D-server's fragment as a NON-ZERO repair obligation: the load-bearing join
++    // assertion. Were the write and repair paths disagreeing on placement, this custodian
++    // would see the object as fully healthy (0 obligations) — the "empty store" symptom the
++    // issue names — even though a D-server actually died.
++    let coord1 = MemCoordination::new();
++    let (zone1, custodian1) = elect(&coord1).await;
++    let telemetry1 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let service1 = CustodianService::new(telemetry1);
++    let one_pass = Duration::from_secs(3600);
++    run_reconstruction_over_backend(
++        MetadataBackend::Redb,
++        &data_dir_path,
++        &service1,
++        &zone1,
++        &custodian1,
++        &configured,
++        one_pass,
++        || 500,
++        async { tokio::time::sleep(Duration::from_millis(60)).await },
++    )
++    .await
++    .expect("the custodian survives the killed D-server and completes its first pass");
++    assert_eq!(
++        under_replicated(&service1),
++        Some(1.0),
++        "the custodian, over the SAME store the gateway PUT wrote, must observe the object as \
++         a non-zero repair obligation after the D-server kill"
++    );
++
++    // PASS 2 — a FRESH custodian instance reopens the (now-repaired) store and reassesses: the
++    // gauge must RETURN TO ZERO.
++    let coord2 = MemCoordination::new();
++    let (zone2, custodian2) = elect(&coord2).await;
++    let telemetry2 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
++    let service2 = CustodianService::new(telemetry2);
++    run_reconstruction_over_backend(
++        MetadataBackend::Redb,
++        &data_dir_path,
++        &service2,
++        &zone2,
++        &custodian2,
++        &configured,
++        one_pass,
++        || 700,
++        async { tokio::time::sleep(Duration::from_millis(60)).await },
++    )
++    .await
++    .expect("a fresh custodian reopens the redb backend cleanly and reassesses");
++    assert_eq!(
++        under_replicated(&service2),
++        Some(0.0),
++        "once the custodian repairs the gateway-written object, the backlog gauge returns to \
++         zero — the day-one signal, through a gateway-written object"
++    );
++
++    // The repair obligation drained and the fragment was re-placed onto the spare domain D —
++    // read directly off the real redb file the custodian committed to.
++    {
++        let meta = RedbMetadataStore::open(data_dir.path().join("meta.redb"))
++            .expect("reopen redb to confirm the repair persisted");
++        assert!(
++            !repair::queued_repairs(&meta)
++                .await
++                .unwrap()
++                .contains(&chunk_id),
++            "the repair obligation was drained by the reconstruction commit"
++        );
++        let inode_id = read::resolve(&meta, 0, KEY).await.unwrap().unwrap();
++        let inode = read::read_inode(&meta, inode_id).await.unwrap().unwrap();
++        assert_eq!(
++            inode.chunk_map[0].placement[1], 3,
++            "the missing fragment (originally on killed D-server 1 / domain B) was re-placed \
++             onto D-server 3 / domain D — the only free distinct domain"
++        );
++    }
++
++    // FINAL — a fresh gateway GET, over the pre-established read fan-out (server B stays
++    // dead; its channel is simply never invoked for this chunk anymore), reads the object back
++    // BYTE-IDENTICAL, reconstructed from the D-server fragments (including the re-placed one).
++    {
++        let meta = RedbMetadataStore::open(data_dir.path().join("meta.redb"))
++            .expect("reopen redb for the GET");
++        let gateway = Gateway::new(meta, read_fanout, MemCoordination::new());
++        gateway.recover().await.expect("recover id allocators");
++        let got = gateway
++            .get_object(KEY)
++            .await
++            .expect("GET must reconstruct the object from the D-server fragments")
++            .expect("the object exists");
++        assert_eq!(
++            got, object,
++            "the S3 object must round-trip byte-identical, reconstructed from the D-server \
++             fragments — surviving the killed D-server via the custodian's repair"
++        );
++    }
++
++    server_a.abort();
++    server_c.abort();
++    server_d.abort();
++    drop((dir_a, dir_c, dir_d));
++}
