@@ -1,0 +1,1306 @@
+diff --git a/crates/server/src/consistency_observable.rs b/crates/server/src/consistency_observable.rs
+index 4adcb4f..5911974 100644
+--- a/crates/server/src/consistency_observable.rs
++++ b/crates/server/src/consistency_observable.rs
+@@ -86,6 +86,16 @@ pub struct History {
+ }
+ 
+ impl History {
++    /// Build a history from already-recorded ops. The #405 [`ObservableS3Client`] only
++    /// grows a history over the wire (there is no way to inject a crafted op), but the
++    /// #406 multi-process merge and the socket-free crafted-history regressions need to
++    /// feed the *sound, local* checks (e.g. [`History::versions_monotone_per_key`]) a
++    /// specific history with no listener. This is that construction seam — it records the
++    /// ops verbatim, in the caller's order.
++    pub fn from_ops(ops: Vec<OpRecord>) -> Self {
++        Self { ops }
++    }
++
+     /// The recorded ops, in real-time (invocation) order.
+     pub fn ops(&self) -> &[OpRecord] {
+         &self.ops
+diff --git a/crates/server/src/consistency_workload.rs b/crates/server/src/consistency_workload.rs
+new file mode 100644
+index 0000000..c739d60
+--- /dev/null
++++ b/crates/server/src/consistency_workload.rs
+@@ -0,0 +1,819 @@
++//! The #329 consistency-checker **workload + serializer** slice (ADR-0041 decision 1–3,
++//! #406, slice 3), built on top of the merged #405 networked observable
++//! ([`crate::consistency_observable`]). This module does exactly what ADR-0041 §Decision
++//! grants the Rust slice — **produce a genuinely concurrent, non-vacuous history over the
++//! real wire and serialize it in the recognized checker's (Elle) format**, plus only the
++//! *sound, local* checks that are cheap to get right — and **nothing more**. It deliberately
++//! does **not** re-implement a global register/namespace-linearizability *verdict*: per
++//! ADR-0041/ADR-0016 that verdict is Elle's, and Elle (JVM/Clojure) runs **only off-Check**.
++//! The seam that routes the verdict there is [`verdict_dispatch`].
++//!
++//! What it provides:
++//!
++//! * a **concurrent register workload** ([`run_concurrent_register_workload`]) that drives
++//!   ≥2 [`ObservableS3Client`]s as concurrent tasks against one shared key over the real S3
++//!   HTTP wire, producing genuinely real-time-overlapping spans across distinct processes;
++//! * a **multi-process history** ([`MultiProcessHistory`]) that merges the per-client
++//!   [`History`]s into one real-time-ordered log, tagging each op with its `:process`;
++//! * an **Elle-EDN serializer** ([`to_elle_edn`]) that emits that history in the recognized
++//!   checker's operation-history format (`:process` / `:type` ∈ `{:invoke,:ok,:fail}` /
++//!   `:f` / `:value` / `:time`);
++//! * the **session** read-your-writes ([`session_read_your_writes`]) + monotonic-read
++//!   ([`session_monotonic_reads`]) checks (ADR-0015 guarantee 3), as *sound, local*
++//!   invariants over a single-session history;
++//! * a **directory-as-set** history ([`DirectoryHistory`]) — create=PUT / delete=DELETE /
++//!   membership=GET-probe under a prefix (no rename, no wire `LIST`; ADR-0041 decision 2) —
++//!   and its serializer to the checker's set op form ([`directory_to_elle_edn`]); and
++//! * the **verdict-dispatch** seam ([`VerdictDispatch`] / [`verdict_dispatch`]) — a pure
++//!   routing value that sends the Elle verdict to the privileged off-Check job, mirroring
++//!   the `xtask::metadata_faults` "deferred ≠ unbuilt" precedent.
++
++use std::collections::BTreeSet;
++use std::net::SocketAddr;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use wyrd_gateway_s3::sigv4::Credentials;
++
++use crate::consistency_observable::{History, ObservableS3Client, OpKind, OpRecord};
++
++/// A process id tagging one client's ops in a merged multi-process history — the `:process`
++/// a register/set linearizability checker uses to know which client issued the op.
++pub type ProcessId = u64;
++
++// ─── Multi-process history (merge + `:process` tagging + concurrency witnesses) ────────
++
++/// One op tagged with the process (client) that issued it. Reuses the #405 [`OpRecord`]
++/// verbatim — the multi-process history is exactly the per-client histories, merged.
++#[derive(Debug, Clone)]
++pub struct ProcessOp {
++    /// The process (client) that issued the op.
++    pub process: ProcessId,
++    /// The recorded op (op kind, key, observed version, wire status, real-time span).
++    pub record: OpRecord,
++}
++
++/// The merged, real-time-ordered multi-process history a concurrent register workload
++/// produces: every client's [`History`] folded into one log, ordered by real-time start,
++/// each op carrying its `:process`. This is the non-vacuous, genuinely-concurrent history
++/// #406 requires (ADR-0041 decision 1) and the input [`to_elle_edn`] serializes.
++#[derive(Debug, Default, Clone)]
++pub struct MultiProcessHistory {
++    ops: Vec<ProcessOp>,
++}
++
++impl MultiProcessHistory {
++    /// Merge per-client `(process, history)` pairs into one real-time-ordered log. Ops are
++    /// ordered by their measured start time (ties broken by process) — the merged real-time
++    /// order a checker places ops in.
++    pub fn merge(labeled: Vec<(ProcessId, History)>) -> Self {
++        let mut ops: Vec<ProcessOp> = Vec::new();
++        for (process, history) in labeled {
++            for record in history.ops() {
++                ops.push(ProcessOp {
++                    process,
++                    record: record.clone(),
++                });
++            }
++        }
++        Self::from_process_ops(ops)
++    }
++
++    /// Build from already-tagged ops (sorting them into real-time start order). The
++    /// socket-free construction seam the crafted-history serializer regressions use.
++    pub fn from_process_ops(mut ops: Vec<ProcessOp>) -> Self {
++        ops.sort_by(|a, b| {
++            a.record
++                .start
++                .cmp(&b.record.start)
++                .then(a.process.cmp(&b.process))
++        });
++        Self { ops }
++    }
++
++    /// The merged ops, in real-time (start) order.
++    pub fn ops(&self) -> &[ProcessOp] {
++        &self.ops
++    }
++
++    /// The distinct process ids that appear in the history.
++    pub fn processes(&self) -> BTreeSet<ProcessId> {
++        self.ops.iter().map(|op| op.process).collect()
++    }
++
++    /// Non-vacuous **and** every op well-formed: at least one op, and none with a reversed
++    /// or missing real-time span. A checker fed an empty or malformed history proves nothing.
++    pub fn well_formed(&self) -> bool {
++        !self.ops.is_empty() && self.ops.iter().all(|op| op.record.well_formed())
++    }
++
++    /// The number of real-time-overlapping op pairs drawn from **distinct** processes. A
++    /// genuinely concurrent history has ≥1 such pair (i.e. ≥2 overlapping spans across
++    /// distinct process ids); a sequential single-client history has none. Two spans overlap
++    /// iff `a.start < b.end && b.start < a.end`.
++    pub fn overlapping_pairs_across_processes(&self) -> usize {
++        let mut pairs = 0;
++        for (i, a) in self.ops.iter().enumerate() {
++            for b in &self.ops[i + 1..] {
++                if a.process != b.process && spans_overlap(&a.record, &b.record) {
++                    pairs += 1;
++                }
++            }
++        }
++        pairs
++    }
++
++    /// Whether the history is genuinely concurrent: ≥2 real-time-overlapping spans across
++    /// distinct process ids (ADR-0041 decision 1 — a non-vacuous, concurrent history).
++    pub fn is_genuinely_concurrent(&self) -> bool {
++        self.overlapping_pairs_across_processes() >= 1
++    }
++
++    /// The versions written by PUTs of `key`, in merged real-time order.
++    pub fn put_versions_for_key(&self, key: &str) -> Vec<u64> {
++        self.ops
++            .iter()
++            .filter(|op| op.record.kind == OpKind::Put && op.record.key == key)
++            .filter_map(|op| op.record.version)
++            .collect()
++    }
++
++    /// Whether the register version **climbs** across overwrites of `key`: ≥2 PUTs whose
++    /// written versions are strictly increasing in real-time order (ADR-0041 decision 1 — an
++    /// overwrite is a new inode version bumped at the commit point).
++    pub fn version_climbs_for_key(&self, key: &str) -> bool {
++        let versions = self.put_versions_for_key(key);
++        versions.len() >= 2 && versions.windows(2).all(|w| w[1] > w[0])
++    }
++
++    /// Every process's OWN reads observe a monotone version sequence per key — the **sound,
++    /// local** monotonic-read guarantee (ADR-0015 guarantee 3), checked per session (a single
++    /// client's ops are sequential, so its own read order *is* real-time order and this holds
++    /// soundly). It reuses [`session_monotonic_reads`] over each process's sub-history.
++    ///
++    /// It deliberately does **not** decide monotonicity across the *merged* multi-process
++    /// history: a PUT's version becomes visible only at its commit (its span *end*), not its
++    /// start, so a start-ordered global sequence would flag a concurrent read that legitimately
++    /// observed the older value — and a global cross-process register decision is exactly the
++    /// linearizability **verdict** ADR-0041 reserves for Elle, off-Check. In-gate we assert only
++    /// the sound per-session invariant; Elle owns the global verdict over the SAME history.
++    pub fn per_process_reads_monotone(&self) -> bool {
++        self.processes().into_iter().all(|process| {
++            let session = History::from_ops(
++                self.ops
++                    .iter()
++                    .filter(|op| op.process == process)
++                    .map(|op| op.record.clone())
++                    .collect(),
++            );
++            session_monotonic_reads(&session)
++        })
++    }
++}
++
++/// Two ops overlap in real time iff each begins before the other ends.
++fn spans_overlap(a: &OpRecord, b: &OpRecord) -> bool {
++    a.start < b.end && b.start < a.end
++}
++
++// ─── Elle-EDN serialization (a stable, well-shaped operation history) ──────────────────
++
++/// An EDN scalar/compound value the serializer emits for `:value`.
++enum EdnValue {
++    Nil,
++    Int(u64),
++    Bool(bool),
++    Str(String),
++    Vector(Vec<EdnValue>),
++}
++
++impl EdnValue {
++    fn render(&self) -> String {
++        match self {
++            EdnValue::Nil => "nil".to_string(),
++            EdnValue::Int(n) => n.to_string(),
++            EdnValue::Bool(b) => b.to_string(),
++            EdnValue::Str(s) => render_edn_string(s),
++            EdnValue::Vector(items) => {
++                let inner: Vec<String> = items.iter().map(EdnValue::render).collect();
++                format!("[{}]", inner.join(" "))
++            }
++        }
++    }
++}
++
++/// Render an EDN string literal: double-quoted, with `\` and `"` escaped (EDN string syntax,
++/// not Rust `Debug`, so the bytes are the checker's — stable regardless of the Rust version).
++fn render_edn_string(s: &str) -> String {
++    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
++    format!("\"{escaped}\"")
++}
++
++/// One Elle operation-history event (an `:invoke` or a completion `:ok`/`:fail`), rendered
++/// as a map with the fields ADR-0041/§Success-criterion (b) names, in that order.
++struct EdnEvent {
++    process: ProcessId,
++    etype: &'static str,
++    f: &'static str,
++    value: EdnValue,
++    time: u128,
++}
++
++impl EdnEvent {
++    fn render(&self) -> String {
++        format!(
++            "{{:process {}, :type :{}, :f :{}, :value {}, :time {}}}",
++            self.process,
++            self.etype,
++            self.f,
++            self.value.render(),
++            self.time
++        )
++    }
++}
++
++/// Render a stream of events as an EDN vector of maps, one map per line — the recognizable
++/// Jepsen/Elle operation-history layout (`[` then each op, newline + one-space indented).
++fn render_edn_vector(events: &[EdnEvent]) -> String {
++    let mut out = String::from("[");
++    for (i, event) in events.iter().enumerate() {
++        if i > 0 {
++            out.push_str("\n ");
++        }
++        out.push_str(&event.render());
++    }
++    out.push(']');
++    out
++}
++
++/// The earliest start time across a set of ops — the history's `t0`, so `:time` is a
++/// relative nanosecond offset (the Jepsen convention) rather than a wall-clock absolute.
++fn history_origin<'a>(records: impl Iterator<Item = &'a OpRecord>) -> Option<SystemTime> {
++    records.map(|r| r.start).min()
++}
++
++/// Nanoseconds of `t` since the history origin `t0` (0 if `t` precedes `t0`, which
++/// well-formed histories never do).
++fn relative_nanos(t: SystemTime, t0: SystemTime) -> u128 {
++    t.duration_since(t0).unwrap_or_default().as_nanos()
++}
++
++/// The `:f` a register op maps to.
++fn register_f(kind: OpKind) -> &'static str {
++    match kind {
++        OpKind::Put => "write",
++        OpKind::Get => "read",
++        OpKind::Delete => "delete",
++    }
++}
++
++/// The completion `:type` a register op's wire status maps to: a delivered 2xx (and a GET's
++/// 404, a legitimate *absent* read) is `:ok`; anything else (a 5xx, a refused write) is
++/// `:fail`.
++fn register_completion_type(kind: OpKind, status: u16) -> &'static str {
++    let ok = match kind {
++        OpKind::Get => matches!(status, 200 | 404),
++        OpKind::Put => status == 200,
++        OpKind::Delete => matches!(status, 200 | 204),
++    };
++    if ok {
++        "ok"
++    } else {
++        "fail"
++    }
++}
++
++/// The `:value` a register op carries at `:invoke` — the write's value is known up front; a
++/// read's is not (it is `nil` until the completion fills it), and a delete carries none.
++fn register_invoke_value(rec: &OpRecord) -> EdnValue {
++    match rec.kind {
++        OpKind::Put => rec.version.map_or(EdnValue::Nil, EdnValue::Int),
++        OpKind::Get | OpKind::Delete => EdnValue::Nil,
++    }
++}
++
++/// The `:value` a register op carries at completion — the write's written value, the read's
++/// observed value (`nil` for an absent key), or `nil` for a delete.
++fn register_complete_value(rec: &OpRecord) -> EdnValue {
++    match rec.kind {
++        OpKind::Put | OpKind::Get => rec.version.map_or(EdnValue::Nil, EdnValue::Int),
++        OpKind::Delete => EdnValue::Nil,
++    }
++}
++
++/// Serialize a multi-process register history to the recognized checker's (Elle) EDN
++/// operation-history format: a vector of `:invoke`/`:ok`/`:fail` maps, one op split into its
++/// invoke (at its start time) and its completion (at its end time), ordered by real time and
++/// each tagged with its `:process`. This is a **stable, well-shaped** serializer — the golden
++/// regression asserts its bytes; real-Elle-parser acceptance is the deferred off-Check leg
++/// (see the module docs and the brief's Scope note).
++pub fn to_elle_edn(history: &MultiProcessHistory) -> String {
++    let Some(t0) = history_origin(history.ops.iter().map(|op| &op.record)) else {
++        return "[]".to_string();
++    };
++
++    // Assign each op a stable per-process sequence index (its order within its own process,
++    // which — because a client's ops are sequential — is also its real-time order there).
++    // Sorting events by `(time, process, seq, phase)` keeps each process's invoke→completion
++    // nesting valid while ordering the whole stream by real time.
++    let mut seq_in_process: std::collections::HashMap<ProcessId, u64> =
++        std::collections::HashMap::new();
++
++    struct Keyed {
++        time: u128,
++        process: ProcessId,
++        seq: u64,
++        phase: u8,
++        event: EdnEvent,
++    }
++    let mut keyed: Vec<Keyed> = Vec::new();
++
++    for op in &history.ops {
++        let seq = seq_in_process.entry(op.process).or_insert(0);
++        let this_seq = *seq;
++        *seq += 1;
++        let rec = &op.record;
++        let f = register_f(rec.kind);
++
++        keyed.push(Keyed {
++            time: relative_nanos(rec.start, t0),
++            process: op.process,
++            seq: this_seq,
++            phase: 0,
++            event: EdnEvent {
++                process: op.process,
++                etype: "invoke",
++                f,
++                value: register_invoke_value(rec),
++                time: relative_nanos(rec.start, t0),
++            },
++        });
++        keyed.push(Keyed {
++            time: relative_nanos(rec.end, t0),
++            process: op.process,
++            seq: this_seq,
++            phase: 1,
++            event: EdnEvent {
++                process: op.process,
++                etype: register_completion_type(rec.kind, rec.status),
++                f,
++                value: register_complete_value(rec),
++                time: relative_nanos(rec.end, t0),
++            },
++        });
++    }
++
++    keyed.sort_by(|a, b| {
++        a.time
++            .cmp(&b.time)
++            .then(a.process.cmp(&b.process))
++            .then(a.seq.cmp(&b.seq))
++            .then(a.phase.cmp(&b.phase))
++    });
++
++    let events: Vec<EdnEvent> = keyed.into_iter().map(|k| k.event).collect();
++    render_edn_vector(&events)
++}
++
++// ─── Session checks (read-your-writes + monotonic reads, ADR-0015 guarantee 3) ─────────
++
++/// **Read-your-writes** over a single session (ADR-0015 guarantee 3): once the session has
++/// written version `w` to a key, every later read of that key by the same session must
++/// observe a version `>= w` — never a stale earlier value, and never *absent* after its own
++/// write. A session's own delete clears that obligation (it then reads its own delete). A
++/// crafted history that reads back a version older than the session's own last write (or
++/// `None` after it) is **rejected** (`false`).
++pub fn session_read_your_writes(session: &History) -> bool {
++    use std::collections::HashMap;
++    let mut last_write: HashMap<&str, u64> = HashMap::new();
++    for op in session.ops() {
++        match op.kind {
++            OpKind::Put => {
++                if let Some(v) = op.version {
++                    last_write.insert(op.key.as_str(), v);
++                }
++            }
++            OpKind::Get => {
++                if let Some(&w) = last_write.get(op.key.as_str()) {
++                    match op.version {
++                        Some(r) if r >= w => {}
++                        _ => return false,
++                    }
++                }
++            }
++            OpKind::Delete => {
++                last_write.remove(op.key.as_str());
++            }
++        }
++    }
++    true
++}
++
++/// **Monotonic reads** over a single session (ADR-0015 guarantee 3): successive reads of a
++/// key by the same session never observe an *older* version than one the session already
++/// read for that key. A crafted history whose reads regress is **rejected** (`false`).
++pub fn session_monotonic_reads(session: &History) -> bool {
++    use std::collections::HashMap;
++    let mut last_read: HashMap<&str, u64> = HashMap::new();
++    for op in session.ops() {
++        if op.kind == OpKind::Get {
++            if let Some(v) = op.version {
++                match last_read.get(op.key.as_str()) {
++                    Some(&prev) if v < prev => return false,
++                    _ => {
++                        last_read.insert(op.key.as_str(), v);
++                    }
++                }
++            }
++        }
++    }
++    true
++}
++
++// ─── Directory-as-set history (ADR-0041 decision 2: create/delete/membership) ──────────
++
++/// A directory (namespace) operation, modelled as a **set** mutation/observation under a
++/// prefix — create appends a member (PUT), delete removes it (DELETE), a membership probe
++/// observes whether a member is present (GET → 200 present / 404 absent). No rename and no
++/// wire `LIST` (the S3 floor is PUT/GET/DELETE only, `crates/gateway-s3/src/lib.rs:40`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DirKind {
++    /// create=PUT — appends the member to the directory set.
++    Add,
++    /// delete=DELETE — removes the member from the set.
++    Remove,
++    /// membership=GET-probe — observes whether the member is present.
++    Contains,
++}
++
++/// One directory-as-set op, with the member it targets, the membership result (for a
++/// [`DirKind::Contains`] probe: `Some(present)`; otherwise `None`), and its real-time span.
++#[derive(Debug, Clone)]
++pub struct DirOp {
++    /// The process (client) that issued the op.
++    pub process: ProcessId,
++    /// Which set operation this records.
++    pub kind: DirKind,
++    /// The member (the object key with the directory prefix stripped).
++    pub member: String,
++    /// For a membership probe: whether the member was present (`200` → `true`, `404` →
++    /// `false`). `None` for add/remove.
++    pub present: Option<bool>,
++    /// Wall-clock time observed just before the op began.
++    pub start: SystemTime,
++    /// Wall-clock time observed just after the op completed.
++    pub end: SystemTime,
++}
++
++/// A recorded directory-as-set history under a prefix — the namespace analogue of
++/// [`MultiProcessHistory`], serialized to the checker's set op form ([`directory_to_elle_edn`]).
++#[derive(Debug, Default, Clone)]
++pub struct DirectoryHistory {
++    ops: Vec<DirOp>,
++}
++
++impl DirectoryHistory {
++    /// Build from already-recorded set ops (sorting them into real-time start order).
++    pub fn from_dir_ops(mut ops: Vec<DirOp>) -> Self {
++        ops.sort_by(|a, b| a.start.cmp(&b.start).then(a.process.cmp(&b.process)));
++        Self { ops }
++    }
++
++    /// Project a register history under `prefix` into a directory-as-set history: PUT → add,
++    /// DELETE → remove, GET → a membership probe (`200` present / anything else absent). The
++    /// member is the object key with `prefix` stripped. Ops whose key is not under `prefix`
++    /// are ignored. This is how a wire-driven namespace workload is recorded as a set history.
++    pub fn from_register_history(prefix: &str, history: &MultiProcessHistory) -> Self {
++        let mut ops = Vec::new();
++        for op in history.ops() {
++            let rec = &op.record;
++            let Some(member) = rec.key.strip_prefix(prefix) else {
++                continue;
++            };
++            let (kind, present) = match rec.kind {
++                OpKind::Put => (DirKind::Add, None),
++                OpKind::Delete => (DirKind::Remove, None),
++                OpKind::Get => (DirKind::Contains, Some(rec.status == 200)),
++            };
++            ops.push(DirOp {
++                process: op.process,
++                kind,
++                member: member.to_string(),
++                present,
++                start: rec.start,
++                end: rec.end,
++            });
++        }
++        Self::from_dir_ops(ops)
++    }
++
++    /// The recorded set ops, in real-time (start) order.
++    pub fn ops(&self) -> &[DirOp] {
++        &self.ops
++    }
++
++    /// Non-vacuous **and** every op well-formed (a sane `start <= end` span).
++    pub fn well_formed(&self) -> bool {
++        !self.ops.is_empty() && self.ops.iter().all(|op| op.end >= op.start)
++    }
++}
++
++/// The `:f` a directory op maps to (set op form): add/remove members, probe membership.
++fn directory_f(kind: DirKind) -> &'static str {
++    match kind {
++        DirKind::Add => "add",
++        DirKind::Remove => "remove",
++        DirKind::Contains => "contains?",
++    }
++}
++
++/// Serialize a directory-as-set history to the recognized checker's EDN set op form — the
++/// namespace analogue of [`to_elle_edn`]. A membership probe's completion `:value` is a
++/// `[member present?]` pair; add/remove carry the member. Same stable, well-shaped layout,
++/// asserted byte-exact by the golden regression.
++pub fn directory_to_elle_edn(history: &DirectoryHistory) -> String {
++    let Some(t0) = history.ops.iter().map(|op| op.start).min() else {
++        return "[]".to_string();
++    };
++
++    struct Keyed {
++        time: u128,
++        process: ProcessId,
++        seq: u64,
++        phase: u8,
++        event: EdnEvent,
++    }
++    let mut seq_in_process: std::collections::HashMap<ProcessId, u64> =
++        std::collections::HashMap::new();
++    let mut keyed: Vec<Keyed> = Vec::new();
++
++    for op in &history.ops {
++        let seq = seq_in_process.entry(op.process).or_insert(0);
++        let this_seq = *seq;
++        *seq += 1;
++        let f = directory_f(op.kind);
++
++        // The member being added/removed/probed is known at invoke; a probe's boolean result
++        // is filled at completion as `[member present?]`.
++        let invoke_value = EdnValue::Str(op.member.clone());
++        let complete_value = match op.kind {
++            DirKind::Contains => EdnValue::Vector(vec![
++                EdnValue::Str(op.member.clone()),
++                EdnValue::Bool(op.present.unwrap_or(false)),
++            ]),
++            DirKind::Add | DirKind::Remove => EdnValue::Str(op.member.clone()),
++        };
++
++        keyed.push(Keyed {
++            time: relative_nanos(op.start, t0),
++            process: op.process,
++            seq: this_seq,
++            phase: 0,
++            event: EdnEvent {
++                process: op.process,
++                etype: "invoke",
++                f,
++                value: invoke_value,
++                time: relative_nanos(op.start, t0),
++            },
++        });
++        keyed.push(Keyed {
++            time: relative_nanos(op.end, t0),
++            process: op.process,
++            seq: this_seq,
++            phase: 1,
++            event: EdnEvent {
++                process: op.process,
++                etype: "ok",
++                f,
++                value: complete_value,
++                time: relative_nanos(op.end, t0),
++            },
++        });
++    }
++
++    keyed.sort_by(|a, b| {
++        a.time
++            .cmp(&b.time)
++            .then(a.process.cmp(&b.process))
++            .then(a.seq.cmp(&b.seq))
++            .then(a.phase.cmp(&b.phase))
++    });
++
++    let events: Vec<EdnEvent> = keyed.into_iter().map(|k| k.event).collect();
++    render_edn_vector(&events)
++}
++
++// ─── Verdict-dispatch seam (mirrors xtask::metadata_faults; ADR-0041/ADR-0016) ─────────
++
++/// The privileged off-Check job that runs the Elle linearizability verdict over the
++/// serialized EDN history. Elle is JVM/Clojure, so — per ADR-0041/ADR-0016 — it runs **only**
++/// here, never in `cargo xtask ci`.
++pub const ELLE_VERDICT_OFF_CHECK_JOB: &str = "consistency-elle-verdict";
++
++/// A deprecated in-gate JVM/Clojure shell-out env var. There is **no** in-gate Elle run; this
++/// is representable only so the routing decision stays testable — selecting it is a hard error
++/// downstream, never a shell-out into the merge gate (the same shape
++/// `xtask::metadata_faults::METADATA_TIER1_LEGACY_CMD_VAR` keeps for its removed legacy leg).
++pub const ELLE_IN_GATE_SHELLOUT_VAR: &str = "WYRD_ELLE_IN_GATE_CMD";
++
++/// Where the Elle linearizability verdict routes. Modelling the route as a value with BOTH
++/// alternatives representable is the non-tautological bar (§Success-criterion e, mirroring
++/// `xtask::metadata_faults::MetadataTierDispatch`): a Check-time unit test binds to
++/// [`verdict_dispatch`], and a regression that re-points the default route at an in-gate JVM
++/// shell-out flips that test **red behaviourally**.
++#[derive(Debug, PartialEq, Eq)]
++pub enum VerdictDispatch {
++    /// Route the verdict to the privileged off-Check job over the serialized EDN history
++    /// (JVM/Clojure runs there, never in `cargo xtask ci`).
++    OffCheckJob {
++        /// The off-Check job name.
++        job: &'static str,
++    },
++    /// The rejected in-gate JVM shell-out — representable but never selected for the default
++    /// inputs; the runner turns it into a hard error.
++    InGateShellOut {
++        /// The deprecated env var that would name the in-gate command.
++        env_var: &'static str,
++    },
++}
++
++/// Decide where the Elle verdict routes. Pure — decided solely from
++/// `in_gate_shellout_configured` (whether the deprecated [`ELLE_IN_GATE_SHELLOUT_VAR`] is
++/// set) — so the dispatch test binds to it with no privileged environment. The default
++/// (var unset) is always the privileged off-Check job (ADR-0041/ADR-0016): the merge gate
++/// stays pure-Rust and never shells a JVM.
++#[must_use]
++pub fn verdict_dispatch(in_gate_shellout_configured: bool) -> VerdictDispatch {
++    if in_gate_shellout_configured {
++        VerdictDispatch::InGateShellOut {
++            env_var: ELLE_IN_GATE_SHELLOUT_VAR,
++        }
++    } else {
++        VerdictDispatch::OffCheckJob {
++            job: ELLE_VERDICT_OFF_CHECK_JOB,
++        }
++    }
++}
++
++// ─── Wire-driven workloads (leg (a) concurrent register; leg (d) directory recording) ──
++
++/// Drive a **concurrent register workload** over the real S3 HTTP wire: one *writer* client
++/// (process `0`) overwrites the shared `key` with strictly-climbing versions `1..=overwrites`
++/// (each committing before the next issues, so the register value only ever climbs), while
++/// `readers` *reader* clients (processes `1..=readers`) concurrently GET the same key until
++/// the writer finishes. Because the sole writer only climbs, every reader observes a
++/// **monotone** version sequence; because the readers run throughout the writer's overwrites,
++/// their read spans **overlap** the writer's write spans in real time across distinct
++/// processes — the genuine concurrency ADR-0041 decision 1 requires.
++///
++/// Returns the merged [`MultiProcessHistory`]. Binds no listener itself — the caller passes
++/// the address of an already-serving gateway (mirrors `s3_http_wire.rs::start_gateway`).
++pub async fn run_concurrent_register_workload(
++    addr: SocketAddr,
++    bucket: &str,
++    creds: Credentials,
++    region: &str,
++    key: &str,
++    readers: usize,
++    overwrites: u64,
++) -> std::io::Result<MultiProcessHistory> {
++    let done = Arc::new(AtomicBool::new(false));
++    // A generous safety cap so a reader can never spin forever if the writer fails before
++    // signalling done (the join below would surface the writer's error either way).
++    let reader_cap: u64 = overwrites.saturating_mul(64).saturating_add(1024);
++
++    let mut reader_handles = Vec::new();
++    for r in 0..readers {
++        let process = (r + 1) as ProcessId;
++        let bucket = bucket.to_string();
++        let creds = creds.clone();
++        let region = region.to_string();
++        let key = key.to_string();
++        let done = Arc::clone(&done);
++        reader_handles.push(tokio::spawn(async move {
++            let mut client = ObservableS3Client::new(addr, bucket, creds, region);
++            let mut issued: u64 = 0;
++            loop {
++                client.get(&key).await?;
++                issued += 1;
++                if done.load(Ordering::SeqCst) || issued >= reader_cap {
++                    break;
++                }
++            }
++            Ok::<(ProcessId, History), std::io::Error>((process, client.into_history()))
++        }));
++    }
++
++    let writer = {
++        let bucket = bucket.to_string();
++        let creds = creds.clone();
++        let region = region.to_string();
++        let key = key.to_string();
++        let done = Arc::clone(&done);
++        tokio::spawn(async move {
++            let mut client = ObservableS3Client::new(addr, bucket, creds, region);
++            for version in 1..=overwrites {
++                client.put(&key, version).await?;
++                client.get(&key).await?;
++            }
++            done.store(true, Ordering::SeqCst);
++            Ok::<(ProcessId, History), std::io::Error>((0, client.into_history()))
++        })
++    };
++
++    let mut labeled = Vec::new();
++    let (writer_process, writer_history) = writer.await.expect("writer task panicked")?;
++    labeled.push((writer_process, writer_history));
++    for handle in reader_handles {
++        let (process, history) = handle.await.expect("reader task panicked")?;
++        labeled.push((process, history));
++    }
++    Ok(MultiProcessHistory::merge(labeled))
++}
++
++/// Drive a **directory-as-set workload** over the real S3 HTTP wire with one client (process
++/// `0`): for each member, create it (PUT) then probe it present (GET → 200); then remove the
++/// first member (DELETE) and probe it absent (GET → 404). Records the run and projects it to
++/// a [`DirectoryHistory`] under `prefix` — the namespace history ADR-0041 decision 2 models.
++pub async fn run_directory_workload(
++    addr: SocketAddr,
++    bucket: &str,
++    creds: Credentials,
++    region: &str,
++    prefix: &str,
++    members: &[&str],
++) -> std::io::Result<DirectoryHistory> {
++    let mut client = ObservableS3Client::new(addr, bucket, creds, region);
++    for member in members {
++        let key = format!("{prefix}{member}");
++        client.put(&key, 1).await?;
++        client.get(&key).await?;
++    }
++    if let Some(first) = members.first() {
++        let key = format!("{prefix}{first}");
++        client.delete(&key).await?;
++        client.get(&key).await?;
++    }
++    let merged = MultiProcessHistory::merge(vec![(0, client.into_history())]);
++    Ok(DirectoryHistory::from_register_history(prefix, &merged))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::{Duration, UNIX_EPOCH};
++
++    fn at(nanos: u64) -> SystemTime {
++        UNIX_EPOCH + Duration::from_nanos(nanos)
++    }
++
++    fn reg(kind: OpKind, key: &str, version: Option<u64>, status: u16, s: u64, e: u64) -> OpRecord {
++        OpRecord {
++            kind,
++            key: key.to_string(),
++            version,
++            status,
++            start: at(s),
++            end: at(e),
++        }
++    }
++
++    #[test]
++    fn verdict_dispatch_defaults_to_the_off_check_job() {
++        assert_eq!(
++            verdict_dispatch(false),
++            VerdictDispatch::OffCheckJob {
++                job: ELLE_VERDICT_OFF_CHECK_JOB
++            }
++        );
++        assert_eq!(
++            verdict_dispatch(true),
++            VerdictDispatch::InGateShellOut {
++                env_var: ELLE_IN_GATE_SHELLOUT_VAR
++            }
++        );
++    }
++
++    #[test]
++    fn overlap_and_climb_witnesses_hold_for_a_concurrent_history() {
++        let history = MultiProcessHistory::from_process_ops(vec![
++            ProcessOp {
++                process: 0,
++                record: reg(OpKind::Put, "k", Some(1), 200, 0, 10),
++            },
++            ProcessOp {
++                process: 1,
++                record: reg(OpKind::Get, "k", Some(1), 200, 5, 15),
++            },
++            ProcessOp {
++                process: 0,
++                record: reg(OpKind::Put, "k", Some(2), 200, 20, 30),
++            },
++        ]);
++        assert!(history.is_genuinely_concurrent());
++        assert!(history.version_climbs_for_key("k"));
++        assert!(history.per_process_reads_monotone());
++    }
++}
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index f3b4efa..d74e8e6 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -15,6 +15,7 @@
+ 
+ pub mod cli;
+ pub mod consistency_observable;
++pub mod consistency_workload;
+ pub mod custodian;
+ pub mod dserver;
+ 
+diff --git a/crates/server/tests/consistency_workload.rs b/crates/server/tests/consistency_workload.rs
+new file mode 100644
+index 0000000..1d1f8e7
+--- /dev/null
++++ b/crates/server/tests/consistency_workload.rs
+@@ -0,0 +1,442 @@
++//! Consistency-checker **workload + serializer** slice (issue #406, ADR-0041 decision 1–3,
++//! #329 slice 3): the load-bearing, `cargo xtask ci`-run regression for the machinery built
++//! on top of the merged #405 networked observable
++//! ([`wyrd_server::consistency_observable`]). It carries BOTH halves the brief names:
++//!
++//! * the **socket-free crafted-history reds** — a genuine, flippable, module-weakening
++//!   red→green on real inputs, producible even where the Check sandbox denies loopback
++//!   `bind`: the Elle-EDN serializer's **byte-exact golden** (register + directory-as-set),
++//!   the session read-your-writes / monotonic-read rejections, the reused per-key
++//!   monotonicity rejection, and the verdict-dispatch routing; and
++//! * the **wire-driven concurrent-workload** non-vacuity / concurrency witnesses — ≥2
++//!   concurrent `ObservableS3Client`s over the real in-process S3 HTTP wire producing a
++//!   genuinely concurrent, version-climbing, monotone-read multi-process history (green
++//!   confirmed by the full `cargo xtask ci`, which permits loopback bind).
++//!
++//! The linearizability **verdict** itself is Elle's (JVM/Clojure), and per ADR-0041/ADR-0016
++//! runs **only off-Check** over the SAME serialized history — [`verdict_dispatch`] is the
++//! seam that routes it there; this in-gate slice does NOT return a register/namespace
++//! linearizability verdict.
++//!
++//! RED before the workload/serializer/session-check/directory/verdict machinery exists (the
++//! `consistency_workload` module is absent, so nothing to construct); GREEN once it does, and
++//! it STAYS red whenever the serializer / a session check / the dispatch is weakened.
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use tokio::net::TcpListener;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::sigv4::Credentials;
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::consistency_observable::{History, OpKind, OpRecord};
++use wyrd_server::consistency_workload::{
++    directory_to_elle_edn, run_concurrent_register_workload, run_directory_workload,
++    session_monotonic_reads, session_read_your_writes, to_elle_edn, verdict_dispatch, DirKind,
++    DirOp, DirectoryHistory, MultiProcessHistory, ProcessOp, VerdictDispatch,
++    ELLE_IN_GATE_SHELLOUT_VAR, ELLE_VERDICT_OFF_CHECK_JOB,
++};
++use wyrd_server::Gateway;
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++const BUCKET: &str = "wyrd-bucket";
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++// ─── Socket-free crafted-history helpers ───────────────────────────────────────────────
++
++fn at(nanos: u64) -> SystemTime {
++    UNIX_EPOCH + Duration::from_nanos(nanos)
++}
++
++fn reg(
++    kind: OpKind,
++    key: &str,
++    version: Option<u64>,
++    status: u16,
++    start: u64,
++    end: u64,
++) -> OpRecord {
++    OpRecord {
++        kind,
++        key: key.to_string(),
++        version,
++        status,
++        start: at(start),
++        end: at(end),
++    }
++}
++
++// ─── (b) The Elle-EDN serializer: byte-exact golden (register) ──────────────────────────
++
++#[test]
++fn register_history_serializes_byte_exact_to_elle_edn() {
++    // A crafted, genuinely concurrent 2-process register history with controlled real-time
++    // spans (so the relative `:time` offsets are exact) covering every op-kind mapping:
++    // a write (:ok), a read (:ok, reads the committed version), a *failed* write (:fail, a
++    // 5xx), and a delete (:ok). The golden is written out independently below — a wrong
++    // field name, op-kind mapping, ordering, or `:time` origin makes this RED.
++    let history = MultiProcessHistory::from_process_ops(vec![
++        ProcessOp {
++            process: 0,
++            record: reg(OpKind::Put, "k", Some(1), 200, 0, 5),
++        },
++        ProcessOp {
++            process: 1,
++            record: reg(OpKind::Get, "k", Some(1), 200, 3, 8),
++        },
++        ProcessOp {
++            process: 0,
++            record: reg(OpKind::Put, "k", Some(2), 500, 10, 12),
++        },
++        ProcessOp {
++            process: 1,
++            record: reg(OpKind::Delete, "k", None, 204, 14, 15),
++        },
++    ]);
++
++    let expected = [
++        "[{:process 0, :type :invoke, :f :write, :value 1, :time 0}",
++        "{:process 1, :type :invoke, :f :read, :value nil, :time 3}",
++        "{:process 0, :type :ok, :f :write, :value 1, :time 5}",
++        "{:process 1, :type :ok, :f :read, :value 1, :time 8}",
++        "{:process 0, :type :invoke, :f :write, :value 2, :time 10}",
++        "{:process 0, :type :fail, :f :write, :value 2, :time 12}",
++        "{:process 1, :type :invoke, :f :delete, :value nil, :time 14}",
++        "{:process 1, :type :ok, :f :delete, :value nil, :time 15}]",
++    ]
++    .join("\n ");
++
++    assert_eq!(
++        to_elle_edn(&history),
++        expected,
++        "the register history must serialize byte-exact to the Elle EDN operation-history \
++         form (:process / :type ∈ {{:invoke,:ok,:fail}} / :f / :value / :time)"
++    );
++}
++
++// ─── (d) The directory-as-set history: byte-exact golden (set op form) ──────────────────
++
++#[test]
++fn directory_history_serializes_byte_exact_to_set_op_form() {
++    // A crafted directory-as-set history: create (add) a member, probe it present, remove it
++    // (delete), probe it absent — driven by 2 processes with controlled spans. A membership
++    // probe's completion value is a `[member present?]` pair. Independent golden below.
++    let history = DirectoryHistory::from_dir_ops(vec![
++        DirOp {
++            process: 0,
++            kind: DirKind::Add,
++            member: "a".to_string(),
++            present: None,
++            start: at(0),
++            end: at(4),
++        },
++        DirOp {
++            process: 1,
++            kind: DirKind::Contains,
++            member: "a".to_string(),
++            present: Some(true),
++            start: at(2),
++            end: at(6),
++        },
++        DirOp {
++            process: 0,
++            kind: DirKind::Remove,
++            member: "a".to_string(),
++            present: None,
++            start: at(8),
++            end: at(10),
++        },
++        DirOp {
++            process: 1,
++            kind: DirKind::Contains,
++            member: "a".to_string(),
++            present: Some(false),
++            start: at(12),
++            end: at(14),
++        },
++    ]);
++
++    let expected = [
++        "[{:process 0, :type :invoke, :f :add, :value \"a\", :time 0}",
++        "{:process 1, :type :invoke, :f :contains?, :value \"a\", :time 2}",
++        "{:process 0, :type :ok, :f :add, :value \"a\", :time 4}",
++        "{:process 1, :type :ok, :f :contains?, :value [\"a\" true], :time 6}",
++        "{:process 0, :type :invoke, :f :remove, :value \"a\", :time 8}",
++        "{:process 0, :type :ok, :f :remove, :value \"a\", :time 10}",
++        "{:process 1, :type :invoke, :f :contains?, :value \"a\", :time 12}",
++        "{:process 1, :type :ok, :f :contains?, :value [\"a\" false], :time 14}]",
++    ]
++    .join("\n ");
++
++    assert_eq!(
++        directory_to_elle_edn(&history),
++        expected,
++        "the directory-as-set history must serialize byte-exact to the checker's set op form \
++         (:add / :remove / :contains? with a [member present?] read value)"
++    );
++}
++
++// ─── (c) Session checks: reject a violation, accept a valid history ─────────────────────
++
++#[test]
++fn session_read_your_writes_rejects_a_stale_own_read_and_accepts_a_fresh_one() {
++    // Violation: the session writes v2, then reads back the stale v1 — read-your-writes broken.
++    let violating = History::from_ops(vec![
++        reg(OpKind::Put, "k", Some(2), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(1), 200, 2, 3),
++    ]);
++    assert!(
++        !session_read_your_writes(&violating),
++        "a read of an OLDER version than the session's own last write must be rejected"
++    );
++
++    // Valid: the session writes v2, then reads back v2 (its own write).
++    let valid = History::from_ops(vec![
++        reg(OpKind::Put, "k", Some(2), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(2), 200, 2, 3),
++    ]);
++    assert!(
++        session_read_your_writes(&valid),
++        "a read that reflects the session's own write (or newer) must be accepted"
++    );
++}
++
++#[test]
++fn session_monotonic_reads_rejects_a_regression_and_accepts_a_monotone_run() {
++    // Violation: read v2 then read v1 — a monotonic-read regression within one session.
++    let violating = History::from_ops(vec![
++        reg(OpKind::Get, "k", Some(2), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(1), 200, 2, 3),
++    ]);
++    assert!(
++        !session_monotonic_reads(&violating),
++        "a read that observes an OLDER version than a previous read must be rejected"
++    );
++
++    // Valid: read v1 then read v2 — non-decreasing.
++    let valid = History::from_ops(vec![
++        reg(OpKind::Get, "k", Some(1), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(2), 200, 2, 3),
++    ]);
++    assert!(
++        session_monotonic_reads(&valid),
++        "a non-decreasing sequence of reads must be accepted"
++    );
++}
++
++#[test]
++fn reused_per_key_monotonicity_rejects_a_version_regression() {
++    // The #405 per-key monotonicity check, reused over a crafted history: a GET observing an
++    // older version than a committed one is a stale/torn read → rejected.
++    let regressing = History::from_ops(vec![
++        reg(OpKind::Put, "k", Some(2), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(1), 200, 2, 3),
++    ]);
++    assert!(
++        !regressing.versions_monotone_per_key(),
++        "a GET observing a version older than one already committed must be rejected"
++    );
++
++    let monotone = History::from_ops(vec![
++        reg(OpKind::Put, "k", Some(1), 200, 0, 1),
++        reg(OpKind::Get, "k", Some(1), 200, 2, 3),
++        reg(OpKind::Put, "k", Some(2), 200, 4, 5),
++    ]);
++    assert!(
++        monotone.versions_monotone_per_key(),
++        "a non-regressing per-key version sequence must be accepted"
++    );
++}
++
++// ─── (e) Verdict-dispatch: route the Elle verdict off-Check (never an in-gate JVM shell) ─
++
++#[test]
++fn verdict_dispatch_routes_the_elle_verdict_to_the_off_check_job() {
++    // The default (no in-gate shell-out var set): the verdict MUST route to the privileged
++    // off-Check job, never an in-gate JVM/Clojure shell-out. Reverting the dispatch so the
++    // default input returns the in-gate shell-out — re-pointing Elle into `cargo xtask ci` —
++    // hits the panic arm. Each assertion uses an independent expectation, not the literal the
++    // function returns.
++    match verdict_dispatch(false) {
++        VerdictDispatch::OffCheckJob { job } => assert_eq!(
++            job, ELLE_VERDICT_OFF_CHECK_JOB,
++            "the default Elle verdict route must be the privileged off-Check job"
++        ),
++        VerdictDispatch::InGateShellOut { env_var } => panic!(
++            "verdict dispatch regressed to an in-gate JVM shell-out `{env_var}` inside \
++             `cargo xtask ci` instead of the off-Check {ELLE_VERDICT_OFF_CHECK_JOB} job"
++        ),
++    }
++}
++
++#[test]
++fn only_the_deprecated_var_reaches_the_in_gate_shellout_route() {
++    // The in-gate shell-out is representable but NEVER the default — only the explicitly-set
++    // deprecated var selects it (and the runner then hard-errors rather than shelling a JVM).
++    assert!(
++        matches!(
++            verdict_dispatch(true),
++            VerdictDispatch::InGateShellOut { env_var }
++                if env_var == ELLE_IN_GATE_SHELLOUT_VAR
++        ),
++        "only the deprecated WYRD_ELLE_IN_GATE_CMD var may reach the removed in-gate route"
++    );
++}
++
++// ─── (a) Wire-driven concurrent workload: non-vacuous, genuinely concurrent history ─────
++
++/// Start the S3 gateway on an ephemeral loopback port (mirrors
++/// `consistency_observable.rs::start_gateway` / `s3_http_wire.rs::start_gateway`). The
++/// gateway serves connections concurrently (`S3Gateway::serve` → `axum::serve`), so ≥2
++/// concurrent clients genuinely produce overlapping real-time spans.
++async fn start_gateway() -> (SocketAddr, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let gateway: Arc<Backend> = Arc::new(Gateway::new(
++        RedbMetadataStore::in_memory().expect("redb"),
++        FsChunkStore::open(dir.path()).expect("fs store"),
++        MemCoordination::new(),
++    ));
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(Arc::clone(&gateway), config);
++    tokio::spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    (addr, dir)
++}
++
++fn creds() -> Credentials {
++    Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn concurrent_workload_produces_a_nonvacuous_genuinely_concurrent_history() {
++    let (addr, _dir) = start_gateway().await;
++    let key = "register-object";
++
++    // One writer (process 0) overwrites the shared key with climbing versions 1..=24 while
++    // two readers (processes 1,2) concurrently GET it — real overlapping spans across
++    // distinct processes over the real S3 HTTP wire.
++    let history = run_concurrent_register_workload(addr, BUCKET, creds(), REGION, key, 2, 24)
++        .await
++        .expect("concurrent register workload");
++
++    // Non-vacuous and every op well-formed.
++    assert!(
++        history.well_formed(),
++        "the merged multi-process history must be non-vacuous and every span well-formed"
++    );
++
++    // ≥2 distinct process ids (the writer + ≥1 reader).
++    let processes = history.processes();
++    assert!(
++        processes.len() >= 2 && processes.contains(&0),
++        "the history must merge ≥2 distinct process ids incl. the writer: {processes:?}"
++    );
++
++    // Genuinely concurrent: ≥2 real-time-overlapping spans across distinct process ids.
++    assert!(
++        history.overlapping_pairs_across_processes() >= 1,
++        "the concurrent workload must produce ≥2 real-time-overlapping spans across distinct \
++         processes (found none — the history is not genuinely concurrent)"
++    );
++
++    // The register version climbs across overwrites of the shared key…
++    assert!(
++        history.version_climbs_for_key(key),
++        "the register version must climb across the writer's overwrites of the shared key"
++    );
++
++    // …and every process's OWN per-key reads observe a monotone version sequence (no
++    // stale/torn read) — the sound, local session invariant. The GLOBAL cross-process
++    // register verdict is Elle's, off-Check, over the SAME serialized history; the in-gate
++    // slice deliberately does not decide it (that is the rejected v1–v3 in-gate vehicle).
++    assert!(
++        history.per_process_reads_monotone(),
++        "each session's per-key reads must observe a monotone version sequence (no stale/torn \
++         read)"
++    );
++
++    // The produced history serializes to the Elle EDN form (well-shaped, tagged with
++    // :process). Byte-exactness is asserted on the crafted golden above (wire times vary).
++    let edn = to_elle_edn(&history);
++    assert!(
++        edn.starts_with('[') && edn.ends_with(']'),
++        "the serialized history must be an EDN operation-history vector"
++    );
++    assert!(
++        edn.contains(":process ") && edn.contains(":type :invoke") && edn.contains(":type :ok"),
++        "the serialized history must carry :process-tagged :invoke/:ok events"
++    );
++}
++
++// ─── (d) Wire-driven directory-as-set recording ────────────────────────────────────────
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn directory_workload_records_and_serializes_a_set_history() {
++    let (addr, _dir) = start_gateway().await;
++    let prefix = "dir/";
++
++    // Create two members, probe each present, then delete the first and probe it absent.
++    let history = run_directory_workload(addr, BUCKET, creds(), REGION, prefix, &["alpha", "beta"])
++        .await
++        .expect("directory workload");
++
++    assert!(
++        history.well_formed(),
++        "the directory-as-set history must be non-vacuous and every span well-formed"
++    );
++
++    // Membership is observed by GET-probe: `alpha` was created, probed present, then deleted
++    // and probed absent; `beta` was created and probed present.
++    let saw_add = |m: &str| {
++        history
++            .ops()
++            .iter()
++            .any(|op| op.kind == DirKind::Add && op.member == m)
++    };
++    let saw_present = |m: &str| {
++        history
++            .ops()
++            .iter()
++            .any(|op| op.kind == DirKind::Contains && op.member == m && op.present == Some(true))
++    };
++    assert!(saw_add("alpha") && saw_add("beta"), "both creates recorded");
++    assert!(
++        saw_present("alpha") && saw_present("beta"),
++        "a membership probe must observe each created member present (200)"
++    );
++    assert!(
++        history
++            .ops()
++            .iter()
++            .any(|op| op.kind == DirKind::Remove && op.member == "alpha"),
++        "the delete of alpha must be recorded as a set remove"
++    );
++    assert!(
++        history.ops().iter().any(|op| op.kind == DirKind::Contains
++            && op.member == "alpha"
++            && op.present == Some(false)),
++        "a membership probe after the delete must observe alpha absent (404)"
++    );
++
++    // …and it serializes to the set op form.
++    let edn = directory_to_elle_edn(&history);
++    assert!(
++        edn.starts_with('[') && edn.contains(":f :add") && edn.contains(":f :contains?"),
++        "the directory history must serialize to the checker's set op form: {edn}"
++    );
++}

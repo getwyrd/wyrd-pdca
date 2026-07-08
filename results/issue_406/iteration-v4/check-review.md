@@ -1,0 +1,15 @@
+Issue 406 adds the consistency workload/history serializer substrate: concurrent S3 observable histories, Elle EDN serialization, session checks, directory-as-set recording, and an off-Check Elle verdict seam.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The owed boundary is Rust history production/serialization plus local checks, not an in-gate linearizability verdict; the brief makes that division explicit in `brief.md:46` and `brief.md:67`. |
+| C2 Reproduction (red pre-fix) | PASS | The pre-fix gap is net-new absence of this machinery; reversing `patch.diff` in a temporary copy made `cargo test -p wyrd-server --test consistency_workload` red with no such test target, matching `brief.md:153`. |
+| C3 Change | PASS | The patch adds the named module/test surface and exports it for the server crate; the target now exposes `consistency_workload` at `crates/server/src/lib.rs:18`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Full green is owed in a loopback-permitted runner: `cargo xtask ci` passed fmt/clippy/build but this sandbox failed on loopback bind before completion, and the patch's own loopback tests also fail at `crates/server/tests/consistency_workload.rs:309`. |
+| C5 Causal adequacy | PASS | The causal question is whether the slice avoids the rejected hand-rolled verdict while producing checker input; the code serializes histories and routes verdicts off-Check at `crates/server/src/consistency_workload.rs:305` and `crates/server/src/consistency_workload.rs:648`. |
+| T1 Structure | PASS | The structure keeps crafted-history construction local and reuses the #405 `History` type via `from_ops`, so tests can exercise local invariants without opening sockets at `crates/server/src/consistency_observable.rs:95`. |
+| T2 Shape | PASS | The shape owed is Elle operation-history EDN with process/type/function/value/time fields; the serializer emits that map shape at `crates/server/src/consistency_workload.rs:223` and register/directory golden tests bind it at `crates/server/tests/consistency_workload.rs:77`. |
+| T3 Runtime | NEEDS-HUMAN | Runtime evidence for the real-wire workload is owed on a host that permits `127.0.0.1:0`; the test asserts overlapping multi-process history at `crates/server/tests/consistency_workload.rs:325`, but local execution cannot bind the listener. |
+| T4 Contribution | PASS | Prior art appears non-duplicative for the affected paths: history shows #405 only added the observable substrate, and affected-path search finds the new serializer/session/verdict symbols only in this patch (`brief.md:216`). |
+| T5 Judgment | PASS | The engineering judgment owed is whether deferred Elle is a routing seam rather than inert scaffolding; the default route is test-bound to the off-Check job at `crates/server/tests/consistency_workload.rs:260`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human sign-off must decide whether the deferred live Elle parser/verdict and real CI loopback run are acceptable for the product claim, because Check only re-ran socket-free greens and hit the declared loopback host caveat (`brief.md:182`). |

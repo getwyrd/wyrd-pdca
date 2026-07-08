@@ -1,0 +1,2064 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0629c9d..69a035d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5010,9 +5010,20 @@ dependencies = [
+ name = "wyrd-testkit"
+ version = "0.0.0"
+ dependencies = [
++ "async-trait",
++ "bytes",
+  "chrono",
+  "rand 0.10.1",
+  "rand_chacha 0.10.0",
++ "tempfile",
++ "tokio",
++ "wyrd-chunkstore-fs",
++ "wyrd-coordination-mem",
++ "wyrd-core",
++ "wyrd-gateway-core",
++ "wyrd-metadata-redb",
++ "wyrd-server",
++ "wyrd-traits",
+ ]
+ 
+ [[package]]
+diff --git a/crates/testkit/Cargo.toml b/crates/testkit/Cargo.toml
+index 42412e0..cc2af88 100644
+--- a/crates/testkit/Cargo.toml
++++ b/crates/testkit/Cargo.toml
+@@ -16,6 +16,27 @@ rand_chacha.workspace = true
+ # `clock` feature is OFF, so no wall-clock source enters this DST seam crate (ADR-0009).
+ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+ 
++# Dev-only: the ADR-0041 consistency-checker integration test
++# (`tests/consistency_models.rs`) drives the **in-process gateway** to produce a
++# non-vacuous recorded history the register model checks. These are the real backends the
++# gateway composes (redb metadata + fs chunks + in-memory coordination, ADR-0010) — the
++# same in-process driving pattern `crates/server/tests/closed_write_path.rs` uses. All
++# dev-only, so the DST seam library itself stays pure (no server/runtime dep leaks into
++# production). `wyrd-server`'s own dev-dependency on `wyrd-testkit` and this one form a
++# dev-only dependency cycle, which Cargo permits.
++[dev-dependencies]
++wyrd-server = { path = "../server" }
++wyrd-core.workspace = true
++wyrd-traits.workspace = true
++wyrd-metadata-redb.workspace = true
++wyrd-chunkstore-fs.workspace = true
++wyrd-coordination-mem.workspace = true
++wyrd-gateway-core.workspace = true
++async-trait.workspace = true
++bytes.workspace = true
++tempfile.workspace = true
++tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
++
+ # Inherit the workspace lint policy (single source of truth in the root
+ # Cargo.toml [workspace.lints.*]).
+ [lints]
+diff --git a/crates/testkit/src/consistency.rs b/crates/testkit/src/consistency.rs
+new file mode 100644
+index 0000000..1140e51
+--- /dev/null
++++ b/crates/testkit/src/consistency.rs
+@@ -0,0 +1,1170 @@
++//! Consistency-checker substrate for Wyrd's **mutable metadata register** (ADR-0041;
++//! ADR-0015 the contract checked).
++//!
++//! ADR-0041 settles the substrate for #329's externally-recognizable consistency artifact:
++//! model the **metadata commit-point register** — the inode `version` bumped under the
++//! commit CAS (`crates/core/src/write.rs:271` `commit_overwrite`), the directory `dirent`
++//! set, and the reserved `meta:version` high-water mark — **never** the immutable
++//! chunk/fragment path (which yields only vacuous histories). This module is the pure-Rust
++//! realization of that decision: three checker model families over a **recorded history**,
++//! a history recorder, a checker-compatible serialization, and the seam to the off-Check
++//! verdict leg.
++//!
++//! # What is exercised at Check vs deferred off-Check
++//!
++//! The models, the session checks, the recorder, and the serialization are pure Rust and
++//! run under the base toolchain inside `cargo xtask ci`. The **live Elle/JVM verdict** over
++//! the serialized history is a privileged **off-Check** job (ADR-0016/ADR-0041 keep
++//! JVM/Clojure out of the unprivileged merge gate); [`verdict_dispatch`] models that routing
++//! decision as a pure value, unit-checkable at Check, exactly as
++//! `xtask/src/metadata_faults.rs`'s `metadata_tier_dispatch` does for the deferred live
++//! partition leg — the "deferred ≠ unbuilt" bar.
++//!
++//! # The three models (ADR-0041 §Decision)
++//!
++//! 1. **A file is a read-write register** ([`check_register`]) — the primary, load-bearing
++//!    model. A key is an object path / inode; a write is an overwriting PUT that bumps the
++//!    inode `version` under the commit-point CAS; a read returns the current version and
++//!    value. Checked for linearizability of the commit point (guarantee 2): read-after-commit
++//!    with no torn or stale read, exactly-one-writer-wins, and no version regression.
++//! 2. **A directory is a list-append / set** ([`check_list_append`]) — the secondary model.
++//!    Create appends a name, delete removes it, rename moves it; a list returns the entry
++//!    set. Checked for namespace linearizability (guarantee 1): no lost create, no
++//!    resurrected delete.
++//! 3. **Sessions carry read-your-writes and monotonic reads** ([`check_read_your_writes`],
++//!    [`check_monotonic_reads`]) over the register and the `meta:version` high-water mark
++//!    (guarantee 3).
++//!
++//! # A checker, not a rubber stamp — provenance is gated on *committed* writes
++//!
++//! Every clause that admits a read's observed value keys it to what the commit point
++//! **actually produced**: a value only a `Fail` write attempted (a lost CAS — "definitely
++//! did not take effect") was never at the commit point, so a read that returns it is a torn
++//! read, and every committed `(key, version)` is produced by exactly one write. Both the
++//! register value-provenance domain and the namespace add/remove sets are therefore built
++//! from `ok` events only (`if !c.ok { continue }`) — a checker whose whole value is its
++//! correctness must not admit a value no committed write ever wrote (issue #406 finding).
++//!
++//! Crucially the commit-point checks are keyed on the inode `version` (the linearization
++//! index), so a committed write whose version was **not captured** must NOT be silently
++//! skipped — that would switch the checks off on exactly the *contended* ops where they
++//! matter most. [`check_register`] therefore **rejects** a committed write with no version
++//! ([`RegViolationKind::UnresolvedWrite`]), and detects a **vanished committed write** — an
++//! absent read after a committed write — version-independently ([`RegViolationKind::LostWrite`]).
++//! The workload recorder is required to capture every committed overwrite's real version
++//! (issue #406, iteration-2 finding: on the contended path a version-less committed write let
++//! the register model false-accept a stale read, a two-winners double-commit, and a superseded
++//! value).
++//!
++//! # History representation
++//!
++//! A history is a flat, index-ordered list of operations, each split into an **invoke** and
++//! a terminal **ok**/**fail** event (the Elle/Knossos op lifecycle). The monotone [`Index`]
++//! is the **real-time proxy**: a lower index was recorded strictly earlier, so
++//! `a.t_complete < b.t_invoke` means `a` completed before `b` began (they do not overlap),
++//! which is the real-time order linearizability is defined against. A per-process invoke →
++//! complete stack pairs the events (a process issues its ops sequentially, so it has at most
++//! one in-flight op).
++
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::fmt;
++
++/// Global recording order — a real-time proxy. Monotone across the whole history: a strictly
++/// lower `index` was recorded strictly earlier in wall-clock terms.
++pub type Index = u64;
++
++/// A logical process / session id. Read-your-writes and monotonic reads are scoped per
++/// process (ADR-0015 guarantee 3).
++pub type Process = u32;
++
++/// The reserved global version-fence key (ADR-0015; `wyrd_core::metadata::VERSION_KEY` =
++/// `b"meta:version"`). Modeled as a register key so the session monotonic-read check covers
++/// the high-water mark uniformly with the per-inode register.
++pub const META_VERSION_KEY: &str = "meta:version";
++
++/// The Elle model the off-Check verdict runs the serialized register history through.
++pub const ELLE_RW_REGISTER: &str = "elle.rw-register";
++
++/// The Elle model the off-Check verdict runs the serialized namespace history through.
++pub const ELLE_LIST_APPEND: &str = "elle.list-append";
++
++/// The op lifecycle: an operation is `Invoke`d, then terminates `Ok` (observed result) or
++/// `Fail` (rejected — e.g. a commit that lost its CAS).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Kind {
++    /// The operation began.
++    Invoke,
++    /// The operation completed with an observed result.
++    Ok,
++    /// The operation was rejected (definitely did not take effect).
++    Fail,
++}
++
++// ─── Read-write register model (ADR-0041 §Decision 1; ADR-0015 guarantee 2) ───────────
++
++/// A register operation function: an overwriting write or a read.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RegF {
++    /// An overwriting PUT that bumps the inode `version` at the commit point.
++    Write,
++    /// A GET returning the current `(value, version)`.
++    Read,
++}
++
++/// One event in the register history (an invoke or a terminal event of a write/read).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct RegOp {
++    /// Recording order (real-time proxy).
++    pub index: Index,
++    /// The process/session that issued the op.
++    pub process: Process,
++    /// Invoke / ok / fail.
++    pub kind: Kind,
++    /// Write or read.
++    pub f: RegF,
++    /// The register key (object path / inode, or [`META_VERSION_KEY`]).
++    pub key: String,
++    /// Write: the value written (`Some` on invoke and ok). Read: the value read (`Some` on an
++    /// ok that observed a value, `None` on invoke or an absent-key ok).
++    pub value: Option<u64>,
++    /// The commit-point version. A read-ok carries the version it observed; a write-ok
++    /// carries the writer's **own** commit version when it is still observable (else `None`).
++    pub version: Option<u64>,
++}
++
++impl RegOp {
++    /// A write invoke: `process` is about to overwrite `key` with `value`.
++    #[must_use]
++    pub fn write_invoke(index: Index, process: Process, key: &str, value: u64) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Invoke,
++            f: RegF::Write,
++            key: key.to_string(),
++            value: Some(value),
++            version: None,
++        }
++    }
++
++    /// A write ok: the overwrite committed `value`, producing commit `version` (when the
++    /// writer could still observe its own value as current; else `None`).
++    #[must_use]
++    pub fn write_ok(
++        index: Index,
++        process: Process,
++        key: &str,
++        value: u64,
++        version: Option<u64>,
++    ) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Ok,
++            f: RegF::Write,
++            key: key.to_string(),
++            value: Some(value),
++            version,
++        }
++    }
++
++    /// A write fail: the overwrite lost its commit CAS to a concurrent winner — it
++    /// **definitely did not take effect**, so its value was never at the commit point.
++    #[must_use]
++    pub fn write_fail(index: Index, process: Process, key: &str, value: u64) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Fail,
++            f: RegF::Write,
++            key: key.to_string(),
++            value: Some(value),
++            version: None,
++        }
++    }
++
++    /// A read invoke: `process` is about to read `key`.
++    #[must_use]
++    pub fn read_invoke(index: Index, process: Process, key: &str) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Invoke,
++            f: RegF::Read,
++            key: key.to_string(),
++            value: None,
++            version: None,
++        }
++    }
++
++    /// A read ok: `process` observed `value` at commit `version`.
++    #[must_use]
++    pub fn read_ok(index: Index, process: Process, key: &str, value: u64, version: u64) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Ok,
++            f: RegF::Read,
++            key: key.to_string(),
++            value: Some(value),
++            version: Some(version),
++        }
++    }
++
++    /// A read ok that found the key absent.
++    #[must_use]
++    pub fn read_absent(index: Index, process: Process, key: &str) -> Self {
++        Self {
++            index,
++            process,
++            kind: Kind::Ok,
++            f: RegF::Read,
++            key: key.to_string(),
++            value: None,
++            version: None,
++        }
++    }
++}
++
++/// The kind of register-linearizability violation found.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RegViolationKind {
++    /// A read returned a `(value, version)` the commit point never produced — a torn read, a
++    /// value no committed write wrote (e.g. a failed write's value), or two reads that
++    /// disagree on the value at one version.
++    TornRead,
++    /// A read (or write observation) saw a strictly older version than one already observed to
++    /// have completed earlier in real time — a stale read / version regression.
++    VersionRegression,
++    /// Two distinct writes both won the same commit-point version (a double-commit), whether
++    /// they wrote the same or different values.
++    TwoWinners,
++    /// A committed write (`ok`) carries **no commit version**. The inode `version` bumped
++    /// under the commit CAS *is* the commit point's linearization index (ADR-0041 §Decision
++    /// 1); a committed write we cannot place in that total order makes the history
++    /// unverifiable, so the sound verdict is to reject it rather than silently skip it. This
++    /// is what closes the **contended-path** hole (issue #406): a recorder that drops a
++    /// contended write's version to `None` must not thereby switch OFF stale-read /
++    /// two-winners / superseded-value detection on exactly those ops.
++    UnresolvedWrite,
++    /// A committed write to a key vanished: a later read found the key **absent** though a
++    /// committed write to it completed earlier in real time. The register has no delete, so a
++    /// committed key stays present — an absent read after a committed write is a lost write.
++    LostWrite,
++    /// The history is malformed (an unmatched invoke/complete).
++    Malformed,
++}
++
++/// A register-linearizability violation: the failing clause plus a human-readable detail.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct RegisterViolation {
++    /// Which ADR-0015 guarantee-2 clause failed.
++    pub kind: RegViolationKind,
++    /// A human-readable description naming the offending ops.
++    pub detail: String,
++}
++
++impl fmt::Display for RegisterViolation {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "register {:?}: {}", self.kind, self.detail)
++    }
++}
++
++/// A completed register operation with its real-time interval `[t_invoke, t_complete]`.
++struct RegCompleted {
++    f: RegF,
++    key: String,
++    value: Option<u64>,
++    version: Option<u64>,
++    ok: bool,
++    t_invoke: Index,
++    t_complete: Index,
++}
++
++fn pair_register(ops: &[RegOp]) -> Result<Vec<RegCompleted>, RegisterViolation> {
++    let mut sorted: Vec<&RegOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    let mut open: BTreeMap<Process, &RegOp> = BTreeMap::new();
++    let mut done = Vec::new();
++    for op in sorted {
++        match op.kind {
++            Kind::Invoke => {
++                if open.insert(op.process, op).is_some() {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::Malformed,
++                        detail: format!("process {} invoked twice without completing", op.process),
++                    });
++                }
++            }
++            Kind::Ok | Kind::Fail => {
++                let Some(inv) = open.remove(&op.process) else {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::Malformed,
++                        detail: format!("process {} completed with no open invoke", op.process),
++                    });
++                };
++                done.push(RegCompleted {
++                    f: op.f,
++                    key: op.key.clone(),
++                    // A write carries its value on both events; a read carries it on ok.
++                    value: op.value.or(inv.value),
++                    version: op.version,
++                    ok: matches!(op.kind, Kind::Ok),
++                    t_invoke: inv.index,
++                    t_complete: op.index,
++                });
++            }
++        }
++    }
++    Ok(done)
++}
++
++/// Check a register history for **linearizability of the commit point** (ADR-0015 guarantee
++/// 2, ADR-0041 §Decision 1): read-after-commit with no torn or stale read,
++/// exactly-one-writer-wins, and no version regression.
++///
++/// The check exploits the inode `version` as the commit point's linearization index — "the
++/// commit point totally orders its versions" (ADR-0041) — so it runs in polynomial time
++/// rather than searching linearizations:
++///
++/// * **No torn read / version→value is a function.** Every committed version maps to exactly
++///   one value; two reads (or a read and a committing write) that report different values at
++///   the same version is a torn read.
++/// * **Value provenance.** A read may only return a value some **committed** write actually
++///   wrote — a value only a failed write attempted was never at the commit point.
++/// * **No stale read / no version regression.** If observation `a` completed (in real time)
++///   before observation `b` began, `b`'s version must be `>= a`'s — a later observation may
++///   never see an older commit point.
++/// * **Exactly-one-writer-wins.** No two committed writes may report the same `(key, version)`.
++/// * **No unresolved committed write.** A write that COMMITTED but whose commit version was
++///   not captured cannot be placed in the commit-point order, so the history is unverifiable
++///   there — rejected outright (`UnresolvedWrite`) rather than silently skipped. This is the
++///   load-bearing fix for the **contended path** (issue #406): the commit-point checks below
++///   are keyed on the version, so a version-less committed write must never be admitted as a
++///   free pass — the recorder is required to capture every committed write's real version.
++/// * **No lost write.** The register has no delete: once a write commits, the key is present
++///   for every later read; an absent read after a committed write is a lost write.
++///
++/// # Errors
++/// Returns the failing clause as a [`RegisterViolation`].
++pub fn check_register(ops: &[RegOp]) -> Result<(), RegisterViolation> {
++    let done = pair_register(ops)?;
++
++    // Pass 0 — no unresolved committed write. The inode `version` bumped under the commit CAS
++    // IS the commit point's linearization index (ADR-0041 §Decision 1: "the commit point
++    // totally orders its versions"). A write that COMMITTED (`ok`) yet carries no version
++    // cannot be placed in that order, so the history is unverifiable at the commit point and
++    // the sound verdict is to REJECT it — never to skip it and let the version-keyed passes
++    // below silently pass over it. This closes the contended-path hole (issue #406,
++    // iteration-2): a recorder that dropped a contended write's version to `None` used to
++    // switch OFF stale-read / two-winners / superseded-value detection on exactly those ops.
++    // A correct recorder captures every committed overwrite's real version (the workload does;
++    // see `consistency_models.rs`), so a well-formed produced history never trips this.
++    for c in &done {
++        if c.f == RegF::Write && c.ok && c.version.is_none() {
++            return Err(RegisterViolation {
++                kind: RegViolationKind::UnresolvedWrite,
++                detail: format!(
++                    "a committed write of {:?} carries no commit version — its place in the commit-point order is unverifiable",
++                    c.key
++                ),
++            });
++        }
++    }
++
++    // The set of values a COMMITTED write actually wrote, per key (the provenance domain). A
++    // read may only return a value some committed write wrote; a value only a FAILED write
++    // attempted was never at the commit point (`Kind::Fail` = "definitely did not take
++    // effect"), so reading it is a torn read. Gate on `c.ok` — the same committed-only filter
++    // Pass 1 below and the namespace model (`if !c.ok { continue }`) already apply.
++    let mut written: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
++    for c in &done {
++        if c.f == RegF::Write && c.ok {
++            if let Some(v) = c.value {
++                written.entry(c.key.as_str()).or_default().insert(v);
++            }
++        }
++    }
++
++    // Pass 1 — exactly-one-writer-wins: each committed `(key, version)` is produced by
++    // EXACTLY one write. Two committed writes reporting the same `(key, version)` are two
++    // winners at one commit point, whether they wrote different OR identical values (a
++    // same-value double-commit is still two winners — count occurrences, not distinct
++    // values). Checked before the torn-read pass so a genuine double-commit surfaces as
++    // `TwoWinners` rather than as its downstream torn-read symptom.
++    let mut winners: BTreeMap<(&str, u64), Vec<u64>> = BTreeMap::new();
++    for c in &done {
++        if c.f == RegF::Write && c.ok {
++            if let (Some(val), Some(ver)) = (c.value, c.version) {
++                let vals = winners.entry((c.key.as_str(), ver)).or_default();
++                vals.push(val);
++                if vals.len() > 1 {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::TwoWinners,
++                        detail: format!(
++                            "version {ver} of {:?} was won by {} distinct writes (values {vals:?})",
++                            c.key,
++                            vals.len(),
++                        ),
++                    });
++                }
++            }
++        }
++    }
++
++    // Pass 2 — no torn read: version -> value is a function, and a read may only return a
++    // value some committed write wrote. Seed the map from committing writes, then check every
++    // read.
++    let mut version_value: BTreeMap<(&str, u64), u64> = BTreeMap::new();
++    for c in &done {
++        if c.f == RegF::Write && c.ok {
++            if let (Some(val), Some(ver)) = (c.value, c.version) {
++                version_value.insert((c.key.as_str(), ver), val);
++            }
++        }
++    }
++    for c in &done {
++        if c.f == RegF::Read && c.ok {
++            let (Some(val), Some(ver)) = (c.value, c.version) else {
++                continue; // an absent-key read observes nothing
++            };
++            if !written
++                .get(c.key.as_str())
++                .is_some_and(|s| s.contains(&val))
++            {
++                return Err(RegisterViolation {
++                    kind: RegViolationKind::TornRead,
++                    detail: format!(
++                        "read of {:?} returned value {val} at version {ver} that no committed write ever wrote",
++                        c.key
++                    ),
++                });
++            }
++            match version_value.get(&(c.key.as_str(), ver)) {
++                Some(prev) if *prev != val => {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::TornRead,
++                        detail: format!(
++                            "version {ver} of {:?} observed with two values ({prev} and {val})",
++                            c.key
++                        ),
++                    });
++                }
++                Some(_) => {}
++                None => {
++                    version_value.insert((c.key.as_str(), ver), val);
++                }
++            }
++        }
++    }
++
++    // Pass 2b — no lost write: the register has no delete, so once a write to a key COMMITS
++    // the key is present for every later read. A read that finds the key ABSENT after some
++    // committed write to it completed (in real time) before the read began is a vanished /
++    // lost committed write (issue #406, iteration-2 hole 3 — an absent read used to be skipped
++    // as "observes nothing"). Version-INDEPENDENT: it fires whether or not the committed write
++    // carried a version, so lost-write detection is never gated on the contended path.
++    let mut earliest_committed: BTreeMap<&str, Index> = BTreeMap::new();
++    for c in &done {
++        if c.f == RegF::Write && c.ok {
++            let e = earliest_committed
++                .entry(c.key.as_str())
++                .or_insert(Index::MAX);
++            *e = (*e).min(c.t_complete);
++        }
++    }
++    for c in &done {
++        if c.f == RegF::Read && c.ok && c.value.is_none() {
++            if let Some(&wc) = earliest_committed.get(c.key.as_str()) {
++                if wc < c.t_invoke {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::LostWrite,
++                        detail: format!(
++                            "read of {:?} found the key absent though a committed write to it completed earlier in real time",
++                            c.key
++                        ),
++                    });
++                }
++            }
++        }
++    }
++
++    // Pass 3 — no stale read / no version regression: per key, a later (non-overlapping) observation
++    // must see a version >= an earlier one. Observations are reads and committing writes that
++    // carry a version.
++    let mut obs_by_key: BTreeMap<&str, Vec<(&RegCompleted, u64)>> = BTreeMap::new();
++    for c in &done {
++        if !c.ok {
++            continue;
++        }
++        if let Some(ver) = c.version {
++            if c.value.is_some() {
++                obs_by_key.entry(c.key.as_str()).or_default().push((c, ver));
++            }
++        }
++    }
++    for (key, obs) in &obs_by_key {
++        for (a, va) in obs {
++            for (b, vb) in obs {
++                // `a` completed strictly before `b` began (they do not overlap in real time).
++                if a.t_complete < b.t_invoke && vb < va {
++                    return Err(RegisterViolation {
++                        kind: RegViolationKind::VersionRegression,
++                        detail: format!(
++                            "{key:?}: an observation of version {va} completed before an observation of the older version {vb} began"
++                        ),
++                    });
++                }
++            }
++        }
++    }
++
++    Ok(())
++}
++
++// ─── Session checks (ADR-0041 §Decision 3; ADR-0015 guarantee 3) ──────────────────────
++
++/// A per-session (read-your-writes / monotonic-read) violation.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct SessionViolation {
++    /// A human-readable description naming the offending session and versions.
++    pub detail: String,
++}
++
++impl fmt::Display for SessionViolation {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "session: {}", self.detail)
++    }
++}
++
++/// Check **read-your-writes** (ADR-0015 guarantee 3): within a session, once it has written
++/// a version of a key, every later read of that key by the same session must observe a
++/// version `>=` its own write. Applies to register keys and [`META_VERSION_KEY`] alike.
++///
++/// # Errors
++/// Returns a [`SessionViolation`] naming the session and versions.
++pub fn check_read_your_writes(ops: &[RegOp]) -> Result<(), SessionViolation> {
++    let mut sorted: Vec<&RegOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    // (process, key) -> the max version this session has itself written.
++    let mut own: BTreeMap<(Process, &str), u64> = BTreeMap::new();
++    for op in sorted {
++        match (op.f, op.kind) {
++            (RegF::Write, Kind::Ok) => {
++                if let Some(ver) = op.version {
++                    let e = own.entry((op.process, op.key.as_str())).or_insert(0);
++                    *e = (*e).max(ver);
++                }
++            }
++            (RegF::Read, Kind::Ok) => {
++                if let (Some(ver), Some(&floor)) =
++                    (op.version, own.get(&(op.process, op.key.as_str())))
++                {
++                    if ver < floor {
++                        return Err(SessionViolation {
++                            detail: format!(
++                                "process {} wrote version {floor} of {:?} but later read the older version {ver}",
++                                op.process, op.key
++                            ),
++                        });
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++    Ok(())
++}
++
++/// Check **monotonic reads** (ADR-0015 guarantee 3): within a session, successive reads of a
++/// key never go backwards in version. Applies to register keys and [`META_VERSION_KEY`].
++///
++/// # Errors
++/// Returns a [`SessionViolation`] naming the session and versions.
++pub fn check_monotonic_reads(ops: &[RegOp]) -> Result<(), SessionViolation> {
++    let mut sorted: Vec<&RegOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    let mut last: BTreeMap<(Process, &str), u64> = BTreeMap::new();
++    for op in sorted {
++        if op.f == RegF::Read && op.kind == Kind::Ok {
++            if let Some(ver) = op.version {
++                let e = last.entry((op.process, op.key.as_str())).or_insert(0);
++                if ver < *e {
++                    return Err(SessionViolation {
++                        detail: format!(
++                            "process {} read version {} of {:?} after already reading the newer version {}",
++                            op.process, ver, op.key, *e
++                        ),
++                    });
++                }
++                *e = ver;
++            }
++        }
++    }
++    Ok(())
++}
++
++// ─── List-append / set model (ADR-0041 §Decision 2; ADR-0015 guarantee 1) ─────────────
++
++/// A namespace operation function.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NsF {
++    /// Bind a new name in the directory (an S3 PUT of a fresh key).
++    Create,
++    /// Unbind a name (an S3 DELETE).
++    Delete,
++    /// Move a name binding (a single dirent mutation): removes the source, adds the
++    /// destination.
++    Rename,
++    /// Read the directory's entry set.
++    List,
++}
++
++/// One event in the namespace history.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NsOp {
++    /// Recording order (real-time proxy).
++    pub index: Index,
++    /// The process/session that issued the op.
++    pub process: Process,
++    /// Invoke / ok / fail.
++    pub kind: Kind,
++    /// Create / delete / rename / list.
++    pub f: NsF,
++    /// Create / delete: the name. Rename: the source name.
++    pub name: String,
++    /// Rename: the destination name.
++    pub to: Option<String>,
++    /// List-ok: the returned entry set.
++    pub entries: Option<Vec<String>>,
++}
++
++impl NsOp {
++    fn simple(index: Index, process: Process, kind: Kind, f: NsF, name: &str) -> Self {
++        Self {
++            index,
++            process,
++            kind,
++            f,
++            name: name.to_string(),
++            to: None,
++            entries: None,
++        }
++    }
++
++    /// A create invoke.
++    #[must_use]
++    pub fn create_invoke(index: Index, process: Process, name: &str) -> Self {
++        Self::simple(index, process, Kind::Invoke, NsF::Create, name)
++    }
++    /// A create ok (the name was bound).
++    #[must_use]
++    pub fn create_ok(index: Index, process: Process, name: &str) -> Self {
++        Self::simple(index, process, Kind::Ok, NsF::Create, name)
++    }
++    /// A create fail (the name was already bound / lost a CAS).
++    #[must_use]
++    pub fn create_fail(index: Index, process: Process, name: &str) -> Self {
++        Self::simple(index, process, Kind::Fail, NsF::Create, name)
++    }
++    /// A delete invoke.
++    #[must_use]
++    pub fn delete_invoke(index: Index, process: Process, name: &str) -> Self {
++        Self::simple(index, process, Kind::Invoke, NsF::Delete, name)
++    }
++    /// A delete ok (the name was unbound).
++    #[must_use]
++    pub fn delete_ok(index: Index, process: Process, name: &str) -> Self {
++        Self::simple(index, process, Kind::Ok, NsF::Delete, name)
++    }
++    /// A rename invoke (`from` -> `to`).
++    #[must_use]
++    pub fn rename_invoke(index: Index, process: Process, from: &str, to: &str) -> Self {
++        Self {
++            to: Some(to.to_string()),
++            ..Self::simple(index, process, Kind::Invoke, NsF::Rename, from)
++        }
++    }
++    /// A rename ok (`from` -> `to`).
++    #[must_use]
++    pub fn rename_ok(index: Index, process: Process, from: &str, to: &str) -> Self {
++        Self {
++            to: Some(to.to_string()),
++            ..Self::simple(index, process, Kind::Ok, NsF::Rename, from)
++        }
++    }
++    /// A list invoke.
++    #[must_use]
++    pub fn list_invoke(index: Index, process: Process) -> Self {
++        Self::simple(index, process, Kind::Invoke, NsF::List, "")
++    }
++    /// A list ok returning `entries`.
++    #[must_use]
++    pub fn list_ok(index: Index, process: Process, entries: Vec<String>) -> Self {
++        Self {
++            entries: Some(entries),
++            ..Self::simple(index, process, Kind::Ok, NsF::List, "")
++        }
++    }
++}
++
++/// The kind of namespace-linearizability violation found.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NsViolationKind {
++    /// A name whose create (or rename destination) completed and was not removed is absent
++    /// from a later list.
++    LostCreate,
++    /// A deleted (or renamed-away) name reappears in a later list without an intervening
++    /// re-create.
++    ResurrectedDelete,
++    /// The history is malformed (an unmatched invoke/complete).
++    Malformed,
++}
++
++/// A namespace-linearizability violation.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NamespaceViolation {
++    /// Which ADR-0015 guarantee-1 clause failed.
++    pub kind: NsViolationKind,
++    /// A human-readable description.
++    pub detail: String,
++}
++
++impl fmt::Display for NamespaceViolation {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "namespace {:?}: {}", self.kind, self.detail)
++    }
++}
++
++struct NsCompleted {
++    f: NsF,
++    name: String,
++    to: Option<String>,
++    entries: Option<Vec<String>>,
++    ok: bool,
++    t_invoke: Index,
++    t_complete: Index,
++}
++
++fn pair_namespace(ops: &[NsOp]) -> Result<Vec<NsCompleted>, NamespaceViolation> {
++    let mut sorted: Vec<&NsOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    let mut open: BTreeMap<Process, &NsOp> = BTreeMap::new();
++    let mut done = Vec::new();
++    for op in sorted {
++        match op.kind {
++            Kind::Invoke => {
++                if open.insert(op.process, op).is_some() {
++                    return Err(NamespaceViolation {
++                        kind: NsViolationKind::Malformed,
++                        detail: format!("process {} invoked twice without completing", op.process),
++                    });
++                }
++            }
++            Kind::Ok | Kind::Fail => {
++                let Some(inv) = open.remove(&op.process) else {
++                    return Err(NamespaceViolation {
++                        kind: NsViolationKind::Malformed,
++                        detail: format!("process {} completed with no open invoke", op.process),
++                    });
++                };
++                done.push(NsCompleted {
++                    f: op.f,
++                    name: op.name.clone(),
++                    to: op.to.clone().or_else(|| inv.to.clone()),
++                    entries: op.entries.clone(),
++                    ok: matches!(op.kind, Kind::Ok),
++                    t_invoke: inv.index,
++                    t_complete: op.index,
++                });
++            }
++        }
++    }
++    Ok(done)
++}
++
++/// Check a namespace history for **namespace linearizability** (ADR-0015 guarantee 1,
++/// ADR-0041 §Decision 2): no lost create and no resurrected delete.
++///
++/// The check is conservative over real-time intervals, so it never rejects a genuinely
++/// linearizable history: an "add" or "remove" of a name is only *asserted* when it is
++/// **definite** — completed before the list began (add) / began before the list ended
++/// (remove) — and a name that is only *possibly* mutated during a list is excused. A rename
++/// contributes both a remove of its source and an add of its destination.
++///
++/// * **No lost create.** If an add of `x` completed before a list began and no remove of `x`
++///   even began before the list ended, `x` must be in the list.
++/// * **No resurrected delete.** If a delete of `x` completed before a list began and no
++///   re-create of `x` began after that delete and before the list ended, `x` must be absent;
++///   and any name present in a list must have some create that began before the list ended.
++///
++/// # Errors
++/// Returns the failing clause as a [`NamespaceViolation`].
++pub fn check_list_append(ops: &[NsOp]) -> Result<(), NamespaceViolation> {
++    let done = pair_namespace(ops)?;
++
++    // Adds and removes of a name, with their real-time intervals. Built from `ok` events only
++    // — a failed create/delete/rename never mutated the namespace.
++    struct Ev {
++        t_invoke: Index,
++        t_complete: Index,
++    }
++    let mut adds: BTreeMap<String, Vec<Ev>> = BTreeMap::new();
++    let mut removes: BTreeMap<String, Vec<Ev>> = BTreeMap::new();
++    for c in &done {
++        if !c.ok {
++            continue;
++        }
++        match c.f {
++            NsF::Create => adds.entry(c.name.clone()).or_default().push(Ev {
++                t_invoke: c.t_invoke,
++                t_complete: c.t_complete,
++            }),
++            NsF::Delete => removes.entry(c.name.clone()).or_default().push(Ev {
++                t_invoke: c.t_invoke,
++                t_complete: c.t_complete,
++            }),
++            NsF::Rename => {
++                removes.entry(c.name.clone()).or_default().push(Ev {
++                    t_invoke: c.t_invoke,
++                    t_complete: c.t_complete,
++                });
++                if let Some(to) = &c.to {
++                    adds.entry(to.clone()).or_default().push(Ev {
++                        t_invoke: c.t_invoke,
++                        t_complete: c.t_complete,
++                    });
++                }
++            }
++            NsF::List => {}
++        }
++    }
++
++    for c in &done {
++        if c.f != NsF::List || !c.ok {
++            continue;
++        }
++        let Some(entries) = &c.entries else { continue };
++        let present: BTreeSet<&str> = entries.iter().map(String::as_str).collect();
++        let (ls, le) = (c.t_invoke, c.t_complete);
++
++        // No lost create: a definitely-added, not-possibly-removed name must be present.
++        for (name, name_adds) in &adds {
++            let definitely_added = name_adds.iter().any(|a| a.t_complete < ls);
++            if !definitely_added {
++                continue;
++            }
++            let possibly_removed = removes
++                .get(name)
++                .is_some_and(|rs| rs.iter().any(|r| r.t_invoke < le));
++            if !possibly_removed && !present.contains(name.as_str()) {
++                return Err(NamespaceViolation {
++                    kind: NsViolationKind::LostCreate,
++                    detail: format!(
++                        "name {name:?} was created and not removed, but a later list omitted it"
++                    ),
++                });
++            }
++        }
++
++        // No resurrected delete: a present name must have some plausible create, and a
++        // definitely-deleted name with no re-create must be absent.
++        for name in &present {
++            let plausibly_created = adds
++                .get(*name)
++                .is_some_and(|as_| as_.iter().any(|a| a.t_invoke < le));
++            if !plausibly_created {
++                return Err(NamespaceViolation {
++                    kind: NsViolationKind::ResurrectedDelete,
++                    detail: format!("a list returned name {name:?} that was never created"),
++                });
++            }
++            if let Some(rs) = removes.get(*name) {
++                for r in rs {
++                    if r.t_complete >= ls {
++                        continue; // not definitely deleted before the list began
++                    }
++                    let recreated = adds.get(*name).is_some_and(|as_| {
++                        as_.iter()
++                            .any(|a| a.t_invoke > r.t_complete && a.t_invoke < le)
++                    });
++                    if !recreated {
++                        return Err(NamespaceViolation {
++                            kind: NsViolationKind::ResurrectedDelete,
++                            detail: format!(
++                                "name {name:?} was deleted but reappeared in a later list without a re-create"
++                            ),
++                        });
++                    }
++                }
++            }
++        }
++    }
++
++    Ok(())
++}
++
++// ─── Concurrency witnesses (the non-vacuous-history bar, Success criterion (d)) ────────
++
++/// The maximum number of register operations that were **in flight simultaneously** — the
++/// concurrency depth of the recorded history. `>= 2` means the history genuinely contains
++/// overlapping ops (not a serial log), which is what makes a linearizability history
++/// non-vacuous (ADR-0041 §Context: the #250 vacuous-history mistake).
++#[must_use]
++pub fn max_register_concurrency(ops: &[RegOp]) -> usize {
++    let mut events: Vec<(Index, i32)> = Vec::new();
++    for op in ops {
++        match op.kind {
++            Kind::Invoke => events.push((op.index, 1)),
++            Kind::Ok | Kind::Fail => events.push((op.index, -1)),
++        }
++    }
++    events.sort_by_key(|e| e.0);
++    let mut cur = 0i32;
++    let mut peak = 0i32;
++    for (_, delta) in events {
++        cur += delta;
++        peak = peak.max(cur);
++    }
++    usize::try_from(peak.max(0)).unwrap_or(0)
++}
++
++/// The largest register version any read observed — `>= 2` proves at least one real overwrite
++/// bumped the inode `version` past its `commit_create` value of 1 (ADR-0041 §Decision 1).
++#[must_use]
++pub fn max_observed_version(ops: &[RegOp]) -> u64 {
++    ops.iter()
++        .filter(|o| o.f == RegF::Read && o.kind == Kind::Ok)
++        .filter_map(|o| o.version)
++        .max()
++        .unwrap_or(0)
++}
++
++// ─── History recorder ─────────────────────────────────────────────────────────────────
++
++/// Accumulates a register history and a namespace history from a running workload, in a
++/// single monotone recording order. A concurrent workload shares one recorder behind a mutex;
++/// each `record_*` call is a short critical section, so the recording order is the real-time
++/// interleaving of the ops (a real-time proxy for the models). Reusable by both the in-process
++/// driver here and a wire-driven driver later (#405).
++#[derive(Debug, Default)]
++pub struct HistoryRecorder {
++    seq: Index,
++    /// The recorded register (rw-register) events.
++    pub register: Vec<RegOp>,
++    /// The recorded namespace (list-append/set) events.
++    pub namespace: Vec<NsOp>,
++}
++
++impl HistoryRecorder {
++    /// A fresh, empty recorder.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    fn next(&mut self) -> Index {
++        let i = self.seq;
++        self.seq += 1;
++        i
++    }
++
++    /// Record a register write invoke; returns nothing — invoke/complete pair by process.
++    pub fn write_invoke(&mut self, process: Process, key: &str, value: u64) {
++        let i = self.next();
++        self.register
++            .push(RegOp::write_invoke(i, process, key, value));
++    }
++    /// Record a register write ok (committed `value` at commit `version` when observable).
++    pub fn write_ok(&mut self, process: Process, key: &str, value: u64, version: Option<u64>) {
++        let i = self.next();
++        self.register
++            .push(RegOp::write_ok(i, process, key, value, version));
++    }
++    /// Record a register write fail (lost the commit CAS — definitely did not take effect).
++    pub fn write_fail(&mut self, process: Process, key: &str, value: u64) {
++        let i = self.next();
++        self.register
++            .push(RegOp::write_fail(i, process, key, value));
++    }
++    /// Record a register read invoke.
++    pub fn read_invoke(&mut self, process: Process, key: &str) {
++        let i = self.next();
++        self.register.push(RegOp::read_invoke(i, process, key));
++    }
++    /// Record a register read ok.
++    pub fn read_ok(&mut self, process: Process, key: &str, value: u64, version: u64) {
++        let i = self.next();
++        self.register
++            .push(RegOp::read_ok(i, process, key, value, version));
++    }
++    /// Record a register read that found the key absent.
++    pub fn read_absent(&mut self, process: Process, key: &str) {
++        let i = self.next();
++        self.register.push(RegOp::read_absent(i, process, key));
++    }
++
++    /// Record a namespace create invoke.
++    pub fn create_invoke(&mut self, process: Process, name: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::create_invoke(i, process, name));
++    }
++    /// Record a namespace create ok.
++    pub fn create_ok(&mut self, process: Process, name: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::create_ok(i, process, name));
++    }
++    /// Record a namespace create fail.
++    pub fn create_fail(&mut self, process: Process, name: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::create_fail(i, process, name));
++    }
++    /// Record a namespace delete invoke.
++    pub fn delete_invoke(&mut self, process: Process, name: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::delete_invoke(i, process, name));
++    }
++    /// Record a namespace delete ok.
++    pub fn delete_ok(&mut self, process: Process, name: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::delete_ok(i, process, name));
++    }
++    /// Record a namespace rename invoke (`from` -> `to`).
++    pub fn rename_invoke(&mut self, process: Process, from: &str, to: &str) {
++        let i = self.next();
++        self.namespace
++            .push(NsOp::rename_invoke(i, process, from, to));
++    }
++    /// Record a namespace rename ok (`from` -> `to`).
++    pub fn rename_ok(&mut self, process: Process, from: &str, to: &str) {
++        let i = self.next();
++        self.namespace.push(NsOp::rename_ok(i, process, from, to));
++    }
++    /// Record a namespace list invoke.
++    pub fn list_invoke(&mut self, process: Process) {
++        let i = self.next();
++        self.namespace.push(NsOp::list_invoke(i, process));
++    }
++    /// Record a namespace list ok returning `entries`.
++    pub fn list_ok(&mut self, process: Process, entries: Vec<String>) {
++        let i = self.next();
++        self.namespace.push(NsOp::list_ok(i, process, entries));
++    }
++}
++
++// ─── Checker-compatible serialization (Elle op-map EDN) ───────────────────────────────
++
++fn kind_edn(kind: Kind) -> &'static str {
++    match kind {
++        Kind::Invoke => ":invoke",
++        Kind::Ok => ":ok",
++        Kind::Fail => ":fail",
++    }
++}
++
++fn edn_value(v: Option<u64>) -> String {
++    v.map_or_else(|| "nil".to_string(), |x| x.to_string())
++}
++
++/// Serialize the register history to the **Elle `rw-register` op-map EDN** the off-Check
++/// verdict consumes (ADR-0041: encode/serialize in Rust, run the JVM verdict off-Check).
++/// Each op is `{:index i, :process p, :type t, :f :txn, :value [[:w|:r key val]]}` — the
++/// recognized `elle.rw-register` transactional shape.
++#[must_use]
++pub fn register_to_edn(ops: &[RegOp]) -> String {
++    let mut sorted: Vec<&RegOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    let mut out = String::from("[\n");
++    for op in sorted {
++        let mop = match op.f {
++            RegF::Write => format!("[:w {:?} {}]", op.key, edn_value(op.value)),
++            RegF::Read => format!("[:r {:?} {}]", op.key, edn_value(op.value)),
++        };
++        out.push_str(&format!(
++            " {{:index {}, :process {}, :type {}, :f :txn, :value [{}]}}\n",
++            op.index,
++            op.process,
++            kind_edn(op.kind),
++            mop
++        ));
++    }
++    out.push(']');
++    out
++}
++
++/// Serialize the namespace history to **Elle `list-append` op-map EDN**. Create/rename append
++/// to a per-directory list, delete removes, and list reads it back.
++#[must_use]
++pub fn namespace_to_edn(ops: &[NsOp]) -> String {
++    let mut sorted: Vec<&NsOp> = ops.iter().collect();
++    sorted.sort_by_key(|o| o.index);
++    let mut out = String::from("[\n");
++    for op in sorted {
++        let mop = match op.f {
++            NsF::Create => format!("[:append :dir {:?}]", op.name),
++            NsF::Delete => format!("[:delete :dir {:?}]", op.name),
++            NsF::Rename => format!(
++                "[:rename :dir {:?} {:?}]",
++                op.name,
++                op.to.clone().unwrap_or_default()
++            ),
++            NsF::List => {
++                let items = op
++                    .entries
++                    .as_ref()
++                    .map(|e| {
++                        e.iter()
++                            .map(|n| format!("{n:?}"))
++                            .collect::<Vec<_>>()
++                            .join(" ")
++                    })
++                    .unwrap_or_default();
++                format!("[:r :dir [{items}]]")
++            }
++        };
++        out.push_str(&format!(
++            " {{:index {}, :process {}, :type {}, :f :txn, :value [{}]}}\n",
++            op.index,
++            op.process,
++            kind_edn(op.kind),
++            mop
++        ));
++    }
++    out.push(']');
++    out
++}
++
++// ─── Off-Check verdict seam (ADR-0041/ADR-0016: JVM verdict is off-Check) ──────────────
++
++/// Where the consistency **verdict** runs. Mirrors `xtask/src/metadata_faults.rs`'s
++/// `MetadataTierDispatch`: the pure Rust models run at Check on every history; the live
++/// Elle/JVM verdict over the same serialized history is representable but routed to a
++/// **privileged off-Check job** only — it MUST NOT enter `cargo xtask ci` (ADR-0016).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum VerdictLeg {
++    /// The pure-Rust model checkers ([`check_register`] / [`check_list_append`] / the session
++    /// checks) — always run at Check, no JVM.
++    InProcessModels,
++    /// The recognized off-Check checker over the serialized EDN history (deferred; ADR-0041).
++    OffCheckElle {
++        /// The Elle model name (e.g. [`ELLE_RW_REGISTER`]).
++        checker: &'static str,
++    },
++}
++
++/// Decide where the verdict routes. Pure — decided solely from whether a privileged JVM
++/// checker environment is configured — so this is unit-checkable inside the unprivileged
++/// `cargo xtask ci` gate. The default (no JVM) is always the in-process Rust models; the
++/// off-Check Elle leg is selected only in the privileged job, keeping JVM/Clojure out of the
++/// merge gate (ADR-0016/ADR-0041).
++#[must_use]
++pub fn verdict_dispatch(jvm_checker_available: bool) -> VerdictLeg {
++    if jvm_checker_available {
++        VerdictLeg::OffCheckElle {
++            checker: ELLE_RW_REGISTER,
++        }
++    } else {
++        VerdictLeg::InProcessModels
++    }
++}
+diff --git a/crates/testkit/src/lib.rs b/crates/testkit/src/lib.rs
+index f479d2a..53ba951 100644
+--- a/crates/testkit/src/lib.rs
++++ b/crates/testkit/src/lib.rs
+@@ -15,6 +15,12 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++/// The consistency-checker substrate (ADR-0041): rw-register + list-append/set models,
++/// per-session read-your-writes / monotonic-read checks over the mutable metadata register,
++/// a history recorder, a checker-compatible EDN serialization, and the off-Check verdict
++/// seam. Pure Rust — no JVM enters `cargo xtask ci` (ADR-0016).
++pub mod consistency;
++
+ use rand::{Rng, RngExt, SeedableRng};
+ use rand_chacha::ChaCha8Rng;
+ 
+diff --git a/crates/testkit/tests/consistency_models.rs b/crates/testkit/tests/consistency_models.rs
+new file mode 100644
+index 0000000..bc21e30
+--- /dev/null
++++ b/crates/testkit/tests/consistency_models.rs
+@@ -0,0 +1,808 @@
++//! **ADR-0041 consistency-checker models + workload + recorder** (issue #406, #329 slice 3).
++//!
++//! This is the load-bearing, C4-verify-flippable artifact for the consistency-checker
++//! substrate. It exercises two things the merge gate can prove without a cluster or a JVM:
++//!
++//! 1. **The models reject crafted-inconsistent histories and accept valid ones** — flippable
++//!    red→green assertions over hand-authored histories:
++//!    * the **rw-register** model (ADR-0041 §Decision 1, ADR-0015 guarantee 2) rejects a torn
++//!      read, a **read of a failed write's value** (a value no committed write ever wrote), a
++//!      version regression / stale read, and a two-winners-at-one-commit-point history
++//!      (distinct OR identical values), and accepts a linearizable one; and — the **contended
++//!      path** (issue #406, iteration-2) — rejects a committed write with no captured commit
++//!      version (`UnresolvedWrite`) and a vanished / lost committed write (`LostWrite`), so the
++//!      commit-point checks are never silently switched off on the very ops that matter most;
++//!    * the **list-append/set** model (ADR-0041 §Decision 2, ADR-0015 guarantee 1) rejects a
++//!      lost-create, a resurrected-delete, and rename variants (a lost rename destination, a
++//!      resurrected rename source) and accepts a valid create/delete/rename history;
++//!    * the **session** read-your-writes / monotonic-read checks (ADR-0041 §Decision 3,
++//!      ADR-0015 guarantee 3) reject a read-your-writes violation over the register and a
++//!      monotonic-read violation over `meta:version`.
++//!
++//!    Each is genuinely flippable: weaken any model to accept-everything (or, for the
++//!    targeted regressions, un-gate provenance / collapse the two-winners count / drop a
++//!    rename branch) and its crafted-rejection assertion goes red **on real inputs** (not by
++//!    a missing symbol — the module is present).
++//!
++//! 2. **The concurrent workload driver, run against the in-process `Gateway`, produces a
++//!    non-vacuous recorded history the register model passes.** The workload drives real
++//!    overwriting PUTs + reads of a small shared key set and directory create/delete/list
++//!    against the same in-process gateway `crates/server/tests/closed_write_path.rs` drives
++//!    (real redb metadata + fs chunks + in-memory coordination, ADR-0010). A barrier forces
++//!    genuinely overlapping ops, and repeated overwrites of a hot key bump the inode `version`
++//!    at the commit point past its `commit_create` value of 1. Every committed overwrite is
++//!    recorded WITH its captured commit version — the shared hot key under a per-key mutex so
++//!    each writer attributes its EXACT version even under multi-writer contention (the gateway
++//!    PUT does not return it, and changing the gateway API is out of scope). So the produced
++//!    history carries **no** `version=None` committed write, and the register model's
++//!    version-keyed detections run on the contended ops rather than being switched off (issue
++//!    #406, iteration-2 finding). The recorder serializes the history to the checker-compatible
++//!    Elle op-map EDN, and the register model then passes it — the non-vacuous, checkable
++//!    history ADR-0041's substrate exists to yield.
++//!
++//! The **live Elle/JVM verdict** over the serialized history is deferred to a privileged
++//! off-Check job (ADR-0016/ADR-0041); [`verdict_dispatch`] models that routing decision as a
++//! pure value here, the "deferred ≠ unbuilt" bar `xtask/src/metadata_faults.rs` sets. The
++//! in-process gateway (`wyrd-gateway-core`'s `ObjectGateway`) exposes put/get/delete but **no
++//! atomic rename**, so the workload drives create/delete/list; the rename model branch is
++//! exercised by crafted histories + the recorder + serialization here, ready for the
++//! wire-driven driver (#405) — see build notes.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tokio::sync::Barrier;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::InodeId;
++use wyrd_core::read;
++use wyrd_gateway_core::{GatewayError, ObjectGateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++use wyrd_testkit::consistency::{
++    check_list_append, check_monotonic_reads, check_read_your_writes, check_register,
++    max_observed_version, max_register_concurrency, namespace_to_edn, register_to_edn,
++    verdict_dispatch, HistoryRecorder, Kind, NamespaceViolation, NsOp, NsViolationKind, RegF,
++    RegOp, RegViolationKind, RegisterViolation, VerdictLeg, ELLE_RW_REGISTER, META_VERSION_KEY,
++};
++use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
++
++// ─────────────────────────── (a) rw-register model ───────────────────────────
++
++/// A valid, linearizable single-key register history is accepted: two overwrites (v1 then
++/// v2) and reads that observe them in real-time-monotone order.
++#[test]
++fn register_accepts_a_linearizable_history() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::read_invoke(2, 1, "k"),
++        RegOp::read_ok(3, 1, "k", 10, 1), // reads v1 after w1, before w2 — no stale read
++        RegOp::write_invoke(4, 0, "k", 20),
++        RegOp::write_ok(5, 0, "k", 20, Some(2)),
++        RegOp::read_invoke(6, 2, "k"),
++        RegOp::read_ok(7, 2, "k", 20, 2),
++    ];
++    assert!(
++        check_register(&ops).is_ok(),
++        "a linearizable register history must be accepted"
++    );
++}
++
++/// A **torn read** — a read that returns a value the commit point never produced — is
++/// rejected. Flip: a model that skips value-provenance accepts this, so the assertion is red.
++#[test]
++fn register_rejects_a_torn_read() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::read_invoke(2, 1, "k"),
++        RegOp::read_ok(3, 1, "k", 99, 1), // value 99 was never written
++    ];
++    let err = check_register(&ops).expect_err("a torn read must be rejected");
++    assert_eq!(err.kind, RegViolationKind::TornRead, "{err}");
++}
++
++/// A read that returns the value of a **definitely-FAILED write** — a value no committed
++/// write ever wrote — is a torn read (issue #406 regression). The commit point never produced
++/// `(99, v2)`: write 99 lost its CAS (`Fail` = "definitely did not take effect"), and version
++/// 2 was never committed. A checker whose whole value is its correctness MUST reject this.
++///
++/// Flip (the model-weakening red this pins): if the value-provenance domain is built from
++/// **all** writes instead of only `ok` ones (drop the `&& c.ok` in `check_register`'s
++/// `written` loop), value 99 is admitted and `check_register` FALSE-ACCEPTS — this assertion
++/// goes red on a real input, not by a missing symbol.
++#[test]
++fn register_rejects_a_read_of_a_failed_writes_value() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::write_invoke(2, 1, "k", 99),
++        RegOp::write_fail(3, 1, "k", 99), // lost the commit CAS — 99 was never committed
++        RegOp::read_invoke(4, 2, "k"),
++        RegOp::read_ok(5, 2, "k", 99, 2), // reads 99 @ v2 — neither ever existed at the commit point
++    ];
++    let err = check_register(&ops).expect_err("a read of a failed write's value must be rejected");
++    assert_eq!(err.kind, RegViolationKind::TornRead, "{err}");
++}
++
++/// A **stale read / version regression** — a read that completed observing a newer version,
++/// followed by a strictly-later read observing an older one — is rejected.
++#[test]
++fn register_rejects_a_version_regression() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::write_invoke(2, 0, "k", 20),
++        RegOp::write_ok(3, 0, "k", 20, Some(2)),
++        RegOp::read_invoke(4, 1, "k"),
++        RegOp::read_ok(5, 1, "k", 20, 2), // sees v2, completes at index 5
++        RegOp::read_invoke(6, 2, "k"),    // begins at index 6 (after 5)
++        RegOp::read_ok(7, 2, "k", 10, 1), // regresses to v1
++    ];
++    let err = check_register(&ops).expect_err("a version regression must be rejected");
++    assert_eq!(err.kind, RegViolationKind::VersionRegression, "{err}");
++}
++
++/// A **two-winners-at-one-commit-point** history — two distinct writes both committing the
++/// same inode version — is rejected (exactly-one-writer-wins, ADR-0015 guarantee 2).
++#[test]
++fn register_rejects_two_winners_at_one_commit_point() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(2)),
++        RegOp::write_invoke(2, 1, "k", 20),
++        RegOp::write_ok(3, 1, "k", 20, Some(2)), // same version 2, different value
++    ];
++    let err = check_register(&ops).expect_err("two winners at one version must be rejected");
++    assert_eq!(err.kind, RegViolationKind::TwoWinners, "{err}");
++}
++
++/// Two writes that both won the same commit-point version with **identical values** are still
++/// two winners (a same-value double-commit). Exactly-one-writer-wins is about *how many*
++/// writes produced a version, not whether their values differ (issue #406 improvement).
++///
++/// Flip (the model-weakening red this pins): if Pass 1 counts *distinct values* rather than
++/// *occurrences* (a `BTreeSet<u64>` of length > 1), this identical-value double-commit is not
++/// flagged and `check_register` FALSE-ACCEPTS — this assertion goes red.
++#[test]
++fn register_rejects_two_winners_with_identical_values() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(2)),
++        RegOp::write_invoke(2, 1, "k", 10),
++        RegOp::write_ok(3, 1, "k", 10, Some(2)), // same version 2, SAME value 10
++    ];
++    let err = check_register(&ops)
++        .expect_err("two winners at one version with identical values must be rejected");
++    assert_eq!(err.kind, RegViolationKind::TwoWinners, "{err}");
++}
++
++// --- (a′) the CONTENDED path: version=None committed writes must not be a free pass ---
++//
++// These four reds pin the iteration-2 carry-forward. Each is a MODEL-WEAKENING red on a real
++// input, not a missing symbol: revert only the guard named in each doc and the crafted history
++// FALSE-ACCEPTS while `consistency.rs` still compiles. Together they lock in that the register
++// model can no longer be fooled on the contended path, where a recorder that failed to capture
++// a committed write's commit version records `version=None`.
++
++/// **Hole 1 — stale read after an unversioned committed overwrite.** A committed overwrite
++/// whose commit version was not captured (`None`), then a read that returns the OLD version.
++/// Pass 3 (version regression) excludes `version=None` writes, so without the unresolved-write
++/// guard the stale read is never compared against the overwrite and the model FALSE-ACCEPTS.
++///
++/// Flip: delete Pass 0 (the `UnresolvedWrite` loop) in `check_register` — `consistency.rs`
++/// still compiles, and this history is accepted → red.
++#[test]
++fn register_rejects_a_stale_read_after_an_unversioned_overwrite() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::write_invoke(2, 1, "k", 20),
++        RegOp::write_ok(3, 1, "k", 20, None), // committed overwrite, version NOT captured
++        RegOp::read_invoke(4, 2, "k"),
++        RegOp::read_ok(5, 2, "k", 10, 1), // stale: reads v1 after the v2 overwrite committed
++    ];
++    let err = check_register(&ops)
++        .expect_err("a committed overwrite with no resolvable commit version must be rejected");
++    assert_eq!(err.kind, RegViolationKind::UnresolvedWrite, "{err}");
++}
++
++/// **Hole 2 — a superseded value reads clean via an unversioned overwrite.** Value provenance
++/// is per-key, so `20` is "known written"; but the overwrite that produced it recorded no
++/// version, so `version_value` has no `(k, 2)` entry and a read claiming `20 @ v2` slips through
++/// the per-key (not per-`(key, version)`) provenance. The unresolved-write guard rejects the
++/// unverifiable committed overwrite before the hole can be exploited.
++///
++/// Flip: delete Pass 0 — the read is admitted (`20` is in the per-key set, `(k, 2)` is unseen)
++/// → red.
++#[test]
++fn register_rejects_a_superseded_value_read_via_an_unversioned_overwrite() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::write_invoke(2, 1, "k", 20),
++        RegOp::write_ok(3, 1, "k", 20, None), // committed but version not captured
++        RegOp::read_invoke(4, 2, "k"),
++        RegOp::read_ok(5, 2, "k", 20, 2), // 20 @ v2 — v2 was never resolved to a value
++    ];
++    let err = check_register(&ops)
++        .expect_err("a read keyed to an unresolved commit version must be rejected");
++    assert_eq!(err.kind, RegViolationKind::UnresolvedWrite, "{err}");
++}
++
++/// **Hole 3 — a lost / vanished committed write.** The register has no delete: once a write
++/// COMMITS the key is present for every later read. A read that finds the key ABSENT after a
++/// committed write to it completed in real time is a lost write. Without the lost-write pass
++/// the absent read is skipped ("observes nothing") and the model FALSE-ACCEPTS. This one is
++/// **version-independent** — it fires even though the committed write carried a version, so
++/// lost-write detection is never gated on the contended path.
++///
++/// Flip: delete Pass 2b (the `LostWrite` block) — the absent read is skipped → red.
++#[test]
++fn register_rejects_a_lost_write_absent_read() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)), // committed, completes at index 1
++        RegOp::read_invoke(2, 1, "k"),           // begins at index 2 (after the write)
++        RegOp::read_absent(3, 1, "k"),           // key vanished — a lost committed write
++    ];
++    let err = check_register(&ops).expect_err("a lost committed write must be rejected");
++    assert_eq!(err.kind, RegViolationKind::LostWrite, "{err}");
++}
++
++/// **Hole 4 — two unversioned winners.** Two committed overwrites of a key whose versions were
++/// not captured. They MIGHT both have won the same commit-point version (two winners); the
++/// model cannot rule it out. Pass 1 was keyed on `Some(version)`, so it simply did not count
++/// them and the model FALSE-ACCEPTED. The unresolved-write guard rejects: an uncountable
++/// committed overwrite is not certifiable.
++///
++/// Flip: delete Pass 0 — neither write is counted by Pass 1 (both `version=None`) → red.
++#[test]
++fn register_rejects_two_unversioned_winners() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, None),
++        RegOp::write_invoke(2, 1, "k", 20),
++        RegOp::write_ok(3, 1, "k", 20, None),
++    ];
++    let err = check_register(&ops)
++        .expect_err("committed overwrites with no resolvable version must be rejected");
++    assert_eq!(err.kind, RegViolationKind::UnresolvedWrite, "{err}");
++}
++
++// ─────────────────────────── (b) list-append / set model ───────────────────────────
++
++/// A valid namespace history is accepted: two creates, a list reflecting both, a delete, and
++/// a list reflecting the removal.
++#[test]
++fn list_append_accepts_a_valid_history() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::create_invoke(2, 0, "b"),
++        NsOp::create_ok(3, 0, "b"),
++        NsOp::list_invoke(4, 1),
++        NsOp::list_ok(5, 1, vec!["a".into(), "b".into()]),
++        NsOp::delete_invoke(6, 0, "a"),
++        NsOp::delete_ok(7, 0, "a"),
++        NsOp::list_invoke(8, 1),
++        NsOp::list_ok(9, 1, vec!["b".into()]),
++    ];
++    assert!(
++        check_list_append(&ops).is_ok(),
++        "a valid namespace history must be accepted"
++    );
++}
++
++/// A **lost create** — a name created and never removed, absent from a later list — is
++/// rejected (no lost create, ADR-0015 guarantee 1).
++#[test]
++fn list_append_rejects_a_lost_create() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::list_invoke(2, 1),
++        NsOp::list_ok(3, 1, vec![]), // "a" is missing though never deleted
++    ];
++    let err = check_list_append(&ops).expect_err("a lost create must be rejected");
++    assert_eq!(err.kind, NsViolationKind::LostCreate, "{err}");
++}
++
++/// A **resurrected delete** — a deleted name reappearing in a later list with no re-create —
++/// is rejected (no resurrected delete, ADR-0015 guarantee 1).
++#[test]
++fn list_append_rejects_a_resurrected_delete() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::delete_invoke(2, 0, "a"),
++        NsOp::delete_ok(3, 0, "a"),
++        NsOp::list_invoke(4, 1),
++        NsOp::list_ok(5, 1, vec!["a".into()]), // "a" resurrected after its delete
++    ];
++    let err = check_list_append(&ops).expect_err("a resurrected delete must be rejected");
++    assert_eq!(err.kind, NsViolationKind::ResurrectedDelete, "{err}");
++}
++
++/// A valid **rename** (a single dirent mutation: remove source, add destination) is accepted
++/// — `a` renamed to `b`, and a later list shows `b` present and `a` gone.
++#[test]
++fn list_append_accepts_a_valid_rename() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::rename_invoke(2, 0, "a", "b"),
++        NsOp::rename_ok(3, 0, "a", "b"),
++        NsOp::list_invoke(4, 1),
++        NsOp::list_ok(5, 1, vec!["b".into()]), // "a" moved to "b"
++    ];
++    assert!(
++        check_list_append(&ops).is_ok(),
++        "a valid rename must be accepted"
++    );
++}
++
++/// A rename whose **destination is lost** — `a` renamed to `b`, then a list omits `b` with no
++/// delete of `b` — is a lost create of the rename's destination (exercises the rename ADD
++/// branch). Flip: if the rename branch does not add its destination to the add-set, `b` is
++/// untracked and this FALSE-ACCEPTS → red.
++#[test]
++fn list_append_rejects_a_rename_that_loses_its_destination() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::rename_invoke(2, 0, "a", "b"),
++        NsOp::rename_ok(3, 0, "a", "b"),
++        NsOp::list_invoke(4, 1),
++        NsOp::list_ok(5, 1, vec![]), // "b" was renamed-in but the list omits it
++    ];
++    let err =
++        check_list_append(&ops).expect_err("a rename whose destination is lost must be rejected");
++    assert_eq!(err.kind, NsViolationKind::LostCreate, "{err}");
++}
++
++/// A rename whose **source is resurrected** — `a` renamed to `b`, then a list still shows `a`
++/// with no re-create — is a resurrected delete of the rename's source (exercises the rename
++/// REMOVE branch). Flip: if the rename branch does not remove its source, `a` is not
++/// definitely-deleted and this FALSE-ACCEPTS → red.
++#[test]
++fn list_append_rejects_a_rename_source_resurrection() {
++    let ops = vec![
++        NsOp::create_invoke(0, 0, "a"),
++        NsOp::create_ok(1, 0, "a"),
++        NsOp::rename_invoke(2, 0, "a", "b"),
++        NsOp::rename_ok(3, 0, "a", "b"),
++        NsOp::list_invoke(4, 1),
++        NsOp::list_ok(5, 1, vec!["a".into(), "b".into()]), // "a" renamed away but still present
++    ];
++    let err =
++        check_list_append(&ops).expect_err("a rename whose source is resurrected must be rejected");
++    assert_eq!(err.kind, NsViolationKind::ResurrectedDelete, "{err}");
++}
++
++/// The `HistoryRecorder` can **record** a rename (invoke + ok), the model checks the recorded
++/// history, and the serialization renders the `[:rename …]` op-map — closing the "rename is
++/// unrecordable / unexercised" gap the recorder had. Drives the real `rename_invoke`/
++/// `rename_ok` recorder API, not hand-built `NsOp`s.
++#[test]
++fn recorder_records_and_checks_and_serializes_a_rename() {
++    let mut rec = HistoryRecorder::new();
++    rec.create_invoke(0, "a");
++    rec.create_ok(0, "a");
++    rec.rename_invoke(0, "a", "b");
++    rec.rename_ok(0, "a", "b");
++    rec.list_invoke(1);
++    rec.list_ok(1, vec!["b".into()]);
++
++    check_list_append(&rec.namespace).expect("the recorded rename history is linearizable");
++
++    let edn = namespace_to_edn(&rec.namespace);
++    assert!(
++        edn.contains("[:rename :dir \"a\" \"b\"]"),
++        "the recorder's rename must serialize to the list-append rename op-map: {edn}"
++    );
++}
++
++// ─────────────────────────── (c) session checks ───────────────────────────
++
++/// A session that does not violate its own view is accepted by both session checks.
++#[test]
++fn session_accepts_read_your_writes_and_monotonic_reads() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 50),
++        RegOp::write_ok(1, 0, "k", 50, Some(3)),
++        RegOp::read_invoke(2, 0, "k"),
++        RegOp::read_ok(3, 0, "k", 50, 3), // reads its own write
++        RegOp::read_invoke(4, 0, "k"),
++        RegOp::read_ok(5, 0, "k", 50, 4), // never goes backwards
++    ];
++    assert!(check_read_your_writes(&ops).is_ok());
++    assert!(check_monotonic_reads(&ops).is_ok());
++}
++
++/// **Read-your-writes** is violated when a session reads a version older than one it wrote.
++#[test]
++fn session_rejects_a_read_your_writes_violation() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 50),
++        RegOp::write_ok(1, 0, "k", 50, Some(5)),
++        RegOp::read_invoke(2, 0, "k"),
++        RegOp::read_ok(3, 0, "k", 30, 3), // reads v3 after writing v5 — RYW broken
++    ];
++    assert!(
++        check_read_your_writes(&ops).is_err(),
++        "a read older than the session's own write must be rejected"
++    );
++}
++
++/// **Monotonic reads** is violated when a session's successive reads of `meta:version` go
++/// backwards — the high-water-mark clause of ADR-0015 guarantee 3.
++#[test]
++fn session_rejects_a_monotonic_read_violation_over_meta_version() {
++    let ops = vec![
++        RegOp::read_invoke(0, 0, META_VERSION_KEY),
++        RegOp::read_ok(1, 0, META_VERSION_KEY, 5, 5),
++        RegOp::read_invoke(2, 0, META_VERSION_KEY),
++        RegOp::read_ok(3, 0, META_VERSION_KEY, 2, 2), // meta:version went backwards
++    ];
++    assert!(
++        check_monotonic_reads(&ops).is_err(),
++        "a backwards meta:version read must be rejected"
++    );
++}
++
++// ─────────────────────────── model/serialization plumbing ───────────────────────────
++
++/// The serialization is the checker-compatible Elle `rw-register` op-map EDN, and the verdict
++/// routing keeps the JVM leg off the unprivileged gate (ADR-0016/ADR-0041).
++#[test]
++fn register_serializes_to_elle_edn_and_verdict_routes_off_check() {
++    let ops = vec![
++        RegOp::write_invoke(0, 0, "k", 10),
++        RegOp::write_ok(1, 0, "k", 10, Some(1)),
++        RegOp::read_invoke(2, 1, "k"),
++        RegOp::read_ok(3, 1, "k", 10, 1),
++    ];
++    let edn = register_to_edn(&ops);
++    assert!(edn.contains(":type :invoke"), "EDN op lifecycle: {edn}");
++    assert!(edn.contains("[:w \"k\" 10]"), "EDN write mop: {edn}");
++    assert!(edn.contains("[:r \"k\" 10]"), "EDN read mop: {edn}");
++
++    // The unprivileged gate always runs the pure Rust models; the Elle/JVM verdict is
++    // representable but selected only in the privileged off-Check job.
++    assert_eq!(verdict_dispatch(false), VerdictLeg::InProcessModels);
++    assert_eq!(
++        verdict_dispatch(true),
++        VerdictLeg::OffCheckElle {
++            checker: ELLE_RW_REGISTER
++        }
++    );
++}
++
++// ─────────────────────────── (d) non-vacuous in-process workload ───────────────────────────
++
++/// The root inode every object key binds under — the flat namespace root
++/// (`crates/server/src/lib.rs:40`).
++const ROOT: InodeId = 0;
++/// Register keyspace prefix (the small shared key set the workload overwrites and reads).
++const HOT: &str = "reg/hot";
++/// Namespace ("directory") prefix; a name `n` is the object key `dir/n`, its dirent
++/// `dirent:0/dir/n`.
++const DIR_PREFIX: &str = "dir/";
++/// Number of concurrent processes/sessions. `>= 2` so the barrier forces overlapping ops.
++const PROCESSES: u32 = 3;
++
++/// A `MetadataStore` that shares one redb database by `Arc`, so the in-process workload can
++/// hand the gateway a writer handle **and** keep a reader handle to observe the committed
++/// inode `version` at the commit point — redb serves concurrent read transactions alongside
++/// the gateway's writes. The gateway takes its store by value (`Gateway::new`), so the shared
++/// handle must be a `MetadataStore` in its own right (ADR-0010: the gateway is generic over
++/// the seam, unchanged by this consumer).
++#[derive(Clone)]
++struct SharedRedb(Arc<RedbMetadataStore>);
++
++#[async_trait]
++impl MetadataStore for SharedRedb {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.0.get(key).await
++    }
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.0.scan(prefix).await
++    }
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        self.0.commit(batch).await
++    }
++}
++
++type WorkGateway = Gateway<SharedRedb, FsChunkStore, MemCoordination>;
++
++/// A unique payload for `value` whose byte length **is** `value` — so the committed inode
++/// `size` recovers the value token from a single inode snapshot, tying `(value, version)`
++/// together atomically without a separate object read that could race an overwrite.
++fn payload(value: u64) -> Vec<u8> {
++    vec![0u8; value as usize]
++}
++
++/// Whether a gateway PUT error is the commit-point CAS conflict (a concurrent writer won).
++fn is_conflict(err: &BoxError) -> bool {
++    err.downcast_ref::<GatewayError>() == Some(&GatewayError::Conflict)
++}
++
++/// Observe a register key's committed `(value, version)` from ONE inode snapshot: `version`
++/// is the real commit-point version, `size` is the value token (see [`payload`]). `None` if
++/// the key is absent. This drives the production read path (`wyrd_core::read`).
++async fn observe(store: &RedbMetadataStore, key: &str) -> Option<(u64, u64)> {
++    let inode_id = read::resolve(store, ROOT, key).await.ok()??;
++    let inode = read::read_inode(store, inode_id).await.ok()??;
++    Some((inode.size, inode.version))
++}
++
++/// Overwrite `key` with `value` through the real gateway PUT and capture the writer's **exact
++/// commit version** — the iteration-2 carry-forward's PREFERRED fix (capture the real commit
++/// version even under contention instead of dropping it to `None`, which switched the
++/// register model's commit-point detection OFF on exactly the contended ops).
++///
++/// The gateway `put_object` returns `()`, not the commit version, and changing the gateway API
++/// is out of scope (brief *Scope*: this slice is a **consumer** of the existing gateway API).
++/// So the version is captured at the consumer by observing the just-committed inode **under
++/// mutual exclusion for a shared key**: while we hold `key_lock`, no other writer can interpose
++/// between our commit and our read-back, so `observe` returns OUR OWN value and thus OUR OWN
++/// commit version. An **uncontended** key (single writer) passes `key_lock = None` — no other
++/// writer can interpose, so its read-back already sees its own value. Either way the inode
++/// `version` genuinely climbs 1→2→… across the multi-writer overwrites of the same inode (real
++/// commit-point bumps, ADR-0041 §Decision 1), and every committed write is recorded WITH its
++/// real version — so the produced history carries no `version=None` committed write for the
++/// model to false-accept. Bounded retry so a pathological storm fails fast rather than hanging.
++async fn versioned_put(
++    gw: &WorkGateway,
++    store: &RedbMetadataStore,
++    key_lock: Option<&tokio::sync::Mutex<()>>,
++    key: &str,
++    value: u64,
++) -> u64 {
++    let _guard = match key_lock {
++        Some(m) => Some(m.lock().await),
++        None => None,
++    };
++    for _ in 0..200 {
++        match gw.put_object(key, &payload(value)).await {
++            Ok(()) => {
++                let (size, version) = observe(store, key)
++                    .await
++                    .expect("a just-committed key must be observable");
++                assert_eq!(
++                    size, value,
++                    "serialized commit+observe must read back our own write (value {value})"
++                );
++                return version;
++            }
++            Err(e) if is_conflict(&e) => continue,
++            Err(e) => panic!("unexpected gateway PUT error: {e}"),
++        }
++    }
++    panic!("PUT to {key} never committed within the retry bound");
++}
++
++/// The committed directory entry set — the real namespace read the list model checks: scan
++/// the shared store's `dirent:0/dir/` keys (a consistent cut, `crates/testkit/src/lib.rs`
++/// `contract_scan_is_consistent_cut`).
++async fn list_dir(store: &RedbMetadataStore) -> Vec<String> {
++    let prefix = format!("dirent:{ROOT}/{DIR_PREFIX}");
++    store
++        .scan(prefix.as_bytes())
++        .await
++        .unwrap_or_default()
++        .into_iter()
++        .filter_map(|(k, _)| {
++            std::str::from_utf8(&k)
++                .ok()
++                .and_then(|s| s.strip_prefix(&prefix))
++                .map(str::to_string)
++        })
++        .collect()
++}
++
++/// One workload process: a barriered contended overwrite of the hot key (forces overlap),
++/// then a read + further overwrites, an **uncontended** per-process register key (whose
++/// single-writer own-writes give the session checks real data to compare against — the RYW
++/// floor and monotonic last-version comparisons execute on produced values, and a correct
++/// gateway passes them, which is what the workload asserts), and directory create/delete/list.
++///
++/// Every committed overwrite is recorded WITH its captured commit version (via
++/// [`versioned_put`]); the shared HOT key is written under `hot_lock` so its version is
++/// attributed exactly even under multi-writer contention (iteration-2 carry-forward). The
++/// produced register history therefore contains **no** `version=None` committed write, so the
++/// register model's contended-path detections (stale read / two winners / superseded value /
++/// lost write) run on real captured versions rather than being switched off.
++async fn run_process(
++    p: u32,
++    gw: Arc<WorkGateway>,
++    store: Arc<RedbMetadataStore>,
++    barrier: Arc<Barrier>,
++    hot_lock: Arc<tokio::sync::Mutex<()>>,
++    values: Arc<AtomicU64>,
++    recorder: Arc<Mutex<HistoryRecorder>>,
++) {
++    // ── Round 1: a barriered overwrite of the HOT key. Every process records its invoke
++    //    before the barrier releases and its ok after — so all invokes precede all oks and
++    //    the recorded history is guaranteed to contain overlapping ops (not a serial log). ──
++    let v0 = values.fetch_add(1, Ordering::Relaxed);
++    recorder.lock().unwrap().write_invoke(p, HOT, v0);
++    barrier.wait().await;
++    let ver0 = versioned_put(&gw, &store, Some(&hot_lock), HOT, v0).await;
++    recorder.lock().unwrap().write_ok(p, HOT, v0, Some(ver0));
++
++    // A read of the contended hot key.
++    recorder.lock().unwrap().read_invoke(p, HOT);
++    match observe(&store, HOT).await {
++        Some((value, version)) => recorder.lock().unwrap().read_ok(p, HOT, value, version),
++        None => recorder.lock().unwrap().read_absent(p, HOT),
++    }
++
++    // Another contended overwrite of the hot key (keeps the version climbing under contention).
++    let v1 = values.fetch_add(1, Ordering::Relaxed);
++    recorder.lock().unwrap().write_invoke(p, HOT, v1);
++    let ver1 = versioned_put(&gw, &store, Some(&hot_lock), HOT, v1).await;
++    recorder.lock().unwrap().write_ok(p, HOT, v1, Some(ver1));
++
++    // An uncontended per-process register key: only this process writes it, so its commit
++    // versions are always observable and its reads are its own writes — the read-your-writes
++    // and monotonic-read comparison logic runs on real produced own-writes (a correct gateway
++    // never trips the reject there, which the produced-history assertions confirm).
++    let pk = format!("reg/p{p}");
++    for _ in 0..2 {
++        let v = values.fetch_add(1, Ordering::Relaxed);
++        recorder.lock().unwrap().write_invoke(p, &pk, v);
++        let ver = versioned_put(&gw, &store, None, &pk, v).await;
++        recorder.lock().unwrap().write_ok(p, &pk, v, Some(ver));
++
++        recorder.lock().unwrap().read_invoke(p, &pk);
++        match observe(&store, &pk).await {
++            Some((value, version)) => recorder.lock().unwrap().read_ok(p, &pk, value, version),
++            None => recorder.lock().unwrap().read_absent(p, &pk),
++        }
++    }
++
++    // ── Namespace: create two entries, delete one, then list the committed directory. The
++    //    in-process gateway has no atomic rename (`ObjectGateway` is put/get/delete), so the
++    //    workload drives create/delete/list; the rename model branch is covered by the
++    //    crafted histories above. ──
++    for k in 0..2 {
++        let name = format!("p{p}-{k}");
++        recorder.lock().unwrap().create_invoke(p, &name);
++        let key = format!("{DIR_PREFIX}{name}");
++        match gw.put_object(&key, b"x").await {
++            Ok(()) => recorder.lock().unwrap().create_ok(p, &name),
++            Err(e) if is_conflict(&e) => recorder.lock().unwrap().create_fail(p, &name),
++            Err(e) => panic!("unexpected create error: {e}"),
++        }
++    }
++    let gone = format!("p{p}-0");
++    recorder.lock().unwrap().delete_invoke(p, &gone);
++    gw.delete_object(&format!("{DIR_PREFIX}{gone}"))
++        .await
++        .expect("delete must succeed");
++    recorder.lock().unwrap().delete_ok(p, &gone);
++
++    recorder.lock().unwrap().list_invoke(p);
++    let names = list_dir(&store).await;
++    recorder.lock().unwrap().list_ok(p, names);
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn workload_against_the_in_process_gateway_yields_a_nonvacuous_checkable_history() {
++    let dir = tempfile::tempdir().expect("temp chunk dir");
++    let store = Arc::new(RedbMetadataStore::in_memory().expect("in-memory redb"));
++    let gw = Arc::new(
++        Gateway::new(
++            SharedRedb(store.clone()),
++            FsChunkStore::open(dir.path()).expect("fs chunk store"),
++            MemCoordination::new(),
++        )
++        .with_chunk_size(64),
++    );
++    gw.recover()
++        .await
++        .expect("recover id allocators (fresh store: a no-op)");
++
++    let barrier = Arc::new(Barrier::new(PROCESSES as usize));
++    // Serializes the commit+observe of the shared HOT key so each writer attributes its EXACT
++    // commit version even under multi-writer contention (the gateway PUT does not return it).
++    let hot_lock = Arc::new(tokio::sync::Mutex::new(()));
++    let values = Arc::new(AtomicU64::new(1)); // value tokens are payload lengths >= 1
++    let recorder = Arc::new(Mutex::new(HistoryRecorder::new()));
++
++    let mut tasks = Vec::new();
++    for p in 0..PROCESSES {
++        tasks.push(tokio::spawn(run_process(
++            p,
++            gw.clone(),
++            store.clone(),
++            barrier.clone(),
++            hot_lock.clone(),
++            values.clone(),
++            recorder.clone(),
++        )));
++    }
++    for t in tasks {
++        t.await.expect("workload process must not panic");
++    }
++
++    // A final read (a fresh observer session) pins the hot key's climbed version into the
++    // history and asserts the overwrites really bumped the commit point past 1.
++    {
++        let observer = PROCESSES;
++        recorder.lock().unwrap().read_invoke(observer, HOT);
++        let (value, version) = observe(&store, HOT).await.expect("hot key exists");
++        recorder
++            .lock()
++            .unwrap()
++            .read_ok(observer, HOT, value, version);
++        assert!(
++            version >= 2,
++            "concurrent overwrites must bump the inode version past its commit_create value of 1"
++        );
++    }
++
++    let history = Arc::try_unwrap(recorder)
++        .expect("all workload tasks have completed")
++        .into_inner()
++        .expect("recorder mutex");
++
++    // The register model PASSES the produced history — the non-vacuous, checkable history
++    // ADR-0041's substrate exists to yield.
++    check_register(&history.register).unwrap_or_else(|e: RegisterViolation| {
++        panic!("produced register history not linearizable: {e}")
++    });
++    check_read_your_writes(&history.register)
++        .unwrap_or_else(|e| panic!("produced history breaks read-your-writes: {e}"));
++    check_monotonic_reads(&history.register)
++        .unwrap_or_else(|e| panic!("produced history breaks monotonic reads: {e}"));
++    check_list_append(&history.namespace).unwrap_or_else(|e: NamespaceViolation| {
++        panic!("produced namespace history not linearizable: {e}")
++    });
++
++    // Non-vacuous: genuinely overlapping ops AND a real commit-point version bump.
++    assert!(
++        max_register_concurrency(&history.register) >= 2,
++        "the history must contain genuinely concurrent, overlapping ops (not a serial log)"
++    );
++    assert!(
++        max_observed_version(&history.register) >= 2,
++        "a real overwrite must have bumped the inode version at the commit point"
++    );
++
++    // Contended-path teeth (issue #406, iteration-2): EVERY committed write in the produced
++    // history carries its real commit version — none was dropped to `None`. This is what makes
++    // `check_register` above a NON-VACUOUS pass on the contended ops: with a version on every
++    // committed write, its version-keyed detections (two winners / superseded value / version
++    // regression) are ACTIVE, not switched off. The history is genuinely contended, too: the
++    // hot key was overwritten by multiple processes past its create version.
++    let committed_writes: Vec<&RegOp> = history
++        .register
++        .iter()
++        .filter(|o| matches!(o.kind, Kind::Ok) && o.f == RegF::Write)
++        .collect();
++    assert!(
++        committed_writes.len() >= (PROCESSES as usize) * 2,
++        "the workload must produce real committed overwrites (contended hot key + per-process keys)"
++    );
++    assert!(
++        committed_writes.iter().all(|o| o.version.is_some()),
++        "every committed write must record its captured commit version (no version=None on the contended path)"
++    );
++
++    // The recorder serializes to the checker-compatible Elle op-map format.
++    let edn = register_to_edn(&history.register);
++    assert!(
++        edn.contains(":type :invoke") && edn.contains("[:w "),
++        "register EDN: {edn}"
++    );
++    let ns_edn = namespace_to_edn(&history.namespace);
++    assert!(ns_edn.contains("[:append :dir "), "namespace EDN: {ns_edn}");
++
++    drop(dir);
++}

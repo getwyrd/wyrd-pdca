@@ -1,0 +1,1445 @@
+diff --git a/crates/server/src/consistency_workload.rs b/crates/server/src/consistency_workload.rs
+new file mode 100644
+index 0000000..8ca6127
+--- /dev/null
++++ b/crates/server/src/consistency_workload.rs
+@@ -0,0 +1,825 @@
++//! The **concurrent consistency workload substrate** for the #329 checker (ADR-0041
++//! §Decision, #329 slice 3). It builds, on top of the landed #405 networked observable
++//! ([`crate::consistency_observable`]), everything a recognized register/list-append checker
++//! (**Elle**) needs to consume — while keeping the *linearizability verdict itself* off-Check
++//! (ADR-0041/ADR-0016: no JVM/Clojure in `cargo xtask ci`):
++//!
++//! 1. a **multi-process history** ([`MultiProcessHistory`]) that merges the per-client
++//!    [`History`]s into one real-time-ordered log, each op tagged with its client's
++//!    `:process` id;
++//! 2. a **concurrency witness** ([`MultiProcessHistory::is_genuinely_concurrent`]) that counts
++//!    an overlap ONLY when it constrains a single register (INV-2);
++//! 3. an **Elle-EDN serializer** ([`MultiProcessHistory::to_elle_edn`] /
++//!    [`DirectoryHistory::to_elle_edn`]) that maps every **indeterminate** wire outcome to
++//!    `:info`, never a definite `:ok`/`:fail` (INV-1);
++//! 4. **session** read-your-writes + monotonic-read checks and a **per-key** read-monotonicity
++//!    check, all *sound* — an indeterminate op never establishes a definite obligation and is
++//!    never counted as a violation (INV-1);
++//! 5. a **directory-as-set** history ([`DirectoryHistory`]) — create=PUT / delete=DELETE /
++//!    membership=GET-probe (no rename, no wire `LIST`) — serialized to the checker's set op
++//!    form, with indeterminate probes mapped to `:info` (no fabricated `[member false]`);
++//! 6. a **verdict-dispatch** value ([`consistency_verdict_dispatch`]) that routes the Elle
++//!    verdict to the privileged off-Check job — representable + unit-tested, never a JVM
++//!    shell-out into `ci` (mirrors `xtask/src/metadata_faults.rs`).
++//!
++//! # The two soundness invariants this substrate must hold SURFACE-WIDE
++//!
++//! **INV-1 (no fabricated certainty).** No function here may turn an **indeterminate** wire
++//! outcome (5xx / timeout / synthetic-0 status — see [`is_indeterminate`]) into a **definite**
++//! obligation, completion type, or membership claim. An indeterminate op is `:info` ("may or
++//! may not have happened"); a local check **SKIPS** it. Enforced across every arm: the register
++//! completion-type (see [`register_completion_keyword`]); the directory completion-type and its
++//! membership derivation (see [`membership`]); the RYW PUT/DELETE obligation arms and the RYW
++//! read side (see [`MultiProcessHistory::session_read_your_writes`]); and the monotonic-read
++//! checks (see [`MultiProcessHistory::session_monotonic_reads`] and
++//! [`MultiProcessHistory::reads_monotone_per_key`]).
++//!
++//! **INV-2 (non-vacuity).** An overlap counts as genuine concurrency ONLY when it imposes an
++//! ordering constraint on **one** register — **same-key**, **read↔write**, across **distinct
++//! processes** (see [`MultiProcessHistory::read_write_overlapping_pairs_across_processes`]).
++//! Read↔read and cross-key overlaps are vacuous and must NOT count.
++//!
++//! The linearizability *verdict* stays Elle's, off-Check (ADR-0041 §Decision): this module
++//! produces, records, and serializes the history and asserts only *sound, local* invariants —
++//! it does **not** re-derive a global register/namespace-linearizability decision in-gate.
++
++use std::collections::{BTreeMap, HashMap};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use crate::consistency_observable::{History, OpKind, OpRecord};
++
++/// A wire outcome whose **effect is unknown**: a 5xx server error, a synthetic-0 status the
++/// client stamps on a timeout, or any status ≥ 500. In Jepsen/Elle semantics such an op is
++/// `:info` — it "may or may not have happened" — so no local check may derive a definite
++/// obligation or outcome from it (INV-1). A determinate 4xx (e.g. a 404 absent read, a 403
++/// refusal) is **not** indeterminate: its effect is known.
++#[must_use]
++pub fn is_indeterminate(status: u16) -> bool {
++    status == 0 || status >= 500
++}
++
++// ─── Multi-process history ────────────────────────────────────────────────────────────
++
++/// One operation tagged with the id of the client **process** (`:process`) that observed it —
++/// the unit a multi-process register history is built from. `record` is the client-observed
++/// [`OpRecord`] from the landed #405 observable; `process` is the client's id.
++#[derive(Debug, Clone)]
++pub struct ProcOp {
++    /// The client process id that observed this op (its `:process` in Elle's history).
++    pub process: usize,
++    /// The client-observed operation record (kind, key, version, status, real-time span).
++    pub record: OpRecord,
++}
++
++/// A merged, real-time-ordered, **`:process`-tagged** history over several concurrent clients
++/// — the multi-process register history a linearizability checker consumes. Built by
++/// [`merge`](MultiProcessHistory::merge)ing per-client histories (or, for crafted tests, from
++/// explicit [`ProcOp`]s via [`from_ops`](MultiProcessHistory::from_ops)).
++#[derive(Debug, Default, Clone)]
++pub struct MultiProcessHistory {
++    ops: Vec<ProcOp>,
++}
++
++impl MultiProcessHistory {
++    /// Merge per-client histories into one real-time-ordered log, tagging every op with its
++    /// client's `:process` id (its index in `histories`) and sorting the merged log by the
++    /// client-observed real-time span (`start`, then `end`). This is the multi-process
++    /// history #329's checker needs: a single log across ≥2 concurrent clients in which
++    /// same-key read↔write spans from distinct processes can overlap.
++    #[must_use]
++    pub fn merge(histories: &[History]) -> Self {
++        let mut ops: Vec<ProcOp> = Vec::new();
++        for (process, history) in histories.iter().enumerate() {
++            for record in history.ops() {
++                ops.push(ProcOp {
++                    process,
++                    record: record.clone(),
++                });
++            }
++        }
++        ops.sort_by(|a, b| {
++            a.record
++                .start
++                .cmp(&b.record.start)
++                .then(a.record.end.cmp(&b.record.end))
++        });
++        Self { ops }
++    }
++
++    /// Build a history from explicit process-tagged ops, preserving the given order — the
++    /// crafted-history constructor the socket-free tests feed determinate/indeterminate
++    /// witnesses through.
++    #[must_use]
++    pub fn from_ops(ops: Vec<ProcOp>) -> Self {
++        Self { ops }
++    }
++
++    /// The merged ops, in real-time order.
++    #[must_use]
++    pub fn ops(&self) -> &[ProcOp] {
++        &self.ops
++    }
++
++    /// Non-vacuous **and** every op individually well-formed (a real `start <= end` span): the
++    /// bar a checker input must clear. An empty or malformed multi-process history proves
++    /// nothing.
++    #[must_use]
++    pub fn well_formed(&self) -> bool {
++        !self.ops.is_empty() && self.ops.iter().all(|op| op.record.well_formed())
++    }
++
++    /// The overlapping op pairs (as index pairs into [`ops`](Self::ops)) that impose an
++    /// ordering constraint on a **single register** — the ONLY overlaps that are non-vacuous
++    /// (INV-2). A pair `(i, j)` counts iff **all** hold:
++    ///
++    /// * **distinct processes** (`a.process != b.process`) — an intra-process pair is
++    ///   sequential, not concurrent;
++    /// * **same key** (`a.record.key == b.record.key`) — a cross-key overlap constrains no
++    ///   single register (vacuous);
++    /// * **read↔write** — exactly one is a read (GET) and the other a write (PUT/DELETE); a
++    ///   read↔read overlap constrains no register (vacuous);
++    /// * **real-time-overlapping spans** (`a.start <= b.end && b.start <= a.end`).
++    #[must_use]
++    pub fn read_write_overlapping_pairs_across_processes(&self) -> Vec<(usize, usize)> {
++        let mut pairs = Vec::new();
++        for i in 0..self.ops.len() {
++            for j in (i + 1)..self.ops.len() {
++                let a = &self.ops[i];
++                let b = &self.ops[j];
++                if a.process != b.process
++                    && a.record.key == b.record.key
++                    && is_read_write_pair(a.record.kind, b.record.kind)
++                    && spans_overlap(&a.record, &b.record)
++                {
++                    pairs.push((i, j));
++                }
++            }
++        }
++        pairs
++    }
++
++    /// Genuinely concurrent iff at least one same-key read↔write overlap across distinct
++    /// processes exists (INV-2). A history of only read↔read or only cross-key overlaps is
++    /// **not** genuinely concurrent — those constrain no single register.
++    #[must_use]
++    pub fn is_genuinely_concurrent(&self) -> bool {
++        !self
++            .read_write_overlapping_pairs_across_processes()
++            .is_empty()
++    }
++
++    /// **Session read-your-writes** (ADR-0015 guarantee 3), sound (INV-1). Per process, per
++    /// key, a **determinate** PUT of `v` establishes an `AtLeast(v)` obligation and a
++    /// **determinate** DELETE establishes an `Absent` obligation; a later determinate read on
++    /// that key must satisfy the standing obligation. Returns `false` iff some read
++    /// *definitely* violates one.
++    ///
++    /// INV-1 across **every** arm, not only the read arm:
++    /// * the **PUT arm** guards [`is_indeterminate`]: an indeterminate PUT does NOT establish
++    ///   `AtLeast(v)` (it clears the obligation to unknown) — so
++    ///   `[PUT k v=2 status=500; GET k v=1 status=200]` is **accepted**;
++    /// * the **DELETE arm** guards [`is_indeterminate`]: an indeterminate DELETE does NOT
++    ///   establish `Absent` — so `[PUT k v=1 200; DELETE k 500; GET k v=1 200]` is **accepted**;
++    /// * the **read arm** treats an indeterminate GET as **no observation** (skipped), keyed on
++    ///   the status, not on `version == None` — a crafted indeterminate GET carrying a
++    ///   `Some(_)` version is still not counted as a resurrection/regression.
++    #[must_use]
++    pub fn session_read_your_writes(&self) -> bool {
++        for ops in self.by_process().values() {
++            let mut obligation: HashMap<&str, Obligation> = HashMap::new();
++            for op in ops {
++                let key = op.record.key.as_str();
++                let status = op.record.status;
++                match op.record.kind {
++                    OpKind::Put => {
++                        if is_indeterminate(status) {
++                            // INV-1: an indeterminate write establishes no definite lower bound.
++                            obligation.insert(key, Obligation::Unknown);
++                        } else if is_success(status) {
++                            obligation
++                                .insert(key, Obligation::AtLeast(op.record.version.unwrap_or(0)));
++                        }
++                        // A determinate-failed PUT had no effect: the obligation is unchanged.
++                    }
++                    OpKind::Delete => {
++                        if is_indeterminate(status) {
++                            // INV-1: an indeterminate delete establishes no definite absence.
++                            obligation.insert(key, Obligation::Unknown);
++                        } else if is_success(status) || status == 404 {
++                            obligation.insert(key, Obligation::Absent);
++                        }
++                        // A determinate-failed DELETE had no effect: obligation unchanged.
++                    }
++                    OpKind::Get => {
++                        if is_indeterminate(status) {
++                            // INV-1: an indeterminate read is no observation — never a violation.
++                            continue;
++                        }
++                        let obl = obligation.get(key).copied().unwrap_or(Obligation::Unknown);
++                        match op.record.version {
++                            // A determinate present read of version `v`.
++                            Some(v) => match obl {
++                                Obligation::Absent => return false, // resurrected after own delete
++                                Obligation::AtLeast(w) if v < w => return false, // read older than own write
++                                _ => {}
++                            },
++                            // `None` version means only "status != 200", which is a definite
++                            // absence ONLY for a determinate 404. Any other determinate non-200
++                            // read (403/409/412/416/…) observed nothing about the register, so it
++                            // must NOT be counted an own-write-lost (INV-1: no fabricated absence).
++                            None => {
++                                if status == 404 && matches!(obl, Obligation::AtLeast(_)) {
++                                    return false; // own write lost: read absent (404) after writing
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        true
++    }
++
++    /// **Session monotonic reads** (ADR-0015 guarantee 3), sound (INV-1). Per process, per
++    /// key, successive **determinate** reads never observe an older register version. An
++    /// indeterminate GET is skipped (keyed on the status via [`is_indeterminate`], **not** on
++    /// `version == None`, so a crafted indeterminate read carrying a stale `Some(_)` version is
++    /// not counted as a regression); an absent (404) read establishes no version to compare.
++    #[must_use]
++    pub fn session_monotonic_reads(&self) -> bool {
++        for ops in self.by_process().values() {
++            if !reads_are_monotone(ops.iter().copied()) {
++                return false;
++            }
++        }
++        true
++    }
++
++    /// **Per-key read monotonicity** across the whole (multi-process) history, sound (INV-1):
++    /// on each key, the determinate reads observed over real time never regress — the reused
++    /// register-monotonicity invariant, guarded against indeterminate reads exactly as the
++    /// session checks are. Unlike [`session_monotonic_reads`](Self::session_monotonic_reads)
++    /// this spans processes, so a global stale read (one process reads a version another
++    /// already observed as superseded) is caught.
++    #[must_use]
++    pub fn reads_monotone_per_key(&self) -> bool {
++        reads_are_monotone(self.ops.iter())
++    }
++
++    /// Serialize to **Elle's EDN operation-history format** — one `:invoke` entry at each op's
++    /// `start` and one completion (`:ok` / `:fail` / `:info`) at its `end`, the whole flat log
++    /// sorted by relative time. Every field the criterion names is present:
++    /// `:process` / `:type` / `:f` / `:value` / `:time`. INV-1: an **indeterminate** completion
++    /// is `:info` (never a definite `:ok`/`:fail`), see [`register_completion_keyword`].
++    ///
++    /// `:time` is nanoseconds relative to the earliest `start` in the history (Jepsen's
++    /// test-relative clock), so the bytes are stable and small.
++    ///
++    /// This in-gate serialization proves the serializer is **stable and well-shaped**; it does
++    /// NOT by itself prove real-Elle-parser acceptance — that is the deferred, off-Check
++    /// verdict leg (ADR-0041), over the SAME serialized history.
++    #[must_use]
++    pub fn to_elle_edn(&self) -> String {
++        if self.ops.is_empty() {
++            return "[]".to_string();
++        }
++        let base = self
++            .ops
++            .iter()
++            .map(|op| op.record.start)
++            .min()
++            .unwrap_or(UNIX_EPOCH);
++        let mut entries: Vec<Entry> = Vec::with_capacity(self.ops.len() * 2);
++        for op in &self.ops {
++            let f = register_f(op.record.kind);
++            entries.push(Entry {
++                time: rel_nanos(base, op.record.start),
++                process: op.process,
++                phase: Phase::Invoke,
++                rendered: render_entry(
++                    op.process,
++                    "invoke",
++                    f,
++                    &register_invoke_value(op.record.kind, op.record.version),
++                    rel_nanos(base, op.record.start),
++                ),
++            });
++            entries.push(Entry {
++                time: rel_nanos(base, op.record.end),
++                process: op.process,
++                phase: Phase::Complete,
++                rendered: render_entry(
++                    op.process,
++                    register_completion_type(op.record.kind, op.record.status).keyword(),
++                    f,
++                    &register_completion_value(op.record.kind, op.record.version),
++                    rel_nanos(base, op.record.end),
++                ),
++            });
++        }
++        render_history(entries)
++    }
++
++    /// Group the ops by process, preserving each process's relative (real-time) order — the
++    /// per-session view the session checks walk.
++    fn by_process(&self) -> BTreeMap<usize, Vec<&ProcOp>> {
++        let mut by: BTreeMap<usize, Vec<&ProcOp>> = BTreeMap::new();
++        for op in &self.ops {
++            by.entry(op.process).or_default().push(op);
++        }
++        by
++    }
++}
++
++/// The standing per-key obligation a session's determinate ops establish.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Obligation {
++    /// No determinate obligation stands (including after an *indeterminate* mutation, whose
++    /// effect is unknown — INV-1).
++    Unknown,
++    /// A determinate PUT of this version stands: a later determinate read must observe ≥ it.
++    AtLeast(u64),
++    /// A determinate DELETE stands: a later determinate read must observe absence.
++    Absent,
++}
++
++/// A read (GET) versus a write (PUT/DELETE): exactly one of each. A read↔read or write↔write
++/// pair is not a read↔write pair.
++fn is_read_write_pair(a: OpKind, b: OpKind) -> bool {
++    (is_read(a) && is_write(b)) || (is_write(a) && is_read(b))
++}
++
++fn is_read(kind: OpKind) -> bool {
++    matches!(kind, OpKind::Get)
++}
++
++fn is_write(kind: OpKind) -> bool {
++    matches!(kind, OpKind::Put | OpKind::Delete)
++}
++
++/// Real-time spans overlap iff neither strictly precedes the other.
++fn spans_overlap(a: &OpRecord, b: &OpRecord) -> bool {
++    a.start <= b.end && b.start <= a.end
++}
++
++fn is_success(status: u16) -> bool {
++    (200..300).contains(&status)
++}
++
++/// Determinate-read monotonicity per key over an op sequence in real-time order (INV-1): an
++/// indeterminate GET is skipped on its **status**, an absent (404) read establishes no version,
++/// and a determinate present read that observes an older version than one already seen on the
++/// same key is a regression.
++fn reads_are_monotone<'a>(ops: impl Iterator<Item = &'a ProcOp>) -> bool {
++    let mut last: HashMap<&str, u64> = HashMap::new();
++    for op in ops {
++        if op.record.kind != OpKind::Get {
++            continue;
++        }
++        if is_indeterminate(op.record.status) {
++            // INV-1: an indeterminate read is not a monotonicity violation.
++            continue;
++        }
++        let Some(v) = op.record.version else {
++            // A determinate absent (404) read establishes no version to compare.
++            continue;
++        };
++        match last.get(op.record.key.as_str()) {
++            Some(&prev) if v < prev => return false,
++            _ => {
++                last.insert(op.record.key.as_str(), v);
++            }
++        }
++    }
++    true
++}
++
++// ─── Elle-EDN rendering (shared by the register and directory serializers) ────────────
++
++/// A completion `:type` in Elle's operation-history vocabulary.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum CompletionType {
++    /// The op definitely took effect.
++    Ok,
++    /// The op definitely did **not** take effect.
++    Fail,
++    /// The op's effect is **unknown** (indeterminate) — `:info` (INV-1).
++    Info,
++}
++
++impl CompletionType {
++    fn keyword(self) -> &'static str {
++        match self {
++            CompletionType::Ok => "ok",
++            CompletionType::Fail => "fail",
++            CompletionType::Info => "info",
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Phase {
++    Invoke,
++    Complete,
++}
++
++struct Entry {
++    time: u128,
++    process: usize,
++    phase: Phase,
++    rendered: String,
++}
++
++/// Sort the flat entry log by `(time, process, phase)` — deterministic, and at equal times an
++/// `:invoke` precedes its completion — then wrap it as an EDN vector, one map per line.
++fn render_history(mut entries: Vec<Entry>) -> String {
++    entries.sort_by(|a, b| {
++        a.time
++            .cmp(&b.time)
++            .then(a.process.cmp(&b.process))
++            .then((a.phase as u8).cmp(&(b.phase as u8)))
++    });
++    let rendered: Vec<String> = entries.into_iter().map(|e| e.rendered).collect();
++    format!("[{}]", rendered.join("\n "))
++}
++
++/// Render one operation-history map: `{:process P, :type :T, :f :F, :value V, :time N}`.
++fn render_entry(process: usize, type_kw: &str, f: &str, value: &str, time: u128) -> String {
++    format!("{{:process {process}, :type :{type_kw}, :f :{f}, :value {value}, :time {time}}}")
++}
++
++/// Nanoseconds of `t` relative to `base` (the history's earliest start).
++fn rel_nanos(base: SystemTime, t: SystemTime) -> u128 {
++    t.duration_since(base).unwrap_or_default().as_nanos()
++}
++
++/// An optional register version as an EDN value: the decimal digits, or `nil` for absent.
++fn edn_version(version: Option<u64>) -> String {
++    match version {
++        Some(v) => v.to_string(),
++        None => "nil".to_string(),
++    }
++}
++
++fn register_f(kind: OpKind) -> &'static str {
++    match kind {
++        OpKind::Put => "write",
++        OpKind::Get => "read",
++        OpKind::Delete => "delete",
++    }
++}
++
++/// The `:value` on the **invoke** entry: a write carries its intended version, a read/delete
++/// carries `nil` (the read result is unknown at invoke time).
++fn register_invoke_value(kind: OpKind, version: Option<u64>) -> String {
++    match kind {
++        OpKind::Put => edn_version(version),
++        OpKind::Get | OpKind::Delete => "nil".to_string(),
++    }
++}
++
++/// The `:value` on the **completion** entry: a write echoes its version, a read carries the
++/// version observed (`nil` if absent), a delete carries `nil`.
++fn register_completion_value(kind: OpKind, version: Option<u64>) -> String {
++    match kind {
++        OpKind::Put | OpKind::Get => edn_version(version),
++        OpKind::Delete => "nil".to_string(),
++    }
++}
++
++/// The register completion `:type` **keyword** (without the leading colon) a `(kind, status)`
++/// maps to — `"ok"`, `"fail"`, or `"info"`. Public so the INV-1 completion-type arm is
++/// directly assertable: an **indeterminate** status MUST map to `"info"` (never a definite
++/// `"ok"`/`"fail"`), a determinate success maps to `"ok"` (a GET's 404 absent read is a
++/// *successful* read of `nil`), and any other determinate status maps to `"fail"`.
++#[must_use]
++pub fn register_completion_keyword(kind: OpKind, status: u16) -> &'static str {
++    register_completion_type(kind, status).keyword()
++}
++
++fn register_completion_type(kind: OpKind, status: u16) -> CompletionType {
++    if is_indeterminate(status) {
++        return CompletionType::Info;
++    }
++    let ok = match kind {
++        OpKind::Put => is_success(status),
++        OpKind::Get | OpKind::Delete => is_success(status) || status == 404,
++    };
++    if ok {
++        CompletionType::Ok
++    } else {
++        CompletionType::Fail
++    }
++}
++
++/// The directory completion `:type` **keyword** a `(op, status)` maps to — the directory
++/// analogue of [`register_completion_keyword`], so the INV-1 directory completion-type arm is
++/// directly assertable: an indeterminate probe MUST map to `"info"`.
++#[must_use]
++pub fn dir_completion_keyword(op: DirOpKind, status: u16) -> &'static str {
++    dir_completion_type(op, status).keyword()
++}
++
++// ─── Directory-as-set history ─────────────────────────────────────────────────────────
++
++/// A directory-as-set operation: create appends a member (a PUT under the prefix), delete
++/// removes it (a DELETE), and a membership probe (a GET-probe) asks whether one member is
++/// present. There is **no** rename and **no** wire `LIST` — the S3 wire floor is PUT/GET/DELETE
++/// only (`crates/gateway-s3/src/lib.rs:347`), so the set is modelled by single-member probes.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DirOpKind {
++    /// Add a member to the set (create = PUT).
++    Create,
++    /// Remove a member from the set (delete = DELETE).
++    Delete,
++    /// Probe one member's presence (membership = GET-probe).
++    Probe,
++}
++
++/// One directory-as-set operation record, tagged with the client `:process` and its real-time
++/// span — the directory analogue of [`OpRecord`].
++#[derive(Debug, Clone)]
++pub struct DirRecord {
++    /// The client process id that observed this op.
++    pub process: usize,
++    /// Which set operation this records.
++    pub op: DirOpKind,
++    /// The member (object name under the prefix) the op targeted.
++    pub member: String,
++    /// The HTTP status the wire returned (200/204/404/…).
++    pub status: u16,
++    /// Real time just before the request began.
++    pub start: SystemTime,
++    /// Real time just after the response was fully read.
++    pub end: SystemTime,
++}
++
++/// A recorded directory-as-set history — the namespace-membership analogue of
++/// [`MultiProcessHistory`], serialized to the checker's set op form.
++#[derive(Debug, Default, Clone)]
++pub struct DirectoryHistory {
++    ops: Vec<DirRecord>,
++}
++
++impl DirectoryHistory {
++    /// Build a directory history from explicit records, preserving order.
++    #[must_use]
++    pub fn from_records(ops: Vec<DirRecord>) -> Self {
++        Self { ops }
++    }
++
++    /// The recorded set operations, in order.
++    #[must_use]
++    pub fn ops(&self) -> &[DirRecord] {
++        &self.ops
++    }
++
++    /// Serialize to the checker's **set op form** in Elle's EDN: create → `:add`, delete →
++    /// `:remove`, probe → `:contains` carrying `[member present?]`. INV-1: an **indeterminate**
++    /// probe is `:info` with `[member nil]` — a fabricated `[member false]` is never emitted
++    /// (see [`membership`]).
++    #[must_use]
++    pub fn to_elle_edn(&self) -> String {
++        if self.ops.is_empty() {
++            return "[]".to_string();
++        }
++        let base = self
++            .ops
++            .iter()
++            .map(|op| op.start)
++            .min()
++            .unwrap_or(UNIX_EPOCH);
++        let mut entries: Vec<Entry> = Vec::with_capacity(self.ops.len() * 2);
++        for op in &self.ops {
++            let f = dir_f(op.op);
++            entries.push(Entry {
++                time: rel_nanos(base, op.start),
++                process: op.process,
++                phase: Phase::Invoke,
++                rendered: render_entry(
++                    op.process,
++                    "invoke",
++                    f,
++                    &dir_invoke_value(op.op, &op.member),
++                    rel_nanos(base, op.start),
++                ),
++            });
++            entries.push(Entry {
++                time: rel_nanos(base, op.end),
++                process: op.process,
++                phase: Phase::Complete,
++                rendered: render_entry(
++                    op.process,
++                    dir_completion_type(op.op, op.status).keyword(),
++                    f,
++                    &dir_completion_value(op.op, &op.member, op.status),
++                    rel_nanos(base, op.end),
++                ),
++            });
++        }
++        render_history(entries)
++    }
++}
++
++/// A directory member's derived presence from a membership-probe status (INV-1):
++/// `200 → Present`, `404 → Absent`, **everything else → Unknown** — never definitely-absent.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Membership {
++    /// The member is present (a determinate 200 probe).
++    Present,
++    /// The member is absent (a determinate 404 probe).
++    Absent,
++    /// The member's presence is unknown (any other status, incl. every indeterminate one) —
++    /// never coerced to `Absent`.
++    Unknown,
++}
++
++/// Derive a probed member's [`Membership`] from the wire status (INV-1): only a 200 proves
++/// presence and only a 404 proves absence; every other status (crucially every indeterminate
++/// one) is `Unknown`, never a fabricated absence.
++#[must_use]
++pub fn membership(status: u16) -> Membership {
++    match status {
++        200 => Membership::Present,
++        404 => Membership::Absent,
++        _ => Membership::Unknown,
++    }
++}
++
++fn dir_f(op: DirOpKind) -> &'static str {
++    match op {
++        DirOpKind::Create => "add",
++        DirOpKind::Delete => "remove",
++        DirOpKind::Probe => "contains",
++    }
++}
++
++/// The `:value` on a directory **invoke**: a create/delete carries the member string; a probe
++/// carries `[member nil]` (the membership result is unknown at invoke time).
++fn dir_invoke_value(op: DirOpKind, member: &str) -> String {
++    match op {
++        DirOpKind::Create | DirOpKind::Delete => format!("\"{member}\""),
++        DirOpKind::Probe => format!("[\"{member}\" nil]"),
++    }
++}
++
++/// The `:value` on a directory **completion**: a create/delete echoes the member; a probe
++/// carries `[member present?]` where `present?` is `true`/`false`/`nil` per [`membership`] —
++/// an indeterminate probe is `[member nil]`, never `[member false]` (INV-1).
++fn dir_completion_value(op: DirOpKind, member: &str, status: u16) -> String {
++    match op {
++        DirOpKind::Create | DirOpKind::Delete => format!("\"{member}\""),
++        DirOpKind::Probe => {
++            let present = match membership(status) {
++                Membership::Present => "true",
++                Membership::Absent => "false",
++                Membership::Unknown => "nil",
++            };
++            format!("[\"{member}\" {present}]")
++        }
++    }
++}
++
++/// Map a directory op's wire status to its completion `:type` (INV-1): an **indeterminate**
++/// status is `:info`; a determinate membership response (probe 200/404) or a determinate
++/// mutation success is `:ok`; any other determinate status is `:fail`.
++fn dir_completion_type(op: DirOpKind, status: u16) -> CompletionType {
++    if is_indeterminate(status) {
++        return CompletionType::Info;
++    }
++    let ok = match op {
++        DirOpKind::Create => is_success(status),
++        DirOpKind::Delete => is_success(status) || status == 404,
++        DirOpKind::Probe => status == 200 || status == 404,
++    };
++    if ok {
++        CompletionType::Ok
++    } else {
++        CompletionType::Fail
++    }
++}
++
++// ─── Verdict-dispatch seam (mirrors xtask/src/metadata_faults.rs) ──────────────────────
++
++/// The off-Check job that runs the recognized checker (**Elle**) over the serialized history
++/// — the privileged leg (JVM/Clojure) ADR-0041/ADR-0016 keep OUT of `cargo xtask ci`.
++pub const ELLE_OFF_CHECK_VERDICT_JOB: &str = "elle-register-verdict";
++
++/// A deprecated in-gate shell-out env var. There is **no** in-gate Elle verdict — the checker
++/// is JVM/Clojure and stays off-Check; this is representable only so the routing decision is
++/// testable, and selecting it is a hard error downstream, never a JVM shell-out into `ci`
++/// (the same shape `metadata_faults.rs` keeps for its removed external command).
++pub const ELLE_IN_GATE_CMD_VAR: &str = "WYRD_ELLE_IN_GATE_CMD";
++
++/// Where the register/namespace linearizability **verdict** routes. Modelling the route as a
++/// value with BOTH alternatives representable is the non-tautological bar (mirrors
++/// `xtask::metadata_faults::MetadataTierDispatch`): a Check-time unit test binds to
++/// [`consistency_verdict_dispatch`], and a regression that re-points the default route at the
++/// (nonexistent) in-gate JVM shell-out flips that test **red behaviourally**.
++#[derive(Debug, PartialEq, Eq)]
++pub enum ConsistencyVerdictDispatch {
++    /// Run the recognized checker (Elle) over the serialized history in the privileged
++    /// off-Check `job` — the ADR-0041 default.
++    OffCheckElle {
++        /// The off-Check verdict job name.
++        job: &'static str,
++    },
++    /// The removed in-gate shell-out to `env_var` — representable but never re-selected for the
++    /// default inputs; the runner turns it into a hard error rather than shelling a JVM into
++    /// `cargo xtask ci`.
++    InGateShellOut {
++        /// The deprecated env var that would (illegitimately) select an in-gate shell-out.
++        env_var: &'static str,
++    },
++}
++
++/// Decide where the consistency verdict routes. Pure — decided solely from
++/// `in_gate_shellout_configured` (whether the deprecated [`ELLE_IN_GATE_CMD_VAR`] is set) — so
++/// the dispatch test binds to it without a privileged environment. The default (var unset) is
++/// **always** the off-Check Elle job (ADR-0041/ADR-0016): the in-gate merge gate stays
++/// pure-Rust and JVM-free.
++#[must_use]
++pub fn consistency_verdict_dispatch(
++    in_gate_shellout_configured: bool,
++) -> ConsistencyVerdictDispatch {
++    if in_gate_shellout_configured {
++        ConsistencyVerdictDispatch::InGateShellOut {
++            env_var: ELLE_IN_GATE_CMD_VAR,
++        }
++    } else {
++        ConsistencyVerdictDispatch::OffCheckElle {
++            job: ELLE_OFF_CHECK_VERDICT_JOB,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    fn at(nanos: u64) -> SystemTime {
++        UNIX_EPOCH + Duration::from_nanos(nanos)
++    }
++
++    fn op(kind: OpKind, key: &str, version: Option<u64>, status: u16, s: u64, e: u64) -> OpRecord {
++        OpRecord {
++            kind,
++            key: key.to_string(),
++            version,
++            status,
++            start: at(s),
++            end: at(e),
++        }
++    }
++
++    #[test]
++    fn indeterminate_predicate_flags_5xx_and_synthetic_zero() {
++        assert!(is_indeterminate(0));
++        assert!(is_indeterminate(500));
++        assert!(is_indeterminate(503));
++        assert!(!is_indeterminate(200));
++        assert!(!is_indeterminate(404));
++        assert!(!is_indeterminate(403));
++    }
++
++    #[test]
++    fn membership_never_fabricates_absence() {
++        assert_eq!(membership(200), Membership::Present);
++        assert_eq!(membership(404), Membership::Absent);
++        assert_eq!(membership(503), Membership::Unknown);
++        assert_eq!(membership(0), Membership::Unknown);
++    }
++
++    #[test]
++    fn indeterminate_put_is_info_not_ok() {
++        assert_eq!(register_completion_keyword(OpKind::Put, 500), "info");
++        assert_eq!(register_completion_keyword(OpKind::Put, 200), "ok");
++        assert_eq!(register_completion_keyword(OpKind::Get, 404), "ok");
++    }
++
++    #[test]
++    fn verdict_routes_off_check_by_default() {
++        assert_eq!(
++            consistency_verdict_dispatch(false),
++            ConsistencyVerdictDispatch::OffCheckElle {
++                job: ELLE_OFF_CHECK_VERDICT_JOB
++            }
++        );
++    }
++
++    #[test]
++    fn cross_key_read_write_overlap_is_not_genuine_concurrency() {
++        let h = MultiProcessHistory::from_ops(vec![
++            ProcOp {
++                process: 1,
++                record: op(OpKind::Get, "a", Some(1), 200, 0, 10),
++            },
++            ProcOp {
++                process: 0,
++                record: op(OpKind::Put, "b", Some(1), 200, 5, 15),
++            },
++        ]);
++        assert!(!h.is_genuinely_concurrent());
++    }
++}
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index f3b4efa..d74e8e6 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -15,6 +15,7 @@
+ 
+ pub mod cli;
+ pub mod consistency_observable;
++pub mod consistency_workload;
+ pub mod custodian;
+ pub mod dserver;
+ 
+diff --git a/crates/server/tests/consistency_workload.rs b/crates/server/tests/consistency_workload.rs
+new file mode 100644
+index 0000000..1241d4d
+--- /dev/null
++++ b/crates/server/tests/consistency_workload.rs
+@@ -0,0 +1,596 @@
++//! The concurrent consistency-workload substrate (issue #406, ADR-0041 §Decision, #329
++//! slice 3): builds on the landed #405 observable
++//! ([`wyrd_server::consistency_observable`]) a **multi-process** register history, an
++//! **Elle-EDN serializer**, **session** read-your-writes / monotonic-read checks, a
++//! **directory-as-set** history, a **concurrency witness**, and an off-Check
++//! **verdict-dispatch** seam — while keeping the linearizability *verdict* itself off-Check
++//! (ADR-0041/ADR-0016: no JVM/Clojure in `cargo xtask ci`).
++//!
++//! # Two soundness invariants, pinned SURFACE-WIDE (the reason #406 was re-planned)
++//!
++//! Every prior attempt fixed the two governing faults only at the one spot a sign-off named,
++//! and the same fault-class reappeared in an adjacent arm. This file ships one crafted,
++//! **socket-free**, flippable red per audited arm so the CLASS goes red if it reappears
++//! anywhere.
++//!
++//! **INV-1 (no fabricated certainty).** An **indeterminate** wire outcome (5xx / timeout /
++//! synthetic-0) must never become a **definite** obligation, completion type, or membership.
++//! Audited: the register serializer completion-type; the directory serializer completion-type
++//! and its membership derivation; the RYW **PUT** arm and **DELETE** arm obligation
++//! establishment; the RYW read side; and both monotonic-read checks.
++//!
++//! **INV-2 (non-vacuity).** An overlap counts as genuine concurrency ONLY when it constrains a
++//! single register — **same-key**, **read↔write**, across **distinct processes**. A cross-key
++//! overlap and a read↔read overlap are vacuous and must NOT count.
++//!
++//! The **core reds are socket-free**: crafted histories fed through the pure serializer / session
++//! checks / witness / dispatch, asserted on real inputs (RED on any module weakening). The
++//! **wire-driven concurrent workload** (leg a's positive witness) binds `127.0.0.1:0` and drives
++//! real signed HTTP, exactly as #405's landed test does; its green is confirmed by the full
++//! `cargo xtask ci` (which permits loopback bind). The linearizability verdict is Elle's,
++//! off-Check, over the SAME serialized history this file produces.
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use tokio::net::TcpListener;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::sigv4::Credentials;
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::consistency_observable::{ObservableS3Client, OpKind, OpRecord};
++use wyrd_server::consistency_workload::{
++    consistency_verdict_dispatch, membership, ConsistencyVerdictDispatch, DirOpKind, DirRecord,
++    DirectoryHistory, Membership, MultiProcessHistory, ProcOp, ELLE_IN_GATE_CMD_VAR,
++    ELLE_OFF_CHECK_VERDICT_JOB,
++};
++use wyrd_server::Gateway;
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++const BUCKET: &str = "wyrd-bucket";
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++// ─── Crafted-history helpers (socket-free) ────────────────────────────────────────────
++
++/// A `SystemTime` `nanos` after the Unix epoch — so crafted real-time spans serialize to
++/// small, readable relative-nanosecond `:time` values.
++fn at(nanos: u64) -> SystemTime {
++    UNIX_EPOCH + Duration::from_nanos(nanos)
++}
++
++fn rec(
++    kind: OpKind,
++    key: &str,
++    version: Option<u64>,
++    status: u16,
++    start: u64,
++    end: u64,
++) -> OpRecord {
++    OpRecord {
++        kind,
++        key: key.to_string(),
++        version,
++        status,
++        start: at(start),
++        end: at(end),
++    }
++}
++
++fn proc_op(
++    process: usize,
++    kind: OpKind,
++    key: &str,
++    version: Option<u64>,
++    status: u16,
++    start: u64,
++    end: u64,
++) -> ProcOp {
++    ProcOp {
++        process,
++        record: rec(kind, key, version, status, start, end),
++    }
++}
++
++fn dir_rec(op: DirOpKind, member: &str, status: u16, start: u64, end: u64) -> DirRecord {
++    DirRecord {
++        process: 0,
++        op,
++        member: member.to_string(),
++        status,
++        start: at(start),
++        end: at(end),
++    }
++}
++
++// ─── (b) Elle-EDN serializer: byte-exact golden, indeterminate → :info (INV-1) ─────────
++
++#[test]
++fn register_serializer_emits_byte_exact_elle_edn_with_info_for_indeterminate() {
++    // A crafted 2-process register history: P0 overwrites the shared key (v1 determinate, v2
++    // INDETERMINATE via a 500), P1 reads it (v1 determinate-present, then a determinate 404
++    // absent). The indeterminate PUT must serialize `:info` (never a definite `:ok`), and the
++    // determinate 404 read must serialize a definite `:ok` of `nil` — proving the completion-type
++    // arm distinguishes indeterminate from determinate-absent.
++    let history = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(1, OpKind::Get, "k", Some(1), 200, 5, 15),
++        proc_op(0, OpKind::Put, "k", Some(2), 500, 30, 40),
++        proc_op(1, OpKind::Get, "k", None, 404, 50, 60),
++    ]);
++
++    // The exact bytes (an EDN operation-history vector, one map per line). Written as a literal,
++    // NOT recomputed with the serializer's own join, so a delimiter/field/order change is caught.
++    let expected = concat!(
++        "[{:process 0, :type :invoke, :f :write, :value 1, :time 0}\n",
++        " {:process 1, :type :invoke, :f :read, :value nil, :time 5}\n",
++        " {:process 0, :type :ok, :f :write, :value 1, :time 10}\n",
++        " {:process 1, :type :ok, :f :read, :value 1, :time 15}\n",
++        " {:process 0, :type :invoke, :f :write, :value 2, :time 30}\n",
++        " {:process 0, :type :info, :f :write, :value 2, :time 40}\n",
++        " {:process 1, :type :invoke, :f :read, :value nil, :time 50}\n",
++        " {:process 1, :type :ok, :f :read, :value nil, :time 60}]",
++    );
++
++    assert_eq!(
++        history.to_elle_edn(),
++        expected,
++        "the register serializer must emit byte-exact Elle EDN, mapping the indeterminate PUT \
++         to :info (never a definite :ok) and the determinate 404 read to a definite :ok of nil"
++    );
++    // Guard rail on the load-bearing INV-1 byte: the indeterminate write is `:info`, and no
++    // definite `:ok` is fabricated for it.
++    assert!(
++        history
++            .to_elle_edn()
++            .contains(":type :info, :f :write, :value 2"),
++        "an indeterminate write must carry :info, not a fabricated definite outcome"
++    );
++}
++
++// ─── (d) Directory-as-set serializer: indeterminate probe → :info, no fabricated false ─
++
++#[test]
++fn directory_serializer_maps_indeterminate_probe_to_info_not_fabricated_absence() {
++    // create=PUT / delete=DELETE / membership=GET-probe (200 present / 404 absent). The probe
++    // of "bob" times out (503, indeterminate) — it must serialize `:info` with `["bob" nil]`,
++    // NEVER a fabricated `["bob" false]`.
++    let history = DirectoryHistory::from_records(vec![
++        dir_rec(DirOpKind::Create, "alice", 200, 0, 10),
++        dir_rec(DirOpKind::Probe, "alice", 200, 20, 30),
++        dir_rec(DirOpKind::Delete, "alice", 204, 40, 50),
++        dir_rec(DirOpKind::Probe, "alice", 404, 60, 70),
++        dir_rec(DirOpKind::Probe, "bob", 503, 80, 90),
++    ]);
++
++    let expected = concat!(
++        "[{:process 0, :type :invoke, :f :add, :value \"alice\", :time 0}\n",
++        " {:process 0, :type :ok, :f :add, :value \"alice\", :time 10}\n",
++        " {:process 0, :type :invoke, :f :contains, :value [\"alice\" nil], :time 20}\n",
++        " {:process 0, :type :ok, :f :contains, :value [\"alice\" true], :time 30}\n",
++        " {:process 0, :type :invoke, :f :remove, :value \"alice\", :time 40}\n",
++        " {:process 0, :type :ok, :f :remove, :value \"alice\", :time 50}\n",
++        " {:process 0, :type :invoke, :f :contains, :value [\"alice\" nil], :time 60}\n",
++        " {:process 0, :type :ok, :f :contains, :value [\"alice\" false], :time 70}\n",
++        " {:process 0, :type :invoke, :f :contains, :value [\"bob\" nil], :time 80}\n",
++        " {:process 0, :type :info, :f :contains, :value [\"bob\" nil], :time 90}]",
++    );
++
++    assert_eq!(
++        history.to_elle_edn(),
++        expected,
++        "the directory serializer must map the indeterminate probe to :info with [member nil], \
++         never a fabricated [member false]"
++    );
++    assert!(
++        !history.to_elle_edn().contains("[\"bob\" false]"),
++        "an indeterminate membership probe must never fabricate a definite [member false]"
++    );
++}
++
++// ─── (d) Membership derivation: 200→present, 404→absent, else→unknown (INV-1 v) ────────
++
++#[test]
++fn membership_derivation_never_coerces_unknown_to_absent() {
++    assert_eq!(membership(200), Membership::Present);
++    assert_eq!(membership(404), Membership::Absent);
++    // Everything else — crucially every indeterminate status — is Unknown, never Absent.
++    assert_eq!(membership(503), Membership::Unknown);
++    assert_eq!(membership(0), Membership::Unknown);
++    assert_eq!(membership(403), Membership::Unknown);
++    assert_ne!(
++        membership(503),
++        Membership::Absent,
++        "an indeterminate probe must never be coerced to a definite absence"
++    );
++}
++
++// ─── (c) Session read-your-writes: sound across EVERY arm (INV-1) ──────────────────────
++
++#[test]
++fn session_read_your_writes_guards_indeterminate_on_every_arm() {
++    // PUT arm (INV-1 ii-a): with NO prior obligation, an indeterminate write must not ESTABLISH a
++    // definite AtLeast from nothing — so reading v=1 afterward is valid. (Pins the "establish"
++    // direction only; the "clear a standing bound" direction is pinned by put_arm_clears below.)
++    let put_arm = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(2), 500, 0, 10),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 20, 30),
++    ]);
++    assert!(
++        put_arm.session_read_your_writes(),
++        "an indeterminate PUT must not create a definite AtLeast obligation from nothing"
++    );
++
++    // PUT arm (INV-1 ii-b): an indeterminate write must CLEAR a STANDING AtLeast to Unknown — after
++    // a determinate v=5 (AtLeast(5)) an indeterminate v=2 write means the committed version is no
++    // longer known, so a later v=1 read is not provably a violation. This is the discriminating red
++    // the bare put_arm above misses: drop the `is_indeterminate → Unknown` clear and AtLeast(5)
++    // stands, so v=1 < 5 flips this to REJECT. (A determinate-failed 500 also fails is_success, so
++    // "does nothing" is NOT a safe substitute for the explicit clear.)
++    let put_arm_clears = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(5), 200, 0, 10),
++        proc_op(0, OpKind::Put, "k", Some(2), 500, 20, 30),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
++    ]);
++    assert!(
++        put_arm_clears.session_read_your_writes(),
++        "an indeterminate PUT must clear a standing AtLeast(5), so a later v=1 read is not a violation"
++    );
++
++    // DELETE arm (INV-1 ii-a): the indeterminate delete must not ESTABLISH Absent — with a standing
++    // AtLeast(1) from the prior determinate PUT, treating the 500 delete as a success would reject
++    // the later v=1 read. Pins the "establish Absent" direction.
++    let delete_arm = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Delete, "k", None, 500, 20, 30),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
++    ]);
++    assert!(
++        delete_arm.session_read_your_writes(),
++        "an indeterminate DELETE must not create a definite Absent obligation"
++    );
++
++    // DELETE arm (INV-1 ii-b): an indeterminate delete must CLEAR a standing AtLeast to Unknown —
++    // after a determinate PUT v=1 (AtLeast(1)) an indeterminate delete means the key MIGHT now be
++    // absent, so a later determinate 404 read is not provably an own-write-lost. Discriminating red:
++    // drop the `is_indeterminate → Unknown` clear and AtLeast(1) stands, so the 404 read trips the
++    // own-write-lost branch and flips this to REJECT.
++    let delete_arm_clears = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Delete, "k", None, 500, 20, 30),
++        proc_op(0, OpKind::Get, "k", None, 404, 40, 50),
++    ]);
++    assert!(
++        delete_arm_clears.session_read_your_writes(),
++        "an indeterminate DELETE must clear a standing AtLeast(1), so a later 404 read is not own-write-lost"
++    );
++
++    // Read arm (INV-1 iii): an indeterminate GET is no observation — even one crafted to carry a
++    // Some(_) version after a determinate delete must not count as a resurrection. RED if the read
++    // arm keys on `version.is_some()` instead of the indeterminate status.
++    let read_arm = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Delete, "k", None, 204, 20, 30),
++        proc_op(0, OpKind::Get, "k", Some(1), 500, 40, 50),
++    ]);
++    assert!(
++        read_arm.session_read_your_writes(),
++        "an indeterminate GET (even carrying a stale version) must not be counted a violation"
++    );
++
++    // Read arm (INV-1 iii'): a DETERMINATE non-404 failed GET (403) observed nothing about the
++    // register — `version` is None only because the status is not 200, NOT because the key is
++    // absent. With a standing AtLeast(1) it must NOT be counted an own-write-lost. RED if the read
++    // arm keys "definite absence" on `version.is_none()` instead of `status == 404` — the exact
++    // INV-1 leak the surface-wide re-plan was meant to close.
++    let non_404_failed_read = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Get, "k", None, 403, 20, 30),
++    ]);
++    assert!(
++        non_404_failed_read.session_read_your_writes(),
++        "a determinate non-404 failed read (403) observed nothing — it must not fabricate a \
++         definite absence / own-write-lost"
++    );
++
++    // REJECT — determinate resurrect-after-own-delete: a determinate present read after a
++    // determinate DELETE with no intervening PUT is a real RYW violation.
++    let resurrect = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Delete, "k", None, 204, 20, 30),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
++    ]);
++    assert!(
++        !resurrect.session_read_your_writes(),
++        "a determinate read that resurrects an own-deleted key must be rejected"
++    );
++
++    // REJECT — determinate version regression: reading v=1 after determinately writing v=2.
++    let regression = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(2), 200, 0, 10),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 20, 30),
++    ]);
++    assert!(
++        !regression.session_read_your_writes(),
++        "a determinate read older than one's own determinate write must be rejected"
++    );
++}
++
++// ─── (c) Session monotonic reads: guard indeterminate, reject determinate regression ───
++
++#[test]
++fn session_monotonic_reads_guard_indeterminate_and_reject_determinate_regression() {
++    // ACCEPT: the second read is indeterminate (503) though it carries a stale Some(1) version —
++    // guarded on status, not on `version == None`, so it is NOT a regression. RED if the guard is
++    // dropped.
++    let valid_indeterminate = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 10),
++        proc_op(0, OpKind::Get, "k", Some(1), 503, 20, 30),
++    ]);
++    assert!(
++        valid_indeterminate.session_monotonic_reads(),
++        "an indeterminate read must not be counted as a monotonicity regression"
++    );
++
++    // REJECT: two determinate reads in one session go backward (2 then 1).
++    let regression = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 10),
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 20, 30),
++    ]);
++    assert!(
++        !regression.session_monotonic_reads(),
++        "a determinate in-session read regression must be rejected"
++    );
++}
++
++// ─── (c) Per-key read monotonicity across processes: sound (INV-1), global ─────────────
++
++#[test]
++fn reads_monotone_per_key_is_global_and_guards_indeterminate() {
++    // REJECT: a global per-key regression that spans processes — P0 observes v=2, then (later in
++    // real time) P1 observes v=1 on the SAME key. This is invisible to the per-session check (each
++    // process reads once) but is a genuine stale read across the fleet.
++    let global_regression = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 10),
++        proc_op(1, OpKind::Get, "k", Some(1), 200, 20, 30),
++    ]);
++    assert!(
++        !global_regression.reads_monotone_per_key(),
++        "a cross-process per-key read regression must be rejected"
++    );
++    assert!(
++        global_regression.session_monotonic_reads(),
++        "the same history is NOT a per-session violation — proving the per-key check is global"
++    );
++
++    // ACCEPT: the lower cross-process read is indeterminate (503) → skipped, not a regression.
++    let valid_indeterminate = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 10),
++        proc_op(1, OpKind::Get, "k", Some(1), 503, 20, 30),
++    ]);
++    assert!(
++        valid_indeterminate.reads_monotone_per_key(),
++        "an indeterminate read must not be counted as a per-key monotonicity regression"
++    );
++}
++
++// ─── (a) Concurrency witness: cross-key and read↔read overlaps are vacuous (INV-2) ─────
++
++#[test]
++fn concurrency_witness_counts_only_same_key_read_write_overlaps() {
++    // NEGATIVE 1 — cross-key only: an overlapping read↔write across processes but on DIFFERENT
++    // keys constrains no single register. RED whenever the witness stops requiring same-key (the
++    // exact v5 leak).
++    let cross_key = MultiProcessHistory::from_ops(vec![
++        proc_op(1, OpKind::Get, "a", Some(1), 200, 0, 10),
++        proc_op(0, OpKind::Put, "b", Some(1), 200, 5, 15),
++    ]);
++    assert!(
++        !cross_key.is_genuinely_concurrent(),
++        "a cross-key read↔write overlap is vacuous — it must not count as genuine concurrency"
++    );
++
++    // NEGATIVE 2 — read↔read only: two overlapping reads on the same key across processes impose
++    // no ordering constraint on the register.
++    let read_read = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Get, "k", Some(1), 200, 0, 10),
++        proc_op(1, OpKind::Get, "k", Some(1), 200, 5, 15),
++    ]);
++    assert!(
++        !read_read.is_genuinely_concurrent(),
++        "a read↔read overlap is vacuous — it must not count as genuine concurrency"
++    );
++
++    // POSITIVE sanity — a same-key read↔write overlap across distinct processes DOES count (so the
++    // negatives above are not vacuously false).
++    let genuine = MultiProcessHistory::from_ops(vec![
++        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
++        proc_op(1, OpKind::Get, "k", Some(1), 200, 5, 15),
++    ]);
++    assert!(
++        genuine.is_genuinely_concurrent(),
++        "a same-key read↔write overlap across distinct processes is genuine concurrency"
++    );
++    assert_eq!(
++        genuine.read_write_overlapping_pairs_across_processes(),
++        vec![(0, 1)],
++        "the witness must identify the single constraining pair"
++    );
++}
++
++// ─── (e) Verdict-dispatch: routes off-Check by default, never an in-gate JVM shell-out ─
++
++#[test]
++fn verdict_dispatch_routes_to_off_check_elle_by_default() {
++    // The default input (no in-gate shell-out configured) MUST route to the privileged off-Check
++    // Elle job — never a JVM shell-out into `cargo xtask ci`. RED if the default is re-pointed at
++    // the in-gate command, exactly the `metadata_faults.rs` shape.
++    assert_eq!(
++        consistency_verdict_dispatch(false),
++        ConsistencyVerdictDispatch::OffCheckElle {
++            job: ELLE_OFF_CHECK_VERDICT_JOB
++        },
++        "the consistency verdict must route to the off-Check Elle job for the default inputs"
++    );
++    // The in-gate route is representable but reachable ONLY via the deprecated var, and the runner
++    // hard-errors rather than shelling a JVM into the gate.
++    assert!(
++        matches!(
++            consistency_verdict_dispatch(true),
++            ConsistencyVerdictDispatch::InGateShellOut { env_var }
++                if env_var == ELLE_IN_GATE_CMD_VAR
++        ),
++        "only the deprecated in-gate command var may reach the (never-shelled) in-gate route"
++    );
++}
++
++// ─── (a) Wire-driven concurrent workload: non-vacuous, genuinely concurrent (leg a) ────
++
++/// Start the S3 gateway on an ephemeral loopback port (mirrors
++/// `s3_http_wire.rs::start_gateway` and #405's `consistency_observable.rs` test): the same
++/// in-process loopback gateway (redb + fs + mem behind the HTTP listener) that fully exhibits
++/// the mutable register, serving connections concurrently (`S3Gateway::serve` → `axum::serve`).
++async fn start_gateway() -> (SocketAddr, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let gateway: Arc<Backend> = Arc::new(Gateway::new(
++        RedbMetadataStore::in_memory().expect("redb"),
++        FsChunkStore::open(dir.path()).expect("fs store"),
++        MemCoordination::new(),
++    ));
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(Arc::clone(&gateway), config);
++    tokio::spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    (addr, dir)
++}
++
++fn client(addr: SocketAddr) -> ObservableS3Client {
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    ObservableS3Client::new(addr, BUCKET, creds, REGION)
++}
++
++/// Leg (a)'s positive witness: **≥2 concurrent `ObservableS3Client`s** — a sole writer
++/// overwriting a shared key and a concurrent reader GETting it — over the real in-process S3
++/// HTTP wire produce a **non-vacuous, well-formed, genuinely concurrent** merged multi-process
++/// history: ≥1 real-time-overlapping SAME-KEY read↔write span pair across distinct process ids
++/// (the only non-vacuous overlap for a single register, INV-2), with the register version
++/// climbing across overwrites and per-key reads observing a monotone version sequence.
++///
++/// Runs on a multi-thread runtime with a start barrier so the two clients genuinely run in
++/// parallel; the gateway serves connections concurrently, so their same-key spans overlap in
++/// real time. This is the leg whose green is confirmed by the full `cargo xtask ci` (loopback
++/// bind permitted); the socket-free reds above carry the flippable RED regardless.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn concurrent_workload_records_a_nonvacuous_genuinely_concurrent_history() {
++    let (addr, _dir) = start_gateway().await;
++    const ROUNDS: u64 = 40;
++    let key = "shared-register";
++
++    let barrier = Arc::new(tokio::sync::Barrier::new(2));
++
++    // Process 0 — the sole writer, overwriting the shared key v=1..=ROUNDS.
++    let writer = {
++        let mut c = client(addr);
++        let barrier = Arc::clone(&barrier);
++        let key = key.to_string();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for v in 1..=ROUNDS {
++                c.put(&key, v).await.expect("put over the wire");
++            }
++            c.into_history()
++        })
++    };
++
++    // Process 1 — a concurrent reader, GETting the same key repeatedly.
++    let reader = {
++        let mut c = client(addr);
++        let barrier = Arc::clone(&barrier);
++        let key = key.to_string();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for _ in 0..ROUNDS {
++                let _ = c.get(&key).await.expect("get over the wire");
++            }
++            c.into_history()
++        })
++    };
++
++    let histories = vec![
++        writer.await.expect("writer task"),
++        reader.await.expect("reader task"),
++    ];
++
++    // Merge into one real-time-ordered, `:process`-tagged multi-process history.
++    let merged = MultiProcessHistory::merge(&histories);
++
++    // Non-vacuous + well-formed, and every driven op across both clients is recorded.
++    assert!(
++        merged.well_formed(),
++        "the merged multi-process history must be non-vacuous and well-formed"
++    );
++    assert_eq!(
++        merged.ops().len() as u64,
++        ROUNDS * 2,
++        "every driven op across both concurrent clients must be recorded"
++    );
++
++    // INV-2 non-vacuity: ≥1 same-key read↔write overlap across distinct processes — the only
++    // overlap that constrains a single register.
++    let overlaps = merged.read_write_overlapping_pairs_across_processes();
++    assert!(
++        !overlaps.is_empty(),
++        "a concurrent writer+reader on a shared key must produce ≥1 same-key read↔write real-time \
++         overlap across distinct processes (found none — the history is not genuinely concurrent)"
++    );
++    assert!(merged.is_genuinely_concurrent());
++
++    // The overlapping pairs are genuinely same-key, cross-process, read↔write.
++    for &(i, j) in &overlaps {
++        let a = &merged.ops()[i];
++        let b = &merged.ops()[j];
++        assert_ne!(a.process, b.process, "an overlap pair must cross processes");
++        assert_eq!(
++            a.record.key, b.record.key,
++            "an overlap pair must be same-key"
++        );
++    }
++
++    // The shared register's written version climbs across overwrites (writer-supplied, ADR-0041
++    // decision-1 overwrite semantics; the backend-observed strengthening is a later slice).
++    let written: Vec<u64> = histories[0]
++        .ops()
++        .iter()
++        .filter(|o| o.kind == OpKind::Put)
++        .map(|o| o.version.expect("a PUT records its written version"))
++        .collect();
++    assert_eq!(
++        written.len() as u64,
++        ROUNDS,
++        "the writer drove every overwrite"
++    );
++    assert!(
++        written.windows(2).all(|w| w[1] > w[0]),
++        "the shared register's written version must climb across overwrites"
++    );
++
++    // Per-key reads observe a monotone version sequence — no stale/torn read on the linearizable
++    // commit-point register (ADR-0041 decision 1).
++    assert!(
++        merged.reads_monotone_per_key(),
++        "the reader must observe a monotone per-key version sequence (no stale/torn read)"
++    );
++}
