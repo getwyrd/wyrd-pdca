@@ -29,6 +29,151 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-07 — cycles considered: issue_257, issue_405, issue_454, issue_455, issue_458
+
+> The five cycles that froze since the 2026-07-04 (cont.) review (which covered 255/256/258/364/365/366).
+> Four (405/454/455/458) are the **M4 closed-write-path / S3-gateway / registration** batch just recorded
+> (commit `655e8fa`, "record completed bundles 454, 455, 458 (M4 closed write path)"); #257 is the
+> redb→TiKV "Option-B" swap slice that also froze 2026-07-06. issue_115 (ACCEPTED) and issue_153
+> (discontinued) remain absent from the frozen index → carried, out of scope; the result dirs
+> issue_262/263/264/265/291 exist under `results/` but are **not** yet in the frozen Act index → out of
+> scope this review (same handling as #204/#207 on 2026-06-23). No contribution disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **NEW & RECURRING (actionable) — the reviewer/gate leaf sandbox cannot bind a loopback socket, so a
+  whole class of loopback-gRPC runtime tests cannot earn an independent red→green at Check and always
+  defers to a socket-capable host (4× this batch: #405, #454, #455, #458).** In every one the named
+  runtime test panics before its assertion because `TcpListener::bind("127.0.0.1:0")` returns
+  `Operation not permitted` / `PermissionDenied`: #405 `consistency_observable.rs:49` (C4 provisional,
+  T3 "run on a host that permits local listeners", `:38,:75`); #454 `s3_gateway_cluster.rs:54,:115` (C4
+  gRPC S3 red→green + T3 provisional); #455 `closed_write_path.rs:83` (C2, C4, T3 all provisional — and
+  its own §10 flags the recurrence "recurs in C2/C4/T3"); #458 `advertise_addr_registration.rs:30`
+  (C2, C4, T3). Two things make this a **harness route, not a PDCA delta**: (a) the reviewer skill
+  already classifies each as *provisional-not-defect* (the compile/unit/fmt legs pass; the gate fail is
+  read as an environment caveat with runnable steps for a capable host, not a blocking C4 FAIL) — the
+  same generalisation the cargo-not-found / stale-target caveats produced, so **no reviewer-skill delta**
+  is owed; (b) unlike the M4 endpoint-gated TiKV legs (252/253/254) — which **skip cleanly** via
+  `WYRD_TIKV_PD_ENDPOINTS`, so the `Verification posture` field pre-declares them — these **hard-fail on
+  bind**, so a brief-template pre-declaration would *not* make them runnable at Check. The load-bearing
+  gap is a leaf-sandbox **capability** (loopback networking), which is `src/pdca_harness/**` machinery →
+  routes **upstream** (below), in the same class as the closed `ensure-cargo.sh` and the zig-cc gate-host
+  items. **No spec/ruleset/gate/skill delta.**
+- **RECURRING (harness bug, reinforces eduralph/pdca-harness#235) — the publish/C4-verify base parser
+  mis-resolves the base again (#454; earlier #252; adjacent #257).** #454 §10 records the
+  `_brief_base`/`_clean_ref` "backtick span wins over first token" rule taking the FIRST backtick span
+  *anywhere* after `@`, so a backticked branch name in a **trailing prose aside** ("not on `main`")
+  hijacked the base → resolved `origin/main` instead of `feat/m4-production-metadata-backend`,
+  false-failing `C4-verify` ("patch does not apply — stale") and would misdirect publish's PR base. This
+  is the same root bug already routed as **harness#235** (whose #252 case was the mirror direction —
+  "main (feature branch `feat/…`)" resolving to the feature branch), now recurring in the opposite
+  direction. #257's non-gating `C4-verify` "stale base — patch does not apply" caveat sits on the same
+  base/ordering axis (adjacent, plausibly a genuine rebase-needed rather than the parser). The recurrence
+  confirms harness#235 is **overdue** and adds a concrete test case (backtick in trailing prose beating
+  the `@`-token; fix = anchor the parse to the token immediately after `@`). Reinforces the existing
+  upstream route — **no new delta**.
+- **#257 Option-B off-Check evidence + the DST/#264 simulator-fidelity axis — pre-declared
+  Verification-posture working as designed, no delta.** #257's binding correctness evidence for the
+  redb→TiKV swap deliberately lives **off-Check** on a privileged ≥3-replica TiKV cluster (four-leg
+  real-cut/no-op/mutated-re-check/restored flips), while the at-Check gate certifies only
+  routing/arithmetic/coverage and the DST seed is redb-only by design — all surfaced as *pre-declared*
+  C2/C4/C5/T5/V sign-off items, none as a surprise. This is the same deferred-≠-unbuilt conversion the
+  `Verification posture` field exists to produce, converging (like #256/#364/#365/#366) on the #367
+  first-deployment gate and the always-human #264 fidelity ratification. **Working as designed — no delta.**
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle.** Fitness-to-purpose in all five; T5 in
+  257/405; C5 in 257. The always-human classes (INTEGRATION.md §4) — the structural constant, not a new
+  pattern. The digest's "2× t3 runtime" / "2× validation — human sign-off must decide" are the
+  loopback-bind batch (405/454/455/458) surfacing through the C2/C4/T3 rows, already accounted above.
+  **No delta warranted** — consistent with every prior review.
+- **Single-cycle §10 nit, not recurring — routed, not a delta.** #455: add a **killed/unreachable-D-server**
+  fault scenario to `closed_write_path` (the slice proves reachable-fragment-loss only; the brief asked
+  for killed-D-server backlog behaviour). This is tied to the human's own #455 sign-off scope call
+  (whether reachable-fragment-loss closes #455 or a further iteration is owed) — routes as a Wyrd tracker
+  follow-up. 1×; does not meet the spec/ruleset/gate/skill bar.
+
+## Process deltas
+
+- **No spec-template / ruleset / gate / agent-skill delta APPLIED in-band this review.** The one new
+  recurring finding (loopback-bind unavailable in the leaf sandbox) is a harness **capability** gap upstream
+  of this repo, and the reviewer skill already defers it correctly — a brief-template pre-declaration would
+  not make the tests runnable, so it would be motion without effect. The base-parser recurrence reinforces an
+  already-open upstream item. The always-human classes (V/C5/T5) and the Option-B/#367/#264 deferrals are
+  structural / working-as-designed.
+- **One process improvement identified but NOT implemented in-band (routed for later, per human direction):
+  a doctor-registration forcing function for new dependencies.** The M4 backend chain kept introducing host
+  prerequisites that were registered in `pdca doctor` only *reactively* — docker/openssl added after they
+  false-failed gates #252-254 (getwyrd/wyrd-pdca#96), and `protoc` for the etcd leg (#365, `Cargo.toml:110`)
+  never registered at all. The brief template only *softly* asks to "seed the render's `[[doctor.checks]]`
+  where you can" (`templates/brief.md.tpl` `External dependencies`). Making that a forcing function (mandatory
+  doctor row + builder proposes it + reviewer flags an unregistered dep + optional `doctor` reconcile
+  mechanism) spans template-provided artifacts (brief template, `agents/*.md`, the doctor schema/mechanism)
+  → it is a scheduled implementation task, **filed rather than applied here** (below). A candidate patch was
+  drafted this session and reverted at the human's direction — implementation is done later.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Harness/driver issue (upstream template) — the reviewer/gate leaf sandbox must permit loopback
+  (`127.0.0.1`) socket binds so gRPC/loopback runtime tests earn a real red→green at Check (#405, #454,
+  #455, #458).** Today `TcpListener::bind("127.0.0.1:0")` returns `Operation not permitted` in the leaf
+  sandbox, so C2/C4/T3 for the whole M4 loopback-gRPC test class (S3 gateway, closed write path,
+  advertise/registration, consistency-observable) can only ever be *provisional* at Check and lean on a
+  hand run on a socket-capable host. Ask: allow loopback binds in the leaf/gate/advisory sandbox profile
+  (or provide a documented socket-capable gate lane). `src/pdca_harness/**` sandbox profile → routes
+  **upstream to the template**. → **FILED eduralph/pdca-harness#261** (2026-07-07, label `bug`);
+  confirm progress next review.
+- **Harness/driver issue (upstream) — base-parser recurrence of a CLOSED issue.** #454's `_clean_ref`
+  mis-resolution (a backtick span in trailing prose beating the `@`-token → wrong base, false `C4-verify`
+  stale-fail, mis-directed publish PR base) is a second occurrence of harness#235 **in the opposite
+  direction** — and #235 is **CLOSED COMPLETED** (2026-07-04), so its fix special-cased the *parenthetical*
+  form and left this bare-backtick-span case open. Fix: anchor the parse to the token immediately after
+  `@`, never let a backtick span elsewhere in the base string win (both directions), + add the #454 case.
+  → **FILED eduralph/pdca-harness#262** (2026-07-07, label `bug`, references #235); confirm progress next
+  review.
+- **Harness/driver enhancement (upstream template) — doctor-registration forcing function for new
+  dependencies.** When a change introduces a dependency a human must install/provide (build tool, system
+  lib, runtime service, capability), the system must REGISTER it — list it in `pdca doctor` with an install
+  hint and prompt the human — instead of letting it surface as a cryptic build failure (docker/openssl
+  #252-254 registered reactively; `protoc` #365 never registered). Scope (implementation later): mandatory
+  registration in the brief template `External dependencies` field; builder proposes the `[[doctor.checks]]`
+  row for a discovered dep; reviewer flags an unregistered dep NEEDS-HUMAN; optional `pdca doctor` reconcile
+  mechanism. Template/agents/doctor-schema = template-provided → routes **upstream**. → **FILED
+  eduralph/pdca-harness#263** (2026-07-07, label `enhancement`; downstream instance follow-up noted there:
+  register `protoc` in this repo's `pdca.toml` once the convention lands). Not implemented in-band.
+- **Tracker (Wyrd, #455 §10) — add a killed/unreachable-D-server fault scenario to `closed_write_path`.**
+  The slice proves reachable-fragment-loss only; the brief asked for killed-D-server backlog behaviour, so
+  broader fault coverage is later hardening and is coupled to the human's #455 sign-off scope decision.
+  → owner: Eduard; next step: file against getwyrd/wyrd (M4 closed write path) if the human's #455 sign-off
+  keeps it as a follow-up rather than a re-iteration; record id next review.
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21) still
+  have not had an Act review and remain absent from this index. → next Act review, if still in scope.
+- From 2026-07-04: design issue **getwyrd/wyrd#426** (shared-conformance-pin governance, #419/#254/#261)
+  and upstream harness items **eduralph/pdca-harness#235** (fail-closed worktree isolation + base parser,
+  CLOSED — its base-parser residual now filed as **#262** from #454) / **#236** (zig-cc-shimmed gate host)
+  should show progress next review; the new **#261** (leaf-sandbox loopback-bind) should too;
+  **#367** (first-deployment gate) remains the convergence point for the deferred live greens of
+  #256/#364/#365/#366 **and now #257** — confirm it lands or is explicitly still deferred.
+- Prior reviews' carried items: `pdca doctor` docker+openssl rows (getwyrd/wyrd-pdca#96); the closed
+  `ensure-cargo.sh` cargo-not-found fix; the upstream `run-verify.sh` bespoke-env/rename run-hook item
+  (2026-07-04 cont.); harness#120/#121; getwyrd/wyrd#242/#243 + doc #244; #268 ADR-0010 `BlockReadFault`
+  amendment; #356 fan-out id-map enhancement; the #256 gateway/custodian process-role tracking issue.
+
+## How effectiveness will be judged
+
+- WATCH the next ~5 cycles for **another loopback-bind-denied deferral**: once the upstream sandbox
+  capability lands, the M4 loopback-gRPC tests (closed write path, S3 gateway, registration,
+  consistency-observable) should earn a real automated red→green at Check instead of a provisional
+  human-run caveat; if the denial recurs before the fix, the routed harness item is overdue. A fifth
+  occurrence (after 405/454/455/458) confirms this is now the dominant Check-time verification gap for M4.
+- WATCH for **another base-parser mis-resolution**: a third occurrence (after #252, #454) makes
+  harness#235 overdue, and the fix must be confirmed to cover *both* directions (prose-aside backtick and
+  parenthetical-branch).
+- The deferred live greens (#256/#364/#365/#366/**#257**) should converge on a real **#367** run — the
+  next review should see each off-Check observation either landed at #367 or explicitly still deferred, so
+  the deferral chain stays auditable.
+
 # Act review — 2026-07-04 (cont.) — cycles considered: issue_255, issue_256, issue_258, issue_364, issue_365, issue_366
 
 > The six cycles that froze after the earlier 2026-07-04 entry (which covered 252/253/254/285/286/

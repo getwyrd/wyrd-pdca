@@ -1,0 +1,760 @@
+diff --git a/crates/server/src/cli.rs b/crates/server/src/cli.rs
+index 51d11f8..88f5ac5 100644
+--- a/crates/server/src/cli.rs
++++ b/crates/server/src/cli.rs
+@@ -1059,6 +1059,36 @@ pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
+     .into())
+ }
+ 
++/// Raise the persisted `meta:next_inode` allocator so the next [`alloc_inode`] returns an id
++/// **≥ `floor`**. This is the seed a gateway runs at startup ([`crate::Gateway::recover`]) so a
++/// restart over a non-empty store — or an in-place upgrade from a store an older single-process
++/// gateway wrote with no counter — resumes allocating strictly above every inode already
++/// committed (issue #364 durability finding 1). Idempotent and monotone: it only ever *raises*
++/// the counter, and a concurrent allocator already past `floor` leaves it untouched. Generic
++/// over `M` so the redb and TiKV backends share it, exactly as [`alloc_inode`] does.
++pub async fn seed_next_inode_floor<M: MetadataStore>(meta: &M, floor: u64) -> Result<(), BoxError> {
++    loop {
++        let current = meta.get(NEXT_INODE_KEY).await?;
++        // An absent counter means "the next id is 1" — `alloc_inode`'s own default.
++        let have: u64 = match &current {
++            Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
++            None => 1,
++        };
++        if have >= floor {
++            return Ok(());
++        }
++        let guard = match &current {
++            Some(bytes) => WriteBatch::new().require(NEXT_INODE_KEY.to_vec(), bytes.clone()),
++            None => WriteBatch::new().require_absent(NEXT_INODE_KEY.to_vec()),
++        };
++        let batch = guard.put(NEXT_INODE_KEY.to_vec(), floor.to_string().into_bytes());
++        if meta.commit(batch).await? == CommitOutcome::Committed {
++            return Ok(());
++        }
++        // Lost the race with a concurrent allocator/seed — re-read and re-check the floor.
++    }
++}
++
+ /// Mint chunk ids `inode_id << 64 | seq` — unique across objects and stable
+ /// across processes.
+ fn chunk_id_minter(inode_id: u64) -> impl FnMut() -> ChunkId {
+@@ -1392,8 +1422,8 @@ where
+     }
+ }
+ 
+-/// Recover the gateway's id allocators from persisted state (#364 durability finding 1)
+-/// and serve the S3 HTTP wire surface over `listener` until it stops. Generic over the
++/// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
++/// finding 1) and serve the S3 HTTP wire surface over `listener` until it stops. Generic over the
+ /// three backend seams (`M` metadata × `C` chunk plane × `Co` coordination) so every
+ /// composition `cmd_s3` selects — the redb+mem+FS single-node front door, the
+ /// redb+mem+gRPC-fanout cluster front door, and the tikv+etcd production composition —
+@@ -1409,9 +1439,11 @@ where
+     C: PlacementChunkStore + Send + Sync + 'static,
+     Co: wyrd_traits::Coordination + Send + Sync + 'static,
+ {
+-    // Resume the in-process id allocators above everything already persisted under the
+-    // data dir, so a RESTART over an existing store never reuses a committed inode or
+-    // chunk id and corrupts an existing object (issue #364 durability finding 1).
++    // Seed the shared, persisted `meta:next_inode` allocator above every inode already under
++    // the data dir, so a RESTART over an existing store (or an in-place upgrade from a store an
++    // older single-process gateway wrote with no counter) never reuses a committed inode id and
++    // corrupts an existing object (issue #364 durability finding 1). Chunk ids are
++    // coordination-free (a fresh random epoch, ADR-0019) and need no recovery.
+     gateway.recover().await?;
+     let mut config = s3::S3Config::new(credentials);
+     config.region = region;
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index f3b4efa..0fa3aa7 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -60,13 +60,20 @@ pub struct Gateway<M, C, Co> {
+     chunk_size: usize,
+     durability: EcScheme,
+     lease_ttl_millis: u64,
+-    // Id allocation is an in-process counter for the single-process gateway (one process,
+-    // not a multi-writer cluster; random/uncoordinated chunk ids per ADR-0019 are a later
+-    // refinement). The counters are seeded from 1 by `new` but MUST be resumed above the
+-    // persisted high-water marks by `recover` before serving over a non-empty store, or a
+-    // restart replays ids from 1 and collides with committed objects (issue #364 finding 1).
+-    next_inode: AtomicU64,
+-    next_chunk: AtomicU64,
++    // Id allocation is cluster-safe: several gateway processes may run active-active over one
++    // shared fleet (M4, "one shared front door, N gateways", #465), so no id may be minted
++    // from per-process state that two processes seeded identically. Inodes come from the
++    // SHARED store's `meta:next_inode` CAS allocator (`cli::alloc_inode`, the CLI cluster
++    // path's scheme), so two gateways never mint the same inode. Chunk ids are
++    // **coordination-free** (ADR-0019): a per-gateway random `chunk_epoch` (the high 64 bits)
++    // makes two processes draw disjoint id ranges without any shared counter, and a per-gateway
++    // monotonic `next_chunk_seq` (the low 64 bits) never repeats within a process — so an
++    // overwrite of an existing inode mints a fresh chunk id rather than re-minting (and
++    // clobbering) the prior version's. This is restart-safe by construction — a new process
++    // resumes inodes from the persisted counter and draws a fresh chunk epoch, never replaying
++    // a committed id and corrupting an object (issue #364 finding 1, preserved and generalised).
++    chunk_epoch: u64,
++    next_chunk_seq: AtomicU64,
+ }
+ 
+ impl<M, C, Co> Gateway<M, C, Co>
+@@ -86,29 +93,29 @@ where
+             chunk_size: DEFAULT_CHUNK_SIZE,
+             durability: DEFAULT_DURABILITY,
+             lease_ttl_millis: DEFAULT_LEASE_TTL_MILLIS,
+-            next_inode: AtomicU64::new(1), // 0 is ROOT
+-            next_chunk: AtomicU64::new(1),
++            chunk_epoch: random_chunk_epoch(),
++            next_chunk_seq: AtomicU64::new(0),
+         }
+     }
+ 
+-    /// Recover the in-process id allocators from persisted state so a **restart** over a
+-    /// non-empty store resumes allocating *above* every inode and chunk id already committed
+-    /// or in-flight — never replaying ids from 1 and colliding with (corrupting) existing
+-    /// objects (issue #364 durability finding 1). A fresh store recovers `(0, 0)` and the
+-    /// allocators stay at 1, exactly as [`new`](Gateway::new) leaves them.
++    /// Seed the **shared, persisted** inode allocator from persisted state so this gateway
++    /// resumes allocating *above* every inode already on disk — a restart over a non-empty
++    /// store, or an in-place upgrade from a store an older single-process gateway wrote with
++    /// no `meta:next_inode` counter, never re-mints a committed inode id and spuriously
++    /// rejects a new-key PUT (issue #364 durability finding 1, preserved).
++    ///
++    /// Chunk ids need **no** recovery: they are coordination-free (a per-gateway random
++    /// [`chunk_epoch`](Self::chunk_epoch), ADR-0019), so a fresh process draws a disjoint id
++    /// range and can never replay a committed chunk id. A fresh store leaves the allocator at
++    /// its default (next id 1), exactly as [`new`](Gateway::new) leaves it.
+     ///
+     /// The composition root calls this after `new` and before serving
+-    /// (`server::cli::cmd_s3`). Idempotent and monotone: it only ever *raises* the counters
+-    /// (`fetch_max`), so a concurrent allocation already past the mark is never rewound.
++    /// (`server::cli::serve_s3`, `cli.rs:1415`). Idempotent and monotone: it only ever
++    /// *raises* the persisted counter, so a concurrent allocation already past the mark is
++    /// never rewound.
+     pub async fn recover(&self) -> Result<()> {
+-        let (max_inode, max_chunk) = metadata::high_water_marks(&self.meta).await?;
+-        self.next_inode
+-            .fetch_max(max_inode.saturating_add(1), Ordering::Relaxed);
+-        // `high_water_marks` already projects the chunk id to the `< 2^64` in-process
+-        // allocation space, so this conversion never truncates a live id.
+-        let next_chunk = u64::try_from(max_chunk).unwrap_or(0).saturating_add(1);
+-        self.next_chunk.fetch_max(next_chunk, Ordering::Relaxed);
+-        Ok(())
++        let (max_inode, _max_chunk) = metadata::high_water_marks(&self.meta).await?;
++        crate::cli::seed_next_inode_floor(&self.meta, max_inode.saturating_add(1)).await
+     }
+ 
+     /// Set the chunk size (mainly so tests can force multi-chunk objects).
+@@ -174,7 +181,12 @@ where
+                 write::commit_overwrite(&self.meta, inode_id, &prior, plan, now_millis()).await?
+             }
+             None => {
+-                let inode_id = self.next_inode.fetch_add(1, Ordering::Relaxed);
++                // Allocate the inode from the SHARED store's `meta:next_inode` CAS allocator,
++                // exactly as the CLI cluster path does (`cli::cluster_store_put`,
++                // `cli.rs:1158`; allocator body `cli.rs:1027`) — never a per-process counter,
++                // so two active-active gateways seeded from the same baseline mint DISTINCT
++                // inodes and the create CAS resolves any dirent race cleanly (issue #477).
++                let inode_id = crate::cli::alloc_inode(&self.meta).await?;
+                 write::commit_create(&self.meta, ROOT, key, inode_id, plan).await?
+             }
+         };
+@@ -193,11 +205,42 @@ where
+         read::read_path(&self.meta, &self.chunks, ROOT, key).await
+     }
+ 
++    /// Mint a **coordination-free** chunk id (ADR-0019). The per-gateway random
++    /// [`chunk_epoch`](Self::chunk_epoch) forms the high 64 bits, so two concurrently-active
++    /// gateways over the same fleet draw disjoint id ranges without any shared counter — neither
++    /// can write a fragment under a chunk id the other has committed or has in flight. The
++    /// monotonic [`next_chunk_seq`](Self::next_chunk_seq) forms the low 64 bits, so an id never
++    /// repeats within a process: an **overwrite** (which reuses the inode but stores a new
++    /// version's fragments) mints fresh ids rather than re-minting the prior version's. The
++    /// epoch's top bit is set, so every id is ≥ 2^127 — clear of the `< 2^64` in-process space
++    /// [`metadata::high_water_marks`] scans and of the cluster path's `(inode << 64) | seq` ids.
+     fn mint_chunk_id(&self) -> ChunkId {
+-        ChunkId::from(self.next_chunk.fetch_add(1, Ordering::Relaxed))
++        let seq = self.next_chunk_seq.fetch_add(1, Ordering::Relaxed);
++        (u128::from(self.chunk_epoch) << 64) | u128::from(seq)
+     }
+ }
+ 
++/// Draw a per-gateway random 64-bit chunk-id epoch (top bit set) from OS entropy.
++///
++/// This is the coordination-free half of the chunk-id scheme (ADR-0019): two gateway
++/// **processes** seeded from the same persisted state still draw **independent** epochs, so
++/// their chunk-id ranges are disjoint and neither can overwrite a chunk the other committed —
++/// the multi-writer invariant (issue #477), without a shared allocator. Setting the top bit
++/// keeps every minted id ≥ 2^127, clear of the `< 2^64` in-process space
++/// [`metadata::high_water_marks`] recovers and of the cluster path's `(inode << 64) | seq` ids.
++///
++/// The entropy comes from [`std::collections::hash_map::RandomState`], which the standard
++/// library seeds from the OS RNG (the same source that keys `HashMap` against collision
++/// attacks) — so no extra crate is pulled into the gateway binary, and each construction draws
++/// a fresh key, so two gateways built in one process draw different epochs too.
++fn random_chunk_epoch() -> u64 {
++    use std::hash::{BuildHasher, Hasher};
++    let raw = std::collections::hash_map::RandomState::new()
++        .build_hasher()
++        .finish();
++    raw | (1u64 << 63)
++}
++
+ /// `Gateway` **is** an [`ObjectGateway`] — the shared gateway seam (`wyrd-gateway-core`)
+ /// the S3 wire surface (`wyrd-gateway-s3`) and any future front-door drive objects through
+ /// (issue #364, T5-a). This impl maps the neutral seam onto the concrete write/read/delete
+diff --git a/crates/server/tests/gateway_multi_writer.rs b/crates/server/tests/gateway_multi_writer.rs
+new file mode 100644
+index 0000000..21355d4
+--- /dev/null
++++ b/crates/server/tests/gateway_multi_writer.rs
+@@ -0,0 +1,281 @@
++//! Issue #477: **two active-active gateways over one shared fleet** must mint globally
++//! unique object ids. The M4 blueprint (#465) is "one shared front door, N gateways, no LB
++//! affinity, plain round-robin", so two `Gateway` processes can serve the SAME
++//! `MetadataStore` + `ChunkStore` **concurrently**. Both recover from the same baseline, so
++//! any id minted from *per-process* state collides across the two processes:
++//!
++//! * Inodes: two per-process counters seeded from the same high-water mark both mint inode 1,
++//!   so the second gateway's `commit_create` fails `require_absent(inode:1)` with a bogus
++//!   `Conflict` and its new-key PUT is spuriously rejected.
++//! * Chunk ids: two per-process chunk counters both mint chunk id 1, so the second gateway's
++//!   fragment write clobbers the first object's fragments on the shared chunk store under the
++//!   colliding id — silent corruption of a committed object.
++//!
++//! This is the two-active-gateways analogue of the two-sequential-CLI-invocations test at
++//! `gateway_cluster.rs`. The fix routes inodes through the shared store's `meta:next_inode`
++//! CAS allocator (`cli::alloc_inode`, exactly as the CLI cluster path does) and mints chunk
++//! ids coordination-free (a per-gateway random epoch, ADR-0019), so neither collides.
++//!
++//! **Genuinely concurrent (iteration-2 carry-forward).** The two gateways' PUTs are driven
++//! under `tokio::spawn` on a multi-thread runtime and released together from a `Barrier`, so
++//! they *race* on the shared `meta:next_inode` CAS allocator — the contended path the fix
++//! rests on. A sequential "A then B" would let the allocator hand out 1 then 2 uncontended and
++//! never exercise the CAS retry, so this test drives several writers per gateway all at once.
++//! A companion test contends `cli::alloc_inode` directly and asserts it never hands out a
++//! duplicate id under that contention.
++//!
++//! It drives the **production** `Gateway::{recover, put_object, get_object}` (and the
++//! production `cli::alloc_inode`) over a shared, **read-back-observable** in-memory metadata +
++//! chunk store (the `Arc<Mutex<…>>`-backed `MemMeta`/`MemChunks` the other gateway tests use).
++//! An in-memory store — not redb — is used precisely because the two gateways are alive
++//! **concurrently**: redb takes an exclusive file lock, so it cannot model two live processes
++//! sharing one store; the shared `Arc` backing does.
++
++use std::collections::{HashMap, HashSet};
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_server::cli::alloc_inode;
++use wyrd_server::Gateway;
++use wyrd_traits::{
++    ChunkStore, CommitOutcome, FragmentId, Health, MetadataStore, PlacementChunkStore, Result,
++    WriteBatch,
++};
++
++/// An in-memory `MetadataStore` whose state is shared by every clone (the `Arc<Mutex<…>>`
++/// backing). Two `Gateway` instances built over clones of one `MemMeta` therefore read and
++/// write the SAME metadata — the coordination point two active-active gateways collide on.
++#[derive(Clone, Default)]
++struct MemMeta {
++    kv: Arc<Mutex<HashMap<Vec<u8>, Bytes>>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// An in-memory `ChunkStore` whose fragments are shared by every clone — **read-back
++/// observable**: a fragment one gateway writes is visible to the other, and a colliding
++/// `FragmentId` overwrites, so a chunk-id collision is a real, observable clobber.
++#[derive(Clone, Default)]
++struct MemChunks {
++    frags: Arc<Mutex<HashMap<FragmentId, Bytes>>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemChunks {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++impl PlacementChunkStore for MemChunks {}
++
++/// A distinct, deterministic payload per object, large enough to erasure-code into several
++/// fragments under the default RS(6,3) scheme. `seed` makes each object's bytes differ, so a
++/// clobber (one gateway's fragments overwriting another's under a colliding chunk id) is
++/// detectable as a byte mismatch on read-back.
++fn payload(seed: u8) -> Vec<u8> {
++    (0..4096u32)
++        .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
++        .collect()
++}
++
++/// Parse the inode id out of an `inode:<id>` metadata key (mirrors `metadata::inode_key`'s
++/// `inode:{id}` format; the parser there is crate-private, so the test reads the key shape
++/// directly to count the DISTINCT inodes the shared allocator handed out).
++fn inode_id_of(key: &[u8]) -> Option<u64> {
++    std::str::from_utf8(key)
++        .ok()?
++        .strip_prefix("inode:")?
++        .parse()
++        .ok()
++}
++
++/// Two `Gateway` instances over ONE shared metadata store and ONE shared, read-back-observable
++/// chunk store — the active-active case — both recovered from the same empty baseline. Several
++/// distinct objects are stored **concurrently**, split across the two gateways and released
++/// together from a barrier so their PUTs genuinely race on the shared `meta:next_inode` CAS
++/// allocator. Every object must read back byte-identical and every object must get its own
++/// inode.
++///
++/// Pre-fix (per-process `AtomicU64` counters): each gateway seeds its counter at 1
++/// independently, so gateway B re-mints inodes 1..N that gateway A already committed — each
++/// such create loses `require_absent(inode:k)` with a bogus `Conflict` and its PUT is rejected
++/// — and re-mints chunk ids 1..N that clobber A's fragments on the shared store. Either way at
++/// least one object no longer round-trips → RED. Post-fix, the shared-CAS inode allocator and
++/// coordination-free chunk ids keep every id disjoint even under the concurrent contention →
++/// every object round-trips → GREEN.
++#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
++async fn two_active_gateways_concurrently_store_distinct_objects_without_collision() {
++    // One shared metadata store and one shared chunk store, cloned into each gateway — a single
++    // fleet, two front doors (the M4 shape).
++    let meta = MemMeta::default();
++    let chunks = MemChunks::default();
++
++    let gw_a = Arc::new(Gateway::new(
++        meta.clone(),
++        chunks.clone(),
++        MemCoordination::new(),
++    ));
++    let gw_b = Arc::new(Gateway::new(
++        meta.clone(),
++        chunks.clone(),
++        MemCoordination::new(),
++    ));
++
++    // Both recover from the SAME (empty) baseline, so any per-process counter would seed
++    // identically — exactly the condition that makes uncoordinated ids collide.
++    gw_a.recover().await.expect("gateway A recovers");
++    gw_b.recover().await.expect("gateway B recovers");
++
++    // A handful of distinct objects, evenly split across the two gateways, each stored on its
++    // own task and released together — so the PUTs run at the same time and the id allocations
++    // genuinely contend (not "A fully completes, then B").
++    const WRITERS: usize = 8;
++    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
++
++    let mut handles = Vec::with_capacity(WRITERS);
++    for i in 0..WRITERS {
++        // Even writers go through gateway A, odd through gateway B — so BOTH gateways are
++        // minting ids concurrently over the one shared store.
++        let gw = if i % 2 == 0 {
++            Arc::clone(&gw_a)
++        } else {
++            Arc::clone(&gw_b)
++        };
++        let barrier = Arc::clone(&barrier);
++        let key = format!("obj-{i}");
++        let body = payload(i as u8);
++        handles.push(tokio::spawn(async move {
++            // Align the start so the allocations actually race on the shared CAS allocator.
++            barrier.wait().await;
++            gw.put_object(&key, &body).await.map(|()| (key, body))
++        }));
++    }
++
++    // Every concurrent PUT must commit. Pre-fix the two gateways re-mint each other's inodes,
++    // so at least one create loses `require_absent(inode:k)` and its PUT errors here.
++    let mut stored = Vec::with_capacity(WRITERS);
++    for h in handles {
++        let (key, body) = h.await.expect("writer task must not panic").expect(
++            "every concurrent PUT over the shared fleet must commit — a bogus `Conflict` here \
++             is the second gateway re-minting an inode the first already committed (issue #477)",
++        );
++        stored.push((key, body));
++    }
++
++    // Every object round-trips byte-identical through BOTH gateways (one shared fleet). Reading
++    // through the OTHER gateway also proves the stores are genuinely shared. A chunk-id
++    // collision would have clobbered some object's fragments — caught here as a byte mismatch.
++    for (key, body) in &stored {
++        assert_eq!(
++            gw_a.get_object(key).await.expect("GET via A").as_deref(),
++            Some(&body[..]),
++            "object `{key}` must round-trip byte-identical through gateway A — no chunk-id \
++             collision clobbered its fragments",
++        );
++        assert_eq!(
++            gw_b.get_object(key).await.expect("GET via B").as_deref(),
++            Some(&body[..]),
++            "object `{key}` must round-trip byte-identical through gateway B — the stores are \
++             shared and its id is disjoint from every other writer's",
++        );
++    }
++
++    // The shared allocator handed out WRITERS **distinct** inodes under the concurrent
++    // contention: exactly one inode record per object, all different. Two objects sharing an
++    // inode would have failed a create above; this is the positive evidence that they did not.
++    let inode_keys = meta.scan(b"inode:").await.expect("scan inode records");
++    let inodes: HashSet<u64> = inode_keys
++        .iter()
++        .filter_map(|(k, _)| inode_id_of(k))
++        .collect();
++    assert_eq!(
++        inodes.len(),
++        WRITERS,
++        "each of the {WRITERS} concurrent objects must have its own inode — the shared \
++         `meta:next_inode` CAS allocator handed out {WRITERS} distinct ids under contention",
++    );
++}
++
++/// The mechanism the fix rests on, exercised directly and under genuine contention: many tasks
++/// call the production `cli::alloc_inode` against ONE shared store at once (released together
++/// from a barrier), and the allocator must hand each a **distinct** id — never two the same.
++/// This is the CAS-retry path the active-active gateway relies on; it is what makes two
++/// gateways minting inodes concurrently over the shared `meta:next_inode` counter safe.
++#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
++async fn shared_inode_allocator_hands_out_distinct_ids_under_contention() {
++    const ALLOCATORS: usize = 16;
++    let meta = MemMeta::default();
++    let barrier = Arc::new(tokio::sync::Barrier::new(ALLOCATORS));
++
++    let mut handles = Vec::with_capacity(ALLOCATORS);
++    for _ in 0..ALLOCATORS {
++        let meta = meta.clone();
++        let barrier = Arc::clone(&barrier);
++        handles.push(tokio::spawn(async move {
++            barrier.wait().await;
++            alloc_inode(&meta)
++                .await
++                .expect("alloc_inode under contention")
++        }));
++    }
++
++    let mut ids = Vec::with_capacity(ALLOCATORS);
++    for h in handles {
++        ids.push(h.await.expect("allocator task must not panic"));
++    }
++
++    let distinct: HashSet<u64> = ids.iter().copied().collect();
++    assert_eq!(
++        distinct.len(),
++        ALLOCATORS,
++        "the shared CAS allocator must never hand two concurrent callers the same inode id \
++         (got {ids:?}) — the contended path two active-active gateways rely on",
++    );
++}
+diff --git a/crates/server/tests/s3_http_wire.rs b/crates/server/tests/s3_http_wire.rs
+index bf9f5fe..ddac2fc 100644
+--- a/crates/server/tests/s3_http_wire.rs
++++ b/crates/server/tests/s3_http_wire.rs
+@@ -522,19 +522,20 @@ async fn get_declares_accurate_content_length_for_truncation_detection() {
+     );
+ }
+ 
+-/// Durability finding 1 (carry-forward): the in-process id allocators must **recover** from
+-/// persisted state on a restart, or a new-key PUT after a restart reuses a committed inode
+-/// id (a spurious conflict) and an overwrite reuses a committed chunk id (clobbering the
+-/// prior object's fragments). A restart is modelled by dropping the gateway and its store
+-/// handles and reopening the SAME persisted redb + filesystem state — the process-restart
+-/// equivalent (mirrors `core/tests/placement_record.rs`).
++/// Durability finding 1 (carry-forward), now cluster-safe (issue #477): a new-key PUT after a
++/// restart must NOT reuse a committed inode id (a spurious conflict) or a committed chunk id
++/// (clobbering the prior object's fragments). The gateway resumes inodes from the SHARED
++/// persisted `meta:next_inode` allocator (seeded by `recover`) and mints coordination-free
++/// chunk ids (a fresh random epoch, ADR-0019), so neither collides. A restart is modelled by
++/// dropping the gateway and its store handles and reopening the SAME persisted redb +
++/// filesystem state — the process-restart equivalent (mirrors `core/tests/placement_record.rs`).
+ #[tokio::test]
+ async fn restart_recovers_id_allocators_no_collision() {
+     let dir = tempfile::tempdir().expect("temp dir");
+     let db_path = dir.path().join("meta.redb");
+     let frags = dir.path().join("frags");
+ 
+-    // Process 1: store object A (inode 1, chunk 1), then "crash" (drop the handles).
++    // Process 1: store object A (inode 1), then "crash" (drop the handles).
+     {
+         let g1 = Gateway::new(
+             RedbMetadataStore::open(&db_path).expect("redb"),
+@@ -575,16 +576,30 @@ async fn restart_recovers_id_allocators_no_collision() {
+     );
+ }
+ 
+-/// Proves `recover` is **load-bearing**, not a no-op: the SAME restart *without* recovery
+-/// re-mints inode id 1 for a new key and collides with A's committed inode
+-/// (`metadata::create` is `require_absent` on the inode key), so the new-key PUT is
+-/// spuriously rejected. This is exactly the corruption finding 1 closes.
++/// A restart is safe **without** `recover` — but *only because the prior process already
++/// persisted the shared inode allocator* (issue #477, iteration-2 carry-forward: the earlier
++/// blanket "safe by construction" claim did not hold for a legacy store, so this test is
++/// narrowed to the case it actually proves). Under the cluster-safe scheme the gateway
++/// allocates inodes from the durable `meta:next_inode` CAS counter and mints coordination-free
++/// chunk ids (a fresh random epoch, ADR-0019). So when process 1 — running *this same code* —
++/// stores object A it also advances the persisted counter past A; a restarted process 2 then
++/// resumes strictly above A even if it never calls `recover`, and its fresh random chunk epoch
++/// keeps chunk ids disjoint. Under the OLD per-process counters this identical
++/// restart-without-recover replayed inode/chunk id 1 and corrupted the store (the finding-1
++/// bug); the coordinated-inode + coordination-free-chunk scheme removes that failure mode for
++/// this case outright.
++///
++/// The *migration* case — a store an older single-process gateway left with inodes on disk but
++/// **no** persisted counter — is a different matter: there `recover` is load-bearing, pinned by
++/// [`recover_seeds_the_allocator_over_a_legacy_store_without_meta_next_inode`].
+ #[tokio::test]
+-async fn restart_without_recover_collides_showing_the_bug() {
++async fn restart_without_recover_is_safe_when_prior_process_persisted_the_allocator() {
+     let dir = tempfile::tempdir().expect("temp dir");
+     let db_path = dir.path().join("meta.redb");
+     let frags = dir.path().join("frags");
+ 
++    // Process 1 (this same coordinated code): storing A advances the persisted `meta:next_inode`
++    // counter past A, so the on-disk store already carries the allocator state.
+     {
+         let g1 = Gateway::new(
+             RedbMetadataStore::open(&db_path).expect("redb"),
+@@ -594,36 +609,155 @@ async fn restart_without_recover_collides_showing_the_bug() {
+         g1.put_object("bucket/a", b"first").await.expect("PUT A");
+     }
+ 
+-    // Restart but SKIP recovery: the in-process counter replays from 1.
++    // Restart and SKIP recover: the persisted `meta:next_inode` counter still resumes the inode
++    // allocator above A, and a fresh random chunk epoch keeps the chunk ids disjoint — so the
++    // new-key PUT commits, with no collision.
+     let g2 = Gateway::new(
+         RedbMetadataStore::open(&db_path).expect("redb reopen"),
+         FsChunkStore::open(&frags).expect("fs reopen"),
+         MemCoordination::new(),
+     );
+-    let collided = g2.put_object("bucket/b", b"second").await;
+-    assert!(
+-        collided.is_err(),
+-        "without recover, a new-key PUT re-mints a committed inode id and is rejected — the \
+-         restart-collision bug finding 1 fixes",
++    g2.put_object("bucket/b", b"second").await.expect(
++        "a new-key PUT after a restart must commit without recover — the prior process persisted \
++         the allocator above A and the chunk epoch is fresh",
++    );
++
++    assert_eq!(
++        g2.get_object("bucket/a").await.expect("get A").as_deref(),
++        Some(&b"first"[..]),
++        "object A survives the restart intact — B's write did not clobber its fragments",
+     );
++    assert_eq!(
++        g2.get_object("bucket/b").await.expect("get B").as_deref(),
++        Some(&b"second"[..]),
++        "object B stored under fresh, non-colliding ids",
++    );
++}
++
++/// `recover` is **load-bearing for the migration case it exists for** (issue #477, iteration-2
++/// carry-forward). A store an *older single-process gateway* wrote carries committed objects
++/// under `inode:` keys but **no** persisted `meta:next_inode` counter — that gateway minted
++/// inodes from an in-process counter and never persisted one. A new gateway started over such a
++/// legacy store:
++///
++/// * **WITHOUT `recover`** re-mints inode 1 for a new key and collides with the legacy inode
++///   (`metadata::create` is `require_absent` on the inode key), so the new-key PUT is spuriously
++///   rejected — exactly the corruption finding 1 closes, and precisely why the plain
++///   restart-without-recover safety claim does *not* extend to a legacy store; but
++/// * **WITH `recover`** (`seed_next_inode_floor` over `high_water_marks`) seeds the persisted
++///   allocator strictly above every legacy inode, so the migrating PUT commits and both objects
++///   round-trip byte-identical.
++///
++/// The legacy on-disk shape is reproduced faithfully by storing an object through the current
++/// gateway (which writes `inode:1` **and** advances `meta:next_inode`) and then deleting the
++/// `meta:next_inode` key — the one artificial step that leaves exactly what the old gateway
++/// left: inodes present, allocator counter absent. This drives the production
++/// `Gateway::{recover, put_object, get_object}`, so it proves `recover` is not a no-op for the
++/// migration it targets.
++#[tokio::test]
++async fn recover_seeds_the_allocator_over_a_legacy_store_without_meta_next_inode() {
++    use wyrd_traits::{MetadataStore, WriteBatch};
++
++    // `cli::NEXT_INODE_KEY` is crate-private; the on-disk key it single-sources is
++    // `meta:next_inode` (`crates/server/src/cli.rs:56`).
++    const NEXT_INODE_KEY: &[u8] = b"meta:next_inode";
++
++    // Reproduce the on-disk shape an older single-process gateway left: a committed object A
++    // under `inode:` keys, but NO persisted allocator. Store A through the current gateway
++    // (which writes inode:1 AND advances meta:next_inode), then DELETE meta:next_inode — the one
++    // artificial step that models a legacy store (inodes present, counter absent).
++    async fn seed_legacy_store(db_path: &std::path::Path, frags: &std::path::Path) {
++        {
++            let g = Gateway::new(
++                RedbMetadataStore::open(db_path).expect("redb"),
++                FsChunkStore::open(frags).expect("fs store"),
++                MemCoordination::new(),
++            );
++            g.put_object("bucket/a", b"first").await.expect("PUT A");
++        }
++        let meta = RedbMetadataStore::open(db_path).expect("redb reopen to strip counter");
++        assert!(
++            meta.get(NEXT_INODE_KEY)
++                .await
++                .expect("get counter")
++                .is_some(),
++            "the current gateway must persist meta:next_inode, so stripping it models a legacy store",
++        );
++        meta.commit(WriteBatch::new().delete(NEXT_INODE_KEY.to_vec()))
++            .await
++            .expect("strip meta:next_inode to model a legacy single-process store");
++    }
++
++    // (1) Over a legacy store WITHOUT recover, the migrating new-key PUT collides — `recover` is
++    //     load-bearing here (unlike the persisted-counter restart above).
++    {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let db_path = dir.path().join("meta.redb");
++        let frags = dir.path().join("frags");
++        seed_legacy_store(&db_path, &frags).await;
++
++        let g = Gateway::new(
++            RedbMetadataStore::open(&db_path).expect("redb reopen"),
++            FsChunkStore::open(&frags).expect("fs reopen"),
++            MemCoordination::new(),
++        );
++        let collided = g.put_object("bucket/b", b"second").await;
++        assert!(
++            collided.is_err(),
++            "over a legacy store WITHOUT recover, a new-key PUT re-mints inode 1 and collides \
++             with the legacy inode — recover is load-bearing for the migration finding 1 closes",
++        );
++    }
++
++    // (2) Over the same legacy shape WITH recover, the allocator is seeded above the legacy
++    //     inode, so the migrating PUT commits and both objects round-trip byte-identical.
++    {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let db_path = dir.path().join("meta.redb");
++        let frags = dir.path().join("frags");
++        seed_legacy_store(&db_path, &frags).await;
++
++        let g = Gateway::new(
++            RedbMetadataStore::open(&db_path).expect("redb reopen"),
++            FsChunkStore::open(&frags).expect("fs reopen"),
++            MemCoordination::new(),
++        );
++        g.recover()
++            .await
++            .expect("recover seeds meta:next_inode above the legacy inodes");
++        g.put_object("bucket/b", b"second").await.expect(
++            "after recover, a new-key PUT over the legacy store must commit — the allocator is \
++             seeded above the legacy inode",
++        );
++        assert_eq!(
++            g.get_object("bucket/a").await.expect("get A").as_deref(),
++            Some(&b"first"[..]),
++            "legacy object A survives the migration byte-identical",
++        );
++        assert_eq!(
++            g.get_object("bucket/b").await.expect("get B").as_deref(),
++            Some(&b"second"[..]),
++            "object B stored under a fresh, non-colliding inode after recover",
++        );
++    }
+ }
+ 
+-/// Durability finding (iter-8 carry-forward): the id allocators must recover from the
+-/// **orphan ledger** too, not only `inode:`/`pending:`. After `PUT → DELETE → restart` a
+-/// deleted object's inode key is gone and its chunk was already committed (so no `pending:`
+-/// entry survives), yet its fragments live on under a grace record (`orphan:<ds>:<chunk>:
+-/// <index>`, `crates/core/src/metadata.rs:60`) until the custodian GC's reader-safe window
+-/// elapses (`crates/custodian/src/gc.rs:134-141`). If `recover` does not count those chunk
+-/// ids it re-mints one for the next object; the stale orphan record then reclaims a fragment
+-/// the re-minting object just wrote — permanent data loss.
++/// Durability finding (iter-8 carry-forward), now cluster-safe (issue #477): a new object
++/// minted after `PUT → DELETE → restart` must not collide with the **orphan ledger**. After a
++/// DELETE the deleted object's inode key is gone and its chunk was already committed (so no
++/// `pending:` entry survives), yet its fragments live on under a grace record
++/// (`orphan:<ds>:<chunk>:<index>`, `crates/core/src/metadata.rs:60`) until the custodian GC's
++/// reader-safe window elapses (`crates/custodian/src/gc.rs:134-141`). If the next object
++/// re-minted that chunk id, the stale orphan record would reclaim a fragment the new object
++/// just wrote — permanent data loss.
+ ///
+ /// This drives the **production** paths (`put_object` / `delete_object` / `recover` /
+ /// `get_object`) and then performs exactly the reclaim the orphan ledger authorises — GC
+-/// deletes each fragment the ledger names once its grace elapses
+-/// (`gc.rs:136,152`) — by deleting those very fragments through the same `ChunkStore`. With
+-/// the orphan scan, B is minted a *fresh* chunk id, so reclaiming the old object's fragments
+-/// leaves B byte-identical. Without it, B re-mints the orphaned chunk id and the reclaim
+-/// deletes B's own fragments: GET B fails. RED before the orphan scan, GREEN after.
++/// deletes each fragment the ledger names once its grace elapses (`gc.rs:136,152`) — by
++/// deleting those very fragments through the same `ChunkStore`. Because chunk ids are now
++/// coordination-free (a fresh random epoch per process, ADR-0019), B's id is disjoint from the
++/// deleted object's orphaned id **by construction**, so reclaiming the old fragments leaves B
++/// byte-identical — no orphan-ledger scan of a per-process counter is needed to keep them apart.
+ #[tokio::test]
+ async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
+     use wyrd_core::metadata::{parse_orphan_key, ORPHAN_PREFIX};
+@@ -634,9 +768,9 @@ async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
+     let frags = dir.path().join("frags");
+     let object_b = b"object B must survive an orphan-ledger reclaim of the deleted object A";
+ 
+-    // Process 1: store object A (inode 1, chunk 1), then DELETE it — its fragments are now
+-    // orphaned under the grace ledger (still on disk), its inode key removed, its pending
+-    // ledger already cleared at commit. Then "crash" (drop the handles).
++    // Process 1: store object A (inode 1), then DELETE it — its fragments are now orphaned
++    // under the grace ledger (still on disk), its inode key removed, its pending ledger already
++    // cleared at commit. Then "crash" (drop the handles).
+     {
+         let g1 = Gateway::new(
+             RedbMetadataStore::open(&db_path).expect("redb"),
+@@ -686,9 +820,9 @@ async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
+     }
+ 
+     // Object B must still round-trip byte-identical: its fragments were minted under a chunk
+-    // id DISJOINT from the reclaimed orphan chunk, so the reclaim never touched them. Without
+-    // the orphan-ledger scan in `high_water_marks`, B re-mints the orphaned chunk id and the
+-    // reclaim above deletes B's own fragments — this GET then fails.
++    // id DISJOINT from the reclaimed orphan chunk (a fresh random epoch, ADR-0019), so the
++    // reclaim never touched them. Were the gateway to re-mint the orphaned chunk id, the
++    // reclaim above would delete B's own fragments — this GET would then fail.
+     let g3 = Gateway::new(
+         RedbMetadataStore::open(&db_path).expect("redb reopen for read"),
+         FsChunkStore::open(&frags).expect("fs reopen for read"),
