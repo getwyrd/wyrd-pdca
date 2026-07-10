@@ -1,0 +1,1073 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a1c1af8..b82785d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5102,6 +5102,7 @@ dependencies = [
+  "bytes",
+  "foundationdb",
+  "futures-util",
++ "serde_json",
+  "tokio",
+  "wyrd-metadata-conformance",
+  "wyrd-traits",
+diff --git a/crates/metadata-fdb/Cargo.toml b/crates/metadata-fdb/Cargo.toml
+index c62a01c..2ff4795 100644
+--- a/crates/metadata-fdb/Cargo.toml
++++ b/crates/metadata-fdb/Cargo.toml
+@@ -19,7 +19,7 @@ publish.workspace = true
+ # while the dedicated `xtask fdb-conformance` job turns the feature on and drives the
+ # shared suite against the throwaway `deploy/` fdbserver.
+ default = []
+-fdb = ["dep:foundationdb", "dep:tokio", "dep:async-trait", "dep:bytes"]
++fdb = ["dep:foundationdb", "dep:tokio", "dep:async-trait", "dep:bytes", "dep:serde_json"]
+ 
+ [dependencies]
+ wyrd-traits.workspace = true
+@@ -30,6 +30,11 @@ foundationdb = { workspace = true, optional = true }
+ tokio = { workspace = true, optional = true }
+ async-trait = { workspace = true, optional = true }
+ bytes = { workspace = true, optional = true }
++# Parses `Database::get_client_status()`'s JSON for the #441 version-skew preflight
++# (`store::client_status`). Not new to the workspace tree — already pinned in the root
++# `Cargo.toml` and used by `wyrd-core`/`wyrd-server` — only new to this crate's own
++# graph, and only under the already-optional `fdb` feature.
++serde_json = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
+ # The conformance test drives the SHARED trait-contract suite — the same `run_all`
+@@ -44,7 +49,7 @@ futures-util.workspace = true
+ # `foundationdb` and the runtime deps are used only under the `fdb` feature; keep
+ # cargo-machete quiet on the default (feature-off) scan, where they look unreferenced.
+ [package.metadata.cargo-machete]
+-ignored = ["foundationdb", "tokio", "async-trait", "bytes"]
++ignored = ["foundationdb", "tokio", "async-trait", "bytes", "serde_json"]
+ 
+ # Inherit the workspace lint policy (single source of truth in the root
+ # Cargo.toml [workspace.lints.*]).
+diff --git a/crates/metadata-fdb/src/lib.rs b/crates/metadata-fdb/src/lib.rs
+index 0a67433..40f8366 100644
+--- a/crates/metadata-fdb/src/lib.rs
++++ b/crates/metadata-fdb/src/lib.rs
+@@ -389,6 +389,14 @@ pub mod config {
+     /// [`CLUSTER_FILE_ENV`] is unset or blank.
+     pub const DEFAULT_CLUSTER_FILE: &str = "/etc/foundationdb/fdb.cluster";
+ 
++    /// The environment variable naming a **multi-version client** external-client
++    /// directory (#441; `docs/design/architecture/07-deployment-view.md` §7.6): a directory
++    /// of additional `libfdb_c` versions FoundationDB's own `ExternalClientDirectory`
++    /// network option loads, letting one client bridge a lockstep cluster upgrade. Unset
++    /// means today's behaviour — `store::ensure_network` boots with no such option set,
++    /// byte-identical to before this env var existed.
++    pub const EXTERNAL_CLIENT_DIR_ENV: &str = "WYRD_FDB_EXTERNAL_CLIENT_DIR";
++
+     /// The environment variable bounding how long one FoundationDB transaction may run,
+     /// in milliseconds. Unset, unparsable, or non-positive falls back to
+     /// [`DEFAULT_TRANSACTION_TIMEOUT_MS`].
+@@ -432,6 +440,14 @@ pub mod config {
+         }
+     }
+ 
++    /// Resolve [`EXTERNAL_CLIENT_DIR_ENV`] into an optional external-client-directory path.
++    /// An unset or whitespace-only value is `None` — no `ExternalClientDirectory` network
++    /// option is set, and the network boots exactly as it did before this env var existed.
++    #[must_use]
++    pub fn external_client_dir(raw: Option<String>) -> Option<String> {
++        raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
++    }
++
+     /// Resolve the per-transaction deadline from a raw [`TRANSACTION_TIMEOUT_ENV`] value.
+     /// Unset, blank, unparsable, or non-positive falls back to
+     /// [`DEFAULT_TRANSACTION_TIMEOUT_MS`] via [`sanitize_transaction_timeout_ms`].
+@@ -481,6 +497,24 @@ pub mod config {
+             assert_eq!(cluster_file(Some("   ".into())), DEFAULT_CLUSTER_FILE);
+         }
+ 
++        #[test]
++        fn an_explicit_external_client_dir_wins() {
++            assert_eq!(
++                external_client_dir(Some("/opt/fdb/multiversion".into())),
++                Some("/opt/fdb/multiversion".to_string())
++            );
++            assert_eq!(
++                external_client_dir(Some("  /opt/fdb/multiversion \n".into())),
++                Some("/opt/fdb/multiversion".to_string())
++            );
++        }
++
++        #[test]
++        fn an_absent_or_blank_external_client_dir_is_none() {
++            assert_eq!(external_client_dir(None), None);
++            assert_eq!(external_client_dir(Some("   ".into())), None);
++        }
++
+         #[test]
+         fn an_explicit_transaction_timeout_wins() {
+             assert_eq!(transaction_timeout_ms(Some("250".into())), 250);
+@@ -762,22 +796,237 @@ pub mod paging {
+     }
+ }
+ 
++/// Fail-closed, **non-feature-gated** readiness classification for the FDB client's
++/// connection to its cluster (#441) — a third pure sibling to [`classify`] and [`config`]:
++/// pure input → output, no `foundationdb` type in any signature, so it compiles and its
++/// unit tests run on **every** machine, FDB or not, in the default `cargo xtask ci`.
++///
++/// # Why this exists
++///
++/// The `foundationdb` C client binds **exactly** to its cluster's wire protocol: a client
++/// built against one FDB version cannot talk to a cluster running another, at all, ever.
++/// Before this module, a version-mismatched client hit the same bounded-but-anonymous `1031
++/// transaction_timed_out` ([`classify::TRANSACTION_TIMED_OUT`]) a genuinely unreachable
++/// cluster produces — an operator who mismatched their client saw the same error as one
++/// whose cluster was simply down. [`verdict`] turns `Database::get_client_status()`'s JSON —
++/// reduced to [`ClientStatus`] by the feature-gated `store` module below; this module never
++/// touches FDB types — into a diagnosis the matching [`message`] can act on.
++///
++/// # The discrimination rule
++///
++/// Established empirically at Plan against a live `libfdb_c` 7.3.77, not guessed: a
++/// connection whose `Status` reports `"connected"` but whose `Compatible` reports `false` is
++/// version skew — **not** "zero reachable coordinators" (under skew the `Coordinators` list
++/// stays populated) and **not** `Healthy == false` alone (that is false in the unreachable
++/// case too). An unreachable cluster's connection instead reports `Status == "failed"` and
++/// carries **no** `ProtocolVersion` at all. [`ClientStatus`] carries the already-reduced
++/// shape — [`ClientStatus::coordinators_reachable`] is `Status == "connected"`;
++/// [`ClientStatus::cluster_protocol`] is `Some` only when the connection reported a protocol
++/// version for a connection that turned out incompatible — so [`verdict`] itself never
++/// inspects raw JSON.
++///
++/// **Fail-honest, always.** An absent, late, unparsable, or novel status — anything
++/// [`verdict`] cannot positively identify as skew within the caller's deadline — degrades to
++/// [`Verdict::Unreachable`] with a version-coupling hint in [`message`], never a guessed
++/// [`Verdict::VersionSkew`].
++pub mod preflight {
++    use std::time::Duration;
++
++    /// The client-side status this module classifies, already reduced from
++    /// `Database::get_client_status()`'s raw JSON by the feature-gated `store` module
++    /// (`store::client_status`) — never constructed here, so this module never depends on
++    /// `foundationdb` or a JSON crate.
++    #[derive(Debug, Clone, PartialEq, Eq)]
++    pub struct ClientStatus {
++        /// The status JSON's top-level `Healthy`.
++        pub healthy: bool,
++        /// Whether the (first) connection reported `Status == "connected"` — a
++        /// network-level signal, deliberately **not** derived from the `Coordinators` list,
++        /// which the skew fixture shows stays populated even when the protocol is
++        /// incompatible.
++        pub coordinators_reachable: bool,
++        /// This client's own version, for the operator-facing message. Not the exact
++        /// `fdb_get_client_version()` string — `foundationdb` 0.10's safe API does not
++        /// expose it — but the API version `get_max_api_version()` returns, plus this
++        /// crate's `fdb-7_3` pin.
++        pub client_version: String,
++        /// The **cluster's** reported protocol version, present only when the connection is
++        /// `"connected"` **and** incompatible — i.e. only in the version-skew shape. `None`
++        /// for both the unreachable shape (no protocol exchange happens at all) and the
++        /// healthy shape (nothing to report — client and cluster already agree).
++        pub cluster_protocol: Option<String>,
++    }
++
++    /// What [`verdict`] concluded.
++    #[derive(Debug, Clone, PartialEq, Eq)]
++    pub enum Verdict {
++        /// The store may proceed: the client reached the cluster and the protocol versions
++        /// agree.
++        Ready,
++        /// The client and cluster disagree on protocol version. `client` is this client's
++        /// own version; `cluster` is the cluster's.
++        VersionSkew {
++            /// This client's own version (API version + the crate's `fdb-7_3` pin).
++            client: String,
++            /// The cluster's reported protocol version.
++            cluster: Option<String>,
++        },
++        /// The cluster could not be confirmed reachable within the caller's deadline — the
++        /// honest fallback for everything [`verdict`] cannot positively call skew, including
++        /// a missing, unparsable, or late-arriving status.
++        Unreachable {
++            /// How long the caller waited before giving up.
++            waited: Duration,
++        },
++    }
++
++    /// Classify a client-status probe. Pure: no I/O, no `foundationdb` type — the
++    /// non-feature-gated seam that makes this decision unit-testable on any machine.
++    ///
++    /// `status` is `None` when the probe itself produced nothing to classify (the
++    /// `Database::get_client_status()` call errored, or never returned before `deadline`).
++    /// Only a status that arrives **strictly within** `deadline` is trusted for a positive
++    /// [`Verdict::Ready`] or [`Verdict::VersionSkew`] call — a bounded probe that overran its
++    /// own bound is not "just in time", it is indistinguishable from luck, so it degrades to
++    /// [`Verdict::Unreachable`] like a missing status would. This is what makes `deadline` a
++    /// real input rather than a pass-through: the fail-honest rule (module docs) applies to
++    /// **lateness**, not only to absence.
++    #[must_use]
++    pub fn verdict(
++        status: Option<&ClientStatus>,
++        elapsed: Duration,
++        deadline: Duration,
++    ) -> Verdict {
++        match status {
++            Some(status)
++                if elapsed < deadline && status.healthy && status.coordinators_reachable =>
++            {
++                Verdict::Ready
++            }
++            Some(status)
++                if elapsed < deadline
++                    && status.coordinators_reachable
++                    && status.cluster_protocol.is_some() =>
++            {
++                Verdict::VersionSkew {
++                    client: status.client_version.clone(),
++                    cluster: status.cluster_protocol.clone(),
++                }
++            }
++            _ => Verdict::Unreachable { waited: elapsed },
++        }
++    }
++
++    /// Render an operator-facing message for `v`. Mainly useful for [`Verdict::VersionSkew`]
++    /// and [`Verdict::Unreachable`] — `FdbMetadataStore::connect()` turns either into its
++    /// `Err`; [`Verdict::Ready`] callers have nothing to report.
++    #[must_use]
++    pub fn message(v: &Verdict) -> String {
++        match v {
++            Verdict::Ready => "FoundationDB metadata store: ready.".to_string(),
++            Verdict::VersionSkew { client, cluster } => {
++                let cluster = cluster.as_deref().unwrap_or("<not reported>");
++                format!(
++                    "FoundationDB metadata store: client/cluster protocol version mismatch \
++                     — this client is {client}, the cluster reports protocol version \
++                     {cluster}. A FoundationDB client cannot talk to a cluster running a \
++                     different protocol version, ever: load the cluster's `libfdb_c` into a \
++                     multi-version external-client directory and point \
++                     WYRD_FDB_EXTERNAL_CLIENT_DIR at it, then upgrade the cluster and drop \
++                     the old library once every client has the new one — see the \
++                     multi-version client upgrade procedure in \
++                     docs/design/architecture/07-deployment-view.md.",
++                )
++            }
++            Verdict::Unreachable { waited } => format!(
++                "FoundationDB metadata store: cluster unreachable after waiting {waited:?} \
++                 for a client-status response. The client could not even determine the \
++                 cluster's protocol version, so this is reported as unreachable rather than \
++                 a guessed version skew. Check that fdbserver is running and that \
++                 WYRD_FDB_CLUSTER_FILE points at a reachable cluster file; if this follows a \
++                 FoundationDB upgrade, an unmigrated client is also worth ruling out — see \
++                 the multi-version client upgrade procedure in \
++                 docs/design/architecture/07-deployment-view.md.",
++            ),
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++
++        fn status(
++            healthy: bool,
++            coordinators_reachable: bool,
++            cluster_protocol: Option<&str>,
++        ) -> ClientStatus {
++            ClientStatus {
++                healthy,
++                coordinators_reachable,
++                client_version: "api 730 (fdb-7_3 pin)".to_string(),
++                cluster_protocol: cluster_protocol.map(str::to_string),
++            }
++        }
++
++        #[test]
++        fn a_healthy_connected_client_is_ready() {
++            let s = status(true, true, None);
++            assert_eq!(
++                verdict(Some(&s), Duration::from_millis(50), Duration::from_secs(5)),
++                Verdict::Ready
++            );
++        }
++
++        #[test]
++        fn no_status_at_all_is_unreachable_not_a_guess() {
++            assert_eq!(
++                verdict(None, Duration::from_secs(5), Duration::from_secs(5)),
++                Verdict::Unreachable {
++                    waited: Duration::from_secs(5)
++                }
++            );
++        }
++
++        #[test]
++        fn a_status_that_only_arrives_at_the_deadline_is_not_trusted() {
++            // Even a status that LOOKS healthy is not believed if it took the entire
++            // budget to arrive: a bounded probe that overran its bound is indistinguishable
++            // from luck, not a confirmed Ready.
++            let s = status(true, true, None);
++            assert_eq!(
++                verdict(Some(&s), Duration::from_secs(5), Duration::from_secs(5)),
++                Verdict::Unreachable {
++                    waited: Duration::from_secs(5)
++                }
++            );
++        }
++
++        #[test]
++        fn ready_message_names_no_version_at_all() {
++            let msg = message(&Verdict::Ready);
++            assert!(!msg.contains("mismatch"));
++        }
++    }
++}
++
+ #[cfg(feature = "fdb")]
+ mod store {
+     //! The live driver. Compiled only under `--features fdb`, which links `libfdb_c`.
+ 
+     use std::fmt;
+     use std::sync::OnceLock;
++    use std::time::{Duration, Instant};
+ 
+     use async_trait::async_trait;
+     use bytes::Bytes;
+-    use foundationdb::api::NetworkAutoStop;
+-    use foundationdb::options::{StreamingMode, TransactionOption};
++    use foundationdb::api::{FdbApiBuilder, NetworkAutoStop};
++    use foundationdb::options::{NetworkOption, StreamingMode, TransactionOption};
+     use foundationdb::{Database, FdbError, RangeOption, Transaction, TransactionCommitError};
+     use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
+ 
+     use crate::classify::{self, CommitClass, CommitUnknownResult};
+     use crate::paging::{self, PageStep, ScanCapExceeded};
++    use crate::preflight;
+     use crate::{config, keyspace};
+ 
+     /// How many attempts a **read** or a **blind** (precondition-free) commit makes on a
+@@ -853,23 +1102,109 @@ mod store {
+     static NETWORK: OnceLock<NetworkAutoStop> = OnceLock::new();
+ 
+     /// Boot the FDB client network thread exactly once per process.
++    ///
++    /// Takes the same [`FdbApiBuilder`] → `NetworkBuilder` → `.boot()` path
++    /// `foundationdb::boot()` takes internally, but stops short of that top-level
++    /// convenience function so [`config::EXTERNAL_CLIENT_DIR_ENV`] can set
++    /// `NetworkOption::ExternalClientDirectory` first — the **multi-version client** #441's
++    /// lockstep-upgrade dance depends on
++    /// (`docs/design/architecture/07-deployment-view.md` §7.6). When the env var is unset,
++    /// the network boots exactly as `foundationdb::boot()` would have: no network option is
++    /// set, byte-identical to this function's behaviour before this env var existed.
+     fn ensure_network() -> &'static NetworkAutoStop {
+         NETWORK.get_or_init(|| {
+-            // SAFETY: `foundationdb::boot()` selects the API version, starts the client run
++            let builder = FdbApiBuilder::default()
++                .build()
++                .expect("fdb api initialized");
++            let builder = match config::external_client_dir(
++                std::env::var(config::EXTERNAL_CLIENT_DIR_ENV).ok(),
++            ) {
++                Some(dir) => builder
++                    .set_option(NetworkOption::ExternalClientDirectory(dir))
++                    .expect(
++                        "WYRD_FDB_EXTERNAL_CLIENT_DIR names a directory the FDB client accepts",
++                    ),
++                None => builder,
++            };
++            // SAFETY: `NetworkBuilder::boot` selects the API version, starts the client run
+             // loop on a dedicated thread, and returns the guard that stops it. Its two
+             // documented requirements are (1) it is called at most once per process and (2)
+             // the returned guard outlives every `Database`. `OnceLock::get_or_init` gives
+             // (1) — the initializer runs exactly once, even under the repeated `make_store`
+             // calls of the conformance suite — and storing the guard in a `static` that is
+             // never dropped gives (2). There is no safe alternative in the `foundationdb`
+-            // crate: `api::NetworkBuilder::boot` is `unsafe` as well.
++            // crate: `api::NetworkBuilder::boot` is `unsafe` as well — the same requirement
++            // `foundationdb::boot()` carried before this function inlined its body to reach
++            // the builder's `set_option`.
+             #[allow(unsafe_code)]
+             unsafe {
+-                foundationdb::boot()
++                builder.boot().expect("fdb network running")
+             }
+         })
+     }
+ 
++    /// How long [`FdbMetadataStore::preflight`] pauses between `get_client_status()` polls
++    /// while a connection is still `"connecting"`. Verified live against `libfdb_c` 7.3.77:
++    /// a fresh `Database`'s connection settles (to `"connected"` or `"failed"`) within
++    /// ~0.2–2s, so a poll interval well under that — and well under the deadline — costs at
++    /// most one wasted round-trip's worth of latency without turning the probe into a busy
++    /// loop.
++    const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
++
++    /// Reduce `Database::get_client_status()`'s raw client-status JSON into the pure
++    /// [`preflight::ClientStatus`] shape, using only the fields #441's design proposal's
++    /// fixture table showed distinguish skew, unreachable, and healthy: `Healthy`,
++    /// `Connections[0].Status`, `Connections[0].Compatible`, `Connections[0].ProtocolVersion`.
++    ///
++    /// **`None` means "not yet actionable", not only "unparsable".** A connection whose
++    /// `Status` is still `"connecting"` — the shape every fresh `Database` reports for a
++    /// beat before it settles (see [`STATUS_POLL_INTERVAL`]) — is `None` too, so
++    /// [`FdbMetadataStore::preflight`]'s poll loop keeps waiting instead of treating an
++    /// in-flight dial as a settled verdict. Anything else that fails to parse — a missing
++    /// field, a shape this probe has never seen — is also `None`, which [`preflight::verdict`]
++    /// degrades to `Unreachable` rather than a guessed `VersionSkew` (fail-honest, the
++    /// `preflight` module docs).
++    fn client_status(bytes: &[u8]) -> Option<preflight::ClientStatus> {
++        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
++        let healthy = value.get("Healthy")?.as_bool()?;
++        let connection = value
++            .get("Connections")
++            .and_then(serde_json::Value::as_array)
++            .and_then(|conns| conns.first());
++        let status_str = connection
++            .and_then(|c| c.get("Status"))
++            .and_then(serde_json::Value::as_str);
++        if status_str == Some("connecting") {
++            // Not yet settled: let the caller poll again rather than judge an in-flight
++            // dial as Unreachable.
++            return None;
++        }
++        let coordinators_reachable = status_str.is_some_and(|s| s == "connected");
++        // `Compatible` defaults to `true` (never absent-and-incompatible) so an
++        // unparsable connection never manufactures a version-skew claim.
++        let compatible = connection
++            .and_then(|c| c.get("Compatible"))
++            .and_then(serde_json::Value::as_bool)
++            .unwrap_or(true);
++        let cluster_protocol = if compatible {
++            None
++        } else {
++            connection
++                .and_then(|c| c.get("ProtocolVersion"))
++                .and_then(serde_json::Value::as_str)
++                .map(str::to_string)
++        };
++        Some(preflight::ClientStatus {
++            healthy,
++            coordinators_reachable,
++            client_version: format!(
++                "api {} (fdb-7_3 pin)",
++                foundationdb::api::get_max_api_version()
++            ),
++            cluster_protocol,
++        })
++    }
++
+     /// A [`MetadataStore`] backed by a FoundationDB cluster (ADR-0042). Metadata keys and
+     /// values are stored **byte-identically** — FDB never interprets a key or a value — so
+     /// the application-level version CAS (a full-value precondition) is exact.
+@@ -895,15 +1230,95 @@ mod store {
+         /// Configuration is owned here, by the driver's own constructor: no `server`-side
+         /// selection arm exists yet (that is a later, blocked issue), so there is nowhere
+         /// else for it to live.
+-        pub fn connect() -> Result<Self> {
++        ///
++        /// Unlike [`Self::open`], `connect()` performs a bounded, fail-closed readiness
++        /// probe before returning `Ok` (#441) — see [`Self::preflight`]. This is the
++        /// operator path reached from `crates/server/src/cli.rs:175` (`open_fdb_meta`);
++        /// [`Self::open`] stays probe-free so the conformance/scan/timeout test harnesses,
++        /// which deliberately point at unreachable clusters, are unaffected.
++        ///
++        /// **`async`, and that is load-bearing.** The probe awaits
++        /// `Database::get_client_status()`, a `foundationdb` future that only resolves on a
++        /// running reactor. Every caller of this constructor is already inside a Tokio
++        /// runtime — `open_fdb_meta` (`crates/server/src/cli.rs:175`) is reached from seven
++        /// call sites, four directly inside `runtime.block_on(async { … })` and three inside
++        /// an `async fn` — so a synchronous `connect()` could only drive that future by
++        /// building its **own** runtime and calling `Runtime::block_on` on it, which Tokio
++        /// panics on ("Cannot start a runtime from within a runtime"). Awaiting on the
++        /// caller's runtime is the only shape that works, and it is the shape the TiKV peer
++        /// already uses (`open_tikv_meta`, `crates/server/src/cli.rs:147`).
++        pub async fn connect() -> Result<Self> {
+             let store = Self::open(&config::cluster_file(
+                 std::env::var(config::CLUSTER_FILE_ENV).ok(),
+             ))?;
+-            Ok(
+-                store.with_transaction_timeout_ms(config::transaction_timeout_ms(
+-                    std::env::var(config::TRANSACTION_TIMEOUT_ENV).ok(),
+-                )),
+-            )
++            let store = store.with_transaction_timeout_ms(config::transaction_timeout_ms(
++                std::env::var(config::TRANSACTION_TIMEOUT_ENV).ok(),
++            ));
++            store.preflight().await?;
++            Ok(store)
++        }
++
++        /// The bounded, fail-closed readiness check [`Self::connect`] performs before
++        /// returning `Ok` (#441). Feeds `Database::get_client_status()`'s JSON (via
++        /// [`client_status`]) into the pure [`preflight::verdict`] and returns
++        /// `Err(preflight::message(..))` on anything but `Ready`, so a client/cluster
++        /// protocol mismatch is reported as *itself* — naming the cluster's protocol version
++        /// and the multi-version upgrade procedure — instead of the anonymous `1031
++        /// transaction_timed_out` the first real transaction would otherwise hit (see this
++        /// crate's `preflight` module docs).
++        ///
++        /// Bounded by this store's own transaction deadline, the same one every transaction
++        /// it creates carries, so a genuinely unreachable cluster fails this probe no more
++        /// slowly than it would have failed the first `get`/`commit`.
++        ///
++        /// **Runs on the caller's runtime.** It owns no runtime and calls no `block_on`; it
++        /// is an `async fn` awaited by [`Self::connect`], which is awaited by
++        /// `open_fdb_meta`. See [`Self::connect`] for why any other shape panics.
++        ///
++        /// **Polls, rather than calling `get_client_status()` once.** Verified live against
++        /// `libfdb_c` 7.3.77 (`deploy/fdb-single-node`): immediately after `Database::new`
++        /// the JSON's `Connections[0].Status` is `"connecting"` — settling to `"connected"`
++        /// or `"failed"` only after (observed) ~0.2–2s. [`client_status`] treats an unsettled
++        /// `"connecting"` connection the same as an unparsable one (`None`), so a single call
++        /// would misclassify *every* fresh, perfectly healthy connect as `Unreachable`. This
++        /// loop instead re-polls at [`STATUS_POLL_INTERVAL`] until a settled status is parsed
++        /// or the deadline elapses — still a single bounded probe from the caller's
++        /// perspective, never slower than that deadline.
++        ///
++        /// `pub` so the cluster-file-free regression case in `tests/timeout.rs` can drive
++        /// this exact production probe against an unreachable coordinator from inside a
++        /// Tokio runtime.
++        pub async fn preflight(&self) -> Result<()> {
++            let deadline = Duration::from_millis(u64::try_from(self.timeout_ms).unwrap_or(0));
++            let started = Instant::now();
++            let status = loop {
++                let remaining = deadline.saturating_sub(started.elapsed());
++                if remaining.is_zero() {
++                    break None;
++                }
++                match tokio::time::timeout(remaining, self.db.get_client_status()).await {
++                    Ok(Ok(bytes)) => {
++                        if let Some(status) = client_status(&bytes) {
++                            break Some(status);
++                        }
++                        // Unsettled ("connecting") or unparsable this round: a short pause,
++                        // still bounded by `remaining` on the next lap.
++                        let pause =
++                            STATUS_POLL_INTERVAL.min(deadline.saturating_sub(started.elapsed()));
++                        if pause.is_zero() {
++                            break None;
++                        }
++                        tokio::time::sleep(pause).await;
++                    }
++                    Ok(Err(_)) | Err(_) => break None,
++                }
++            };
++            let elapsed = started.elapsed();
++
++            match preflight::verdict(status.as_ref(), elapsed, deadline) {
++                preflight::Verdict::Ready => Ok(()),
++                other => Err(preflight::message(&other).into()),
++            }
+         }
+ 
+         /// Open the store against an explicit `cluster_file` path, with the default
+diff --git a/crates/metadata-fdb/tests/conformance.rs b/crates/metadata-fdb/tests/conformance.rs
+index 91a6035..ba442d4 100644
+--- a/crates/metadata-fdb/tests/conformance.rs
++++ b/crates/metadata-fdb/tests/conformance.rs
+@@ -35,6 +35,70 @@ fn trait_contract_against_fdb() {
+     run(cluster_file);
+ }
+ 
++/// The **production** constructor, driven the way production drives it: `connect()` awaited
++/// from inside a Tokio runtime, resolving its own cluster file from `WYRD_FDB_CLUSTER_FILE`
++/// (#441).
++///
++/// `open()` — what the suite above uses — is deliberately probe-free. `connect()` is the
++/// operator path (`open_fdb_meta`, `crates/server/src/cli.rs:175`, awaited from seven call
++/// sites), and it is the one that runs the version-skew readiness probe. This case is the
++/// only place the *whole* production entry point runs: env resolution → `Database::new` →
++/// `preflight().await` → `Ok`.
++///
++/// It pins two things a pure unit test cannot:
++///
++/// 1. **No nested runtime.** Every caller of `connect()` is already on a runtime, so a
++///    `connect()` that drove its probe on a runtime of its own would panic here with
++///    *"Cannot start a runtime from within a runtime"* — the exact way a `wyrd
++///    --metadata-backend fdb` invocation would die, in code no `cargo xtask ci` job
++///    compiles.
++/// 2. **`Ready` against a real, matched cluster.** `store::client_status` parses the real
++///    `get_client_status()` JSON of the live `libfdb_c`, and `preflight::verdict` calls it
++///    `Ready` — so the probe now standing in front of every production connect does not
++///    reject the healthy case it must let through.
++#[test]
++fn connect_probes_the_real_cluster_from_inside_a_runtime() {
++    let Some(cluster_file) = cluster_file() else {
++        eprintln!(
++            "wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE not set — skipping the FoundationDB \
++             connect probe (clean skip; the gate stays green without an FDB)."
++        );
++        return;
++    };
++    run_connect(cluster_file);
++}
++
++/// `connect()` reads `WYRD_FDB_CLUSTER_FILE` itself — the value `xtask fdb-conformance`
++/// exported. `cluster_file` is re-read here only so the skip gate and the failure message
++/// name the same cluster; nothing mutates the environment.
++#[cfg(feature = "fdb")]
++fn run_connect(cluster_file: String) {
++    use wyrd_metadata_fdb::FdbMetadataStore;
++
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .expect("tokio runtime");
++
++    let store = runtime.block_on(async { FdbMetadataStore::connect().await });
++
++    assert!(
++        store.is_ok(),
++        "connect() must reach the matched cluster at {cluster_file} and pass its readiness \
++         probe; it returned: {:?}",
++        store.err().map(|e| e.to_string()),
++    );
++}
++
++#[cfg(not(feature = "fdb"))]
++fn run_connect(cluster_file: String) {
++    let _ = cluster_file;
++    eprintln!(
++        "wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE is set but the crate was built without \
++         `--features fdb` — skipping. Run it via `cargo xtask fdb-conformance`."
++    );
++}
++
+ #[cfg(feature = "fdb")]
+ fn run(cluster_file: String) {
+     use wyrd_metadata_conformance as conformance;
+diff --git a/crates/metadata-fdb/tests/preflight.rs b/crates/metadata-fdb/tests/preflight.rs
+new file mode 100644
+index 0000000..2d18770
+--- /dev/null
++++ b/crates/metadata-fdb/tests/preflight.rs
+@@ -0,0 +1,186 @@
++//! #441 Success criterion — binds `wyrd_metadata_fdb::preflight` as a non-feature-gated,
++//! **pure** module.
++//!
++//! This is its own test binary — not a `#[cfg(test)] mod` co-located inside a modified
++//! `src/lib.rs` — specifically so `cargo test -p wyrd-metadata-fdb --test preflight`
++//! exercises it on the **default build**: no `fdb` feature, no `libfdb_c`, no Docker, stock
++//! toolchain (#441's Falsifiability + Test file fields; `engine/scripts/run-verify.sh`'s
++//! `_is_test_file`, `:69`, only recognizes an ADDED `*/tests/*.rs` as earning a full
++//! red→green — a co-located test would degrade `C4-verify` to green-only, `:244-254`).
++//!
++//! `use wyrd_metadata_fdb::preflight::*` compiling at all, with no `--features fdb`, IS
++//! assertion 1: `preflight` is `pub`, non-feature-gated, and takes no `foundationdb` type in
++//! its signature — sibling to `classify` (`crates/metadata-fdb/src/lib.rs:141`) and `config`
++//! (`:384`; `:382` before this patch inserted `EXTERNAL_CLIENT_DIR_ENV` above it).
++//!
++//! What this binary does **not** cover, deliberately: the live probe that feeds `verdict`
++//! (`FdbMetadataStore::preflight`, `crates/metadata-fdb/src/lib.rs`) is feature-gated and
++//! links `libfdb_c`, so it is driven from inside a Tokio runtime by
++//! `tests/timeout.rs::preflight_against_an_unreachable_cluster_is_err_not_a_panic` and
++//! `tests/conformance.rs::connect_probes_the_real_cluster_from_inside_a_runtime`, both run
++//! by `cargo xtask fdb-conformance`.
++
++use std::time::Duration;
++
++use wyrd_metadata_fdb::preflight::{message, verdict, ClientStatus, Verdict};
++
++/// A ~5s bound, matching #441's design proposal: all three captured fixtures below settled
++/// within ~2s against a live `libfdb_c` 7.3.77 (`LastConnectTime` 1.93s in the skew run),
++/// so a 5s deadline separates every case.
++const DEADLINE: Duration = Duration::from_secs(5);
++
++/// #441's design proposal, §Design 1's fixture table, row **skew**: a 7.3 client against
++/// `foundationdb:7.1.61`. Captured JSON: `Healthy: false`, `Connections[0].Status:
++/// "connected"`, `Connections[0].Compatible: false`, `Connections[0].ProtocolVersion:
++/// "fdb00b071010000"` (the *cluster's*), `NumConnectionsFailed: 0`. `store::client_status`
++/// (the feature-gated JSON→`ClientStatus` reduction this fixture stands in for) sets
++/// `cluster_protocol` only when the live JSON reported a protocol version for an
++/// incompatible connection — exactly this shape.
++fn skew_fixture() -> ClientStatus {
++    ClientStatus {
++        healthy: false,
++        coordinators_reachable: true,
++        client_version: "api 730 (fdb-7_3 pin)".to_string(),
++        cluster_protocol: Some("fdb00b071010000".to_string()),
++    }
++}
++
++/// #441's design proposal, §Design 1's fixture table, row **unreachable**: nothing listening.
++/// Captured JSON: `Healthy: false`, `Connections[0].Status: "failed"`,
++/// `Connections[0].Compatible: true` (meaningless here — no protocol was ever exchanged),
++/// `Connections[0].ProtocolVersion` **absent**, `NumConnectionsFailed: 1`. Note: the
++/// `Coordinators` list is a real, populated field of this JSON too — deliberately not
++/// modelled in [`ClientStatus`], because the design proposal found it does NOT distinguish
++/// this case from skew (both keep it populated); `coordinators_reachable` here is the
++/// *connection status* signal, not the coordinator list.
++fn unreachable_fixture() -> ClientStatus {
++    ClientStatus {
++        healthy: false,
++        coordinators_reachable: false,
++        client_version: "api 730 (fdb-7_3 pin)".to_string(),
++        cluster_protocol: None,
++    }
++}
++
++/// #441's design proposal, §Design 1's fixture table, row **healthy**: a 7.3 client against
++/// `foundationdb:7.3.77`. Captured JSON: `Healthy: true`, `Connections[0].Status:
++/// "connected"`, `Connections[0].Compatible: true`, `Connections[0].ProtocolVersion:
++/// "fdb00b073000000"`, `NumConnectionsFailed: 0`. `cluster_protocol` is `None` here because
++/// `store::client_status` only carries a protocol version for an *incompatible* connection
++/// (there is nothing to report when client and cluster already agree).
++fn healthy_fixture() -> ClientStatus {
++    ClientStatus {
++        healthy: true,
++        coordinators_reachable: true,
++        client_version: "api 730 (fdb-7_3 pin)".to_string(),
++        cluster_protocol: None,
++    }
++}
++
++/// Assertion 3 (skew row): a connected-but-incompatible status classifies as
++/// `VersionSkew`, naming the **cluster's** protocol version — never the client's, which
++/// would misdiagnose the mismatch's direction.
++#[test]
++fn skew_fixture_is_version_skew() {
++    let status = skew_fixture();
++    let v = verdict(Some(&status), Duration::from_millis(1930), DEADLINE);
++    assert_eq!(
++        v,
++        Verdict::VersionSkew {
++            client: status.client_version.clone(),
++            cluster: Some("fdb00b071010000".to_string()),
++        },
++        "a connected-but-incompatible status must classify as VersionSkew: {v:?}"
++    );
++}
++
++/// Assertion 3 (unreachable row): a failed connection with no protocol version classifies
++/// as `Unreachable`, not skew.
++#[test]
++fn unreachable_fixture_is_unreachable() {
++    let status = unreachable_fixture();
++    let v = verdict(Some(&status), Duration::from_millis(50), DEADLINE);
++    assert_eq!(
++        v,
++        Verdict::Unreachable {
++            waited: Duration::from_millis(50)
++        },
++        "a failed connection with no protocol version must classify as Unreachable: {v:?}"
++    );
++}
++
++/// Assertion 3 (healthy row): a healthy, connected, compatible status classifies as
++/// `Ready`.
++#[test]
++fn healthy_fixture_is_ready() {
++    let status = healthy_fixture();
++    let v = verdict(Some(&status), Duration::from_millis(120), DEADLINE);
++    assert_eq!(
++        v,
++        Verdict::Ready,
++        "a healthy, connected, compatible client must be Ready: {v:?}"
++    );
++}
++
++/// Assertion 2: `message(VersionSkew)` contains `protocol`, the **cluster's** protocol
++/// version, and a pointer to the multi-version external-client-directory upgrade
++/// procedure — an operator must be able to act on this without reading source.
++#[test]
++fn version_skew_message_names_the_cluster_protocol_and_the_upgrade_path() {
++    let v = Verdict::VersionSkew {
++        client: "api 730 (fdb-7_3 pin)".to_string(),
++        cluster: Some("fdb00b071010000".to_string()),
++    };
++    let msg = message(&v);
++
++    assert!(
++        msg.contains("protocol"),
++        "names the axis of the mismatch: {msg}"
++    );
++    assert!(
++        msg.contains("fdb00b071010000"),
++        "names the CLUSTER's protocol version (the field that identifies the mismatch, \
++         #441's design proposal), not just the client's: {msg}"
++    );
++    assert!(
++        msg.contains("WYRD_FDB_EXTERNAL_CLIENT_DIR")
++            || msg.to_lowercase().contains("external-client")
++            || msg.to_lowercase().contains("multi-version"),
++        "points at the multi-version external-client-directory upgrade procedure: {msg}"
++    );
++}
++
++/// Assertion 2: `message(Unreachable)` must NOT claim version skew — an operator whose
++/// cluster is genuinely down must not be told (falsely) that their client is mismatched.
++#[test]
++fn unreachable_message_does_not_claim_version_skew() {
++    let msg = message(&Verdict::Unreachable {
++        waited: Duration::from_secs(5),
++    });
++    assert!(
++        !msg.contains("mismatch"),
++        "an Unreachable verdict must not claim a version mismatch: {msg}"
++    );
++}
++
++/// Fail-honest (§Design 1): a status this probe cannot positively call skew — connected,
++/// unhealthy, but with no reported cluster protocol version at all — degrades to
++/// `Unreachable` rather than guessing `VersionSkew`. This is the shape an unparsable or
++/// novel `get_client_status()` payload reduces to.
++#[test]
++fn an_ambiguous_status_degrades_to_unreachable_never_a_guessed_skew() {
++    let ambiguous = ClientStatus {
++        healthy: false,
++        coordinators_reachable: true,
++        client_version: "api 730 (fdb-7_3 pin)".to_string(),
++        cluster_protocol: None,
++    };
++    let v = verdict(Some(&ambiguous), Duration::from_millis(100), DEADLINE);
++    assert_eq!(
++        v,
++        Verdict::Unreachable {
++            waited: Duration::from_millis(100)
++        },
++        "a status with no cluster protocol version must never guess VersionSkew: {v:?}"
++    );
++}
+diff --git a/crates/metadata-fdb/tests/timeout.rs b/crates/metadata-fdb/tests/timeout.rs
+index efafe28..8465b6d 100644
+--- a/crates/metadata-fdb/tests/timeout.rs
++++ b/crates/metadata-fdb/tests/timeout.rs
+@@ -78,6 +78,26 @@ fn a_conditional_commit_that_times_out_is_never_a_conflict() {
+     run_conditional_commit_times_out();
+ }
+ 
++/// The #441 readiness probe, driven **from inside a Tokio runtime** — the shape every
++/// production caller has (`open_fdb_meta`, `crates/server/src/cli.rs:175`, is awaited from
++/// seven call sites that are all already on a runtime).
++///
++/// Two properties, and the first is why this case exists at all:
++///
++/// 1. **It returns.** `preflight` owns no runtime and calls no `block_on`; it awaits on the
++///    caller's. A version of it that built its own runtime and blocked on it would panic
++///    here with Tokio's *"Cannot start a runtime from within a runtime"* — silently, for
++///    every `wyrd … --metadata-backend fdb` invocation, since no gate compiles the `fdb`
++///    feature. `guarded` drives it on a real multi-thread runtime, so that panic is a test
++///    failure rather than a production one.
++/// 2. **It fails honest.** An unreachable coordinator is `Unreachable`, never a guessed
++///    `VersionSkew`: the client never exchanged a protocol version with anything, so it has
++///    no basis to claim a mismatch (`preflight`'s fail-honest rule).
++#[test]
++fn preflight_against_an_unreachable_cluster_is_err_not_a_panic() {
++    run_preflight_times_out();
++}
++
+ #[cfg(feature = "fdb")]
+ fn run_get_times_out() {
+     use wyrd_traits::MetadataStore;
+@@ -140,6 +160,26 @@ fn run_conditional_commit_times_out() {
+     }
+ }
+ 
++#[cfg(feature = "fdb")]
++fn run_preflight_times_out() {
++    let store = unreachable_store("preflight");
++    // The production probe, on the caller's runtime — exactly as `connect()` awaits it.
++    let outcome = guarded(async move { store.preflight().await });
++
++    let err = outcome
++        .expect_err("a readiness probe against an unreachable cluster must not report Ready");
++    let msg = err.to_string();
++    assert!(
++        msg.contains("unreachable"),
++        "an unreachable coordinator must be reported as unreachable: {msg}",
++    );
++    assert!(
++        !msg.contains("mismatch"),
++        "the client never exchanged a protocol version with anything, so it must not claim \
++         a version mismatch — that is the misdiagnosis #441 exists to prevent: {msg}",
++    );
++}
++
+ /// Drive `fut` on a fresh runtime, failing the test if it does not finish within
+ /// [`WALL_CLOCK_GUARD`]. This is the assertion that a missing deadline is a *test failure*
+ /// and not a hung CI job.
+@@ -215,6 +255,11 @@ fn run_conditional_commit_times_out() {
+     feature_off();
+ }
+ 
++#[cfg(not(feature = "fdb"))]
++fn run_preflight_times_out() {
++    feature_off();
++}
++
+ #[cfg(not(feature = "fdb"))]
+ fn feature_off() {
+     eprintln!(
+diff --git a/crates/server/src/cli.rs b/crates/server/src/cli.rs
+index ff4bcff..3b3f0b6 100644
+--- a/crates/server/src/cli.rs
++++ b/crates/server/src/cli.rs
+@@ -159,16 +159,25 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
+ /// Unlike [`open_tikv_meta`], there is no pre-check env lookup here: the driver's
+ /// own `connect()` owns cluster-file env resolution (`WYRD_FDB_CLUSTER_FILE`) and
+ /// deliberately falls back to `/etc/foundationdb/fdb.cluster` when it is unset
+-/// (`metadata-fdb/src/lib.rs:424-433`, unit-tested at `:479-482`) — a hard
++/// (`metadata-fdb/src/lib.rs:432-441`, unit-tested at `:494-498`) — a hard
+ /// pre-check here would contradict that contract and break a stock FDB install
+-/// that relies on the default cluster file. `connect()` is synchronous (unlike
+-/// `open_tikv_meta`'s `.await`), so this helper is too; the hint below is only
+-/// error *context* on a failed connect, not a precondition.
++/// that relies on the default cluster file. The hint below is only error *context*
++/// on a failed connect, not a precondition.
++///
++/// `async`, **exactly like [`open_tikv_meta`]**, and for the same reason: `connect()`
++/// awaits a bounded `get_client_status()` readiness probe (#441's version-skew guard,
++/// `metadata-fdb/src/lib.rs:1250`), and that future needs a running reactor. Every caller
++/// of this helper is already inside one — four inside `runtime.block_on(async { … })`,
++/// three inside an `async fn` — so driving the probe on a runtime of its own would
++/// panic with Tokio's "Cannot start a runtime from within a runtime". Await it on the
++/// caller's runtime instead; the seam is the peer's, not a new one.
+ #[cfg(feature = "fdb")]
+-fn open_fdb_meta() -> Result<wyrd_metadata_fdb::FdbMetadataStore, BoxError> {
+-    wyrd_metadata_fdb::FdbMetadataStore::connect().map_err(|e| {
+-        format!("fdb backend: set WYRD_FDB_CLUSTER_FILE to the cluster file path: {e}").into()
+-    })
++async fn open_fdb_meta() -> Result<wyrd_metadata_fdb::FdbMetadataStore, BoxError> {
++    wyrd_metadata_fdb::FdbMetadataStore::connect()
++        .await
++        .map_err(|e| {
++            format!("fdb backend: set WYRD_FDB_CLUSTER_FILE to the cluster file path: {e}").into()
++        })
+ }
+ 
+ /// The L5 `Coordination` backend `server` composes behind the unchanged
+@@ -371,7 +380,7 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
+             }
+             #[cfg(feature = "fdb")]
+             MetadataBackend::Fdb => {
+-                let meta = open_fdb_meta()?;
++                let meta = open_fdb_meta().await?;
+                 local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
+             }
+         }
+@@ -457,7 +466,7 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
+             }
+             #[cfg(feature = "fdb")]
+             MetadataBackend::Fdb => {
+-                let meta = open_fdb_meta()?;
++                let meta = open_fdb_meta().await?;
+                 local_store_get(&meta, &chunks, key, out).await
+             }
+         }
+@@ -838,7 +847,7 @@ where
+         }
+         #[cfg(feature = "fdb")]
+         MetadataBackend::Fdb => {
+-            let meta = open_fdb_meta()?;
++            let meta = open_fdb_meta().await?;
+             service
+                 .run_reconstruction_until(
+                     zone, custodian, &meta, configured, interval, clock, shutdown,
+@@ -1478,13 +1487,13 @@ where
+         }
+         #[cfg(feature = "fdb")]
+         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
+-            let meta = open_fdb_meta()?;
++            let meta = open_fdb_meta().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+             serve_s3(gateway, credentials, region, listener).await
+         }
+         #[cfg(all(feature = "fdb", feature = "etcd"))]
+         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
+-            let meta = open_fdb_meta()?;
++            let meta = open_fdb_meta().await?;
+             let coord = open_etcd_coordination().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+             serve_s3(gateway, credentials, region, listener).await
+@@ -1549,7 +1558,7 @@ fn cluster_put(
+             }
+             #[cfg(feature = "fdb")]
+             MetadataBackend::Fdb => {
+-                let meta = open_fdb_meta()?;
++                let meta = open_fdb_meta().await?;
+                 cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
+             }
+         };
+@@ -1597,7 +1606,7 @@ fn cluster_get(
+             }
+             #[cfg(feature = "fdb")]
+             MetadataBackend::Fdb => {
+-                let meta = open_fdb_meta()?;
++                let meta = open_fdb_meta().await?;
+                 cluster_store_get(&meta, &fanout, key).await?
+             }
+         };
+diff --git a/docs/design/architecture/07-deployment-view.md b/docs/design/architecture/07-deployment-view.md
+index 2f89702..525366f 100644
+--- a/docs/design/architecture/07-deployment-view.md
++++ b/docs/design/architecture/07-deployment-view.md
+@@ -86,3 +86,72 @@ The wiring of a production single-zone (Small multi-node) deployment — who dia
+ **Two planes.** Bulk **fragment** data flows directly client/gateway → D servers (the gRPC chunk path that scales with the fleet); the **metadata commit** is a separate, smaller gRPC path to TiKV. Keeping them distinct is the Colossus-class separation that lets throughput scale with D servers rather than through a metadata bottleneck. On a private-network deployment (e.g. Hetzner vSwitch) only the gateway's S3 port is exposed publicly; every other path stays on the internal network.
+ 
+ **Out of single-zone scope.** Cross-zone replication (L3) uses **NATS JetStream** (client `4222`) and appears only at the **provider-fleet** profile (M9+); it is not part of a single-zone deployment (ADR-0027).
++
++## 7.6 FoundationDB metadata backend: packaging and version coupling
++
++ADR-0042 chose FoundationDB (`fdb`, behind the off-by-default `--features fdb`) as the production `MetadataStore` for the Small multi-node and Provider fleet profiles (§7.1). Unlike the pure-Rust TiKV client, the `foundationdb` crate binds a **shared C library** (`libfdb_c`) whose wire protocol is **exactly** coupled to the cluster's — a client built against one FDB version cannot talk to a cluster running another, at all, ever. This section is the packaging contract that follows from that fact: how the client library reaches a Wyrd process, and what happens when it disagrees with the cluster (#441).
++
++### Container path (primary)
++
++The primary distribution is an OCI image carrying `wyrd` built with `--features fdb` plus a matching `libfdb_c`. Building and publishing that image is **#470's** deliverable, not this section's; this section fixes the *decision* the image implements. The image pins one `libfdb_c` version at build time — the same version-coupling rule as bare metal (below) applies unchanged; an image is a packaging choice, not an exemption from FDB's protocol coupling.
++
++### Bare-metal path
++
++Outside a container, the host needs FoundationDB's own `foundationdb-clients` `.deb`/`.rpm` installed (it ships `libfdb_c.so` and, optionally, `fdbcli`) — a **host prerequisite**, not something Wyrd's own build vendors or statically links (see "The single-binary trade" below). The cluster file (`fdb.cluster`) is located via `WYRD_FDB_CLUSTER_FILE` (`crates/metadata-fdb/src/lib.rs:386`), falling back to FoundationDB's own default `/etc/foundationdb/fdb.cluster` (`:390`, resolved by `config::cluster_file`, `:436`) — the same default a stock FoundationDB install already writes there, so a host that followed FoundationDB's own install instructions needs no Wyrd-specific configuration to be reached.
++
++### Version coupling and the fail-closed guard
++
++Before #441, a version-mismatched client and a genuinely unreachable cluster produced the **same** symptom: a bounded but anonymous `1031 transaction_timed_out` (the per-transaction deadline #438 added, `crates/metadata-fdb/src/lib.rs:424`). An operator who mismatched their client saw exactly the error an operator with a down cluster would see. The defect was **misdiagnosis**, not hanging.
++
++`FdbMetadataStore::connect()` (`crates/metadata-fdb/src/lib.rs:1250`) — the constructor `open_fdb_meta` calls (`crates/server/src/cli.rs:175`), i.e. every `wyrd … --metadata-backend fdb` invocation — now performs a bounded readiness probe (`preflight`, `:1291`) via `Database::get_client_status()` before returning `Ok`. The pure, non-feature-gated `wyrd_metadata_fdb::preflight` module (`:832`, sibling to `classify`/`config`) classifies the result into `Ready` / `VersionSkew` / `Unreachable`; a non-`Ready` verdict fails the connect with a message naming the **cluster's** protocol version and pointing at the upgrade procedure below — instead of the anonymous timeout.
++
++The discriminator is `Compatible == false` on a connection whose `Status` is `"connected"`. It is deliberately **not** "zero reachable coordinators" (under skew the coordinator list stays populated) and not `Healthy == false` alone (false in both failure cases). Anything the probe cannot positively identify as skew — an unparsable, novel, or late status — degrades to `Unreachable` *with* a version-coupling hint, **never** to a guessed `VersionSkew`: an operator whose cluster is merely down must not be sent hunting for a version mismatch.
++
++Two shapes this guard deliberately keeps:
++
++* `connect()` and its probe are **`async`**, awaited on the caller's runtime — exactly like the TiKV peer `open_tikv_meta` (`crates/server/src/cli.rs:147`). All seven `open_fdb_meta` call sites are already inside a Tokio runtime, so a probe that drove itself on a runtime of its own would panic with *"Cannot start a runtime from within a runtime"* on every invocation.
++* `FdbMetadataStore::open()` (`crates/metadata-fdb/src/lib.rs:1326`), used only by the cluster-file-gated test harnesses, keeps **no** probe — so tests that point at an unreachable coordinator on purpose (`tests/timeout.rs`) are unaffected. The probe belongs to `connect()`, the *operator* path.
++
++### The multi-version client upgrade dance
++
++FoundationDB's own answer to a lockstep cluster upgrade is the **multi-version client**: a directory of additional `libfdb_c` versions the client loads via the `ExternalClientDirectory` network option, so one client process can speak to a cluster mid-upgrade. Wyrd exposes this as `WYRD_FDB_EXTERNAL_CLIENT_DIR` (`crates/metadata-fdb/src/lib.rs:398`), consumed by `ensure_network()` (`:1114`) when the client network boots; unset, behaviour is byte-identical to a client with no multi-version support.
++
++The upgrade sequence:
++
++1. **Add** the cluster's *new* `libfdb_c` version to every client's external-client directory (pointed to by `WYRD_FDB_EXTERNAL_CLIENT_DIR`) — the *old* library stays in place too, so the client can still speak the version the cluster is currently running.
++2. **Upgrade** the cluster to the new FoundationDB version. During the transition the multi-version client speaks whichever protocol the coordinators currently answer with; a rolling cluster upgrade does not require every client to be updated in the same instant.
++3. **Drop** the old `libfdb_c` from the external-client directory only once every client in the fleet has the new one and the cluster upgrade is complete — the mirror image of step 1.
++
++This turns a cluster upgrade into a **configuration/image change** (update the external-client directory, then the cluster) rather than an architecture change — no code in Wyrd's own tree needs to move.
++
++### Manual repro of the guided error
++
++Reproducing the guided error needs a cluster running a FoundationDB version the client was not built against. #470 automates this against the `wyrd:fdb` image it builds (its acceptance criterion 4); until then, this is the manual procedure — **run and observed** against a `libfdb_c` 7.3.77 client and a `foundationdb/foundationdb:7.1.61` cluster:
++
++```sh
++# 1. Bring up a cluster running an OLDER FoundationDB than the client wyrd was built
++#    against. --network host, matching deploy/fdb-single-node/docker-compose.yml's own
++#    note: a libfdb_c client on the HOST must reach the address the server ADVERTISES
++#    (127.0.0.1:4500), which a default bridge-network port mapping does not give you.
++docker run -d --name fdb71 --network host \
++  -e FDB_NETWORKING_MODE=host -e FDB_PORT=4500 -e FDB_PROCESS_CLASS=unset \
++  -e FDB_CLUSTER_FILE_CONTENTS="docker:docker@127.0.0.1:4500" \
++  foundationdb/foundationdb:7.1.61
++docker exec fdb71 fdbcli --exec "configure new single memory"
++
++# 2. Point a cluster file at it and run a `wyrd` built with --features fdb:
++printf 'docker:docker@127.0.0.1:4500\n' > /tmp/skew.cluster
++echo hello > /tmp/payload
++WYRD_FDB_CLUSTER_FILE=/tmp/skew.cluster \
++  wyrd put /tmp/payload --key smoke --metadata-backend fdb --data-dir /tmp/skew-data
++```
++
++Observed: the connect fails in **~200 ms** with **exit status 1** (not a panic, not a hang) and a message containing `client/cluster protocol version mismatch`, the cluster's reported protocol version `fdb00b071010000`, and a pointer to the multi-version upgrade procedure above — instead of the anonymous `1031 transaction_timed_out` this produced before #441.
++
++For contrast, a cluster file naming an unreachable coordinator (`x:x@192.0.2.1:4500`, RFC 5737 TEST-NET-1) reports `cluster unreachable … reported as unreachable rather than a guessed version skew` and never claims a mismatch. Tear the skew cluster down with `docker rm -f fdb71`.
++
++### The single-binary trade
++
++The **single binary (dev)** profile (§7.1) stays a true static binary with **zero new demands** from this section: `crates/metadata-fdb/Cargo.toml`'s `default = []` means the default build never links `libfdb_c` — indeed a machine without it could not compile this crate's real driver at all if the feature were on by default. `fdb` is only reachable via the explicit, off-by-default `--features fdb` build — a **production**-tier build, per ADR-0014 (`docs/design/adr/0014-single-binary-dev-only.md:18`: the single-binary profile is *"for development and evaluation only"*, explicitly not a supported production tier).
++
++FoundationDB itself does not support static-linking `libfdb_c`, and doing so would defeat the multi-version client above — the only sanctioned upgrade mechanism — so an `fdb`-backed Wyrd is **never** a single static binary; it always carries a shared-library dependency, container or bare metal. This is a property of FoundationDB's own distribution model, not a Wyrd shortcoming, and no ADR change follows from stating it: ADR-0014 already scopes single-binary to dev/eval, and `fdb` was never that profile.

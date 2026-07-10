@@ -29,6 +29,87 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-10 — cycles considered: issue_439, issue_440, issue_441, issue_468 (FDB batch; issue_477 already recorded 07-07)
+
+## What the cycles' records exposed
+
+- **The dominant §6 recurrence is leaf-sandbox *capability*, not a spec/gate gap (4 of 4:
+  #439, #440, #441, #468).** Each FoundationDB slice's live verification is a Docker-backed
+  conformance run (`cargo xtask fdb-conformance` → single-node cluster via `docker compose`),
+  and each surfaces `T3 Runtime` NEEDS-HUMAN for the *same* reason: the reviewer/adversary
+  leaf sandbox denies **Docker API** access. The host is Docker-capable (`docker info` OK,
+  CLI + compose present), but the socket is denied inside the sandbox, so the live leg skips
+  — #440 "socket permission denied", #441 "Docker CLI/compose installed but Docker API
+  permission was denied", #439/#468 same class. This is a direct sibling of the
+  already-fixed **#261** (loopback-bind denial): a physical capability the leaf sandbox
+  withholds, so the green cannot be earned at Check even when the operator wants it and the
+  host can do it.
+- **A standing per-bundle prior-art tax from the same sandbox posture (3 of 4: #439, #440,
+  #441).** The codex reviewer runs `codex exec --sandbox workspace-write` with no network
+  grant, so it cannot reach `api.github.com`; the closed/rejected-PR prior-art check
+  (T4/T5) is forced to NEEDS-HUMAN every bundle — a mechanical check handed to the human on
+  principle each time. #441 self-nominates this for Act.
+- **The adversary leaf's empty artifact is ambiguous (#439).** When the codex adversary
+  couldn't reach Docker it produced *no* verdict; an infra-abort reads identically to "ran,
+  found nothing" (§10: "empty verdict was infra, not substance"). Cf. #330 where the same
+  leaf failed with `'codex'` not found — also surfaced only as an opaque empty result.
+- **What is working-as-designed and needs no delta.** The Docker-gated runtime leg is
+  *pre-declared*: #440/#441/#468 each carry a `Verification posture` field with a named
+  confirmer (#470), so the T3 NEEDS-HUMAN is a *declared* deferred sign-off item — exactly
+  the conversion the 2026-06-21 (`Verification posture`) and 2026-07-04 (M4 endpoint-gated,
+  working-as-designed) reviews intended. The deferral itself is correct; only the
+  can't-run-even-when-capable capability gap is the bug.
+- **Validation fitness-to-purpose is NEEDS-HUMAN in every bundle — always-human by design**
+  (INTEGRATION.md §4). No delta warranted, consistent with prior reviews.
+
+## Process deltas
+
+- **None warranted.** Every recurring signal this review is a **leaf-sandbox harness
+  capability gap**, which belongs upstream to the harness (template-vs-instance boundary),
+  not to a Wyrd spec-template / ruleset / gate / agent-skill change. The deferred-runtime
+  pattern is already covered by the `Verification posture` field; the prior-art gap is a
+  sandbox capability, not a process rule. A forced template/gate change here would be worse
+  than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Harness/driver (upstream) — Docker API denied in the leaf/reviewer sandbox.** Filed
+  **eduralph/pdca-harness#276** (sibling of #261). Docker-gated conformance legs (FDB, TiKV,
+  etcd) can't be exercised at Check even on a Docker-capable host — recurs #439/#440/#441/#468
+  T3. → owner: Eduard; next step: grant scoped Docker-API access to the leaf/gate sandbox.
+- **Harness/driver (upstream) — reviewer leaf has no network grant.** Filed
+  **eduralph/pdca-harness#277**. `codex exec` can't reach `api.github.com`, forcing the
+  closed/rejected-PR prior-art check to NEEDS-HUMAN on every bundle (#439/#440/#441 T4/T5).
+  → owner: Eduard; next step: grant scoped github.com access or a read-only `gh` proxy.
+- **Harness/driver (upstream) — adversary leaf empty-on-infra-failure.** Filed
+  **eduralph/pdca-harness#278** (relates to #138). The advisory leaf should mark an
+  infra-abort as `infra-empty` (distinct from "no findings") so §6 can label it "leaf did
+  not run" and prompt a re-run (#439). → owner: Eduard; next step: leaf output-contract delta.
+- **Already routed elsewhere (no action here).** The planner-vs-harness gaps this batch
+  surfaced — a `Test file` that can't earn per-fix RED, a vacuous `#![cfg(madsim)]` test, a
+  private-binary symbol — are covered by upstream **#275** + instance-side
+  **getwyrd/wyrd-pdca#104**; wave-base / agent-drift by **#273 / #274**; the C4-verify
+  structural-red wording is tracked (noted in #468). Recorded so they are not re-filed.
+- **Already tracked (project tracker) — FDB operator-fitness / go-no-go.** #440/#441 leave
+  "is compiled-and-selected FDB support without a locally reproduced live Docker round trip
+  sufficient?" as an always-human sign-off call. This is **not** a loose Act item: the
+  production-fitness decision is owned by **getwyrd/wyrd#442** (release-gating "FDB go/no-go:
+  fault + contention battery against `metadata-fdb`, then flip the production default"), which
+  depends on #438–#441, reuses #257's harness, and names #470 as the live-container confirmer.
+  No PDCA delta; recorded here only so the deferral is cross-linked to its existing owner
+  rather than carried untracked. → next step: nothing for Act; the go/no-go verdict lands under
+  #442. Watch that it records before the FDB default is flipped.
+
+## How effectiveness will be judged
+
+- Once **#276/#277** land, the next Docker-gated / prior-art cycles should stop raising T3 and
+  T4/T5 as *capability-forced* NEEDS-HUMAN — they should either earn their green at Check or
+  reduce to a genuine judgment call. Watch the next ~5 backend-conformance cycles.
+- **#278** should convert the next infra-aborted advisory leaf into an explicit "leaf did not
+  run" row rather than a silent empty pass.
+- The #470 live-FDB confirmer should appear as run-green (or an explicit "still deferred") at
+  the next review, keeping the deferral auditable.
+
 # Act review — 2026-07-07 — cycles considered: issue_257, issue_405, issue_454, issue_455, issue_458
 
 > The five cycles that froze since the 2026-07-04 (cont.) review (which covered 255/256/258/364/365/366).

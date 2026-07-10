@@ -1,0 +1,837 @@
+diff --git a/crates/dst/tests/commit_ambiguity.rs b/crates/dst/tests/commit_ambiguity.rs
+new file mode 100644
+index 0000000..15378b6
+--- /dev/null
++++ b/crates/dst/tests/commit_ambiguity.rs
+@@ -0,0 +1,285 @@
++//! **Commit ambiguity** — the one failure shape FoundationDB introduces that neither redb
++//! nor the simulated-TiKV model can render, driven inside the deterministic simulator
++//! (issue #468).
++//!
++//! `1021 commit_unknown_result` means the commit **may or may not have landed** and the
++//! client cannot tell. The production driver surfaces it as a distinguishable `Err`, never
++//! as `Ok(Conflict)` and never retried, because a `WriteBatch` is not guaranteed idempotent
++//! (`crates/metadata-fdb/src/lib.rs:67-73`, `:150-153`). A caller's only correct move is a
++//! **settling re-read**.
++//!
++//! This cannot be tested against a real cluster: *"A healthy `fdbserver` cannot be made to
++//! emit 1021 on demand"* (`crates/metadata-fdb/src/lib.rs:71`). A real fault battery can
++//! only *sample* the ambiguity space; a seed-driven nemesis inside madsim **searches** it —
++//! which is exactly why the simulated-FDB model exists.
++//!
++//! ## The invariant
++//!
++//! An ambiguous commit is never counted either way without a settling re-read; once the
++//! re-read settles it, at most one writer won, the inode's version bumped exactly as many
++//! times as there were winners, and no torn/hybrid inode is ever observable.
++//!
++//! ## Why this file, and not `concurrency.rs`
++//!
++//! `concurrency.rs`'s `exactly_one_writer_wins_over` (`:75`) is the **shared** property body
++//! driving redb and simulated-TiKV, and it `.unwrap()`s the commit result (`:106`). That
++//! strictness is correct *for those stores* — an `Err` from their `commit` genuinely is a
++//! bug — so it must not be weakened to accommodate an ambiguity-capable store. The ambiguity
++//! scenario therefore gets its own property body here.
++//!
++//! Requires `--cfg madsim` (set by `cargo xtask dst`, which sweeps 50 seeds); without it
++//! this file compiles to nothing, so a normal `cargo test` neither builds nor runs it. The
++//! structural companion guard, `crates/dst/tests/no_fdb_linkage.rs`, is deliberately *not*
++//! madsim-gated.
++#![cfg(madsim)]
++
++use std::sync::Arc;
++
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_core::metadata::{ChunkRef, EcScheme};
++use wyrd_core::{read, write};
++use wyrd_traits::CommitOutcome;
++
++#[path = "support/mod.rs"]
++mod support;
++use support::{FdbObservations, SimCommitUnknownResult, SimFdbMetadataStore};
++
++const CHUNK: usize = 4;
++const LEASE_EXPIRY: u64 = 6_000;
++const RS: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
++
++/// How many seeds the two plain-`#[test]` sweeps below drive. `cargo xtask dst` sweeps its
++/// own 50 seeds over the `#[madsim::test]` entry point; these explicit sweeps additionally
++/// need to see **both halves** of the ambiguity space (an ambiguous commit that landed and
++/// one that did not), which a single seed cannot show.
++const AMBIGUITY_SWEEP_SEEDS: u64 = 64;
++
++/// A unique, deterministic chunk-id generator starting just above `base`. Each writer gets
++/// a disjoint id range, so an inode's `chunk_map` **identifies** the writer that wrote it —
++/// which is what lets a settling re-read decide whether *this* writer's ambiguous commit
++/// landed.
++fn ids_from(base: u128) -> impl FnMut() -> u128 {
++    let mut n = base;
++    move || {
++        n += 1;
++        n
++    }
++}
++
++/// How an observer treats a commit that returned `1021 commit_unknown_result`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Observer {
++    /// The **correct** move: re-read the inode and let the store's own state settle whether
++    /// the ambiguous commit landed.
++    SettlingReRead,
++    /// The **violating** observer (the demonstrated red): assume an ambiguous commit did not
++    /// land — i.e. count it as a loser without re-reading. Half the ambiguity space makes
++    /// that assumption false.
++    AssumeNotCommitted,
++}
++
++/// The ambiguity property body. Four writers read the same prior inode, stage independently,
++/// then race the version-conditional CAS while the `1021` nemesis is armed. Every `Err` is
++/// settled by re-reading the inode (or, for the violating observer, *not*), and the invariant
++/// is asserted over the settled set.
++///
++/// Note what is **not** done here: no commit result is `.unwrap()`ed, and no `Err` is turned
++/// into a winner or a loser before the settling read. That is the property.
++async fn ambiguous_commit_settles_over(meta: Arc<SimFdbMetadataStore>, observer: Observer) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let chunks = Arc::new(FsChunkStore::open(dir.path()).expect("fs store"));
++
++    // An existing object at version 1. The nemesis is still disarmed, so the fixture's own
++    // commits are determinate — the ambiguity under test is the four-writer race, not the
++    // fixture build.
++    let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
++    write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
++    write::write_fragments(&*chunks, &v0).await.unwrap();
++    write::commit_create(&*meta, 0, "obj", 1, &v0)
++        .await
++        .unwrap();
++    write::release(&*meta, &v0).await.unwrap();
++    let prior = read::read_inode(&*meta, 1).await.unwrap().unwrap();
++
++    // Arm the 1021 nemesis: the first CAS the resolver accepts becomes ambiguous, and the
++    // seed decides whether its mutation landed.
++    meta.arm_commit_ambiguity(1);
++
++    let mut handles = Vec::new();
++    for i in 0..4u128 {
++        let meta = Arc::clone(&meta);
++        let chunks = Arc::clone(&chunks);
++        let prior = prior.clone();
++        handles.push(madsim::task::spawn(async move {
++            let plan =
++                write::plan_write(b"contended", CHUNK, RS, ids_from(0x1000 * (i + 1))).unwrap();
++            write::intent(&*meta, &plan, LEASE_EXPIRY).await.unwrap();
++            write::write_fragments(&*chunks, &plan).await.unwrap();
++            // NOT unwrapped: this commit may legitimately be ambiguous.
++            let outcome = write::commit_overwrite(&*meta, 1, &prior, &plan, 0).await;
++            (outcome, plan.chunk_refs())
++        }));
++    }
++
++    let mut results = Vec::new();
++    for handle in handles {
++        results.push(handle.await.unwrap());
++    }
++
++    // ── settle ────────────────────────────────────────────────────────────────────────
++    // ONE re-read of the committed inode; every ambiguous commit is decided against it.
++    let settled = read::read_inode(&*meta, 1).await.unwrap().unwrap();
++
++    let mut winners: u64 = 0;
++    let mut winner_chunk_map: Option<Vec<ChunkRef>> = None;
++    for (outcome, chunk_map) in &results {
++        let won = match outcome {
++            Ok(CommitOutcome::Committed) => true,
++            Ok(CommitOutcome::Conflict) => false,
++            Err(err) => {
++                // The ONLY `Err` a correct simulated-FDB commit may return is the ambiguous
++                // one, and it must be distinguishable by type — not by message. A blind
++                // batch losing a race, or any other fault, would fail here.
++                assert!(
++                    err.downcast_ref::<SimCommitUnknownResult>().is_some(),
++                    "a simulated-FDB commit returned a non-1021 Err: {err}"
++                );
++                match observer {
++                    // Correct: the store's settled state decides. Chunk ids are disjoint per
++                    // writer, so an exact chunk-map match means *this* writer's commit landed.
++                    Observer::SettlingReRead => settled.chunk_map == *chunk_map,
++                    // Violating: assume it did not land.
++                    Observer::AssumeNotCommitted => false,
++                }
++            }
++        };
++        if won {
++            winners += 1;
++            winner_chunk_map = Some(chunk_map.clone());
++        }
++    }
++
++    // ── the invariant ─────────────────────────────────────────────────────────────────
++    assert!(
++        winners <= 1,
++        "at most one writer may win the version CAS; {winners} settled as winners"
++    );
++
++    // The load-bearing clause. An ambiguous commit that LANDED but was counted as a loser
++    // (or vice versa) shows up exactly here: the store bumped the version, the observer
++    // counted nobody. This is the assertion the `AssumeNotCommitted` observer trips.
++    assert_eq!(
++        settled.version - prior.version,
++        winners,
++        "the settled winner count ({winners}) must equal the inode's version bump ({} -> {}) \
++         — an ambiguous commit was counted without a settling re-read",
++        prior.version,
++        settled.version,
++    );
++
++    // No torn/hybrid inode: the committed chunk map is exactly ONE writer's plan (or the
++    // untouched prior), never a mix of several.
++    match winner_chunk_map {
++        Some(expected) => {
++            assert_eq!(
++                settled.chunk_map, expected,
++                "the settled inode's chunk map must be the winner's, whole — not a \
++                 torn/hybrid of several writers' plans"
++            );
++            // …and the object reassembles to the winner's bytes, end to end.
++            let bytes = read::read_path(&*meta, &*chunks, 0, "obj").await.unwrap();
++            assert_eq!(bytes.as_deref(), Some(&b"contended"[..]));
++        }
++        None => {
++            assert_eq!(
++                settled, prior,
++                "with no winner the inode must be byte-identical to the prior — a commit \
++                 that did not land must leave nothing behind"
++            );
++        }
++    }
++}
++
++/// Drive the four-writer ambiguity race at one fixed seed and return what the store observed.
++/// Mirrors `concurrency.rs:158`'s `run_pinned_race`.
++fn run_ambiguity_race(seed: u64, observer: Observer) -> FdbObservations {
++    let rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
++    rt.block_on(async move {
++        let meta = Arc::new(SimFdbMetadataStore::new());
++        ambiguous_commit_settles_over(Arc::clone(&meta), observer).await;
++        meta.observations()
++    })
++}
++
++/// **The seed sweep `cargo xtask dst` drives** (`MADSIM_TEST_NUM=50`, `xtask/src/main.rs:1337`):
++/// with the 1021 nemesis armed, no invariant is violated at any seed — an ambiguous commit is
++/// never counted as a winner *or* a loser without a settling re-read; once settled, exactly one
++/// writer won and the version bumped exactly once; no torn/hybrid inode is observable.
++///
++/// The `ambiguous_commits == 1` assertion keeps the sweep honest: a seed where the nemesis
++/// never fired would prove nothing about ambiguity, and this fails loudly rather than passing
++/// vacuously.
++#[madsim::test]
++async fn commit_ambiguity_invariants_hold_under_the_dst_seed_sweep() {
++    let meta = Arc::new(SimFdbMetadataStore::new());
++    ambiguous_commit_settles_over(Arc::clone(&meta), Observer::SettlingReRead).await;
++
++    let obs = meta.observations();
++    assert_eq!(
++        obs.ambiguous_commits, 1,
++        "the 1021 nemesis must strike exactly the one commit its budget allows — a sweep \
++         that never armed it is vacuous"
++    );
++}
++
++/// The sweep is only meaningful if it actually explores **both halves** of the ambiguity
++/// space: seeds where the ambiguous commit landed (so the settling re-read must count it a
++/// winner) and seeds where it did not (so the re-read must count it a loser and let a later
++/// writer win). This asserts both occur, and — because `run_ambiguity_race` asserts the full
++/// invariant at every seed — that the invariant holds across all of them.
++#[test]
++fn the_settling_re_read_covers_both_halves_of_the_ambiguity_space() {
++    let mut landed = 0u64;
++    let mut did_not_land = 0u64;
++    for seed in 0..AMBIGUITY_SWEEP_SEEDS {
++        let obs = run_ambiguity_race(seed, Observer::SettlingReRead);
++        assert_eq!(
++            obs.ambiguous_commits, 1,
++            "the nemesis must fire once at seed {seed}"
++        );
++        if obs.ambiguous_commits_that_landed == 1 {
++            landed += 1;
++        } else {
++            did_not_land += 1;
++        }
++    }
++    assert!(
++        landed >= 1,
++        "no seed in 0..{AMBIGUITY_SWEEP_SEEDS} produced an ambiguous commit that LANDED; the \
++         settling re-read is never exercised on the half that matters"
++    );
++    assert!(
++        did_not_land >= 1,
++        "no seed in 0..{AMBIGUITY_SWEEP_SEEDS} produced an ambiguous commit that did NOT land; \
++         the sweep only sees one half of the ambiguity space"
++    );
++}
++
++/// **The demonstrated red** (cf. `crates/metadata-conformance/tests/demonstrated_red.rs`),
++/// proving the invariant above is load-bearing rather than a tautology.
++///
++/// The *only* thing that changes is the observer: instead of settling an `Err` by re-reading,
++/// it **assumes the ambiguous commit did not land**. That is precisely the reasoning
++/// `crates/metadata-fdb/src/lib.rs:67-73` forbids. On every seed where the struck commit
++/// actually landed, the store bumped the inode's version while this observer counted zero
++/// winners — and the version-bump assertion panics.
++///
++/// If the sweep somehow contained no landed-ambiguous seed, this test would *not* panic and
++/// `#[should_panic]` would fail it — so it doubles as a vacuity guard on the nemesis itself.
++#[test]
++#[should_panic(expected = "must equal the inode's version bump")]
++fn assuming_an_ambiguous_commit_did_not_land_fails_the_sweep() {
++    for seed in 0..AMBIGUITY_SWEEP_SEEDS {
++        run_ambiguity_race(seed, Observer::AssumeNotCommitted);
++    }
++}
+diff --git a/crates/dst/tests/conformance.rs b/crates/dst/tests/conformance.rs
+index 48b08c6..e4ed586 100644
+--- a/crates/dst/tests/conformance.rs
++++ b/crates/dst/tests/conformance.rs
+@@ -1,7 +1,8 @@
+ //! The **shared** `MetadataStore` trait-contract suite, run inside the deterministic
+-//! simulator over **both** implementations — the deterministic redb backend and the
+-//! deterministic simulated-TiKV model (`support::SimTikvMetadataStore`) — so the
+-//! identical property suite pins the trait by two implementations (ADR-0006;
++//! simulator over **every** in-simulator implementation — the deterministic redb backend,
++//! the deterministic simulated-TiKV model (`support::SimTikvMetadataStore`) and the
++//! deterministic simulated-FDB model (`support::SimFdbMetadataStore`, issue #468) — so the
++//! identical property suite pins the trait by more than one implementation (ADR-0006;
+ //! proposal 0015 §"Pinning the trait with the second implementation" and
+ //! §"Definition of done", accepted
+ //! `docs/design/proposals/accepted/0015-milestone-4-production-metadata-backend-revised.md:546-555,655-657`).
+@@ -23,7 +24,7 @@ use wyrd_metadata_redb::RedbMetadataStore;
+ 
+ #[path = "support/mod.rs"]
+ mod support;
+-use support::SimTikvMetadataStore;
++use support::{SimFdbMetadataStore, SimTikvMetadataStore};
+ 
+ /// The deterministic redb backend passes every shared contract clause under the
+ /// simulator (Tier-0 spine, unchanged — proposal 0015 lines 489-499).
+@@ -42,3 +43,18 @@ async fn redb_backend_passes_shared_contract() {
+ async fn sim_tikv_backend_passes_shared_contract() {
+     wyrd_metadata_conformance::run_all(|_tag| async { SimTikvMetadataStore::new() }).await;
+ }
++
++/// The third implementation — the deterministic simulated-FDB model, whose commit is
++/// *optimistic* (no lock; the resolver rejects at commit time) — passes the **identical**
++/// shared contract clauses. Shared, not forked: the FFI backend Wyrd chose for production
++/// (ADR-0042) is now held to the same in-simulator standard as the backends it replaces
++/// (issue #468).
++///
++/// The `1021 commit_unknown_result` nemesis is deliberately **off** here
++/// ([`SimFdbMetadataStore::new`] arms nothing): the shared clauses legitimately assume a
++/// determinate commit outcome, so arming it would be testing the suite rather than the
++/// store. The ambiguity property gets its own body in `crates/dst/tests/commit_ambiguity.rs`.
++#[madsim::test]
++async fn sim_fdb_backend_passes_shared_contract() {
++    wyrd_metadata_conformance::run_all(|_tag| async { SimFdbMetadataStore::new() }).await;
++}
+diff --git a/crates/dst/tests/no_fdb_linkage.rs b/crates/dst/tests/no_fdb_linkage.rs
+new file mode 100644
+index 0000000..20f9b00
+--- /dev/null
++++ b/crates/dst/tests/no_fdb_linkage.rs
+@@ -0,0 +1,197 @@
++//! **No `libfdb_c` in the simulator's dependency graph** — the mechanical guarantee that
++//! backs the simulated-FDB model (issue #468).
++//!
++//! `crates/dst` is the deterministic-simulation tier (ADR-0009). The `foundationdb` crate
++//! binds `libfdb_c`, which **spawns its own network thread** and does real, non-deterministic
++//! I/O — `ensure_network()` boots it behind a process-wide `OnceLock`
++//! (`crates/metadata-fdb/src/lib.rs:846-869`). Linking it into a DST build target would
++//! violate seed determinism outright (ADR-0035; the rejection is recorded at
++//! `crates/dst/tests/support/mod.rs:6-8`). So the FDB backend is **modelled**
++//! (`support::SimFdbMetadataStore`), never linked — and there is exactly one way `libfdb_c`
++//! could enter this graph: someone adding the dependency to `crates/dst/Cargo.toml`.
++//!
++//! Two assertions, both cheap and deterministic, both run by `cargo xtask ci` (via
++//! `run_dst()`):
++//!
++//! 1. **The purity invariant.** `crates/dst/Cargo.toml` declares neither `wyrd-metadata-fdb`
++//!    nor `foundationdb` — with a **planted red** proving the scanner actually catches one,
++//!    rather than resting green on non-existence (the shape of
++//!    `xtask/tests/deploy_no_orchestrator_coupling.rs:67`).
++//! 2. **The model exists.** `crates/dst/tests/support/mod.rs` declares
++//!    `SimFdbMetadataStore` — the second parametrization this slice ships. A structural
++//!    assertion, stated plainly: it pins the *seam*, not the behaviour. The behavioural
++//!    red→green for the 1021 ambiguity property lives in
++//!    `crates/dst/tests/commit_ambiguity.rs`, which only executes under `--cfg madsim`.
++//!
++//! ## Why a plain-text scan and not a TOML parse
++//!
++//! `crates/dst` has no `toml`/`serde` dependency. Adding one to satisfy a guard would trip
++//! ADR-0003 §2's three-test dependency audit and the `deny.toml` allowlist — a real cost for
++//! no benefit, since the property ("this manifest names no FDB dependency") is a property of
++//! the manifest's *text*.
++//!
++//! Unlike its sibling `commit_ambiguity.rs`, this file is deliberately **not**
++//! `#![cfg(madsim)]`-gated, so it also runs under a bare
++//! `cargo test -p wyrd-dst --test no_fdb_linkage`.
++
++use std::path::{Path, PathBuf};
++
++/// The dependency names that would drag `libfdb_c` into the simulator: the FDB backend crate
++/// itself, and the `foundationdb` FFI crate it binds.
++const FDB_DEPENDENCY_NEEDLES: [&str; 2] = ["wyrd-metadata-fdb", "foundationdb"];
++
++/// This crate's directory (`<root>/crates/dst`).
++fn crate_dir() -> PathBuf {
++    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
++}
++
++/// The dependency name a single manifest line declares, if it is one of the banned ones.
++///
++/// Handles the three shapes a Cargo manifest can use, and ignores prose:
++///
++/// * `foundationdb = { version = "0.9" }`
++/// * `wyrd-metadata-fdb.workspace = true`
++/// * `[dependencies.foundationdb]`
++///
++/// A comment mentioning FoundationDB — as this crate's own docs do — is **not** a dependency,
++/// so everything from a `#` on is stripped first.
++fn scan_line(line: &str) -> Option<&'static str> {
++    let code = line.split('#').next().unwrap_or("").trim();
++    if code.is_empty() {
++        return None;
++    }
++
++    // `[dependencies.foundationdb]` / `[target.'cfg(x)'.dev-dependencies.foundationdb]`
++    if let Some(section) = code.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
++        let last = section.rsplit('.').next().unwrap_or("");
++        return FDB_DEPENDENCY_NEEDLES.iter().copied().find(|n| last == *n);
++    }
++
++    // `name = ...` / `name.workspace = true` — the key is the text before the first
++    // `=`, `.` or whitespace.
++    let key = code
++        .split(['=', '.', ' ', '\t'])
++        .next()
++        .unwrap_or("")
++        .trim_matches('"');
++    FDB_DEPENDENCY_NEEDLES.iter().copied().find(|n| key == *n)
++}
++
++/// Every banned FDB dependency a Cargo manifest declares. **One scanner, two call sites**:
++/// the real `crates/dst/Cargo.toml` (which must be empty) and a planted temp fixture (which
++/// must not be).
++fn scan_manifest_at(manifest: &Path) -> Vec<String> {
++    let text = std::fs::read_to_string(manifest)
++        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
++    text.lines()
++        .filter_map(scan_line)
++        .map(str::to_string)
++        .collect()
++}
++
++/// A unique temp directory, mirroring `xtask/tests/deploy_no_orchestrator_coupling.rs:72-79`.
++fn temp_fixture_dir(tag: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!(
++        "wyrd-no-fdb-linkage-{tag}-{}-{}",
++        std::process::id(),
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .expect("system clock before UNIX epoch")
++            .as_nanos()
++    ));
++    std::fs::create_dir_all(&dir).expect("create fixture dir");
++    dir
++}
++
++// ─── (1) the purity invariant, with a planted red ─────────────────────────────────────
++
++#[test]
++fn scan_line_catches_every_manifest_dependency_shape() {
++    assert_eq!(
++        scan_line("foundationdb = { version = \"0.9\" }"),
++        Some("foundationdb")
++    );
++    assert_eq!(
++        scan_line("wyrd-metadata-fdb.workspace = true"),
++        Some("wyrd-metadata-fdb")
++    );
++    assert_eq!(
++        scan_line("[target.'cfg(madsim)'.dev-dependencies.foundationdb]"),
++        Some("foundationdb")
++    );
++    assert_eq!(
++        scan_line("[dependencies.wyrd-metadata-fdb]"),
++        Some("wyrd-metadata-fdb")
++    );
++}
++
++#[test]
++fn scan_line_ignores_comments_and_unrelated_dependencies() {
++    // This crate's own manifest and docs discuss FoundationDB in prose; prose is not a
++    // dependency edge. Only a real declaration is a violation.
++    assert!(scan_line("# never depend on foundationdb here (ADR-0035)").is_none());
++    assert!(scan_line("wyrd-metadata-redb.workspace = true # not foundationdb").is_none());
++    assert!(scan_line("[dev-dependencies]").is_none());
++    // A crate whose name merely *contains* a needle is not the needle.
++    assert!(scan_line("foundationdb-sys-shim.workspace = true").is_none());
++}
++
++#[test]
++fn scan_manifest_is_red_when_an_fdb_dependency_is_planted() {
++    // Plant a REAL FDB dependency in a temp-fixture manifest and prove the SAME scanner the
++    // invariant below runs catches it: a demonstrated red, not a guard resting red on
++    // non-existence (`xtask/tests/deploy_no_orchestrator_coupling.rs:67-99`).
++    let dir = temp_fixture_dir("planted");
++    let manifest = dir.join("Cargo.toml");
++    std::fs::write(
++        &manifest,
++        "[package]\nname = \"wyrd-dst\"\n\n[dev-dependencies]\n\
++         wyrd-metadata-redb.workspace = true\nwyrd-metadata-fdb.workspace = true\n\
++         foundationdb = { version = \"0.9\", features = [\"fdb-7_1\"] }\n",
++    )
++    .expect("write fixture manifest");
++
++    let violations = scan_manifest_at(&manifest);
++    std::fs::remove_dir_all(&dir).ok();
++
++    assert_eq!(
++        violations,
++        vec!["wyrd-metadata-fdb".to_string(), "foundationdb".to_string()],
++        "planting the FDB dependencies must be caught, once each"
++    );
++}
++
++#[test]
++fn the_dst_manifest_declares_no_fdb_dependency() {
++    // The invariant itself: `libfdb_c` cannot reach a DST build target, because nothing in
++    // this crate's graph names it.
++    let manifest = crate_dir().join("Cargo.toml");
++    let violations = scan_manifest_at(&manifest);
++    assert!(
++        violations.is_empty(),
++        "{} declares FDB dependenc(ies) {violations:?} — `libfdb_c` spawns its own network \
++         thread and would break the simulator's seed determinism (ADR-0009/ADR-0035). The FDB \
++         backend is MODELLED in tests/support/mod.rs, never linked.",
++        manifest.display()
++    );
++}
++
++// ─── (2) the model this slice ships actually exists ───────────────────────────────────
++
++#[test]
++fn the_dst_support_module_declares_the_simulated_fdb_store() {
++    // The seam the purity guard protects is only worth protecting if the model exists: the
++    // point of #468 is that the FFI backend gets an in-simulator story, not merely that it
++    // is kept out of the simulator. Scanned as text because `support/mod.rs` is a
++    // madsim-only module this (non-madsim) test binary cannot link.
++    let support = crate_dir().join("tests/support/mod.rs");
++    let text = std::fs::read_to_string(&support)
++        .unwrap_or_else(|e| panic!("read {}: {e}", support.display()));
++    assert!(
++        text.contains("pub struct SimFdbMetadataStore"),
++        "{} must declare `SimFdbMetadataStore` — the simulated-FDB model whose 1021 \
++         commit-ambiguity property `crates/dst/tests/commit_ambiguity.rs` drives under \
++         `--cfg madsim` (issue #468)",
++        support.display()
++    );
++}
+diff --git a/crates/dst/tests/support/mod.rs b/crates/dst/tests/support/mod.rs
+index 7fcdbf2..dd134bd 100644
+--- a/crates/dst/tests/support/mod.rs
++++ b/crates/dst/tests/support/mod.rs
+@@ -27,10 +27,43 @@
+ //! explicitly open M4 design point. This model proposes the **pessimistic-lock at an
+ //! atomic prewrite** level of fidelity and demonstrates it reaches the target
+ //! interleaving; the human ratifies that choice at sign-off.
++//!
++//! ## The simulated-FoundationDB model (issue #468)
++//!
++//! [`SimFdbMetadataStore`] is the **second parametrization** of the skeleton above —
++//! not a second framework (issue #468 item 4; #258/#447 landed this shape *to* be
++//! parametrized). The recorded decision, condensed from the design proposal:
++//!
++//! * **Why a simulated FDB at all, when a contract harness already exists.** The
++//!   harness leg is kept — `crates/metadata-fdb/tests/conformance.rs` drives the same
++//!   `wyrd_metadata_conformance::run_all` clauses against a real `fdbserver`, so it is
++//!   the equivalence anchor. But **none** of those clauses touches commit ambiguity,
++//!   and none *could*: `crates/metadata-fdb/src/lib.rs:71` states that "a healthy
++//!   `fdbserver` cannot be made to emit 1021 on demand". `1021 commit_unknown_result`
++//!   is the one genuinely new failure shape FDB introduces, and a real fault battery
++//!   can only *sample* it. A seed-driven nemesis inside the simulator can *search* it.
++//! * **Why not the real driver in-simulator.** `libfdb_c` spawns its own network
++//!   thread and does real I/O (`crates/metadata-fdb/src/lib.rs:846-869`), which would
++//!   violate seed determinism outright (ADR-0009, ADR-0035, and the rejection recorded
++//!   at lines 6-8 above). So the FDB backend is *modelled*, never linked — and
++//!   `crates/dst/tests/no_fdb_linkage.rs` mechanically keeps `libfdb_c` out of the
++//!   simulator's dependency graph.
++//! * **The fidelity claimed.** Optimistic conflict at commit (the `1020 not_committed`
++//!   class) plus a seed-selected commit ambiguity (the `1021` class), over a plain
++//!   `BTreeMap` rather than a versioned MVCC keyspace. MVCC fidelity buys nothing for
++//!   this trait: the version compare-and-set is a *full-value* precondition and FDB
++//!   stores keys/values byte-identically (`crates/metadata-fdb/src/lib.rs:873-875`).
++//!   As with the simulated-TiKV choice above, **the human ratifies this at sign-off.**
++//! * **No `Undeterminable` `CommitOutcome`.** The production driver models the
++//!   ambiguous outcome as `Err(classify::CommitUnknownResult)`, never `Ok(Conflict)`
++//!   (`crates/metadata-fdb/src/lib.rs:67-73`, `:150-153`). The model reproduces exactly
++//!   that; adding a third `CommitOutcome` variant would make the simulation *less*
++//!   faithful, not more.
+ 
+ #![allow(dead_code)]
+ 
+ use std::collections::{BTreeMap, HashSet};
++use std::fmt;
+ use std::sync::Mutex;
+ use std::time::Duration;
+ 
+@@ -258,3 +291,250 @@ impl MetadataStore for SimTikvMetadataStore {
+         }
+     }
+ }
++
++// ───────────────────── the simulated-FoundationDB model (#468) ─────────────────────
++
++/// The simulated `1021 commit_unknown_result`: the commit **may or may not** have
++/// landed and the client cannot tell. The only correct move for an observer is to
++/// re-read.
++///
++/// A distinguishable error type, not a `String`, mirroring the production driver's
++/// downcastable `classify::CommitUnknownResult`
++/// (`crates/metadata-fdb/src/lib.rs:150-153`, and "Errors a caller can tell apart",
++/// `:110-117`) — so the scenario settles an ambiguous commit by *type*, never by
++/// string-matching a message.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SimCommitUnknownResult;
++
++impl fmt::Display for SimCommitUnknownResult {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "simulated-FDB: 1021 commit_unknown_result — the commit may or may not \
++             have landed; re-read to settle it"
++        )
++    }
++}
++
++impl std::error::Error for SimCommitUnknownResult {}
++
++/// One `u64` from a `ChaCha8Rng`, without pulling the `rand::Rng` trait into scope at
++/// every call site (the same helper shape as `crates/dst/tests/network.rs:521-525`).
++fn rng_u64(rng: &mut rand_chacha::ChaCha8Rng) -> u64 {
++    use rand::Rng;
++    rng.next_u64()
++}
++
++/// How faithfully the simulated-FDB model renders a commit's failure modes.
++///
++/// The two FDB-shaped modes. Both share the same *optimistic* commit shape — FDB takes
++/// no lock; the resolver decides at commit time — which is what distinguishes this model
++/// from [`SimTikvMetadataStore`]'s pessimistic prewrite lock-grab.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FdbFidelity {
++    /// The resolver rejects a conditional batch at commit time (the `1020
++    /// not_committed` class) — the commit outcome is always *determinate*. This is the
++    /// mode the shared contract suite runs against: those clauses legitimately assume a
++    /// determinate commit, so arming the nemesis there would be testing the suite, not
++    /// the store.
++    OptimisticConflictAtCommit,
++    /// The above **plus** the `1021 commit_unknown_result` nemesis: on a commit the
++    /// resolver accepted, the reply is lost. The model decides from the seed whether the
++    /// mutation landed, applies it or not, and returns [`SimCommitUnknownResult`]
++    /// **without telling the caller which**.
++    CommitUnknownResult,
++}
++
++/// Per-simulation observation of the ambiguity actually exercised. Instance state
++/// (never a `static`), exactly as [`Observations`] — so it lives inside madsim's
++/// simulated world and cannot leak across seeds/threads (ADR-0035).
++///
++/// A sweep that never armed the nemesis is *visibly* vacuous: `ambiguous_commits`
++/// stays 0.
++#[derive(Debug, Default, Clone, Copy)]
++pub struct FdbObservations {
++    /// Commits struck by the 1021 nemesis — the resolver accepted them, then the reply
++    /// was lost.
++    pub ambiguous_commits: u64,
++    /// Of those, the ones whose mutation the seed decided **did** land. This is the
++    /// half of the ambiguity space an observer that "assumes not committed" gets wrong.
++    pub ambiguous_commits_that_landed: u64,
++    /// Conditional batches the resolver rejected outright (the `1020` class).
++    pub resolver_conflicts: u64,
++}
++
++#[derive(Debug)]
++struct FdbInner {
++    /// The committed key/value state. A plain map, not a versioned MVCC keyspace — see
++    /// the fidelity note in the module docs.
++    truth: BTreeMap<Vec<u8>, Bytes>,
++    fidelity: FdbFidelity,
++    /// How many more commits the 1021 nemesis may strike in this simulation. A budget,
++    /// not a coin: the *schedule* (which writer reaches the resolver first) and the
++    /// *outcome* (whether the struck commit landed) are the seed-derived degrees of
++    /// freedom, so every seed spends the budget and explores one point of the ambiguity
++    /// space. A per-commit coin would instead waste most seeds on no fault at all.
++    nemesis_budget: u64,
++    /// Seed-derived, so a bug-finding seed replays the *same* fault decisions (ADR-0009).
++    /// Never wall-clock, never thread scheduling.
++    rng: rand_chacha::ChaCha8Rng,
++    obs: FdbObservations,
++}
++
++/// A deterministic **simulated-FoundationDB** `MetadataStore` (see module docs).
++///
++/// Not a real or linked FoundationDB: `libfdb_c` owns a network thread and cannot live
++/// inside the simulator (ADR-0009/ADR-0035). This is a small, in-memory,
++/// seed-reproducible *model* of the one thing neither redb nor simulated-TiKV renders —
++/// a commit whose outcome the client **cannot determine** (`1021
++/// commit_unknown_result`, `crates/metadata-fdb/src/lib.rs:67-73`).
++///
++/// Instance state under a `Mutex`, never a `static` (ADR-0035), exactly as
++/// [`SimTikvMetadataStore`].
++#[derive(Debug)]
++pub struct SimFdbMetadataStore {
++    inner: Mutex<FdbInner>,
++}
++
++impl SimFdbMetadataStore {
++    /// A fresh, empty store with the nemesis **disarmed**
++    /// ([`FdbFidelity::OptimisticConflictAtCommit`]).
++    pub fn new() -> Self {
++        Self::with_fidelity(FdbFidelity::OptimisticConflictAtCommit)
++    }
++
++    /// A fresh, empty store at the given [`FdbFidelity`]; the nemesis, when selected,
++    /// gets a budget of one strike per simulation.
++    ///
++    /// Must be constructed **inside** a madsim runtime: the fault RNG is seeded from the
++    /// run seed (`madsim::runtime::Handle::current().seed()`), the same seam
++    /// `crates/dst/tests/network.rs:513-519` uses for its fault selection.
++    pub fn with_fidelity(fidelity: FdbFidelity) -> Self {
++        use rand::SeedableRng;
++        let nemesis_budget = match fidelity {
++            FdbFidelity::OptimisticConflictAtCommit => 0,
++            FdbFidelity::CommitUnknownResult => 1,
++        };
++        Self {
++            inner: Mutex::new(FdbInner {
++                truth: BTreeMap::new(),
++                fidelity,
++                nemesis_budget,
++                rng: rand_chacha::ChaCha8Rng::seed_from_u64(
++                    madsim::runtime::Handle::current().seed(),
++                ),
++                obs: FdbObservations::default(),
++            }),
++        }
++    }
++
++    /// Arm the `1021` nemesis for the next `budget` commits the resolver accepts.
++    ///
++    /// Called **after** a scenario's fixture is in place, so the ambiguity lands on the
++    /// commits under test rather than on the fixture build. The nemesis is deliberately
++    /// scoped to **conditional** batches: a blind batch's ambiguity is a different
++    /// concern, held by the production driver's blind-retry gate (which never re-applies
++    /// 1021 — `crates/metadata-fdb/src/lib.rs:53-56`) and already pinned by that crate's
++    /// `store::tests`.
++    pub fn arm_commit_ambiguity(&self, budget: u64) {
++        let mut inner = self.inner.lock().unwrap();
++        inner.fidelity = FdbFidelity::CommitUnknownResult;
++        inner.nemesis_budget = budget;
++    }
++
++    /// A snapshot of what this store observed during the run.
++    pub fn observations(&self) -> FdbObservations {
++        self.inner.lock().unwrap().obs
++    }
++
++    /// The optimistic commit: take a read version (a round-trip), send the commit RPC
++    /// (a second round-trip), then let the resolver decide — atomically, no await.
++    ///
++    /// FDB takes **no lock**: a writer stages its mutations locally and the resolver
++    /// rejects it at commit time if a key in its *read-conflict set* moved. That is the
++    /// structural difference from `SimTikvMetadataStore::commit_await_inside`, whose
++    /// winner is decided at a pessimistic prewrite lock-grab.
++    async fn commit_optimistic(&self, batch: &WriteBatch) -> Result<CommitOutcome> {
++        let conditional = !batch.preconditions.is_empty();
++
++        // Phase 1 — `get_read_version`: a network round-trip. Every concurrent writer
++        // yields here, and — unlike TiKV's prewrite — takes nothing with it.
++        network_hop().await;
++
++        // Phase 2 — the commit RPC. The client is now in flight and cannot observe the
++        // resolver's verdict until the reply arrives. This is the window `1021` lives in.
++        network_hop().await;
++
++        // Phase 3 — resolver + apply: ONE atomic step, no await inside, so a batch is
++        // all-or-nothing and no torn/hybrid state is ever observable.
++        let mut inner = self.inner.lock().unwrap();
++
++        if !preconditions_hold(&inner.truth, &batch.preconditions) {
++            // `1020 not_committed` (or the observed miss read inside the transaction):
++            // the trait's `Conflict`. Structurally unreachable for a blind batch — an
++            // empty precondition list holds vacuously here, exactly as FDB's resolver
++            // cannot reject a write-only transaction whose read-conflict set is empty
++            // (`crates/metadata-fdb/src/lib.rs:62-64`). The assert pins that: a blind
++            // batch must NEVER escape as `Conflict`, or the many callers that `?` the
++            // result and ignore the `CommitOutcome` would read a dropped write as
++            // success (`crates/traits/src/lib.rs:346-350`).
++            assert!(
++                conditional,
++                "simulated-FDB: a precondition-free batch reached the Conflict arm — a \
++                 blind write must never surface as Ok(Conflict)"
++            );
++            inner.obs.resolver_conflicts += 1;
++            return Ok(CommitOutcome::Conflict);
++        }
++
++        // The resolver ACCEPTED. Now — and only now — the reply may be lost: `1021
++        // commit_unknown_result`. The seed decides whether the mutation landed; the
++        // caller is NOT told. Never `Ok(Conflict)`, never retried by the caller.
++        if inner.fidelity == FdbFidelity::CommitUnknownResult
++            && conditional
++            && inner.nemesis_budget > 0
++        {
++            inner.nemesis_budget -= 1;
++            let landed = rng_u64(&mut inner.rng) % 2 == 0;
++            if landed {
++                apply(&mut inner.truth, batch);
++                inner.obs.ambiguous_commits_that_landed += 1;
++            }
++            inner.obs.ambiguous_commits += 1;
++            return Err(BoxError::from(SimCommitUnknownResult));
++        }
++
++        apply(&mut inner.truth, batch);
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++impl Default for SimFdbMetadataStore {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++#[async_trait]
++impl MetadataStore for SimFdbMetadataStore {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        // A read version plus a `get`: a network round-trip in either fidelity.
++        network_hop().await;
++        Ok(self.inner.lock().unwrap().truth.get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        network_hop().await;
++        let inner = self.inner.lock().unwrap();
++        Ok(inner
++            .truth
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect())
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        self.commit_optimistic(&batch).await
++    }
++}

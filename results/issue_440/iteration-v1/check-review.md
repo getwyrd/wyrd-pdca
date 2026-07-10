@@ -1,0 +1,15 @@
+Reviewing issue 440: expose the shipped FoundationDB metadata backend through `wyrd-server` metadata-backend selection without changing the `MetadataStore` consumer seam.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The owed decision is concrete: default builds must reject `fdb` with a feature hint, list it in unknown/usage text, and keep FDB linkage out of default CI; the brief states those checks at `brief.md:12`. |
+| C2 Reproduction (red pre-fix) | PASS | Reverting the production hunks reproduced the user defect: `--metadata-backend fdb` returned unknown-backend text and no-args usage omitted `fdb`, matching `brief.md:111`. |
+| C3 Change | PASS | The patch reaches the composition surface the operator depends on: `fdb` feature/dependency at `crates/server/Cargo.toml:31`, config selection at `crates/server/src/cli.rs:120`, usage at `crates/server/src/cli.rs:268`, and lockfile dependency at `Cargo.lock:5183`. |
+| C4 Verification (red->green) | NEEDS-HUMAN | The exact `./engine/scripts/run-verify.sh` harness is absent here; my manual red phase went red before the intended assertions because `#[cfg(feature = "fdb")]` in `crates/server/tests/fdb_backend_selection.rs:44` becomes an undeclared cfg under workspace `warnings = "deny"` at `Cargo.toml:195`, while patched green checks passed. |
+| C5 Causal adequacy | PASS | The owed root-cause decision is satisfied: missing server selection is fixed by composition-root arms to `FdbMetadataStore::connect()` at `crates/server/src/cli.rs:168`, with no capability-probe/runtime-guard smell introduced. |
+| T1 Structure | PASS | The boundary decision holds: changes stay in server composition, manifest, lockfile, and a regression test; no consumer refactor is needed beyond backend dispatch arms such as `crates/server/src/cli.rs:373`. |
+| T2 Shape | PASS | The feature shape matches the risk boundary: default builds keep FDB optional at `crates/server/Cargo.toml:31`, feature-on builds select `MetadataBackend::Fdb` in the gated test at `crates/server/tests/fdb_backend_selection.rs:44`. |
+| T3 Runtime | NEEDS-HUMAN | The binding runtime checks passed (`cargo test -p wyrd-server --test fdb_backend_selection`, `cargo xtask ci`, feature-on check/test), but the live FDB `put`/`get` required by `brief.md:154` was not exercised because Docker socket access was denied. |
+| T4 Contribution | PASS | Prior-art by affected file path was mechanically checked; `git log -G 'Fdb|fdb|metadata-fdb'` over server files found no previous server-side FDB selection attempt, consistent with `brief.md:199`. |
+| T5 Judgment | PASS | The human decision is not blocked by scope creep: this implements selection, not deployment, and leaves #439's compose/doctor/CI workflow boundary intact as scoped at `brief.md:109`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human sign-off must decide whether default-build selection plus feature-on compile/test is sufficient before the unavailable live FDB round-trip is rerun in a Docker-enabled environment, because `brief.md:161` says that check is non-gating but not silently skippable. |
