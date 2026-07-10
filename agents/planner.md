@@ -157,11 +157,42 @@ your **own** initiative — the human should never have to ask for it:
    **Plan-blocking gap**, not a detail for Do to discover after three cycles: surface it to
    the human and provision the environment or narrow the criterion *before* the brief hands
    off. Don't ship a criterion that cannot fail on the environment Do gets.
+4. **Check the criterion against the HARNESS that will run it, not just against the repo.**
+   Steps 1–3 verify the brief's *claims*. A criterion can survive all three and still be
+   un-evaluable by the gates the driver actually invokes — the brief then reads well and
+   demonstrates nothing. Open `pdca.toml`'s `[[gates.checks]]` (note which are `gating = true`
+   and which advisory) and the runner each names, then confirm all four:
+   - **The `Test file` earns a per-fix RED.** A bundle-scoped red→green gate typically
+     discriminates on the patch **adding** a `tests/`-style file. A test co-located inside a
+     modified production file — or appended to an *existing* test file — yields no added-test
+     classification and silently degrades to **green-only**. Where the gate exposes a
+     classification hook (here: `./engine/scripts/run-verify.sh --classify <patch>`), **dry-run
+     it on a synthetic patch listing the files you expect Do to touch** and require an
+     `ADDED_TEST` line. This is cheap and catches the failure before Do writes anything.
+   - **The named test actually executes under the gate's own invocation.** A test gated by
+     `#![cfg(...)]`, a cargo feature, or an env var compiles to **nothing** under a bare runner
+     and prints "0 tests … ok" — a vacuous pass that looks green in *both* the fix and
+     reverted-fix phases, so the gate concludes "the test passes without the fix". Run the
+     gate's exact command against an existing peer test and read what it prints.
+   - **The named symbol is reachable from the named test.** A function private to a *binary*
+     target is not callable from an integration test; a `#[cfg(feature = …)]` item is not
+     compiled by a gate that never enables the feature. Check visibility and target, not just
+     that the symbol exists.
+   - **The patch will apply on the gate's base.** A bundle-scoped verify applies `patch.diff`
+     to a clean checkout of the brief's `Repo + branch target` — **not** the wave-folded base
+     Do built on. Two bundles in different waves that touch a **shared file** therefore produce
+     a dependent whose patch does not apply. Cross-check the batch's expected file sets, make
+     them disjoint where you can, and pre-declare the collision where you can't.
+
+   Fix the **brief** (move the test to its own file, name a runner that reaches it, re-scope
+   the files) — never paper over it by weakening the criterion. A criterion no gate can
+   evaluate is a Plan-blocking gap of the same class as step 3's: surface it and stop.
 
 Conclude with one line stating you ran this pass and what it changed (or "verified, no
 gaps"). It is unconditional and applies to **every** brief — distinct from the
 category-gated Plan-exit gate above, which gates the brief's *shape* for structural
-defects; this gates claim accuracy + completeness. In batch mode, run it per `brief.md`.
+defects; this gates claim accuracy, completeness, and **gate-evaluability**. In batch mode,
+run it per `brief.md`, and run step 4's collision check across the batch as a whole.
 
 ## Ending the session
 
