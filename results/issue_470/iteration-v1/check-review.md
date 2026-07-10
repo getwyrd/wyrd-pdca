@@ -1,0 +1,15 @@
+Reviewing issue 470: add a first-class FoundationDB-capable `wyrd` OCI image with pinned client/cluster version checks and CI coverage.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The owed behavior is clear: a production-shaped FDB image plus mechanical version coupling, with Docker execution treated as supplementary sign-off rather than the container-free binding gate. |
+| C2 Reproduction (red pre-fix) | PASS | Red was reproduced after stashing the patch: `cargo test -p xtask --test fdb_image` exited 101 because the `xtask` package had no `fdb_image` test target. |
+| C3 Change | PASS | The patch creates the production image surface and its checks: pinned `FDB_VERSION` at `deploy/docker/wyrd/Dockerfile:28`, non-root runtime at `deploy/docker/wyrd/Dockerfile:122`, PR image workflow at `.github/workflows/fdb-image.yml:57`, and the consistency guard at `xtask/tests/fdb_image.rs:93`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Human must accept or rerun the exact harness gate because targeted red→green passed and `cargo xtask ci` ended green, but the configured wrapper `./engine/xtask.sh ci` was absent here and Docker daemon access was denied. |
+| C5 Causal adequacy | PASS | No symptom-guard smell found: the change adds the missing FDB-capable image and load-bearing version drift check rather than probing around an eager/runtime failure (`xtask/tests/fdb_image.rs:106`, `xtask/tests/fdb_image.rs:285`). |
+| T1 Structure | PASS | The work stays in the intended slice: Dockerfile, workflow, and test-local helpers only, with no `xtask/src/` or deploy-profile migration (`xtask/tests/fdb_image.rs:20`, `xtask/tests/fdb_image.rs:35`). |
+| T2 Shape | PASS | The file-shape obligations are covered: multi-stage build, parameterized features/version, pinned FDB client install, workflow path filters, and exact crate/compose/image line coupling (`deploy/docker/wyrd/Dockerfile:36`, `.github/workflows/fdb-image.yml:22`, `Cargo.toml:108`, `deploy/fdb-single-node/docker-compose.yml:22`). |
+| T3 Runtime | NEEDS-HUMAN | Human must run the real image legs because this sandbox has Docker CLI/compose but cannot connect to `/var/run/docker.sock`; the current evidence proves files and tests, not `docker build`, `docker run`, FDB connect, or version-skew behavior (`.github/workflows/fdb-image.yml:59`). |
+| T4 Contribution | NEEDS-HUMAN | Human must confirm non-local open/closed/rejected prior art because local affected-path history for the three new paths was empty and `HEAD` still lists only the old Dockerfiles, but PR-state history was not mechanically available here. |
+| T5 Judgment | PASS | The patch respects the declared boundaries: it does not migrate the TiKV stack or edit `deploy/README.md`, and the workflow only builds `wyrd:fdb` from the new image definition (`.github/workflows/fdb-image.yml:57`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide production fitness after exercising the Docker-dependent path, because the operator artifact is the image itself and reviewer verification stopped at red→green tests plus `cargo xtask ci` due Docker socket denial. |
