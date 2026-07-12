@@ -37,7 +37,10 @@
   never touched and concurrent lanes get private worktrees. `engine/xtask.sh` runs
   `cargo xtask ci` in `$PDCA_WORKTREE` (falling back to `../wyrd` if isolation is off), so
   the gate tests the SAME tree the builder edited; the per-fix `C4-verify` gate uses its
-  own dedicated `../wyrd-verify` worktree off `origin/main` (`$WYRD_REPO` overrides). Both
+  own dedicated `../wyrd-verify` worktree, cut off **the bundle's resolved base** — not a
+  hardcoded `origin/main` (see "How `C4-verify` resolves the base" below). `$WYRD_VERIFY_BASE`
+  overrides the *base*; `$WYRD_REPO` / `$WYRD_VERIFY` override the *repo* and *worktree*
+  paths. Both
   the cycle worktree and the `C4-verify` worktree (and its `pdca-verify` branch) are
   **scoped per lane** under in-driver concurrency (`-l<slot>` suffix from `$PDCA_LANE`), so
   `--lanes N` runs without two lanes colliding on a checkout or a branch — the active gate
@@ -45,18 +48,34 @@
 - **Per-area branch map:** single-slice fixes and standalone features target **`main`**
   directly. Wyrd has **no maintenance branches** (no `maintenance/*`, no
   master-vs-maintenance split) — don't invent one. **A multi-slice milestone stacks on a
-  shared integration branch** instead (the generic rule is fork-discipline.md §3):
-  **Milestone 4** (proposal 0007's PR sequence — issues #252, #253, …) targets
-  **`feat/m4-production-metadata-backend`** (cut off `main`); each M4 slice branches off
-  *that* branch and PRs *into* it, and the integration branch merges to `main` in one PR
-  when M4 completes. So an M4 bundle's brief **"Repo + branch target" is
-  `getwyrd/wyrd @ feat/m4-production-metadata-backend`, not `@ main`** — that is the base
-  the publisher opens the slice PR against. (Caveat: the per-fix `C4-verify` gate
-  currently validates against a hardcoded `origin/main`; for a *later* stacked slice whose
-  integration base has diverged from `main` — once an earlier M4 slice has merged into it —
-  that gate base should follow the integration branch. A known follow-up
-  (getwyrd/wyrd-pdca#91); harmless for the first slice, where the integration branch still
-  equals `main`.) Add another integration branch here when a future milestone needs the same.
+  shared integration branch** instead (the generic rule is fork-discipline.md §3).
+  The worked example — **Milestone 4** (proposal 0007's PR sequence — issues #252, #253, …)
+  — targeted **`feat/m4-production-metadata-backend`** (cut off `main`); each M4 slice
+  branched off *that* branch and PR'd *into* it, and the integration branch merged to `main`
+  in one PR when M4 completed. So an M4 bundle's brief **"Repo + branch target"** read
+  `getwyrd/wyrd @ feat/m4-production-metadata-backend`, not `@ main` — that is the base the
+  publisher opens the slice PR against. **M4 is COMPLETE** (merged as getwyrd/wyrd PR #489;
+  the branch is deleted from `origin`), so this stands as the **pattern**, not a live
+  instruction — a brief naming that branch today names a ref that no longer exists, and
+  `C4-verify` would warn and fall back to `origin/main`. Add another integration branch here
+  when a future milestone needs the same.
+- **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
+  "validates against a hardcoded `origin/main`" caveat no longer applies).
+  `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:
+  1. **`$WYRD_VERIFY_BASE`** — explicit override, used **verbatim**, so pass the full ref
+     (`origin/<branch>`);
+  2. the **brief's "Repo + branch target"** base, prefixed `origin/` — parsed exactly as
+     `publish._clean_ref` does, so the gate validates against the SAME base the PR is opened
+     against (a stacked slice therefore validates against its own integration branch);
+  3. **`origin/main`**.
+
+  A named base that does not exist on `origin` warns and falls back to `origin/main`.
+  *Remaining gap:* a **wave fold** builds the next wave on a driver-generated
+  `pdca-integration/<base>` branch that **no brief names**, and a bundle-scoped gate is never
+  told about it — so a wave≥1 dependent is still verified against `origin/<brief base>`.
+  That is a different problem from #91 and is tracked upstream as
+  **eduralph/pdca-harness#273**; it is live here (`wave_mode = "stack"`), and the
+  `$WYRD_VERIFY_BASE` slot above is what a fix would feed.
 - **Override convention:** a maintainer's explicit base-branch request on the PR wins
   (per `GOVERNANCE.md` decision-making); otherwise `main`.
 - **Cross-version cherry-pick rules:** none today (single line). If back-porting starts,
