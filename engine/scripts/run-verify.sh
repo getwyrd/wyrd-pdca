@@ -26,12 +26,17 @@
 # real command uses (for `crates/dst`: RUSTFLAGS=--cfg madsim + MADSIM_TEST_NUM, as
 # xtask::run_dst does). $WYRD_VERIFY_MADSIM_SEEDS tunes the seed count.
 #
-# Non-production (manifest) classification (issue #165, v0.43.0): N/A for Wyrd. That
-# exit-77 UNVERIFIABLE branch is for repos whose patch must touch a non-behavioral
-# manifest the test can't move (a translation manifest / file-registration list, e.g.
-# po/POTFILES.{in,skip}). Wyrd is a pure-Rust workspace with no such manifests, so every
-# fix is a real red->green (or the co-located green-only above); there is nothing to
-# classify as UNVERIFIABLE here. Add the exit-77 path only if such a manifest ever appears.
+# UNVERIFIABLE (exit 77 -> §6 NEEDS-HUMAN, non-gating): the gate could not MEASURE the
+# bundle. Not a verdict on the fix — the absence of one.
+#   * Zero tests ran (#114). `cargo test` exits 0 on a target that compiled to nothing, so an
+#     exit-status check reads an empty binary as a pass. Scoring that green is a false green in
+#     the very gate meant to prove the fix is real; scoring it red accuses a correct bundle of a
+#     defect the exit code cannot evidence. Either leg reporting 0 tests is reported as what it
+#     is. (#104 removes the dominant cause — a cfg gate — but a test can still vanish behind an
+#     unset feature, an #[ignore], or a filter that matches nothing.)
+#   * Non-production (manifest) classification (issue #165, v0.43.0) is N/A for Wyrd: that
+#     branch is for repos whose patch must touch a non-behavioral manifest the test can't move
+#     (e.g. po/POTFILES.{in,skip}). Wyrd is a pure-Rust workspace with no such manifests.
 #
 # Isolation: runs in a dedicated `../wyrd-verify` git worktree off the bundle's base —
 # `origin/main` by default, or the integration branch the brief targets, so a stacked
@@ -116,6 +121,20 @@ _rustflags_with() { # <cfg-name>... -> the RUSTFLAGS value
   for c in "$@"; do rf="${rf:+$rf }--cfg $c"; done
   printf '%s' "$rf"
 }
+
+# --- how many tests actually EXECUTED (#114) ---------------------------------------
+# `cargo test` exits 0 when it runs ZERO tests, so exit status alone cannot tell "the test
+# ran and passed" from "the target compiled to nothing". #104 fixes the dominant cause (a
+# cfg gate), but a target still reports zero for other reasons — a `#[cfg(feature = "…")]`
+# test whose feature the gate does not enable, every test `#[ignore]`d, a filter matching
+# nothing. Sum the harness summaries instead:
+#     test result: ok. 3 passed; 0 failed; 0 ignored; ...
+# Counts passed+failed only: an `#[ignore]`d test asserted nothing, so it did not run.
+_tests_ran() { # <cargo-test-output> -> total tests executed across every target
+  printf '%s\n' "$1" \
+    | sed -nE 's/^test result:.*[[:space:]]([0-9]+) passed;[[:space:]]([0-9]+) failed;.*/\1 \2/p' \
+    | awk '{ t += $1 + $2 } END { print t + 0 }'
+}
 # The cargo package name from the patch's ADDED `<crate>/Cargo.toml` (a net-new crate the
 # patch introduces — there is no pre-patch Cargo.toml to read). Pure patch parsing, "" if
 # none — the fallback _pkg_name uses when a test's crate isn't in the worktree yet (#88).
@@ -183,6 +202,13 @@ fi
 if [ "${1:-}" = "--cfgs" ]; then
   shift
   _crate_cfgs "$@"
+  exit 0
+fi
+
+# --tests-ran <file>: tests actually executed in a captured `cargo test` output (#114). No
+# worktree, no cargo — for engine/tests.
+if [ "${1:-}" = "--tests-ran" ]; then
+  _tests_ran "$(cat "${2:?--tests-ran needs a file of cargo test output}")"
   exit 0
 fi
 
@@ -289,7 +315,16 @@ fi
 ensure_cargo || exit $?
 
 TEST_ENV=()
-run_test() { ( cd "$VERIFY" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" cargo test --quiet "${TEST_ARGS[@]}" ); }
+TESTS_RAN=0
+# Captures the harness output so a zero-test run can be told apart from a real pass (#114) —
+# the output still reaches the operator on stderr. Sets $TESTS_RAN; returns cargo's status.
+run_test() {
+  local out rc=0
+  out="$( ( cd "$VERIFY" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" cargo test --quiet "${TEST_ARGS[@]}" ) 2>&1 )" || rc=$?
+  printf '%s\n' "$out" >&2
+  TESTS_RAN="$(_tests_ran "$out")"
+  return "$rc"
+}
 
 # The cfg gate the test sources sit behind, and the env that satisfies it (#104). Computed
 # once, AFTER the patch is applied (an added test does not exist in the worktree before
@@ -323,8 +358,19 @@ fi
 _build_test_env
 echo "run-verify.sh: GREEN — cargo test ${TEST_ARGS[*]} (fix applied)" >&2
 if ! run_test; then
-  echo "run-verify.sh: FAIL — the bundle's test is RED *with* the fix applied (not green)." >&2
+  echo "run-verify.sh: FAIL — the bundle's test does not pass with the fix applied (it failed to" >&2
+  echo "               build, or it ran and failed)." >&2
   exit 1
+fi
+# A target that compiled to nothing exits 0 (#114). That is not a green — it is the absence of
+# a measurement, and passing it would be a false green in the very gate meant to prove the fix
+# is real. Report it as what it is rather than inventing a verdict.
+if [ "$TESTS_RAN" -eq 0 ]; then
+  echo "run-verify.sh: UNVERIFIABLE — the target ran 0 tests with the fix applied, so the GREEN" >&2
+  echo "               leg asserted nothing (\`cargo test\` exits 0 on an empty target). The test is" >&2
+  echo "               compiled out: a cfg the gate does not set (#104), a feature it does not" >&2
+  echo "               enable, every test #[ignore]d, or a filter that matches nothing." >&2
+  exit 77
 fi
 
 # --- RED: revert the production change, keep the added test, the test must fail ----
@@ -353,7 +399,19 @@ for f in "${ALL[@]}"; do
 done
 echo "run-verify.sh: RED — cargo test ${TEST_ARGS[*]} (production reverted, test kept)" >&2
 if run_test; then
-  echo "run-verify.sh: FAIL — the test PASSES without the fix, so it does not catch the bug (no red)." >&2
+  # cargo exited 0 — but that means "the test passes without the fix" ONLY if a test actually
+  # ran. A zero-test target exits 0 too, and calling that "the test does not catch the bug"
+  # accuses a correct bundle of a defect the exit code cannot evidence (#114).
+  if [ "$TESTS_RAN" -eq 0 ]; then
+    echo "run-verify.sh: UNVERIFIABLE — with production reverted the target ran 0 tests, so no RED" >&2
+    echo "               could be established. This is NOT 'the test passes without the fix' — the" >&2
+    echo "               test never ran. It is compiled out: a cfg the gate does not set (#104), a" >&2
+    echo "               feature it does not enable, every test #[ignore]d, or a filter matching" >&2
+    echo "               nothing." >&2
+    exit 77
+  fi
+  echo "run-verify.sh: FAIL — the test PASSES without the fix ($TESTS_RAN test(s) ran), so it does" >&2
+  echo "               not catch the bug (no red)." >&2
   exit 1
 fi
 
