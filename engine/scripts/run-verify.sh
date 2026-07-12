@@ -18,6 +18,14 @@
 # gates it. Ship the test as its own file (crates/<c>/tests/<t>.rs) to earn the
 # full red->green.
 #
+# Cfg-gated test targets (#104): a test whose crate root is `#![cfg(NAME)]` compiles to
+# NOTHING without `--cfg NAME` — an empty binary that reports "running 0 tests" and exits 0.
+# An exit-status check cannot tell that from a test that ran and passed, so the GREEN leg
+# would measure a vacuum and the RED leg would call a correct bundle broken. The gate reads
+# the cfg off the test sources it is about to compile and passes the same flags the crate's
+# real command uses (for `crates/dst`: RUSTFLAGS=--cfg madsim + MADSIM_TEST_NUM, as
+# xtask::run_dst does). $WYRD_VERIFY_MADSIM_SEEDS tunes the seed count.
+#
 # Non-production (manifest) classification (issue #165, v0.43.0): N/A for Wyrd. That
 # exit-77 UNVERIFIABLE branch is for repos whose patch must touch a non-behavioral
 # manifest the test can't move (a translation manifest / file-registration list, e.g.
@@ -71,6 +79,43 @@ _is_test_file() { case "$1" in */tests/*.rs | tests/*.rs) return 0 ;; *) return 
 # (empty for root-level docs/CI files) maps to its cargo package.
 _crate_dir()    { case "$1" in crates/*/*) echo "crates/$(echo "$1" | cut -d/ -f2)" ;; xtask/*) echo "xtask" ;; *) echo "" ;; esac; }
 _in()           { local x="$1"; shift; local e; for e in "$@"; do [ "$e" = "$x" ] && return 0; done; return 1; }
+
+# --- cfg-gated test targets (#104) ------------------------------------------------
+# A test file whose CRATE ROOT is `#![cfg(NAME)]` compiles to NOTHING without `--cfg NAME`:
+# the harness links an empty binary, prints "running 0 tests" and exits 0. That is
+# indistinguishable, to an exit-status check, from a test that ran and passed — so the GREEN
+# leg measures a vacuum and the RED leg concludes "the test PASSES without the fix" and fails
+# a correct bundle. Every `crates/dst/tests/*.rs` is `#![cfg(madsim)]` (ADR-0009), which is
+# why #258 had to be reconciled by hand.
+#
+# So: read the cfg off the test sources this run will COMPILE, and hand `cargo test` the same
+# flags the crate's real command uses (wyrd `xtask::run_dst` appends `--cfg madsim` to
+# RUSTFLAGS and sets MADSIM_TEST_NUM). Pure (file in, names out) so engine/tests can pin it.
+_crate_cfgs() { # <source-file>... -> the crate-level cfg names, deduped
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    sed -nE 's/^[[:space:]]*#!\[cfg\(([A-Za-z_][A-Za-z0-9_]*)\)\].*/\1/p' "$f"
+  done | sort -u
+}
+
+# Env a cfg needs to run the way its real command runs it. madsim multiplies each
+# `#[madsim::test]` across seeds; xtask::run_dst sets MADSIM_TEST_NUM=50, and the gate matches
+# it so a seed-dependent red is not missed by a single-seed run. Override for a faster gate
+# with $WYRD_VERIFY_MADSIM_SEEDS.
+_cfg_extra_env() { # <cfg-name> -> zero or more KEY=VALUE lines
+  case "$1" in
+    madsim) printf 'MADSIM_TEST_NUM=%s\n' "${WYRD_VERIFY_MADSIM_SEEDS:-50}" ;;
+  esac
+}
+
+# RUSTFLAGS with `--cfg <name>` appended for each cfg — APPENDED to any inherited RUSTFLAGS
+# (never clobbered), mirroring xtask::run_dst.
+_rustflags_with() { # <cfg-name>... -> the RUSTFLAGS value
+  local rf="${RUSTFLAGS:-}" c
+  for c in "$@"; do rf="${rf:+$rf }--cfg $c"; done
+  printf '%s' "$rf"
+}
 # The cargo package name from the patch's ADDED `<crate>/Cargo.toml` (a net-new crate the
 # patch introduces — there is no pre-patch Cargo.toml to read). Pure patch parsing, "" if
 # none — the fallback _pkg_name uses when a test's crate isn't in the worktree yet (#88).
@@ -130,6 +175,14 @@ fi
 # (the net-new-crate path of _pkg_name). No worktree, no cargo — for engine/tests (#88).
 if [ "${1:-}" = "--pkg-name" ]; then
   _pkg_from_added_cargo "${2:?--pkg-name needs a crate dir}" "${3:?--pkg-name needs a patch path}"
+  exit 0
+fi
+
+# --cfgs <source-file>...: the crate-level cfg gates of those sources (#104). No worktree,
+# no cargo — for engine/tests.
+if [ "${1:-}" = "--cfgs" ]; then
+  shift
+  _crate_cfgs "$@"
   exit 0
 fi
 
@@ -195,14 +248,21 @@ ADDED_TESTS=()
 for f in "${ADDED[@]:-}"; do [ -n "$f" ] && _is_test_file "$f" && ADDED_TESTS+=("$f"); done
 
 # --- map changed files -> the cargo test targets to run --------------------------
+# Alongside the cargo args, record the test SOURCES this invocation will compile, so the
+# cfg gate they sit behind can be read off them once the patch is applied (#104):
+#   * added-test path — exactly the file we `--test`;
+#   * fallback path   — the crate's whole tests/ dir, since a bare `-p <pkg>` compiles all.
 declare -A SEEN_PKG=()
 TEST_ARGS=()
+TEST_SRC_FILES=()   # explicit test sources (relative to $VERIFY)
+TEST_SRC_CRATES=()  # crate dirs whose tests/*.rs are all compiled
 GREEN_ONLY=0
 if [ "${#ADDED_TESTS[@]}" -gt 0 ]; then
   for t in "${ADDED_TESTS[@]}"; do
     c="$(_crate_dir "$t")"; [ -n "$c" ] || continue
     pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
     TEST_ARGS+=("-p" "$pkg" "--test" "$(basename "$t" .rs)"); SEEN_PKG["$pkg"]=1
+    TEST_SRC_FILES+=("$t")
     # A crate the patch itself CREATES has no pre-patch state, so its test is born green —
     # there is no per-fix RED to isolate (like a co-located test). Run green-only (#88).
     [ -f "$VERIFY/$c/Cargo.toml" ] || GREEN_ONLY=1
@@ -215,6 +275,7 @@ if [ "${#TEST_ARGS[@]}" -eq 0 ]; then
     pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
     [ -n "${SEEN_PKG[$pkg]:-}" ] && continue
     TEST_ARGS+=("-p" "$pkg"); SEEN_PKG["$pkg"]=1
+    TEST_SRC_CRATES+=("$c")
   done
 fi
 if [ "${#TEST_ARGS[@]}" -eq 0 ]; then
@@ -227,13 +288,39 @@ fi
 # requires a toolchain. See engine/lib/ensure-cargo.sh.
 ensure_cargo || exit $?
 
-run_test() { ( cd "$VERIFY" && cargo test --quiet "${TEST_ARGS[@]}" ); }
+TEST_ENV=()
+run_test() { ( cd "$VERIFY" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" cargo test --quiet "${TEST_ARGS[@]}" ); }
+
+# The cfg gate the test sources sit behind, and the env that satisfies it (#104). Computed
+# once, AFTER the patch is applied (an added test does not exist in the worktree before
+# that), and reused by the RED leg — which keeps the same test files.
+_build_test_env() {
+  local srcs=() c f kv
+  for f in "${TEST_SRC_FILES[@]+"${TEST_SRC_FILES[@]}"}"; do [ -n "$f" ] && srcs+=("$VERIFY/$f"); done
+  for c in "${TEST_SRC_CRATES[@]+"${TEST_SRC_CRATES[@]}"}"; do
+    [ -n "$c" ] || continue
+    for f in "$VERIFY/$c"/tests/*.rs; do [ -f "$f" ] && srcs+=("$f"); done
+  done
+  [ "${#srcs[@]}" -gt 0 ] || return 0
+
+  local cfgs=()
+  mapfile -t cfgs < <(_crate_cfgs "${srcs[@]}")
+  [ "${#cfgs[@]}" -gt 0 ] && [ -n "${cfgs[0]:-}" ] || return 0
+
+  TEST_ENV+=("RUSTFLAGS=$(_rustflags_with "${cfgs[@]}")")
+  for c in "${cfgs[@]}"; do
+    while IFS= read -r kv; do [ -n "$kv" ] && TEST_ENV+=("$kv"); done < <(_cfg_extra_env "$c")
+  done
+  echo "run-verify.sh: cfg-gated test target (${cfgs[*]}) — without the flag it compiles to 0" >&2
+  echo "               tests and the gate measures nothing; running with ${TEST_ENV[*]} (#104)." >&2
+}
 
 # --- GREEN: with the fix applied, the test passes --------------------------------
 if ! git -C "$VERIFY" apply "$PATCH" 2>/dev/null; then
   echo "run-verify.sh: patch.diff does not apply on $BASE_REF — the bundle is stale; rebase Do." >&2
   exit 1
 fi
+_build_test_env
 echo "run-verify.sh: GREEN — cargo test ${TEST_ARGS[*]} (fix applied)" >&2
 if ! run_test; then
   echo "run-verify.sh: FAIL — the bundle's test is RED *with* the fix applied (not green)." >&2

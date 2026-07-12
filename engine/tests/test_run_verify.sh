@@ -153,4 +153,34 @@ check "WYRD_VERIFY_BASE override wins over the brief" \
   "origin/release-1.2" \
   "$(PDCA_BUNDLE="$TMP/b_m4" WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
 
+# 9. cfg-gated test targets (#104). A test whose crate root is `#![cfg(NAME)]` compiles to
+#    an EMPTY binary without `--cfg NAME` — "running 0 tests", exit 0 — which an exit-status
+#    check reads as a pass. The gate must read the cfg off the sources it compiles and pass
+#    the flag, or every crates/dst (madsim) bundle is measured against a vacuum.
+printf '%s\n' '#![cfg(madsim)]' '#[madsim::test] async fn t() {}' > "$TMP/dst_test.rs"
+check "crate-root #![cfg(madsim)] -> madsim" \
+  "madsim" \
+  "$("$RV" --cfgs "$TMP/dst_test.rs")"
+
+printf '%s\n' '#[test] fn plain() {}' > "$TMP/plain_test.rs"
+check "ungated test -> no cfg (the flag must NOT be invented)" \
+  "" \
+  "$("$RV" --cfgs "$TMP/plain_test.rs")"
+
+# An indented / attribute-adjacent form still counts; a `#[cfg(...)]` on an ITEM (not the
+# crate root `#![...]`) does NOT — it gates one item, not the whole binary.
+printf '%s\n' '  #![cfg(feature_x)]' > "$TMP/indented.rs"
+check "indented crate-root cfg -> still detected" \
+  "feature_x" \
+  "$("$RV" --cfgs "$TMP/indented.rs")"
+
+printf '%s\n' '#[cfg(madsim)] fn only_this_item() {}' > "$TMP/item_cfg.rs"
+check "item-level #[cfg] is NOT a crate gate -> no cfg" \
+  "" \
+  "$("$RV" --cfgs "$TMP/item_cfg.rs")"
+
+check "multiple sources -> deduped union, sorted" \
+  $'feature_x\nmadsim' \
+  "$("$RV" --cfgs "$TMP/dst_test.rs" "$TMP/indented.rs" "$TMP/plain_test.rs")"
+
 [ "$fail" -eq 0 ] && { echo "test_run_verify.sh: all passed"; exit 0; } || { echo "test_run_verify.sh: FAILURES"; exit 1; }
