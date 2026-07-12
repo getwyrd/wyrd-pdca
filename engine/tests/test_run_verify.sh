@@ -183,4 +183,42 @@ check "multiple sources -> deduped union, sorted" \
   $'feature_x\nmadsim' \
   "$("$RV" --cfgs "$TMP/dst_test.rs" "$TMP/indented.rs" "$TMP/plain_test.rs")"
 
+# 10. tests actually EXECUTED (#114). `cargo test` exits 0 on a target that compiled to
+#     nothing, so the gate must count what ran instead of trusting the exit status —
+#     otherwise a 0-test run is a false GREEN, and in the RED leg a false accusation.
+printf '%s\n' 'running 0 tests' \
+  'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' \
+  > "$TMP/out_zero.txt"
+check "empty target (cargo still exits 0) -> 0 tests ran" \
+  "0" \
+  "$("$RV" --tests-ran "$TMP/out_zero.txt")"
+
+printf '%s\n' 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s' \
+  > "$TMP/out_three.txt"
+check "3 passing tests -> 3 ran" \
+  "3" \
+  "$("$RV" --tests-ran "$TMP/out_three.txt")"
+
+printf '%s\n' 'test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s' \
+  > "$TMP/out_failed.txt"
+check "failures count as RUN (a red is a measurement) -> 3 ran" \
+  "3" \
+  "$("$RV" --tests-ran "$TMP/out_failed.txt")"
+
+# An #[ignore]d test asserted nothing, so it did NOT run — this is one of the ways a target
+# reports zero after #104 removes the cfg cause.
+printf '%s\n' 'test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s' \
+  > "$TMP/out_ignored.txt"
+check "all tests #[ignore]d -> 0 ran (ignored is not executed)" \
+  "0" \
+  "$("$RV" --tests-ran "$TMP/out_ignored.txt")"
+
+# Multiple targets in one invocation: sum across every summary line.
+printf '%s\n' 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' \
+  'test result: ok. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' \
+  > "$TMP/out_multi.txt"
+check "multiple targets -> summed across summaries" \
+  "7" \
+  "$("$RV" --tests-ran "$TMP/out_multi.txt")"
+
 [ "$fail" -eq 0 ] && { echo "test_run_verify.sh: all passed"; exit 0; } || { echo "test_run_verify.sh: FAILURES"; exit 1; }
