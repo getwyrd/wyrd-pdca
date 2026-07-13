@@ -1,0 +1,15 @@
+Review task: add the first FoundationDB-backed `MetadataStore` implementation, gated behind `fdb`, with shared conformance and contention coverage for issue 438.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance target is explicit: a feature-gated FDB backend plus shared conformance/contention proof against a live single-node server, with server selection out of scope (`brief.md:22`). |
+| C2 Reproduction (red pre-fix) | NEEDS-HUMAN | The live demonstrated-red decision remains owed: this sandbox could not access Docker, so I could not rerun the required FDB red assertions against the real server (`brief.md:31`; `crates/metadata-fdb/tests/contention.rs:46`). |
+| C3 Change | PASS | The patch adds the missing FDB workspace member and implementation surface the spec calls for (`Cargo.toml:18`; `crates/metadata-fdb/src/lib.rs:411`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Feature-on FDB tests compile here, but the live red→green leg was not exercised because `docker info` was denied at `/var/run/docker.sock`; `cargo xtask fdb-conformance` therefore skipped (`xtask/src/main.rs:291`; `crates/metadata-fdb/tests/conformance.rs:56`). |
+| C5 Causal adequacy | NEEDS-HUMAN | Maintainer must decide whether a not-yet-selected backend is causally sufficient for this slice, because production construction is explicitly deferred and only tests currently exercise the store (`crates/metadata-fdb/src/lib.rs:7`; `brief.md:130`). |
+| T1 Structure | PASS | The implementation is isolated as a concrete backend crate, with the throwaway FDB topology under `deploy/` rather than coupled into library crates (`Cargo.toml:18`; `deploy/fdb-single-node/docker-compose.yml:1`). |
+| T2 Shape | PASS | The FDB dependency wall is off by default and backend deps are optional, preserving feature-off workspace builds while exposing a dedicated `fdb` feature (`crates/metadata-fdb/Cargo.toml:10`; `crates/metadata-fdb/Cargo.toml:21`). |
+| T3 Runtime | NEEDS-HUMAN | The runtime behavior that matters is live FDB conflict classification, and I could only confirm clean feature-off skips plus feature-on compilation, not a real cluster run (`crates/metadata-fdb/tests/contention.rs:38`; `crates/metadata-fdb/src/lib.rs:491`). |
+| T4 Contribution | NEEDS-HUMAN | New `foundationdb` dependency adoption is human-only by the brief/INTEGRATION rule; prior-art by affected path was mechanically empty via `git log --all -- crates/metadata-fdb` (`Cargo.toml:105`; `brief.md:165`). |
+| T5 Judgment | NEEDS-HUMAN | Human sign-off must accept the dependency/runtime deferral package: `cargo xtask ci` hit an unrelated loopback bind host failure, while the FDB live leg skipped for Docker permission (`crates/chunkstore-grpc/tests/list_delete.rs:55`; `xtask/src/main.rs:295`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Fitness-to-purpose is always a human sign-off item, and here it specifically hinges on rerunning `cargo xtask fdb-conformance` where Docker and the 7.3 FDB client/server are actually available (`brief.md:113`; `xtask/src/main.rs:396`). |
