@@ -331,9 +331,12 @@ class Config:
         a CLI override that lowers ``max_passes`` after load must lower the clamp with it,
         or the last allowed pass can be spent on an auto-iterate — stranding the bundle at
         ITERATE_DO (issue #260's abandonment shape) instead of halting AWAITING_SIGNOFF
-        with the findings in front of the human."""
+        with the findings in front of the human. The clamp reaches 0 for a one-pass
+        budget: with a single allowed pass there is no next pass to rebuild in, so the
+        only budget that keeps the invariant is "no auto-iterations at all" (flow's
+        spent >= budget check then declines before the decision is recorded)."""
         self.max_passes = max(1, n)
-        self.max_auto_iters = min(self.max_auto_iters, max(1, self.max_passes - 1))
+        self.max_auto_iters = min(self.max_auto_iters, max(0, self.max_passes - 1))
 
     def close_class(self, disposition: str) -> str:
         """The close class matching ``disposition``, or "" if it is not a close hint.
@@ -482,16 +485,21 @@ class Config:
         # rebuild with no human prompt, so a false-looking value must never silently enable
         # it (bool("false") is True; "False" failed the old case-sensitive env check).
         auto_iterate = _parse_opt_in(driver_cfg.get("auto_iterate", False), "auto_iterate")
-        if os.environ.get("PDCA_AUTO_ITERATE"):
+        # A PRESENT env var always overrides — `in`, not get() truthiness, so a user can
+        # disable a toml-enabled opt-in for one run with `PDCA_AUTO_ITERATE=` (the empty
+        # string parses OFF; the old truthy guard skipped the override entirely).
+        if "PDCA_AUTO_ITERATE" in os.environ:
             auto_iterate = _parse_opt_in(
                 os.environ["PDCA_AUTO_ITERATE"], "PDCA_AUTO_ITERATE")
         # Keep the auto budget strictly below the pass budget, so exhausting it always lands
         # the bundle on a clean AWAITING_SIGNOFF halt rather than leaving it mid-flight at
-        # ITERATE_DO when the wave's passes run out (issue #260's abandonment shape).
+        # ITERATE_DO when the wave's passes run out (issue #260's abandonment shape). The
+        # clamp reaches 0 at max_passes = 1: with one allowed pass there is no next pass to
+        # rebuild in, so the only budget below it is none at all (#132).
         max_auto_iters = max(1, int(driver_cfg.get("max_auto_iters", 3)))
         if os.environ.get("PDCA_MAX_AUTO_ITERS"):
             max_auto_iters = max(1, int(os.environ["PDCA_MAX_AUTO_ITERS"]))
-        max_auto_iters = min(max_auto_iters, max(1, max_passes - 1))
+        max_auto_iters = min(max_auto_iters, max(0, max_passes - 1))
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
         overflow = max(0, int(driver_cfg.get("overflow", 0)))  # issue #226; 0 ⇒ heal in place
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213

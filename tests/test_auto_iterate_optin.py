@@ -79,6 +79,13 @@ class AutoIterateOptIn(unittest.TestCase):
         cfg = self._load(env={"PDCA_AUTO_ITERATE": "1"})
         self.assertTrue(cfg.auto_iterate)
 
+    def test_env_empty_string_disables_a_toml_enabled_opt_in(self) -> None:
+        # A PRESENT env var always overrides: `PDCA_AUTO_ITERATE=` must turn a
+        # toml-enabled opt-in OFF for the run, not be skipped as falsy.
+        cfg = self._load('[driver]\nauto_iterate = true\n',
+                         env={"PDCA_AUTO_ITERATE": ""})
+        self.assertFalse(cfg.auto_iterate)
+
     # --- a CLI --max-passes override re-clamps the auto budget -------------------
 
     def test_override_max_passes_reclamps_auto_budget(self) -> None:
@@ -96,6 +103,17 @@ class AutoIterateOptIn(unittest.TestCase):
         self.assertEqual(cfg.max_auto_iters, 2)
         cfg.override_max_passes(50)  # raising the pass budget keeps the configured cap
         self.assertEqual(cfg.max_auto_iters, 2)
+
+    def test_one_pass_budget_means_zero_auto_iterations(self) -> None:
+        # With a single allowed pass there is no next pass to rebuild in — an auto budget
+        # of 1 would spend the only pass on an iterate-do and strand the bundle at
+        # ITERATE_DO. The clamp must reach 0 so flow's spent >= budget check declines.
+        cfg = self._load('[driver]\nauto_iterate = true\nmax_passes = 20\n')
+        cfg.override_max_passes(1)
+        self.assertEqual(cfg.max_auto_iters, 0)
+        # And the same via config alone, without a CLI override.
+        cfg = self._load('[driver]\nauto_iterate = true\nmax_passes = 1\n')
+        self.assertEqual(cfg.max_auto_iters, 0)
 
 
 if __name__ == "__main__":
