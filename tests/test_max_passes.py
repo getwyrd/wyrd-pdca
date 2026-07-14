@@ -140,7 +140,8 @@ class FlowMaxPassesCap(unittest.TestCase):
 
         msg = err.getvalue()
         # Loud, actionable, and names ONLY the capped bundle with a resume hint.
-        self.assertIn("hit the 2-pass cap with issue_BATCH1 still iterating", msg)
+        self.assertIn("pass budget exhausted after 2 pass(es)", msg)
+        self.assertIn("issue_BATCH1 [ITERATE_DO]", msg)
         self.assertIn("pdca flow BATCH1", msg)
         # The capped bundle is left iterating and unpublished; the sibling is done + published.
         self.assertEqual(results["BATCH1"], state.ITERATE_DO)
@@ -170,7 +171,7 @@ class FlowMaxPassesCap(unittest.TestCase):
         finally:
             leaves.run_signoff_batch = orig
 
-        self.assertNotIn("-pass cap", err.getvalue())
+        self.assertNotIn("pass budget exhausted", err.getvalue())
         self.assertEqual(iters["BATCH1"], 2)
         self.assertTrue(all(s == state.COMPLETE for s in results.values()))
 

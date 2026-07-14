@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 
 from . import act as act_mod
+from . import assemble
 from . import brief
 from . import families
 from . import gates
@@ -59,6 +60,11 @@ REVIEWER_INPUTS = ["patch.diff", "brief.md", "check-gates.json"]
 # The interactive sign-off leaf writes its decision here; the flow reads it and
 # routes it through the C6-guarded signoff.record (never a model-written §9).
 SIGNOFF_DECISION = "signoff-decision"
+
+# Where a FAILED Do builder leaves its captured error tail (#279) — the Do-side twin of the
+# reviewer/advisory `check-*.error.log` (#138), so a failed batch can be post-mortem'd from
+# the bundle instead of terminal scrollback.
+BUILD_ERROR_LOG = "build.error.log"
 VALID_DECISIONS = frozenset({"accept", "iterate-do", "iterate-plan", "discontinue"})
 
 
@@ -195,13 +201,17 @@ def _invoke(
     # nothing until it finishes (minutes) and would otherwise look hung.
     # progress.py's stream reader dispatches on the family's stream_format; a family
     # declaring a format it doesn't recognize runs stream-less (heartbeat Tiers 1+2).
+    # tee_stderr regardless: the stream path already tees, and a stream-LESS family
+    # (generic, gemini) otherwise captures nothing at all, so its `*.error.log` reads
+    # "(no output captured)" — a post-mortem artifact that explains nothing (#286 review).
     use_stream = (stream_json and bool(profile.stream_argv)
                   and profile.stream_format in progress.STREAM_FORMATS)
     if use_stream:
         argv += list(profile.stream_argv)
     rc, output, produced = progress.run_with_heartbeat(
         argv, cwd=workdir, input_text=prompt, label=label, status=status,
-        stream_json=use_stream, stream_format=profile.stream_format, env=run_env)
+        stream_json=use_stream, tee_stderr=True, stream_format=profile.stream_format,
+        env=run_env)
     if rc != 0:
         # Only the stream path gives a real "did a session start" signal. Without it
         # (a stream-less family) we cannot tell invocation-death from a substantive
@@ -615,52 +625,85 @@ def do_build(d: Path, cfg: Config) -> None:
     # cfg.builder.mode would run a command variant as a stub (or vice versa) (#134).
     n = attempt_no(d)
     builder = select_builder(d, cfg, n)  # escalate-on-iterate (#135); difficulty (#134)
-    if builder.mode == "command":
-        _record_loop_attempt(d, n, builder)
-        # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
-        # primary checkout is never mutated. Best-effort: None ⇒ edit in place, as before.
-        wt = worktree.ensure(d, cfg)
-        profile = cfg.profile(builder)
-        if wt and profile.cwd_discovery:
-            # A cwd-discovery family (claude) finds its subagents AND the builder_guard
-            # PreToolUse hook by walking up from its cwd, so cwd MUST stay the harness root
-            # (.claude/agents + .claude/settings live there). Confining its cwd to the
-            # worktree would hide both — `--agent builder` would not resolve and the
-            # STOP-discipline guard would not load. It is grounded in the worktree via
-            # the profile's grounding flag + the prompt instead (as in #94), not by cwd.
-            # (The profile is the SELECTED builder's, so an escalated/variant claude
-            # backend gets this too.)
-            extra = [profile.grounding_flag, str(wt)] if profile.grounding_flag else None
-            workdir, env = cfg.root, {"PDCA_WORKTREE": str(wt)}
-        elif wt:
-            # Other command builders (codex, a local agentic CLI) have no cwd-walking agent
-            # machinery, so CONFINE them by running *in* the worktree (cwd): otherwise the
-            # leaf is launched from the harness root with nothing stopping it from writing
-            # the host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
-            # But the builder must ALSO read brief.md and write its artifacts (patch.diff /
-            # the test / build-notes.md) in the BUNDLE dir, which is outside that cwd — and a
-            # sandboxing family (codex `--sandbox workspace-write`) can only write cwd + roots
-            # granted with its grounding flag. So grant the bundle dir as an extra writable
-            # root (#230); a family with no grounding flag (generic) is unsandboxed and reaches
-            # it anyway. cwd stays the worktree, so #136 still confines source edits.
-            workdir, env = wt, {"PDCA_WORKTREE": str(wt)}
-            extra = [profile.grounding_flag, str(d)] if profile.grounding_flag else None
-        else:
-            workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
-        if not profile.native_guard:
-            # A family without its own PreToolUse STOP hook gets the driver's `gh`
-            # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
-            env = guard.shim_env(cfg, env)
-        # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
-        _invoke(
-            builder, workdir, _build_prompt(d),
-            label=f"Do {d.name}",
-            status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
-            stream_json=True,  # Tier 3: show the builder's live tool-use
-            env=env, extra_argv=extra, cfg=cfg,
-        )
+    # Clear a stale tail from a prior attempt before EITHER backend runs — an iterate-do
+    # archives it with its attempt, but a rebuild that didn't archive (a resumed run, a
+    # backend switched to stub) would otherwise leave a log at the top level that describes
+    # a failure this build never had (#280 review).
+    error_log = d / BUILD_ERROR_LOG
+    error_log.unlink(missing_ok=True)
+    if builder.mode != "command":
+        _stub_build(d, cfg)
         return
-    _stub_build(d, cfg)
+    # The capture wraps the WHOLE of Do — its SETUP as well as the leaf invocation. Do can
+    # die before the leaf ever launches, and the most likely way is `worktree.ensure`, which
+    # deliberately raises WorktreeError when the target's base ref doesn't resolve (#235,
+    # fail-closed — it refuses to run Do in the operator's primary checkout). In a wave batch
+    # that is precisely what an unpushed folded base looks like. Wrapping only `_invoke` left
+    # those failures with NO bundle-local trace at all — worse than before, since the stale
+    # log was already cleared above — so a post-mortem was back to terminal scrollback for the
+    # one failure mode most likely to hit a whole wave (#286 review).
+    try:
+        _do_build_command(d, cfg, builder, n)
+    except Exception as exc:  # noqa: BLE001 — capture, then re-raise for the caller
+        try:
+            error_log.write_text(_format_leaf_attempt(exc, 1), encoding="utf-8")
+            print(f"leaves: {d.name} — Do failed; captured the error tail in "
+                  f"{BUILD_ERROR_LOG}", file=sys.stderr)
+        except OSError:
+            pass  # never let error-capture mask the real failure
+        raise
+
+
+def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None:
+    """Run Do on a command backend: set up isolation, then invoke the leaf.
+
+    Every failure here — setup or invocation — is captured to `build.error.log` by the
+    caller and re-raised, so `flow._isolate` still contains it and drops just this bundle.
+    """
+    _record_loop_attempt(d, n, builder)
+    # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
+    # primary checkout is never mutated. Best-effort for the cases isolation can't apply
+    # (None ⇒ edit in place); a real checkout whose base ref won't resolve RAISES (#235).
+    wt = worktree.ensure(d, cfg)
+    profile = cfg.profile(builder)
+    if wt and profile.cwd_discovery:
+        # A cwd-discovery family (claude) finds its subagents AND the builder_guard
+        # PreToolUse hook by walking up from its cwd, so cwd MUST stay the harness root
+        # (.claude/agents + .claude/settings live there). Confining its cwd to the
+        # worktree would hide both — `--agent builder` would not resolve and the
+        # STOP-discipline guard would not load. It is grounded in the worktree via
+        # the profile's grounding flag + the prompt instead (as in #94), not by cwd.
+        # (The profile is the SELECTED builder's, so an escalated/variant claude
+        # backend gets this too.)
+        extra = [profile.grounding_flag, str(wt)] if profile.grounding_flag else None
+        workdir, env = cfg.root, {"PDCA_WORKTREE": str(wt)}
+    elif wt:
+        # Other command builders (codex, a local agentic CLI) have no cwd-walking agent
+        # machinery, so CONFINE them by running *in* the worktree (cwd): otherwise the
+        # leaf is launched from the harness root with nothing stopping it from writing
+        # the host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
+        # But the builder must ALSO read brief.md and write its artifacts (patch.diff /
+        # the test / build-notes.md) in the BUNDLE dir, which is outside that cwd — and a
+        # sandboxing family (codex `--sandbox workspace-write`) can only write cwd + roots
+        # granted with its grounding flag. So grant the bundle dir as an extra writable
+        # root (#230); a family with no grounding flag (generic) is unsandboxed and reaches
+        # it anyway. cwd stays the worktree, so #136 still confines source edits.
+        workdir, env = wt, {"PDCA_WORKTREE": str(wt)}
+        extra = [profile.grounding_flag, str(d)] if profile.grounding_flag else None
+    else:
+        workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
+    if not profile.native_guard:
+        # A family without its own PreToolUse STOP hook gets the driver's `gh`
+        # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
+        env = guard.shim_env(cfg, env)
+    # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
+    _invoke(
+        builder, workdir, _build_prompt(d),
+        label=f"Do {d.name}",
+        status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
+        stream_json=True,  # Tier 3: show the builder's live tool-use
+        env=env, extra_argv=extra, cfg=cfg,
+    )
 
 
 def _build_prompt(d: Path) -> str:
@@ -839,6 +882,256 @@ def _seed_sandbox_agents(cfg: Config, sandbox: Path) -> None:
               "`--agent` may not resolve", file=sys.stderr)
 
 
+# The ONLY `sandbox.network` keys the driver will carry into a leaf's temp cwd, each with the
+# value shape that counts as a real grant (issues #261, #277). An allow-list, not a copy: a
+# key absent from here — above all `sandbox.excludedCommands`, which makes a command bypass
+# the sandbox entirely — is never seeded, however an instance configures it. A grant whose
+# value fails its filter (an empty domain list, a non-boolean) seeds nothing, which is how a
+# knob ships documented-but-OFF.
+_SEEDED_NETWORK_KEYS = {
+    "allowLocalBinding": lambda v: isinstance(v, bool),                    # #261 loopback bind
+    "allowedDomains": lambda v: isinstance(v, list) and bool(v),           # #277 e.g. github
+    "deniedDomains": lambda v: isinstance(v, list) and bool(v),            # its counterpart
+}
+
+
+def _sandbox_argv(cfg: Config, profile: families.FamilyProfile, *,
+                  seeded: bool) -> list[str]:
+    """Every sandbox flag this leaf's family needs, for the grants the instance opted into.
+
+    ``seeded`` gates ONLY the claude confinement flag, never the codex network grant. The
+    two depend on entirely different things, and conflating them breaks one of them:
+
+    * the confinement flag (:func:`_settings_scope_argv`) is meaningless AND DANGEROUS
+      without the seeded settings file on disk — it drops the operator's ambient sandbox in
+      favour of a project scope that does not exist, leaving the leaf wholly unconfined
+      (#290). A failed seed therefore withholds it: fail closed.
+    * the codex network grant rides on ``argv``, and codex never reads that file at all, so
+      a failed write says nothing about it. Gating it on ``seeded`` would silently kill a
+      codex leaf's Docker access because of a claude-shaped failure it has no stake in.
+
+    Two grants, two shapes, because the vendors' sandboxes differ and neither is strictly
+    tighter (#291) — so they are separate opt-ins, each named for what it actually does:
+
+    * ``[leaves.sandbox] unsandboxed_commands`` (claude) — a NAMED command leaves the sandbox
+      entirely; every other command stays confined. Realized by the seeded ``excludedCommands``
+      + the confinement flags from :func:`_settings_scope_argv`.
+    * ``[leaves.sandbox] network_access`` (codex) — ``--sandbox workspace-write`` has no
+      per-command escape, and its docker-socket denial is **seccomp, not filesystem** (a relayed
+      socket in a granted writable dir is still refused), so only opening the network layer
+      works. That frees the socket/network layer for EVERY command in the leaf, while the
+      filesystem stays confined for every command. It cannot be scoped to one command, which is
+      exactly why it does not ride on ``unsandboxed_commands`` — that key promises "only these
+      commands leave the sandbox", and this would not keep the promise.
+
+    claude deliberately takes no ``network_argv``: it scopes network by DOMAIN instead
+    (``allowedDomains``, #277), which is strictly better where it exists.
+    """
+    argv = _settings_scope_argv(cfg, profile) if seeded else []
+    if cfg.leaf_network_access and profile.network_argv:
+        argv += list(profile.network_argv)
+    return argv
+
+
+def _settings_scope_argv(cfg: Config, profile: families.FamilyProfile) -> list[str]:
+    """Flags confining the leaf to the settings the harness SEEDS — nothing of the operator's.
+
+    Only when an exemption is granted, and only for a family that has such a flag (claude:
+    ``--setting-sources project``). Without it the seeded ``sandbox.excludedCommands`` is a
+    floor rather than a ceiling: array settings CONCATENATE across scopes and the union is
+    monotonic, so the operator's own ``~/.claude/settings.json`` exemptions merge into the
+    leaf and nothing can remove them (PR #288 review). Dropping the user scope also stops the
+    operator's ``permissions`` and ``allowedDomains`` riding in the same way.
+
+    The cost is that the leaf no longer sees user-scope settings at all, so an instance whose
+    **auth** lives there (``apiKeyHelper``, ``env.ANTHROPIC_API_KEY``) must move it into the
+    environment. That fails loudly at leaf start — and now lands in ``check-*.error.log``.
+    """
+    if cfg.leaf_unsandboxed_commands and profile.settings_scope_argv:
+        return list(profile.settings_scope_argv)
+    return []
+
+
+def _seed_sandbox_settings(cfg: Config, sandbox: Path,
+                           profile: families.FamilyProfile) -> bool:
+    """Carry the sandbox capabilities a Check needs into the leaf sandbox (#261, #277).
+
+    Claude Code loads **project** settings from ``.claude/settings.json`` relative to the
+    subprocess cwd — the same walk-up that finds ``.claude/agents`` (#161). The reviewer /
+    advisory leaves run in a temp cwd, so the rendered project's ``.claude/settings.json``
+    is invisible to them and its ``sandbox`` policy silently does not apply. Two capabilities
+    a Check legitimately needs are denied as a result:
+
+    * ``network.allowLocalBinding`` (#261) — without it the leaf's Bash tool runs under
+      Claude Code's bubblewrap+seccomp sandbox where ``TcpListener::bind("127.0.0.1:0")``
+      fails ``Operation not permitted``, so every loopback-socket runtime test panics before
+      its assertion and C2/C4/T3 can only ever be *provisional*.
+    * ``network.allowedDomains`` (#277) — the reviewer's prior-art check needs the
+      closed/rejected-PR corpus (``gh pr list --state closed`` → api.github.com). Blocked, it
+      cannot be settled mechanically and is forced NEEDS-HUMAN on *every* bundle.
+
+    Separately, a **Docker-backed conformance gate** (a live etcd/TiKV/FDB cluster via
+    ``docker compose``) is denied the docker socket inside the sandbox even on a Docker-capable
+    host, so its runtime evidence can never be earned at Check and always defers to a
+    human-run confirmer — the process gets burdensome exactly where it should be mechanical
+    (#276). The fix is NOT a socket-wide grant (``allowAllUnixSockets`` would hand *every*
+    Bash line the leaf writes access to *every* unix socket — and a root-owned docker daemon
+    is root-adjacent). It is a **named-command exemption**: ``[leaves.sandbox]
+    unsandboxed_commands`` in pdca.toml lists the conformance commands, and only those run
+    outside the sandbox. Everything else the leaf does stays confined — which holds only
+    because the exemption ships with ``allowUnsandboxedCommands: false`` beside it; the list
+    is a *ceiling*, not a floor (see below).
+
+    That list is **harness-owned on purpose**. This function never copies the project's own
+    ``sandbox.excludedCommands`` — that is the operator's *gate* workaround, and inheriting it
+    would let the leaf run whatever the operator exempted for CI (PR #268). A leaf's exemption
+    is declared once, deliberately, in pdca.toml.
+
+    **Seeded through an ALLOW-LIST of individual keys** (:data:`_SEEDED_NETWORK_KEYS`), never
+    by copying the ``sandbox`` block, and never ``permissions``. Each wider copy would hand
+    the leaf a capability its ``tools:`` frontmatter does not grant: ``permissions.allow``
+    carries ``Edit``/``Write``, and ``sandbox.excludedCommands`` — which docs 05 recommends to
+    a project as the workaround for its *gates* — makes the named command bypass the sandbox
+    **entirely**, so a reviewer could run the test runner unconfined (PR #268 review). Widening
+    the seed means adding a key here, deliberately — not loosening the copy.
+
+    Each key is **value-filtered**, so a present-but-empty grant seeds nothing: that is how a
+    grant stays OFF by default (the shipped ``allowedDomains: []`` documents the knob without
+    enabling it). Nothing granted at all ⇒ no file written, so an instance that configures no
+    sandbox is unaffected.
+
+    The two sources are **independent**. The network grants are the project's, read from its
+    ``.claude/settings.json`` best-effort; the command exemptions are the harness's, read from
+    ``pdca.toml``. An absent or unparseable settings file costs the network grant and nothing
+    else — it must never suppress a pdca.toml exemption (PR #288 review). Best-effort
+    throughout, like the agent seeding: any read/parse/write error degrades to a no-op, never
+    an aborted Check.
+
+    Scope: this covers the reviewer / advisory **leaves**. Gate commands are plain
+    subprocesses of ``pdca`` and inherit the operator's ambient sandbox instead (docs 05).
+    The **codex** family sandbox (``codex exec --sandbox workspace-write``) is not configured by
+    this file at all — it reads none of it. Its grants ride on ``argv`` instead: ``[leaves.sandbox]
+    network_access`` opens its socket/network layer, which is the only thing that reaches the
+    docker socket *or* api.github.com there (#291, :func:`_sandbox_argv`).
+    """
+    src = cfg.root / ".claude" / "settings.json"
+    granted: dict = {}
+
+    # The NETWORK grants are the project's (claude reads them from its own settings.json), so
+    # they are read from there — best-effort. An absent or unparseable file means no network
+    # grant, and nothing more: it must not suppress the harness-owned exemptions below.
+    if src.is_file():
+        try:
+            settings = json.loads(src.read_text(encoding="utf-8"))
+            network = (settings.get("sandbox") or {}).get("network") or {}
+            net_granted = {key: network[key] for key, valid in _SEEDED_NETWORK_KEYS.items()
+                           if key in network and valid(network[key])}
+            if net_granted:
+                granted["network"] = net_granted
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            print(f"leaves: could not read sandbox settings from {src} ({exc}); the leaf gets "
+                  "no network grant", file=sys.stderr)
+
+    # A leaf's sandbox EXEMPTIONS are HARNESS-owned — `[leaves.sandbox] unsandboxed_commands`
+    # in pdca.toml (#276) — and NEVER this settings file's own ``excludedCommands``, which is
+    # the operator's *gate* workaround and must not be inherited by a leaf (#268). Because
+    # they are the harness's, they must not depend on the project having (or being able to
+    # parse) a `.claude/settings.json` AT ALL: gating them on that made the documented Docker
+    # exemption silently do nothing for an instance without one (PR #288 review).
+    #
+    # An exemption LIST alone does not bound what escapes the sandbox. TWO holes, and BOTH
+    # must be closed or "only these commands run outside the sandbox" — the promise made in
+    # this docstring, in docs 05 and in pdca.toml — is not true (PR #288 review):
+    #
+    # 1. `allowUnsandboxedCommands` defaults to TRUE (settings schema, v2.1.207:
+    #    `sandbox?.allowUnsandboxedCommands ?? true`), and while true the model may retry ANY
+    #    sandbox-denied command with the `dangerouslyDisableSandbox` parameter and have it run
+    #    unconfined. False makes that parameter "completely ignored" (the schema's own words).
+    #    It is a SCALAR, so the seeded project scope genuinely overrides the operator's.
+    # 2. Array-valued settings CONCATENATE across scopes (user → project → local → managed):
+    #    the CLI folds each scope through a merge customizer that unions any two arrays, and
+    #    that union is MONOTONIC — no scope, not even managed policy, can remove what a lower
+    #    one added. So the operator's own `~/.claude/settings.json` `excludedCommands` (their
+    #    INTERACTIVE exemptions — a broad `docker *`) merges straight into the leaf, and a
+    #    seeded list can only ever be a FLOOR. The one way to bound it is to not load the lower
+    #    scope at all: the family's `settings_scope_argv` (claude: `--setting-sources
+    #    project`), applied by the callers. A family without that flag cannot be bounded, so the
+    #    exemption is REFUSED rather than granted unbounded — fail closed, and say why.
+    #
+    # …and a THIRD hole, which swallows the other two whole (#289). When `sandbox.enabled` is
+    # true but the sandbox's own dependencies are missing, Claude Code does NOT fail — it
+    # DISABLES the sandbox, warns, and runs every command unconfined ("Sandbox disabled:
+    # …dependencies are missing: socat not installed · Commands will run WITHOUT sandboxing").
+    # A bounded exemption on top of no sandbox at all is not bounded; it is nothing. So seed
+    # `failIfUnavailable` — "Exit with an error at startup if sandbox.enabled is true but the
+    # sandbox cannot start" (its schema) — and let the leaf REFUSE rather than run unconfined
+    # under a boundary this file, docs 05 and pdca.toml all claim it has. It fails loudly, and
+    # the tail lands in the bundle's `*.error.log` (#280/#286) instead of scrollback. `pdca
+    # doctor` catches the same gap BEFORE a run; this catches the operator who skipped it.
+    if cfg.leaf_unsandboxed_commands:
+        if profile.settings_scope_argv:
+            # `enabled` FIRST — without it none of the rest means anything, and this seed was
+            # worse than useless (PR #290 review). `sandbox.enabled` defaults to FALSE
+            # (`sandbox?.enabled ?? false`), and `failIfUnavailable` is gated on it
+            # (`enabled && … && failIfUnavailable`). Worse: `--setting-sources project` drops
+            # the user/local scope, which is exactly where an operator's `sandbox.enabled: true`
+            # lives — so BOUNDING the exemption was REMOVING the sandbox it claims to bound. The
+            # leaf ran fully unconfined and the fail-closed guard never fired. Verified: with
+            # these keys but no `enabled`, a leaf starts silently on a socat-less host; with it,
+            # it refuses — "sandbox required but unavailable … refusing to start without a
+            # working sandbox".
+            granted["enabled"] = True
+            granted["excludedCommands"] = list(cfg.leaf_unsandboxed_commands)
+            granted["allowUnsandboxedCommands"] = False
+            granted["failIfUnavailable"] = True
+        else:
+            # The posture line must describe the posture the leaf ACTUALLY gets. With
+            # `network_access` also set, this same run appends the network grant a few lines
+            # later — so "the leaf stays fully sandboxed" was a lie whenever BOTH keys were
+            # configured, and a warning that misstates the active security posture is worse than
+            # no warning at all (PR #292 review, local pass).
+            if cfg.leaf_network_access and profile.network_argv:
+                posture = ("The leaf keeps its FILESYSTEM confinement — but `network_access = "
+                           "true` is set, so its socket/network layer IS open, for every command "
+                           "it runs and not just the named ones.")
+            elif profile.network_argv:
+                posture = ("The leaf stays fully sandboxed. For codex, use `[leaves.sandbox] "
+                           "network_access = true` instead: its sandbox has no per-command "
+                           "escape, and its docker-socket denial is the network layer, not the "
+                           "filesystem (#291).")
+            else:
+                posture = "The leaf stays fully sandboxed."
+            print("leaves: [leaves.sandbox] unsandboxed_commands is set, but the "
+                  f"'{profile.name}' family cannot be confined to the harness's own settings, "
+                  f"so a per-command exemption cannot be bounded — NOT granted. {posture}",
+                  file=sys.stderr)
+
+    if not granted:
+        return True   # nothing promised, nothing to seed
+    try:
+        dest = sandbox / ".claude"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "settings.json").write_text(
+            json.dumps({"sandbox": granted}, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # FAIL CLOSED (PR #290 review). This used to warn "the leaf runs under the ambient
+        # sandbox policy" and carry on — the exact OPPOSITE of what happened. The caller still
+        # passed `--setting-sources project`, so the leaf loaded ONLY project scope … which is
+        # this file, which does not exist. No `sandbox.enabled` (it defaults FALSE), and the
+        # operator's own user-scope sandbox dropped along with it: the leaf ran COMPLETELY
+        # unconfined, under a message asserting it was protected.
+        #
+        # False makes the caller WITHHOLD `--setting-sources`, so the leaf keeps the operator's
+        # ambient sandbox. The exemption then simply does not happen and a Docker-backed leg
+        # defers to a human, exactly as when none is configured. Degrade the FEATURE, never the
+        # BOUNDARY.
+        print(f"leaves: could not seed sandbox settings into {sandbox} ({exc}); the exemption "
+              "did NOT take effect — the leaf keeps the operator's ambient sandbox and a "
+              "Docker-backed leg will defer to a human", file=sys.stderr)
+        return False
+    return True
+
+
 def _run_review_sandboxed(d: Path, cfg: Config) -> None:
     """Run the reviewer in a temp dir holding ONLY the reviewer inputs.
 
@@ -856,6 +1149,10 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         # Seed unconditionally: flag families need it to resolve `--agent` (#161);
         # for inline families it is harmless (role prompts only, never build-notes).
         _seed_sandbox_agents(cfg, sandbox)
+        # …and the project's sandbox policy, which is likewise invisible from a temp cwd
+        # (#261) — without it a loopback-socket runtime test can't bind, so it can never
+        # earn an automated red→green at Check.
+        seeded = _seed_sandbox_settings(cfg, sandbox, profile)
         # Ground citations on the brief's target checkout (#75): name it via $PDCA_TARGET
         # so the reviewer doesn't wander into unrelated checkouts, and grant read access
         # via the family's grounding flag (claude: --add-dir). Independence holds — the
@@ -863,7 +1160,10 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
         extra_argv = ([profile.grounding_flag, str(target)]
-                      if target and profile.grounding_flag else None)
+                      if target and profile.grounding_flag else [])
+        # The confinement flag rides on `seeded` (a file that is not there must not cost
+        # the leaf its ambient sandbox, #290); the codex network grant does not (#291).
+        extra_argv += _sandbox_argv(cfg, profile, seeded=seeded)
         error_log = d / "check-review.error.log"
         # A transient (no-output) reviewer failure is retried with backoff before it
         # degrades to a §6 placeholder; the failed attempts' stderr lands in error_log.
@@ -876,9 +1176,8 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             env=env, extra_argv=extra_argv, cfg=cfg,
         )
         if err is not None:
-            transient = getattr(err, "transient", False)
             _review_unavailable(d, f"reviewer leaf failed: {err}",
-                                transient=transient, error_log=error_log)
+                                failure=_failure_class(err), error_log=error_log)
             return
         produced = sandbox / "check-review.md"
         if produced.exists():
@@ -887,42 +1186,91 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
             _review_unavailable(d, "reviewer produced no check-review.md")
 
 
-def _review_unavailable(d: Path, reason: str, *, transient: bool = False,
+# How a reviewer / advisory leaf failed (#138, #278). The split that matters downstream is
+# INFRA (nothing reviewed the diff) vs SUBSTANTIVE (it reviewed, and yielded nothing usable) —
+# but the two infra shapes need different *actions* from the operator, so keep them distinct.
+_FAIL_TRANSIENT = "transient"      # ran, exited non-zero with no output; retries exhausted
+_FAIL_STARTUP = "startup"          # never ran at all — the command could not be launched
+_FAIL_SUBSTANTIVE = "substantive"  # ran and produced output, but no usable verdict
+
+
+def _failure_class(exc: Exception | None) -> str:
+    """Classify a failed leaf invocation.
+
+    A :class:`LeafError` means the child actually ran: ``transient`` (no output — a rate
+    limit / 5xx / network blip) or substantive. But a **startup** failure never produces a
+    LeafError at all — the spawn raises ``FileNotFoundError`` before one exists, when the
+    configured binary is absent or not executable (the canonical ``[Errno 2] … 'codex'``).
+    Reading ``.transient`` off such an exception yields ``False``, so it was reported as "the
+    leaf ran but did not yield a usable verdict" — for a leaf that never started (PR #285
+    review). It is infra, and it is precisely the case #278 exists to distinguish; but a
+    *plain* re-run fails the same way, so it is not the same action as a transient blip."""
+    if isinstance(exc, LeafError):
+        return _FAIL_TRANSIENT if exc.transient else _FAIL_SUBSTANTIVE
+    if isinstance(exc, OSError):  # FileNotFoundError / PermissionError from the spawn
+        return _FAIL_STARTUP
+    return _FAIL_SUBSTANTIVE
+
+
+def _review_unavailable(d: Path, reason: str, *, failure: str = _FAIL_SUBSTANTIVE,
                         error_log: Path | None = None) -> None:
     """Write a placeholder review flagging the gap as a §6 NEEDS-HUMAN, so a failed or
     interrupted reviewer leaves a re-runnable bundle — not a half-checked one that
     crashes assemble. The bundle still reaches sign-off; accept is blocked (C6).
 
-    ``transient`` classifies the placeholder (#138) so the human can tell a transient
-    infra blip (safe to re-run) from a reviewer that genuinely needs a human; when an
-    ``error_log`` with the failed attempts' output exists, the placeholder points at it."""
+    ``failure`` (see :func:`_failure_class`) classifies the placeholder (#138) so the human
+    can tell infra — a transient blip, or a leaf that never started — from a reviewer that
+    genuinely needs a human; when an ``error_log`` with the failed attempts' output exists,
+    the placeholder points at it."""
     print(f"leaves: {d.name} — advisory review unavailable ({reason})", file=sys.stderr)
     (d / "check-review.md").write_text(
         "# Advisory review — NOT COMPLETED\n\n"
         f"The reviewer did not produce a verdict table ({reason}).\n\n"
-        + _unavailable_classification(transient, error_log)
+        + _unavailable_classification(failure, error_log)
         + "- NEEDS-HUMAN — re-run the Check reviewer; this bundle has no advisory review "
         "and must not be accepted until one exists.\n",
         encoding="utf-8",
     )
 
 
-def _unavailable_classification(transient: bool, error_log: Path | None) -> str:
+def _unavailable_classification(failure: str, error_log: Path | None) -> str:
     """Shared classification block for a failed reviewer/advisory placeholder (#138):
-    name the failure class and point at the captured error log when present."""
-    if transient:
+    name the failure class and point at the captured error log when present.
+
+    Leads with a machine-readable leaf-status marker (#278). Without it, an empty advisory
+    artifact is ambiguous — "the adversary ran and found nothing" reads exactly like "the
+    adversary never ran", so an infra failure (no Docker, missing binary) presents as a clean
+    adversarial pass and the operator has to hand-annotate "infra, not substance". `assemble`
+    reads the marker and labels the §6 row accordingly.
+
+    Both infra shapes (transient, startup) carry the INFRA marker — nothing reviewed the diff
+    either way — but their prose differs, because the operator's next action does: a transient
+    blip is safe to re-run as-is; a leaf that never started will fail the same way until its
+    command is fixed."""
+    status = {
+        _FAIL_TRANSIENT: assemble.LEAF_STATUS_INFRA,
+        _FAIL_STARTUP: assemble.LEAF_STATUS_STARTUP,
+    }.get(failure, assemble.LEAF_STATUS_HUMAN)
+    marker = f"<!-- pdca:leaf-status {status} -->\n\n"
+    if failure == _FAIL_TRANSIENT:
         kind = ("**transient infra — safe to re-run.** The leaf exited non-zero with no "
                 "output and retries did not recover, so it almost certainly hit a usage/"
                 "rate limit or a transient API/network error rather than reviewing the "
                 "diff; a sibling advisory leaf of a different family may already have "
                 "covered it.")
+    elif failure == _FAIL_STARTUP:
+        kind = ("**startup infra — the leaf never ran.** Its configured command could not be "
+                "launched at all (the binary is absent, or not executable), so nothing "
+                "reviewed the diff — this is NOT an empty verdict. A plain re-run will fail "
+                "the same way: fix the leaf's `argv` / PATH first (`pdca doctor` checks each "
+                "command leaf's CLI), then re-run.")
     else:
         kind = ("**substantive — needs a human.** The leaf ran but did not yield a usable "
                 "verdict; do not assume an infra blip.")
     log_ref = ""
     if error_log is not None and error_log.exists():
         log_ref = f" See `{error_log.name}` in this bundle for the captured error."
-    return f"Failure class: {kind}{log_ref}\n\n"
+    return f"{marker}Failure class: {kind}{log_ref}\n\n"
 
 
 # Stub bases per 5/5/1 element — what a real reviewer would re-derive; the offline
@@ -991,7 +1339,13 @@ def _advisory_prompt(spec: dict, leaf_id: str) -> str:
         "cited path:line on the target source at $PDCA_TARGET, never other checkouts. "
         f"Write check-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
         "bullet with a path:line. For any finding a human must adjudicate, prefix the "
-        "bullet '- NEEDS-HUMAN — ' (it becomes a SUMMARY §6 item). You are ADVISORY — you "
+        "bullet '- NEEDS-HUMAN — ' (it becomes a SUMMARY §6 item). If the finding is an "
+        "IMPLEMENTATION defect the builder can fix by iterating — a logic bug, a missed "
+        "case, a weak or incorrect test, a conformance nit — prefix it "
+        "'- NEEDS-HUMAN [impl] — ' instead, so the driver can route it straight back to Do "
+        "without spending the human's attention (issue #264). Keep the plain "
+        "'- NEEDS-HUMAN — ' form for anything needing a human ARCHITECTURAL / scope / "
+        "fitness-to-purpose decision; when in doubt, OMIT '[impl]'. You are ADVISORY — you "
         "never gate; the human decides at sign-off. If you find nothing, say so explicitly."
     )
 
@@ -1089,10 +1443,15 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         # Seed unconditionally: flag families need it to resolve `--agent` (#161);
         # for inline families it is harmless (role prompts only, never build-notes).
         _seed_sandbox_agents(cfg, sandbox)
+        # …and the project's sandbox policy, which is likewise invisible from a temp cwd
+        # (#261) — without it a loopback-socket runtime test can't bind, so it can never
+        # earn an automated red→green at Check.
+        seeded = _seed_sandbox_settings(cfg, sandbox, profile)
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
         extra = ([profile.grounding_flag, str(target)]
-                 if target and profile.grounding_flag else None)
+                 if target and profile.grounding_flag else [])
+        extra += _sandbox_argv(cfg, profile, seeded=seeded)   # see _run_review_sandboxed
         out = sandbox / f"check-advisory-{leaf_id}.md"
         error_log = d / f"check-advisory-{leaf_id}.error.log"
         err = _invoke_leaf_resilient(
@@ -1102,9 +1461,8 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
             status=lambda: progress.bundle_activity(sandbox, (out.name,)),
             stream_json=True, env=env, extra_argv=extra, cfg=cfg)
         if err is not None:  # advisory must never crash the cycle
-            transient = getattr(err, "transient", False)
             _advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
-                                  transient=transient, error_log=error_log)
+                                  failure=_failure_class(err), error_log=error_log)
             return
         if out.exists():
             shutil.copy2(out, advisory_artifact(d, leaf_id))
@@ -1122,12 +1480,13 @@ def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
         encoding="utf-8")
 
 
-def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *, transient: bool = False,
+def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
+                          failure: str = _FAIL_SUBSTANTIVE,
                           error_log: Path | None = None) -> None:
     print(f"leaves: {d.name} — advisory '{leaf_id}' unavailable ({reason})", file=sys.stderr)
     advisory_artifact(d, leaf_id).write_text(
         f"# Advisory review — {leaf_id} — NOT COMPLETED\n\n"
-        + _unavailable_classification(transient, error_log)
+        + _unavailable_classification(failure, error_log)
         + f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
         "re-run it or adjudicate by hand.\n",
         encoding="utf-8")

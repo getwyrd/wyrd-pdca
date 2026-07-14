@@ -8,12 +8,14 @@ plus the C6 accept-gate, the independence contract, and an iterate transition.
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -409,6 +411,461 @@ class AdvisoryReviewResilience(unittest.TestCase):
             leaves._invoke = orig
         self.assertIn("NOT COMPLETED",
                       (self.d / "check-review.md").read_text(encoding="utf-8"))
+
+    def _exempt(self, *commands: str) -> None:
+        """Grant a leaf sandbox exemption, on a family that can actually be BOUNDED.
+
+        Only a family with `settings_scope_argv` (claude: `--setting-sources project`) can be
+        confined to the harness's own settings; without that, the operator's user-scope
+        `excludedCommands` concatenate into the leaf and the list is a floor, not a ceiling.
+        So the exemption is claude-only by construction (#288 review) — the default stub
+        reviewer here is codex, which is refused (asserted separately below).
+        """
+        self.cfg.reviewer = LeafConfig(mode="stub", family="claude")
+        self.cfg.leaf_unsandboxed_commands = list(commands)
+
+    def _project_settings(self, payload: dict) -> None:
+        cdir = self.cfg.root / ".claude"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "settings.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def _capture_sandbox_settings(self) -> dict:
+        """Run the sandboxed reviewer, returning what landed at <sandbox>/.claude/settings.json."""
+        (self.d / "patch.diff").write_text("x\n", encoding="utf-8")
+        (self.d / "check-gates.json").write_text("{}\n", encoding="utf-8")
+        seen: dict = {}
+        orig = leaves._invoke
+
+        def capture(leaf, workdir, prompt, **k):
+            f = Path(workdir) / ".claude" / "settings.json"
+            seen["exists"] = f.exists()
+            seen["content"] = json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+            seen["extra_argv"] = list(k.get("extra_argv") or [])
+            (Path(workdir) / "check-review.md").write_text("ok\n", encoding="utf-8")
+
+        leaves._invoke = capture
+        try:
+            leaves._run_review_sandboxed(self.d, self.cfg)
+        finally:
+            leaves._invoke = orig
+        return seen
+
+    def test_sandbox_seeds_project_sandbox_settings(self) -> None:
+        # #261: Claude Code loads project settings from `.claude/settings.json` relative to
+        # the subprocess cwd. The reviewer runs in a temp cwd, so the project's sandbox
+        # policy — notably sandbox.network.allowLocalBinding — never applied, and every
+        # loopback-socket runtime test failed to bind before its assertion ran.
+        self._project_settings({
+            "sandbox": {"network": {"allowLocalBinding": True}},
+            "permissions": {"allow": ["Edit", "Write"]},
+        })
+        seen = self._capture_sandbox_settings()
+        self.assertTrue(seen["exists"])
+        self.assertIs(seen["content"]["sandbox"]["network"]["allowLocalBinding"], True)
+        # ONLY the loopback grant travels — the project's Edit/Write allow-list must not
+        # widen the reviewer's surface past what its `tools:` frontmatter grants.
+        self.assertNotIn("permissions", seen["content"])
+
+    def test_never_seeds_excluded_commands_or_the_whole_sandbox_block(self) -> None:
+        # PR #268 review (codex): docs 05 tells a project to use `sandbox.excludedCommands`
+        # as the workaround for its GATES. Copying the whole `sandbox` object would carry
+        # that into the reviewer's cwd, letting it run the excluded command OUTSIDE the
+        # sandbox — a capability its `tools:` grant never gave it. The seed is an ALLOW-LIST
+        # of named network keys, so `excludedCommands` / `enabled` can never ride along.
+        #
+        # #277 deliberately ADDED `allowedDomains` to that allow-list (the reviewer's
+        # prior-art check needs api.github.com), so it is now carried — by name, not by a
+        # loosened copy. The exclusions below are the part that must never change.
+        self._project_settings({"sandbox": {
+            "enabled": True,
+            "excludedCommands": ["cargo *"],
+            "network": {"allowLocalBinding": True, "allowedDomains": ["api.github.com"]},
+        }})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"], {"sandbox": {"network": {
+            "allowLocalBinding": True, "allowedDomains": ["api.github.com"]}}})
+        # the load-bearing exclusions
+        self.assertNotIn("excludedCommands", seen["content"]["sandbox"])
+        self.assertNotIn("enabled", seen["content"]["sandbox"])
+        self.assertNotIn("permissions", seen["content"])
+
+    def test_network_grant_is_seeded_for_the_prior_art_check(self) -> None:
+        # #277: the reviewer's prior-art check needs the closed/rejected-PR corpus via
+        # `gh pr list --state closed` → api.github.com. Without the grant it can never be
+        # settled mechanically and is forced NEEDS-HUMAN on every bundle.
+        self._project_settings({"sandbox": {"network": {
+            "allowedDomains": ["github.com", "api.github.com"]}}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"]["sandbox"]["network"]["allowedDomains"],
+                         ["github.com", "api.github.com"])
+
+    def test_an_empty_domain_list_is_off_and_seeds_nothing(self) -> None:
+        # This is how the grant ships: documented in settings.json, but OFF. An empty list
+        # must not create a seeded file, or it would look like a configured (empty) policy.
+        self._project_settings({"sandbox": {"network": {"allowedDomains": []}}})
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_the_shipped_default_seeds_only_the_loopback_grant(self) -> None:
+        # The template's own .claude/settings.json: loopback ON (#261), domains OFF (#277).
+        self._project_settings({"sandbox": {"network": {
+            "allowLocalBinding": True, "allowedDomains": []}}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"], {"sandbox": {"network": {"allowLocalBinding": True}}})
+
+    def test_denied_domains_are_carried(self) -> None:
+        self._project_settings({"sandbox": {"network": {"deniedDomains": ["evil.example"]}}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"]["sandbox"]["network"]["deniedDomains"],
+                         ["evil.example"])
+
+    def test_a_non_list_domain_grant_seeds_nothing(self) -> None:
+        self._project_settings({"sandbox": {"network": {"allowedDomains": "github.com"}}})
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_named_conformance_command_is_exempted_from_the_sandbox(self) -> None:
+        # #276: a Docker-backed conformance gate is denied the docker socket inside the leaf
+        # sandbox even on a Docker-capable host, so its evidence always defers to a human.
+        # Naming the command exempts THAT COMMAND — not the socket, not the whole leaf.
+        self._exempt("cargo xtask fdb-conformance")
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"]["sandbox"]["excludedCommands"],
+                         ["cargo xtask fdb-conformance"])
+
+    def test_the_exemption_list_comes_from_pdca_toml_not_the_project_settings(self) -> None:
+        # THE load-bearing distinction (#268 doctrine, preserved). The project's own
+        # `sandbox.excludedCommands` is its GATE workaround — inheriting it would let the leaf
+        # run whatever the operator exempted for CI. A leaf's exemption is declared in
+        # pdca.toml, deliberately, and nowhere else.
+        self.cfg.leaf_unsandboxed_commands = []                       # harness grants nothing
+        self._project_settings({"sandbox": {
+            "excludedCommands": ["docker *", "rm -rf /"],             # the operator's own list
+            "network": {"allowLocalBinding": True},
+        }})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("excludedCommands", seen["content"]["sandbox"])
+
+    def test_the_harness_list_does_not_merge_with_the_project_list(self) -> None:
+        # Even when BOTH exist, only the harness-declared commands reach the leaf.
+        self._exempt("cargo xtask fdb-conformance")
+        self._project_settings({"sandbox": {"excludedCommands": ["docker *"]}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"]["sandbox"]["excludedCommands"],
+                         ["cargo xtask fdb-conformance"])
+
+    def test_no_exemptions_by_default(self) -> None:
+        # Off unless declared: an instance that names nothing gets a fully sandboxed leaf.
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("excludedCommands", seen["content"]["sandbox"])
+
+    def test_the_exemption_is_seeded_without_any_project_settings(self) -> None:
+        # PR #288 review (codex). The exemption list is HARNESS-owned (pdca.toml), so it must
+        # not depend on the project having a `.claude/settings.json` at all. Gating it on that
+        # file made the documented Docker exemption silently do nothing for an instance
+        # without one — the leaf stayed sandboxed and still deferred to a human confirmer.
+        self._exempt("cargo xtask fdb-conformance")
+        self.assertFalse((self.cfg.root / ".claude" / "settings.json").is_file())
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"], {"sandbox": {
+            "enabled": True,
+            "excludedCommands": ["cargo xtask fdb-conformance"],
+            "allowUnsandboxedCommands": False,
+            "failIfUnavailable": True}})
+
+    def test_an_unparseable_settings_file_still_seeds_the_exemption(self) -> None:
+        # A corrupt settings.json costs the NETWORK grant and nothing else.
+        cdir = self.cfg.root / ".claude"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "settings.json").write_text("{ not json", encoding="utf-8")
+        self._exempt("cargo xtask fdb-conformance")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            seen = self._capture_sandbox_settings()      # must NOT raise
+        self.assertEqual(seen["content"]["sandbox"]["excludedCommands"],
+                         ["cargo xtask fdb-conformance"])
+        self.assertNotIn("network", seen["content"]["sandbox"])   # …but no network grant
+        self.assertIn("no network grant", buf.getvalue())
+
+    def test_nothing_granted_still_seeds_nothing(self) -> None:
+        # The independence must not become "always write a file": no settings, no exemption.
+        self.cfg.leaf_unsandboxed_commands = []
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_an_exemption_alone_is_enough_to_seed(self) -> None:
+        # No network grant at all, but a named command ⇒ the settings file is still written.
+        self._exempt("cargo xtask tikv-conformance")
+        self._project_settings({"permissions": {"allow": ["Read"]}})
+        seen = self._capture_sandbox_settings()
+        self.assertEqual(seen["content"], {"sandbox": {
+            "enabled": True,
+            "excludedCommands": ["cargo xtask tikv-conformance"],
+            "allowUnsandboxedCommands": False,
+            "failIfUnavailable": True}})
+
+    def test_the_exemption_list_is_a_ceiling_not_a_floor(self) -> None:
+        """PR #288 review (codex). An exemption LIST does not bound what escapes the sandbox.
+        Claude Code's `allowUnsandboxedCommands` defaults to TRUE (settings schema, v2.1.207:
+        `sandbox?.allowUnsandboxedCommands ?? true`), and while true the model may retry ANY
+        sandbox-denied command with `dangerouslyDisableSandbox` and have it run unconfined. So
+        seeding only `excludedCommands` left the named list a floor: "only these commands run
+        outside the sandbox" — which pdca.toml, docs 05 and the seed's own docstring all
+        promise — was simply not true. Setting it false makes `dangerouslyDisableSandbox`
+        "completely ignored" (the schema's own words), so the list becomes the only way out."""
+        self._exempt("cargo xtask fdb-conformance")
+        seen = self._capture_sandbox_settings()
+        self.assertIs(seen["content"]["sandbox"]["allowUnsandboxedCommands"], False)
+
+    def test_an_exempted_leaf_is_confined_to_the_harnesss_own_settings(self) -> None:
+        """PR #288 review (codex), the second hole — and the one no seeded file can close.
+
+        Array-valued settings CONCATENATE across scopes (user → project → local → managed):
+        the CLI folds each scope through a merge customizer that unions any two arrays, and the
+        union is MONOTONIC — no scope can remove what a lower one added. So a maintainer whose
+        own `~/.claude/settings.json` exempts `docker *` for their INTERACTIVE use has that
+        merged straight into the leaf, and the harness's list is a floor, not the promised
+        ceiling. Since nothing we WRITE can subtract, the only fix is to stop the lower scope
+        loading at all: `--setting-sources project`.
+        """
+        self._exempt("cargo xtask fdb-conformance")
+        seen = self._capture_sandbox_settings()
+        argv = seen["extra_argv"]
+        self.assertIn("--setting-sources", argv)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "project")
+
+    def test_a_failed_seed_never_leaves_the_leaf_unsandboxed(self) -> None:
+        """PR #290 review (codex). The seed's write is best-effort — but the confinement flag
+        was NOT, so a failed write produced the worst possible outcome.
+
+        `_seed_sandbox_settings` caught the OSError, warned "the leaf runs under the ambient
+        sandbox policy", and carried on. The caller then still passed `--setting-sources
+        project`, so the leaf loaded ONLY project scope — which is the file that had just failed
+        to be written. No `sandbox.enabled` (it defaults FALSE), and the operator's own
+        user-scope sandbox dropped along with it: the leaf ran COMPLETELY unconfined, under a
+        message asserting the exact opposite.
+
+        Now the flag is withheld, so the leaf keeps the operator's ambient sandbox and the
+        exemption simply does not happen. Degrade the FEATURE, never the BOUNDARY.
+        """
+        self._exempt("cargo xtask fdb-conformance")
+        real_write = Path.write_text
+
+        def enospc(self, *a, **k):          # only the SEED's write fails — the fixture's don't
+            if self.name == "settings.json":
+                raise OSError("ENOSPC")
+            return real_write(self, *a, **k)
+
+        buf = io.StringIO()
+        with mock.patch.object(Path, "write_text", enospc), redirect_stderr(buf):
+            seen = self._capture_sandbox_settings()
+        self.assertFalse(seen["exists"])                            # nothing on disk…
+        self.assertNotIn("--setting-sources", seen["extra_argv"])   # …so don't drop the ambient
+        self.assertIn("did NOT take effect", buf.getvalue())
+
+    def test_an_exempted_leaf_actually_has_a_sandbox_to_be_bounded_by(self) -> None:
+        """PR #290 review (codex). Without this key the whole feature was worse than useless.
+
+        `sandbox.enabled` DEFAULTS TO FALSE (`sandbox?.enabled ?? false`), and
+        `failIfUnavailable` is gated on it (`enabled && … && failIfUnavailable`). Worse:
+        `--setting-sources project` (#288) drops the user/local scope — exactly where an
+        operator's `sandbox.enabled: true` lives. So BOUNDING the exemption was REMOVING the
+        sandbox it claims to bound: the leaf ran fully unconfined, every command escaped, and
+        the fail-closed guard never fired — while pdca.toml and docs 05 promised a boundary.
+
+        Verified end-to-end: with these keys but no `enabled`, a leaf starts silently on a
+        socat-less host; with it, it refuses — "sandbox required but unavailable … refusing to
+        start without a working sandbox".
+        """
+        self._exempt("cargo xtask fdb-conformance")
+        seen = self._capture_sandbox_settings()
+        self.assertIs(seen["content"]["sandbox"]["enabled"], True)
+
+    def test_a_leaf_with_no_exemption_gets_no_sandbox_it_never_asked_for(self) -> None:
+        # `enabled` rides WITH the exemption, like the rest: an instance that grants none keeps
+        # whatever ambient sandbox policy it already had.
+        self.cfg.leaf_unsandboxed_commands = []
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("enabled", seen["content"]["sandbox"])
+
+    def test_an_exempted_leaf_refuses_to_run_unsandboxed(self) -> None:
+        """Issue #289 — the hole that swallows the other two whole.
+
+        Claude Code's sandbox does NOT fail closed. With `sandbox.enabled` true and a
+        dependency missing (observed: `socat`), it DISABLES the sandbox, warns, and runs every
+        command unconfined. A bounded exemption on top of no sandbox at all is not bounded — it
+        is nothing, while pdca.toml and docs 05 both promise the leaf is confined to the named
+        commands. `failIfUnavailable` makes the leaf REFUSE to start instead ("Exit with an
+        error at startup if sandbox.enabled is true but the sandbox cannot start").
+        """
+        self._exempt("cargo xtask fdb-conformance")
+        seen = self._capture_sandbox_settings()
+        self.assertIs(seen["content"]["sandbox"]["failIfUnavailable"], True)
+
+    def test_a_leaf_with_no_exemption_is_not_forced_to_fail(self) -> None:
+        # Rides WITH the exemption: an instance granting none keeps the ambient behaviour and
+        # is not made to hard-fail on a sandbox it never asked for.
+        self.cfg.leaf_unsandboxed_commands = []
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("failIfUnavailable", seen["content"]["sandbox"])
+    def test_a_codex_leaf_gets_the_network_grant_that_reaches_docker(self) -> None:
+        """Issue #291. #276's whole goal — a Docker-gated conformance leg earning its green at
+        Check — was UNMET for codex, the harness's DEFAULT reviewer and the family whose
+        NEEDS-HUMAN notes #276 quotes. It got a refusal and a docs line saying it was "out of
+        harness scope". Both were wrong: it is one config flag.
+
+        Verified on codex-cli 0.142.3, on a Docker-capable host: `--sandbox workspace-write`
+        alone denies `docker ps`; adding `sandbox_workspace_write.network_access=true` yields
+        `server=29.6.1`. The denial is codex's seccomp/network layer, NOT the filesystem — a
+        relayed socket in a granted writable dir is refused too — so no path grant can fix it.
+        The filesystem stays confined either way (a write outside the workspace is denied).
+        """
+        self.cfg.reviewer = LeafConfig(mode="stub", family="codex")
+        self.cfg.leaf_network_access = True
+        argv = self._capture_sandbox_settings()["extra_argv"]
+        self.assertIn("-c", argv)
+        self.assertIn("sandbox_workspace_write.network_access=true", argv)
+
+    def test_no_network_grant_by_default(self) -> None:
+        # Opt-in: it opens the socket/network layer for EVERY command in the leaf, so it never
+        # rides along with anything else.
+        self.cfg.reviewer = LeafConfig(mode="stub", family="codex")
+        argv = self._capture_sandbox_settings()["extra_argv"]
+        self.assertNotIn("sandbox_workspace_write.network_access=true", argv)
+
+    def test_the_network_grant_does_not_ride_on_the_command_exemption(self) -> None:
+        # THE distinction (#291). `unsandboxed_commands` promises "only these commands leave the
+        # sandbox". codex's grant frees the network for EVERY command, so honouring that key
+        # with this flag would silently break the promise. Separate keys, separate opt-ins.
+        self.cfg.reviewer = LeafConfig(mode="stub", family="codex")
+        self.cfg.leaf_unsandboxed_commands = ["cargo xtask fdb-conformance"]  # NOT network
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            argv = self._capture_sandbox_settings()["extra_argv"]
+        self.assertNotIn("sandbox_workspace_write.network_access=true", argv)
+        self.assertIn("network_access", buf.getvalue())   # …but the refusal names the fix
+
+    def test_the_refusal_warning_states_the_posture_the_leaf_actually_gets(self) -> None:
+        """PR #292 review (local codex pass). With BOTH keys set on codex, the per-command
+        exemption is correctly refused — but the same run then appends the network grant. The
+        warning still said "The leaf stays fully sandboxed", which was simply false; a warning
+        that misstates the active security posture is worse than no warning at all."""
+        self.cfg.reviewer = LeafConfig(mode="stub", family="codex")
+        self.cfg.leaf_unsandboxed_commands = ["cargo xtask fdb-conformance"]   # refused…
+        self.cfg.leaf_network_access = True                                    # …but this IS on
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            argv = self._capture_sandbox_settings()["extra_argv"]
+        self.assertIn("sandbox_workspace_write.network_access=true", argv)   # the grant is live
+        warning = buf.getvalue()
+        self.assertNotIn("stays fully sandboxed", warning)     # …so it must not claim otherwise
+        self.assertIn("socket/network layer IS open", warning)
+
+    def test_claude_does_not_take_the_blanket_network_grant(self) -> None:
+        # claude scopes network by DOMAIN (`allowedDomains`, #277), which is strictly better
+        # where it exists — so it must not also get codex's blanket opener.
+        self.cfg.reviewer = LeafConfig(mode="stub", family="claude")
+        self.cfg.leaf_network_access = True
+        argv = self._capture_sandbox_settings()["extra_argv"]
+        self.assertNotIn("sandbox_workspace_write.network_access=true", argv)
+
+    def test_a_leaf_with_no_exemption_is_not_confined(self) -> None:
+        # The confinement rides WITH the exemption. An instance that grants none keeps today's
+        # behaviour — its leaves still see the operator's settings, exactly as before.
+        self.cfg.leaf_unsandboxed_commands = []
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("--setting-sources", seen["extra_argv"])
+
+    def test_a_family_that_cannot_be_bounded_is_refused_the_exemption(self) -> None:
+        # Fail closed. codex has no way to be confined to the harness's settings (it does not
+        # read them at all), so an exemption there could only ever be unbounded. Refuse it and
+        # say why, rather than grant a boundary that does not hold.
+        self.cfg.reviewer = LeafConfig(mode="stub", family="codex")
+        self.cfg.leaf_unsandboxed_commands = ["cargo xtask fdb-conformance"]
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            seen = self._capture_sandbox_settings()
+        self.assertFalse(seen["exists"])                     # nothing granted at all
+        self.assertIn("NOT granted", buf.getvalue())
+
+    def test_a_leaf_with_no_exemption_is_not_silently_hardened(self) -> None:
+        # The escape hatch is closed only ALONGSIDE a list. An instance that grants no
+        # exemption keeps the ambient default rather than having policy imposed on it.
+        self.cfg.leaf_unsandboxed_commands = []
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("allowUnsandboxedCommands", seen["content"]["sandbox"])
+
+    def test_the_socket_wide_grant_is_never_seeded(self) -> None:
+        # We deliberately do NOT ship `allowAllUnixSockets`: it would let ANY command the leaf
+        # runs reach the docker socket, and a root-owned daemon (the common setup) is
+        # root-adjacent. It is not in the allow-list, so configuring it cannot reach a leaf.
+        self._project_settings({"sandbox": {
+            "allowAllUnixSockets": True,
+            "network": {"allowLocalBinding": True},
+        }})
+        seen = self._capture_sandbox_settings()
+        self.assertNotIn("allowAllUnixSockets", seen["content"]["sandbox"])
+
+    def test_a_false_grant_is_carried_faithfully(self) -> None:
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": False}}})
+        seen = self._capture_sandbox_settings()
+        self.assertIs(seen["content"]["sandbox"]["network"]["allowLocalBinding"], False)
+
+    def test_no_sandbox_key_seeds_nothing(self) -> None:
+        # An instance that configures no sandbox is unaffected: no settings file is written.
+        self._project_settings({"permissions": {"allow": ["Read"]}})
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_sandbox_block_without_the_grant_seeds_nothing(self) -> None:
+        # A project that configures a sandbox but not loopback binding gets no seeded file:
+        # there is nothing this fix needs to carry, so the leaf keeps the ambient policy.
+        self._project_settings({"sandbox": {"enabled": True, "excludedCommands": ["cargo *"]}})
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_non_boolean_grant_seeds_nothing(self) -> None:
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": "yes"}}})
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_absent_project_settings_seeds_nothing(self) -> None:
+        self.assertFalse(self._capture_sandbox_settings()["exists"])
+
+    def test_malformed_project_settings_does_not_abort_check(self) -> None:
+        # Best-effort, like the agent seeding: a corrupt settings.json degrades to a no-op.
+        # (With no pdca.toml exemption declared there is nothing else to grant, so no file is
+        # written at all. The exemption's independence from this file is pinned separately.)
+        cdir = self.cfg.root / ".claude"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "settings.json").write_text("{ not json", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            seen = self._capture_sandbox_settings()          # must NOT raise
+        self.assertFalse(seen["exists"])
+        self.assertIn("could not read sandbox settings", buf.getvalue())
+
+    def test_advisory_sandbox_seeds_settings_too(self) -> None:
+        # The advisory leaves hit the same bind wall as the main reviewer (#261 names
+        # advisory explicitly), so they get the same policy.
+        self._project_settings({"sandbox": {"network": {"allowLocalBinding": True}}})
+        (self.d / "patch.diff").write_text("x\n", encoding="utf-8")
+        (self.d / "check-gates.json").write_text("{}\n", encoding="utf-8")
+        seen: dict = {}
+        orig = leaves._invoke
+
+        def capture(leaf, workdir, prompt, **k):
+            f = Path(workdir) / ".claude" / "settings.json"
+            seen["content"] = json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+            (Path(workdir) / "check-advisory-lens.md").write_text("ok\n", encoding="utf-8")
+
+        leaves._invoke = capture
+        try:
+            leaves._run_advisory_sandboxed(
+                self.d, self.cfg, LeafConfig(mode="command", family="claude"),
+                {"id": "lens", "role": "a lens"}, "lens")
+        finally:
+            leaves._invoke = orig
+        self.assertIs(seen["content"]["sandbox"]["network"]["allowLocalBinding"], True)
 
 
 class AdvisoryReviewers(unittest.TestCase):

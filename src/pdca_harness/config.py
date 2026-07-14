@@ -8,6 +8,7 @@ stdlib ``tomllib`` so the harness has no runtime dependencies.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,36 @@ class Config:
     # vice-versa with no per-brief edits — the cross-vendor decorrelation Check relies on
     # (INTEGRATION §4), made automatic. No different-vendor leaf ⇒ same-vendor fallback + §6.
     advisory_selection: dict = field(default_factory=dict)
+    # Commands a Check leaf may run OUTSIDE its sandbox ([leaves.sandbox]
+    # unsandboxed_commands, issue #276). The reviewer/advisory leaves run under Claude Code's
+    # sandbox, which denies the docker socket — so a Docker-backed conformance gate (a live
+    # etcd/TiKV/FDB cluster via `docker compose`) skips even on a Docker-capable host, and its
+    # runtime evidence can never be earned at Check. Naming that command here exempts THAT
+    # COMMAND, and nothing else: every other Bash line the leaf writes stays sandboxed.
+    #
+    # Deliberately a HARNESS-owned list, not the project's own
+    # `.claude/settings.json` `sandbox.excludedCommands` — that one is the operator's gate
+    # workaround and must never be inherited by a leaf (PR #268). An exemption a leaf gets is
+    # declared here, on purpose, in one auditable place. Empty (the default) ⇒ nothing is
+    # exempt and the leaf is fully sandboxed.
+    leaf_unsandboxed_commands: list[str] = field(default_factory=list)
+    # Open a Check leaf's SOCKET/NETWORK layer ([leaves.sandbox] network_access, issue #291) —
+    # the codex-shaped counterpart of the list above, and deliberately a SEPARATE key because
+    # the two sandboxes grant along different axes and neither is strictly tighter:
+    #
+    #   claude  a NAMED COMMAND leaves the sandbox entirely (filesystem too); every other
+    #           command stays confined.
+    #   codex   `--sandbox workspace-write` has no per-command escape. Its denial of the docker
+    #           socket is not a filesystem denial at all (a relayed socket in a granted writable
+    #           dir is still refused) — it is the seccomp/network layer. Opening it frees the
+    #           socket/network layer for EVERY command in the leaf, while the FILESYSTEM stays
+    #           confined for every command (verified: a write outside the workspace is denied).
+    #
+    # So this must not ride on `unsandboxed_commands`, whose promise is "only these commands
+    # leave the sandbox" — a promise the codex realization would not keep. Named for what it
+    # actually does instead. Also grants codex api.github.com, so the reviewer's prior-art check
+    # (#277) can be settled mechanically too. Empty/False (the default) ⇒ today's behaviour.
+    leaf_network_access: bool = False
     # Builder escalation ladder (issue #135): an OPEN list of stronger Do backends keyed
     # on the attempt number ([[leaves.builder_escalation]] in pdca.toml). Each:
     # {min_iteration, family, mode, argv}. On iterate, do_build picks the entry with the
@@ -174,12 +205,23 @@ class Config:
     # Do+Check band. ``1`` (the default) keeps the driver strictly serial. ``[driver].lanes``
     # in pdca.toml; ``PDCA_LANES`` overrides for a single run (like ``PDCA_BUNDLE_ROOT``).
     lanes: int = 1
-    # Max Do↔sign-off passes a single wave runs before it STOPS and loudly reports any
-    # bundle still iterating (rather than silently dropping it and publishing the rest).
-    # The cap bounds a non-converging bundle; a bundle that legitimately needs more
-    # iterations is resumed with ``pdca flow <id>`` or by raising this. ``[driver].max_passes``
-    # in pdca.toml; ``PDCA_MAX_PASSES`` overrides for a single run (like ``PDCA_LANES``).
+    # Sign-off pass budget for one `pdca flow` run (issue #260): how many build-all →
+    # sign-off passes a wave (or iterations a single issue) gets before the driver stops
+    # driving it. A bundle still iterating when the budget runs out is left un-terminal and
+    # NAMED on stderr with a resume hint — never silently dropped. ``[driver].max_passes``;
+    # ``PDCA_MAX_PASSES`` overrides for one run; ``--max-passes`` overrides both.
     max_passes: int = 20
+    # Auto-iterate (issue #264): when every open SUMMARY §6 item is implementation-level
+    # (a `gate` cell of the 5/5/1 — C2/C4/T1..T4), let the driver record `iterate-do` and
+    # rebuild instead of stopping for a human. A judgment cell (C5/T5/validation), an
+    # unverifiable gate, an external dependency, or an unmarked advisory finding still
+    # halts. It never auto-accepts. OFF by default. ``[driver].auto_iterate``;
+    # ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
+    auto_iterate: bool = False
+    # The per-bundle cap on those automatic rounds; on exhaustion the bundle halts at
+    # AWAITING_SIGNOFF for the human. Clamped below ``max_passes`` so a wave's pass budget
+    # can't run out mid-auto-iteration (which #260 would then report as abandoned).
+    max_auto_iters: int = 3
     # Worktree isolation (issue #94): run a cycle's Do/Check in a dedicated git worktree
     # off the target's base, so the host's primary checkout is never mutated in place.
     # On by default; ``[driver].worktree = false`` disables (then Do/Check edit the
@@ -277,6 +319,24 @@ class Config:
                 return cls
         return ""
 
+    def current_doctor_checks(self) -> list[dict]:
+        """The ``[[doctor.checks]]`` rows **as they are on disk right now** (issue #263).
+
+        ``Config`` is loaded once per ``pdca`` invocation, but a `pdca flow` can run for
+        hours and ``pdca.toml`` is edited *during* it: the Plan beat registers a row for a
+        dependency it just enumerated, and the human pastes in the row the builder proposed
+        at Do. A snapshot taken before Plan would then report a correctly-registered
+        dependency as unregistered at Check — a §6 blocker for work already done.
+
+        Falls back to the snapshot when ``pdca.toml`` is absent or unparseable (a test's
+        synthetic ``Config``, a mid-write file), so this never crashes an assemble.
+        """
+        try:
+            data = tomllib.loads((self.root / "pdca.toml").read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return list(self.doctor_checks)
+        return list(data.get("doctor", {}).get("checks", []))
+
     @classmethod
     def load(cls, root: Path | None = None) -> "Config":
         """Load ``pdca.toml`` from ``root`` (or the nearest ancestor that has one)."""
@@ -333,6 +393,25 @@ class Config:
         # Advisory-selection policy (issue #200) — how the driver picks from that list.
         advisory_selection = dict(leaves.get("advisory_selection", {}))
 
+        # Commands a Check leaf may run outside its sandbox (issue #276) — a harness-owned
+        # exemption list, never the project's own settings.json `excludedCommands`.
+        leaf_unsandboxed_commands = [
+            str(c) for c in (leaves.get("sandbox", {}).get("unsandboxed_commands") or [])
+            if str(c).strip()
+        ]
+        # …and the codex-shaped grant: open the leaf's socket/network layer (issue #291).
+        # STRICT, and fail CLOSED. `bool("false")` is True — every non-empty string is — so a
+        # quoted `network_access = "false"` (an easy TOML slip) silently handed a codex leaf full
+        # network/socket access, which is the exact opposite of what it says (PR #292 review,
+        # local pass). This is a security grant: it turns on for the boolean `true` and for
+        # nothing else, and a non-boolean is reported rather than guessed at.
+        _net = leaves.get("sandbox", {}).get("network_access", False)
+        if not isinstance(_net, bool):
+            print(f"config: [leaves.sandbox] network_access must be a boolean, got "
+                  f"{_net!r} — treating it as FALSE (the grant stays closed). Write "
+                  "`network_access = true`, unquoted.", file=sys.stderr)
+        leaf_network_access = _net is True
+
         # Builder escalation ladder (issue #135) — stronger Do backends keyed on attempt
         # number. PDCA_LEAVES_MODE forces their mode too (CI / offline determinism); ""
         # leaves it unset so select_builder falls back to the default builder's mode.
@@ -363,12 +442,23 @@ class Config:
         if os.environ.get("PDCA_LANES"):
             lanes = int(os.environ["PDCA_LANES"])
         lanes = max(1, lanes)
-        # Per-wave iteration cap. PDCA_MAX_PASSES overrides [driver].max_passes for one run.
-        # Floor of 1; a bundle still iterating when it's hit is reported, not dropped.
+        # Sign-off pass budget. PDCA_MAX_PASSES overrides [driver].max_passes for one run.
+        # Floor of 1 = a single build-all + sign-off pass (issue #260).
         max_passes = int(driver_cfg.get("max_passes", 20))
         if os.environ.get("PDCA_MAX_PASSES"):
             max_passes = int(os.environ["PDCA_MAX_PASSES"])
         max_passes = max(1, max_passes)
+        # Auto-iterate on implementation-only Check findings (issue #264). Opt-in.
+        auto_iterate = bool(driver_cfg.get("auto_iterate", False))
+        if os.environ.get("PDCA_AUTO_ITERATE"):
+            auto_iterate = os.environ["PDCA_AUTO_ITERATE"] not in ("0", "false", "")
+        # Keep the auto budget strictly below the pass budget, so exhausting it always lands
+        # the bundle on a clean AWAITING_SIGNOFF halt rather than leaving it mid-flight at
+        # ITERATE_DO when the wave's passes run out (issue #260's abandonment shape).
+        max_auto_iters = max(1, int(driver_cfg.get("max_auto_iters", 3)))
+        if os.environ.get("PDCA_MAX_AUTO_ITERS"):
+            max_auto_iters = max(1, int(os.environ["PDCA_MAX_AUTO_ITERS"]))
+        max_auto_iters = min(max_auto_iters, max(1, max_passes - 1))
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
         overflow = max(0, int(driver_cfg.get("overflow", 0)))  # issue #226; 0 ⇒ heal in place
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
@@ -415,12 +505,16 @@ class Config:
             install_extra_bootstrap=install_extra_bootstrap,
             manual_test_cmd=manual_test_cmd,
             advisory_leaves=advisory_leaves,
+            leaf_unsandboxed_commands=leaf_unsandboxed_commands,
+            leaf_network_access=leaf_network_access,
             advisory_selection=advisory_selection,
             builder_escalation=builder_escalation,
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             lanes=lanes,
             max_passes=max_passes,
+            auto_iterate=auto_iterate,
+            max_auto_iters=max_auto_iters,
             worktree=worktree,
             overflow=overflow,
             lane_preflight=lane_preflight,
