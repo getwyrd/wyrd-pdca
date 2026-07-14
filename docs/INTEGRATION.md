@@ -185,8 +185,10 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 ## 8. Committing and PR conventions
 - **DCO sign-off:** `git commit -s` (Developer Certificate of Origin, ADR-0003 §1 — Wyrd
   uses DCO, not a CLA). Already aligned with the harness's `DCO` file.
-- **Commit-message format:** concise subject; body explains the *why*; trailer
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+- **Commit-message format:** concise subject; body explains the *why*. **No AI
+  attribution anywhere:** no `Co-Authored-By: Claude …` (or any model/vendor) trailer in
+  commits, and no Claude/model references in PR bodies or comments — authorship is the
+  human DCO sign-off alone.
 - **PR description format:** Root cause / Fix / Verified against / Test
   (`templates/pr-description.md.tpl`); reference the issue with `Fixes #nnnn`.
 - **Enforcement mechanism:** host-side — `dco`, `require-issue`, and `adr-immutability`
