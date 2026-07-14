@@ -45,6 +45,17 @@
 # PR from), so C4-verify applies the patch on the same tree the PR opens against. Never the
 # live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY / $WYRD_VERIFY_BASE override.
 #
+# Driver-named bases (harness v0.54.0): the driver exports AT MOST ONE of
+#   * $PDCA_BASE        (#54)  — the brief's `Onto branch` (an existing PR head publish
+#                                commits onto), as a full `<remote>/<branch>` ref;
+#   * $PDCA_VERIFY_BASE (#273) — the wave's folded integration branch
+#                                (`origin/pdca-integration/<base>`) for a wave>0 bundle in a
+#                                dependency batch, so a dependent verifies against
+#                                base+prereqs instead of false-failing "patch does not
+#                                apply" on a file it shares with its prereq.
+# Either outranks every local resolution below — the test base must never diverge from the
+# base publish commits to. Neither is set for an ordinary wave-0 single bundle.
+#
 # Lane-safe (docs 09 §parallel lanes): under in-driver concurrency the driver pins each
 # worker to a slot and exports $PDCA_LANE (0..N-1); a serial run leaves it unset. The
 # per-fix verify worktree AND the branch it checks out are a shared mutable resource, so
@@ -166,11 +177,15 @@ _brief_base() {
   printf '%s' "$tok"
 }
 
-# The remote-tracking base ref the patch must apply against, resolving the precedence:
-#   $WYRD_VERIFY_BASE (explicit override) > brief target base > origin/main (#91).
+# The remote-tracking base ref the patch must apply against, resolving the precedence the
+# driver documents (#54/#273):
+#   $PDCA_BASE > $PDCA_VERIFY_BASE (driver-named, full refs, at most one set — see header)
+#   > $WYRD_VERIFY_BASE (explicit override) > brief target base > origin/main (#91).
 # No git access (existence is checked at the call site), so it doubles as the --print-base
 # unit hook.
 _resolve_base_ref() {
+  if [ -n "${PDCA_BASE:-}" ]; then printf '%s' "$PDCA_BASE"; return 0; fi
+  if [ -n "${PDCA_VERIFY_BASE:-}" ]; then printf '%s' "$PDCA_VERIFY_BASE"; return 0; fi
   if [ -n "${WYRD_VERIFY_BASE:-}" ]; then printf '%s' "$WYRD_VERIFY_BASE"; return 0; fi
   local b; b="$(_brief_base)"
   if [ -n "$b" ]; then printf 'origin/%s' "$b"; else printf 'origin/main'; fi

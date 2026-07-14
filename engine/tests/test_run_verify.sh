@@ -153,6 +153,20 @@ check "WYRD_VERIFY_BASE override wins over the brief" \
   "origin/release-1.2" \
   "$(PDCA_BUNDLE="$TMP/b_m4" WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
 
+# driver-named bases (harness v0.54.0): at most one of PDCA_BASE (#54, an `Onto branch`
+# PR head) / PDCA_VERIFY_BASE (#273, the wave's folded integration branch) is exported,
+# already as a full ref; either outranks the local override and the brief — the test base
+# must never diverge from the base publish commits to.
+check "PDCA_VERIFY_BASE (wave fold, #273) wins over override + brief" \
+  "origin/pdca-integration/main" \
+  "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_VERIFY_BASE=origin/pdca-integration/main \
+     WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
+
+check "PDCA_BASE (Onto branch, #54) outranks everything" \
+  "origin/feat/existing-pr-head" \
+  "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_BASE=origin/feat/existing-pr-head \
+     PDCA_VERIFY_BASE=origin/pdca-integration/main "$RV" --print-base)"
+
 # 9. cfg-gated test targets (#104). A test whose crate root is `#![cfg(NAME)]` compiles to
 #    an EMPTY binary without `--cfg NAME` — "running 0 tests", exit 0 — which an exit-status
 #    check reads as a pass. The gate must read the cfg off the sources it compiles and pass
