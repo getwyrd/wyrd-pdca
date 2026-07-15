@@ -29,6 +29,127 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-15 — cycles considered: issue_398, issue_399, issue_406, issue_430, issue_431, issue_469, issue_470, issue_490, issue_554
+
+> The nine frozen cycles the ledger had not yet counted (58 → 67): #469/#470 froze 2026-07-10
+> alongside the FDB batch but were not in that review's scope; #399/#406 froze 07-08; #398/#430/
+> #431/#490/#554 froze 07-15 and are the first batch run on **harness v0.54.0** (bumped `3f1e643`,
+> 07-14; release cut 07-12 *after* upstream #277/#278/#291/#293 closed). No contribution
+> disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **DOMINANT & ACTIONABLE — the codex-reviewer sandbox denials persist *after* their upstream
+  fixes closed, because this instance never adopted the new opt-in knob (4×: #430, #431, #490,
+  #554 — all on v0.54.0).** In all four, the reviewer's independent `cargo xtask ci` rerun stops
+  at a loopback-bind `PermissionDenied` (e.g. `list_delete_over_grpc`; #431 self-nominates it in
+  §10), and `api.github.com` is unreachable, forcing the T4 closed/rejected-PR prior-art check to
+  NEEDS-HUMAN — the exact symptoms of harness#261 (closed 07-09) and harness#277 (closed 07-12).
+  Root cause traced this review: the harness#291 fix ships the grant as an **opt-in config key**
+  — `[leaves.sandbox] network_access = true` (codex's denial is its seccomp/network layer; no
+  path grant fixes it) — and this repo's `pdca.toml` carried it **commented out**. So this is an
+  **instance-config adoption gap**, not an upstream regression: the one finding that meets the
+  process-delta bar this review (delta applied below). Corroborating evidence: #406's original
+  loopback NEEDS-HUMAN rows were all **CLEARED** by a full re-Check on the human's box (loopback
+  works outside the sandbox), and #399/#469/#470's Docker/gh denials all *pre-date* the fixes
+  (froze 07-08/07-10) — the earlier routes were right, the fixes just hadn't been switched on here.
+- **NEW harness bug (evidence-integrity class) — lane worktree not reset between iterations, so a
+  *gating* C4-ci green attested the PREVIOUS iteration's code (#554 §10).** `wyrd.pdca-wt-l1` kept
+  iteration-4 state into iteration 5 (likely trigger: host standby mid-process); the reviewer
+  caught it independently ("`$PDCA_TARGET` contains the preceding iteration … `patch.diff` applies
+  cleanly to its `HEAD`", `check-review.md`). The strongest failure class a deterministic gate can
+  have — a green certifying a tree that doesn't match `patch.diff`. Harness machinery → routed
+  upstream (below).
+- **RECURRING harness bug — the harness's own disk footprint false-reds gating gates (2×: #430,
+  #554).** #430's gating C4-ci red was `cli_roundtrip.rs:43` panicking on `Disk quota exceeded
+  (os error 122)`; #554's C4 gate failed at `dst_commit.rs` for quota headroom. The #554 sign-off
+  diagnosed the cause: accumulated `../wyrd-*/target` dirs + stale lane/verify worktrees **>200 G**
+  exhaust the user quota. Echoes #252 §10's "lazy worktree cleanup" (2026-07-04), whose footprint
+  axis was never addressed. Quota exhaustion mid-`cargo test` yields an arbitrary failing test
+  name, so the red is misattributed to the patch until a human traces it — twice in one batch.
+  Harness machinery → routed upstream (below).
+- **Working as designed — no delta.** #398 is the first **likely-close** (no-patch) cycle and the
+  shape worked: a single §6 row asking the human to confirm the close disposition, cleanly
+  confirmable at sign-off. #406 demonstrates the full-re-Check-at-sign-off path clearing every
+  provisional row. #469/#470 carried their Docker/gh gaps as pre-declared T3/T5 items with the
+  #442 go/no-go owner already recorded (2026-07-10 review) — nothing new owed.
+- **C5 / T5 / V remain NEEDS-HUMAN by design in every cycle** (fitness-to-purpose in all nine;
+  the always-human classes, INTEGRATION.md §4). The structural constant — no delta, consistent
+  with every prior review.
+- **Wyrd code follow-ups from §10, none a process delta (4 items: #490 ×2, #554 ×2)** — routed to
+  the tracker below: buffered-PUT lease renewal; `write_new_object` commit-instant contract;
+  custodian peer re-dial after degraded boot; identity-keyed fleet uniqueness.
+
+## Process deltas
+
+- **Gates/leaf config (this repo, applied by the human this session): `[leaves.sandbox]
+  network_access = true`** (`pdca.toml:582-584`, previously commented out; verified parsing with
+  an unquoted boolean and a single table declaration). Opens the codex reviewer leaf's
+  socket/network layer per harness#291: loopback binds (the 4× C4-rerun blocker), `api.github.com`
+  (the standing T4 prior-art tax, harness#277), and the Docker socket (harness#276/#291).
+  Trade-off accepted knowingly: the grant applies to every command in that leaf (no per-domain
+  scoping); filesystem confinement is retained; rootless docker remains the preferred hardening.
+  The claude-side `unsandboxed_commands` key stays commented — no claude-family leaf currently
+  needs a Docker-backed conformance leg.
+- **No spec-template / ruleset / agent-skill delta warranted.** The two new harness findings
+  (worktree reset, disk footprint) are `src/pdca_harness/**` machinery → upstream; the rest is
+  working-as-designed or always-human.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Harness/driver (upstream) — lane worktree not reset between iterations; gating green can
+  attest stale code (#554).** Ask: reset/re-populate `$PDCA_WORKTREE` before gates and verify the
+  tree matches `patch.diff`, failing CLOSED on mismatch. → **FILED eduralph/pdca-harness#296**
+  (2026-07-15, bug) — https://github.com/eduralph/pdca-harness/issues/296
+- **Harness/driver (upstream) — prune/bound the harness's worktree/target footprint (#430, #554).**
+  Ask: sweep lane/verify worktrees on publish/freeze, GC per-lane `target/` dirs, optional doctor
+  row warning near-quota. → **FILED eduralph/pdca-harness#297** (2026-07-15, bug) —
+  https://github.com/eduralph/pdca-harness/issues/297
+- **Tracker (Wyrd, #490 §10) — buffered `put_object` lease renewal** (a PUT slower than the 30 s
+  TTL deterministically Conflicts, cannot succeed on retry; renew on the buffered path or route
+  through streaming). → **FILED getwyrd/wyrd#560** (milestone 0.1 Alpha) —
+  https://github.com/getwyrd/wyrd/issues/560
+- **Tracker (Wyrd, #490 §10) — `write_new_object`/`write_new_object_placed` commit-instant
+  contract** (start-of-call `now` makes the present-but-expired guard arm vacuous on the helper
+  paths; latent today). → **FILED getwyrd/wyrd#561** —
+  https://github.com/getwyrd/wyrd/issues/561
+- **Tracker (Wyrd, #554 §10) — custodian never re-dials a peer dropped at a degraded boot** (GC
+  pause lasts the process lifetime; re-dial each pass so the run-loop doc's "recovered on the next
+  whole-fleet pass" becomes true). → **FILED getwyrd/wyrd#562** (milestone M7) —
+  https://github.com/getwyrd/wyrd/issues/562
+- **Tracker (Wyrd, #554 §10) — key the fleet-uniqueness refusal on attested identity, not endpoint
+  string equality** (endpoint aliasing accepted as a trust assumption at the #554 sign-off; close
+  structurally at M5 step-ca). → **FILED getwyrd/wyrd#563** (milestone M5) —
+  https://github.com/getwyrd/wyrd/issues/563
+
+## Still open (carried)
+
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued/handed off, 2026-06-21)
+  remain absent from the frozen index → carried, out of scope.
+- Result dirs **issue_250/262/263/264/265/291/367/407** exist under `results/` but are not in the
+  frozen Act index → out of scope this review (same handling as prior reviews).
+- Upstream closures observed this review: harness **#261, #262, #263, #276, #277, #278, #291,
+  #293** all CLOSED — the adoption knob is now switched on here; effectiveness judged below.
+- Prior carried items unchanged: getwyrd/wyrd#426 (shared-conformance-pin governance); #442 (FDB
+  go/no-go, owns the #438–#441/#470 fitness deferral); #268 ADR-0010 `BlockReadFault` amendment;
+  #356 fan-out id-map; the #367 first-deployment-gate convergence (M4 itself merged as
+  getwyrd/wyrd#489 per INTEGRATION.md — confirm #367's runbook items landed with it next review).
+
+## How effectiveness will be judged
+
+- **The `network_access` knob is the testable delta:** the next codex-reviewed cycles should stop
+  raising loopback-bind C4-rerun provisionals and gh-unreachable T4 prior-art NEEDS-HUMAN rows.
+  If either recurs **with the knob active**, that is a genuine upstream defect (a #291-style
+  family gap for loopback) — file it with the evidence; do not re-toggle config.
+- **harness#296** should make a stale-worktree gating green impossible (fail-closed mismatch);
+  watch for any reviewer grounding note of the "`$PDCA_TARGET` contains the preceding iteration"
+  form — one more occurrence before the fix confirms severity, any occurrence after it means the
+  fix regressed.
+- **harness#297** should end quota-exhaustion gate false-reds; a third `os error 122`-class
+  gating red (after #430/#554) before the fix lands makes it overdue.
+- The four Wyrd follow-ups (#560–#563) should appear as scheduled/closed at their milestones —
+  #560 before 0.1 Alpha ships the lease guard to users.
+
 # Act review — 2026-07-10 — cycles considered: issue_439, issue_440, issue_441, issue_468 (FDB batch; issue_477 already recorded 07-07)
 
 ## What the cycles' records exposed
