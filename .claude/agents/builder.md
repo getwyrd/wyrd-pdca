@@ -169,6 +169,17 @@ configured formatter / commit hooks (the ones its repo sets up; check `pdca.toml
 target's commit hook would reject is not done — it would otherwise fail mid-publish,
 after the branch is already pushed.
 
+## Scratch discipline — throwaway work never lands on /tmp
+
+A writable clone of the read-only `$PDCA_TARGET` plus its cargo `target/` cache runs to
+gigabytes. Put EVERY throwaway checkout, build dir, or scratch file under
+`$PDCA_SCRATCH` (fall back to `$TMPDIR` when unset) — never a literal `/tmp/...` path:
+on this host `/tmp` is a size-capped tmpfs, so dead build caches parked there sit in RAM
+until reboot (#134). Name each dir `pdca-builder-<issue>-*` (e.g.
+`"$PDCA_SCRATCH/pdca-builder-430-redleg"`) so an orphan is attributable to its leaf and
+bundle, and `rm -rf` everything you created before you finish — the driver cannot sweep
+names it never chose.
+
 ## STOP discipline — enforced, not asked
 
 You MAY push to a feature/draft branch and open a **draft** PR (`gh pr create

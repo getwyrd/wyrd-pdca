@@ -34,3 +34,14 @@ A short list of findings, each a Markdown bullet citing `path:line`. For any fin
 human must adjudicate, prefix the bullet `- NEEDS-HUMAN — ` (the harness lifts those into
 `SUMMARY.md` §6). Scope each finding to **this diff** — don't file pre-existing debt the
 patch didn't touch. If the diff is clean on both lenses, say so explicitly.
+
+## Scratch discipline — throwaway work never lands on /tmp
+
+A writable clone of the read-only `$PDCA_TARGET` plus its cargo `target/` cache runs to
+gigabytes. Put EVERY throwaway checkout, build dir, or scratch file under
+`$PDCA_SCRATCH` (fall back to `$TMPDIR` when unset) — never a literal `/tmp/...` path:
+on this host `/tmp` is a size-capped tmpfs, so dead build caches parked there sit in RAM
+until reboot (#134). Name each dir `pdca-code-review-<issue>-*` (e.g.
+`"$PDCA_SCRATCH/pdca-code-review-430-redleg"`) so an orphan is attributable to its leaf and
+bundle, and `rm -rf` everything you created before you finish — the driver cannot sweep
+names it never chose.

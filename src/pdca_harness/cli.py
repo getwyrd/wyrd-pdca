@@ -145,6 +145,48 @@ def _inhibit_suspend_and_reexec() -> None:
     os.execvpe(wrapped[0], wrapped, {**os.environ, "PDCA_FLOW_INHIBITED": "1"})
 
 
+def _export_scratch(cfg: Config, env: dict | None = None) -> Path | None:
+    """Create + export the configured scratch root, once, at CLI entry (issue #134).
+
+    The heavy /tmp users are the model leaves (red/green-leg clones of the target, cargo
+    ``target/`` caches), and on a tmpfs host those park gigabytes in RAM until reboot.
+    Setting BOTH variables here — before any leaf, gate, or verify subprocess spawns, and
+    before the first ``tempfile`` use (it caches its directory) — means every child
+    inherits the redirect with no per-call-site threading:
+
+      * ``PDCA_SCRATCH`` — the leaves' DESIGNATED scratch root; the agent definitions
+        instruct throwaway checkouts/builds go under it, named ``pdca-<leaf>-<issue>-*``.
+      * ``TMPDIR``       — so bare ``mktemp -d`` and Python ``tempfile`` (including the
+        harness's own review/advisory sandboxes) follow without knowing about the knob.
+
+    Unset ``scratch_dir`` ⇒ ``None``, byte-for-byte today's behavior. An uncreatable dir
+    warns and falls back to today's behavior rather than aborting the run (the knob is a
+    hygiene redirect, not a correctness gate). ``env`` is injected for tests; the real
+    call mutates ``os.environ`` and resets ``tempfile``'s cached directory.
+    """
+    if not cfg.scratch_dir:
+        return None
+    import tempfile
+    target = Path(cfg.scratch_dir).expanduser()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        # Probe WRITABILITY, not mere existence: a pre-existing read-only dir passes
+        # mkdir(exist_ok=True), and exporting it would break every mktemp downstream
+        # instead of taking this documented fallback.
+        with tempfile.NamedTemporaryFile(dir=target):
+            pass
+    except OSError as exc:
+        print(f"pdca: scratch_dir {target} is not usable ({exc}) — leaf scratch stays on "
+              f"the default temp location for this run.", file=sys.stderr)
+        return None
+    e = os.environ if env is None else env
+    e["PDCA_SCRATCH"] = str(target)
+    e["TMPDIR"] = str(target)
+    if env is None:
+        tempfile.tempdir = None  # drop the cached location so gettempdir() re-reads TMPDIR
+    return target
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=_prog_name(), description="PDCA quality-cycle driver")
     # No subcommand → status (the bundle dashboard), the most-reached-for view (#88).
@@ -301,6 +343,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:  # malformed pdca.toml (tomllib) or a bad config value
         print(f"pdca: invalid pdca.toml — {exc}", file=sys.stderr)
         return 2
+    # Redirect throwaway heavy leaf work off tmpfs /tmp (issue #134) — must precede every
+    # subprocess spawn and the first tempfile use, so one export covers them all.
+    _export_scratch(cfg)
 
     if not args.cmd:  # bare invocation → the status dashboard (#88)
         return _status(cfg, None)
