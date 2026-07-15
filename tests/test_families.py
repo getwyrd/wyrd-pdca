@@ -361,7 +361,20 @@ class ShippedPdcaTomlExamples(unittest.TestCase):
     def test_the_commented_example_parses_when_uncommented(self) -> None:
         src = self._source()
         block = re.search(r"^# \[leaves\.sandbox\]\n(?:^#[^\n]*\n)+", src, re.M)
-        self.assertIsNotNone(block, "the [leaves.sandbox] example must still be there")
+        if block is None:
+            # This instance ACTIVATED the table (#135): the example is now live config, and
+            # the exactly-once guard above forbids keeping the commented example beside it.
+            # The example-guard's two promises are asserted on the REAL file instead: it
+            # parses, and `network_access` is the UNQUOTED boolean (a quoted "true"/"false"
+            # is rejected by Config.load and the grant stays closed — the #292 fail-closed
+            # contract this test exists to protect).
+            sandbox = tomllib.loads(src).get("leaves", {}).get("sandbox")
+            self.assertIsNotNone(sandbox, "the [leaves.sandbox] table must exist, live "
+                                          "or as the commented example")
+            self.assertIn("network_access", sandbox,
+                          "the activated table must carry the grant it was activated FOR")
+            self.assertIsInstance(sandbox["network_access"], bool)
+            return
         uncommented = "\n".join(
             line[2:] if line.startswith("# ") else line.lstrip("#")
             for line in block.group(0).strip().splitlines())
