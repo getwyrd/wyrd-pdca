@@ -178,6 +178,11 @@ def _export_scratch(cfg: Config, env: dict | None = None) -> Path | None:
     except OSError as exc:
         print(f"pdca: scratch_dir {target} is not usable ({exc}) — leaf scratch stays on "
               f"the default temp location for this run.", file=sys.stderr)
+        # The rejected root may have ARRIVED via $PDCA_SCRATCH (Config.load copies the env
+        # override into cfg.scratch_dir). Falling back without clearing it would hand every
+        # leaf the bad path anyway — the role prompts tell them to PREFER $PDCA_SCRATCH.
+        # $TMPDIR is not ours to clear: a pre-set value belongs to the operator.
+        (os.environ if env is None else env).pop("PDCA_SCRATCH", None)
         return None
     e = os.environ if env is None else env
     e["PDCA_SCRATCH"] = str(target)

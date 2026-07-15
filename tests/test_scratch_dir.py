@@ -111,6 +111,21 @@ class ScratchExport(unittest.TestCase):
         self.assertEqual(env, {})
         self.assertIn("not usable", err.getvalue())
 
+    def test_rejected_env_override_is_cleared_on_fallback(self) -> None:
+        # The bad root may have arrived via $PDCA_SCRATCH itself; falling back while the
+        # variable survives hands every leaf the rejected path anyway (the role prompts
+        # prefer $PDCA_SCRATCH over $TMPDIR). It must be cleared. A pre-set TMPDIR is the
+        # operator's and stays.
+        blocker = self.tmp / "blocking-file"
+        blocker.write_text("not a dir", encoding="utf-8")
+        env = {"PDCA_SCRATCH": str(blocker / "sub"), "TMPDIR": "/operator/tmp"}
+        err = io.StringIO()
+        with redirect_stderr(err):
+            got = cli._export_scratch(self._cfg(str(blocker / "sub")), env)
+        self.assertIsNone(got)
+        self.assertNotIn("PDCA_SCRATCH", env)
+        self.assertEqual(env["TMPDIR"], "/operator/tmp")
+
     def test_uncreatable_dir_warns_and_falls_back(self) -> None:
         blocker = self.tmp / "file"
         blocker.write_text("not a dir", encoding="utf-8")
