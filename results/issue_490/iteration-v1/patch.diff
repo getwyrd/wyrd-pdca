@@ -1,0 +1,289 @@
+diff --git a/crates/core/src/metadata.rs b/crates/core/src/metadata.rs
+index 6aa8d7b..f23bc9c 100644
+--- a/crates/core/src/metadata.rs
++++ b/crates/core/src/metadata.rs
+@@ -512,19 +512,36 @@ pub async fn sweep_pending(
+     store.commit(batch).await
+ }
+ 
+-/// **Renew** the pending-ledger lease on every chunk in `chunks` to `entry` in one atomic
+-/// batch. The streaming write path calls this as an upload progresses so an already-written
+-/// but not-yet-committed chunk's lease never lapses before the final commit: until the
+-/// commit publishes the inode, an in-flight chunk's fragments are protected from the
+-/// custodian **GC** only by its unexpired pending lease (they are in no committed chunk map,
+-/// so GC's reference set does not cover them). A single start-of-upload deadline let a slow
+-/// upload run past it and the GC would reclaim the early chunks as expired garbage before
+-/// the commit — publishing an object with missing fragments (issue #364 durability finding
+-/// 2, `write::stream_write_data`). A plain overwrite of each `pending:<id>` entry, so it is
+-/// idempotent; an empty slice is a no-op.
++/// **Renew** the pending-ledger lease on every chunk in `chunks` to `entry` in one atomic,
++/// **conditional** batch. The streaming write path calls this as an upload progresses so an
++/// already-written but not-yet-committed chunk's lease never lapses before the final commit:
++/// until the commit publishes the inode, an in-flight chunk's fragments are protected from
++/// the custodian **GC** only by its unexpired pending lease (they are in no committed chunk
++/// map, so GC's reference set does not cover them). A single start-of-upload deadline let a
++/// slow upload run past it and the GC would reclaim the early chunks as expired garbage
++/// before the commit — publishing an object with missing fragments (issue #364 durability
++/// finding 2, `write::stream_write_data`).
++///
++/// Renewal may only **extend** a lease that still exists — it must never re-create authority
++/// the sweep already revoked (issue #490). A *blind* overwrite of each `pending:<id>` entry
++/// resurrected a chunk whose lease had already lapsed and been swept mid-upload, and the
++/// upload then committed an inode pointing at bytes the GC was free to reclaim. So each entry
++/// is read back and the renewal **refuses** — returning [`CommitOutcome::Conflict`], nothing
++/// written — when a chunk's entry is either:
++///  * **absent** — a sweep reclaimed it (`sweep_expired_leases`), or
++///  * present but its recorded `lease_expiry_millis` is **`< now_millis`** — lapsed but not
++///    yet reaped (renewing it would resurrect revoked authority, `write.rs:417-418`). The
++///    strict `<` keeps the healthy renewal-at-the-deadline path (`now == expiry`) alive.
++///
++/// The check and the write are ONE batch: for every chunk it pairs
++/// `require(pending_key, current-value)` with `put(pending_key, entry)`, so a sweep that
++/// deletes an entry **between** the read-back and the commit turns the precondition false and
++/// the whole batch is `Conflict` — a read-verify-then-blind-put in two commits could not
++/// close that interleave. An empty slice is a no-op.
+ pub async fn renew_pending(
+     store: &impl MetadataStore,
+     chunks: &[ChunkId],
++    now_millis: u64,
+     entry: &PendingEntry,
+ ) -> Result<CommitOutcome> {
+     if chunks.is_empty() {
+@@ -532,7 +549,18 @@ pub async fn renew_pending(
+     }
+     let mut batch = WriteBatch::new();
+     for &chunk in chunks {
+-        batch = batch.put(pending_key(chunk), encode(entry));
++        let key = pending_key(chunk);
++        let current = match store.get(&key).await? {
++            // Swept out from under the upload — refuse rather than resurrect.
++            None => return Ok(CommitOutcome::Conflict),
++            Some(bytes) => bytes,
++        };
++        let existing: PendingEntry = decode(&current)?;
++        if existing.lease_expiry_millis < now_millis {
++            // Lapsed but not yet reaped — renewing it would revive revoked authority.
++            return Ok(CommitOutcome::Conflict);
++        }
++        batch = batch.require(key.clone(), current).put(key, encode(entry));
+     }
+     store.commit(batch).await
+ }
+diff --git a/crates/core/src/write.rs b/crates/core/src/write.rs
+index 5d0e1ba..ca9072c 100644
+--- a/crates/core/src/write.rs
++++ b/crates/core/src/write.rs
+@@ -429,14 +429,26 @@ async fn lease_write_chunk(
+     renew_at: &mut u64,
+ ) -> Result<PlannedChunk> {
+     if !leased.is_empty() && now_millis >= *renew_at {
+-        metadata::renew_pending(
++        // Renewal is CONDITIONAL: it refuses (Conflict) if an in-flight lease was swept or
++        // has already lapsed. A lapsed lease is dead — resurrecting it would let this upload
++        // commit an inode over fragments the GC is free to reclaim (issue #490). Abort the
++        // upload BEFORE the next chunk is written toward commit, rather than publish missing
++        // fragments.
++        let outcome = metadata::renew_pending(
+             meta,
+             leased,
++            now_millis,
+             &PendingEntry {
+                 lease_expiry_millis: now_millis + lease_ttl_millis,
+             },
+         )
+         .await?;
++        if outcome != CommitOutcome::Committed {
++            return Err(WriteError::LeaseLapsed {
++                chunks: leased.clone(),
++            }
++            .into());
++        }
+         *renew_at = now_millis + lease_ttl_millis / 2;
+     }
+     let planned = intent_and_write_chunk(
+@@ -590,3 +602,36 @@ fn parse_pending_key(key: &[u8]) -> Option<ChunkId> {
+         .parse()
+         .ok()
+ }
++
++/// Errors specific to the write path; surfaced through the trait's boxed error.
++#[derive(Debug)]
++pub enum WriteError {
++    /// A streaming upload's in-flight pending lease could not be **renewed** because it had
++    /// already lapsed — swept out from under the upload, or expired past its recorded
++    /// deadline (issue #490). A lapsed lease is dead authority; renewing it would resurrect
++    /// protection the custodian sweep already revoked and let the upload commit an inode over
++    /// fragments the GC is free to reclaim. The upload is aborted before its next chunk is
++    /// written toward commit, so nothing is published.
++    LeaseLapsed {
++        /// The in-flight chunk ids whose leases the renewal could not extend.
++        chunks: Vec<ChunkId>,
++    },
++}
++
++impl std::fmt::Display for WriteError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            WriteError::LeaseLapsed { chunks } => {
++                write!(
++                    f,
++                    "streaming upload aborted: an in-flight pending lease lapsed and could \
++                     not be renewed ({} in-flight chunk(s)); refusing to resurrect a swept \
++                     lease and publish missing fragments",
++                    chunks.len()
++                )
++            }
++        }
++    }
++}
++
++impl std::error::Error for WriteError {}
+diff --git a/crates/core/tests/stream_lease_lapse.rs b/crates/core/tests/stream_lease_lapse.rs
+new file mode 100644
+index 0000000..0c54b1b
+--- /dev/null
++++ b/crates/core/tests/stream_lease_lapse.rs
+@@ -0,0 +1,143 @@
++//! Issue #490 (streaming-write carry-forward from #364): a streaming PUT whose in-flight
++//! lease **LAPSES** mid-upload must not be allowed to resurrect its swept pending entries and
++//! publish an object over reclaimed fragments.
++//!
++//! A streaming PUT commits only after its *last* chunk arrives, so until then an early chunk's
++//! fragments are protected from the custodian sweep/GC solely by its pending-ledger lease
++//! (`crates/core/src/write.rs:409-415`). If the upload stalls past the TTL between two chunks
++//! and the sweep runs, that early chunk's `pending:<id>` entry is reclaimed — a genuinely dead
++//! upload the sweep is entitled to reap (`write.rs:417-418`). The renewal fired by the next
++//! chunk used to do a **blind** `put` of every in-flight lease, RE-CREATING the swept entry
++//! (`metadata.rs` `renew_pending`) and letting the upload commit an inode whose chunk map
++//! points at bytes the GC was free to reclaim.
++//!
++//! The deterministic mid-upload seam is the **input stream** itself: an async generator that,
++//! between yielding chunk 1's and chunk 2's bytes, advances the shared logical clock past the
++//! TTL and awaits `sweep_expired_leases` — reclaiming chunk 1's pending entry WHILE the upload
++//! is still running (the peer `stream_lease_renewal.rs` suite can only sweep after the whole
++//! `stream_write_data` call returns, so a clock jump alone can never place the sweep
++//! mid-upload). The renewal must then REFUSE and the upload must fail.
++//!
++//! Note (honest red): `sweep_expired_leases` deletes only the ledger entry — the fragment
++//! BYTES stay on the store (`write.rs:561-562`), so a pre-fix read-back would still succeed.
++//! The binding assertions are therefore the ones that are red pre-fix and green post-fix:
++//!   * the upload ERRORS instead of committing, and
++//!   * the swept `pending:<id>` is NOT resurrected by the renewal.
++
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++
++use bytes::Bytes;
++use futures_util::stream;
++use pollster::block_on;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_core::metadata::{self, EcScheme};
++use wyrd_core::write;
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_traits::{ChunkId, MetadataStore};
++
++/// The pending-lease lifetime the streaming write stamps.
++const TTL: u64 = 30_000;
++
++#[test]
++fn lapsed_in_flight_lease_aborts_the_upload_without_resurrecting_swept_entries() {
++    block_on(async {
++        let dir = tempfile::tempdir().unwrap();
++        let chunks = FsChunkStore::open(dir.path().join("frags")).unwrap();
++        let meta = RedbMetadataStore::in_memory().unwrap();
++
++        // A shared logical clock read per chunk by `now_fn` AND advanced by the input stream
++        // between chunk 1 and chunk 2 — the mid-upload seam. Single-threaded (`block_on`), so
++        // an `Rc<Cell<..>>` shared by the clock closure and the stream generator is sound.
++        let clock = Rc::new(Cell::new(0u64));
++
++        // What the mid-upload sweep reclaimed, captured so the test can prove the fault was
++        // actually injected (the sweep really tore out an in-flight lease).
++        let reclaimed: Rc<RefCell<Vec<ChunkId>>> = Rc::new(RefCell::new(Vec::new()));
++
++        // 12 bytes at chunk_size 4 → three single-fragment chunks (scheme None), minted 1,2,3.
++        let payloads = [
++            Bytes::from(vec![0u8, 1, 2, 3]),
++            Bytes::from(vec![4u8, 5, 6, 7]),
++            Bytes::from(vec![8u8, 9, 10, 11]),
++        ];
++
++        let meta_ref = &meta;
++        let stream_clock = clock.clone();
++        let reclaimed_log = reclaimed.clone();
++        // An async generator that yields the three chunk buffers in order but, on the step that
++        // produces chunk 2 (index 1), first jumps the clock a full 2·TTL ahead and runs the
++        // custodian sweep — reclaiming chunk 1's pending entry (stamped to expire at TTL) while
++        // the upload is mid-flight. Chunk 1 has already been written by the time this step runs
++        // (`stream_write_data` fully awaits each chunk before pulling the next item).
++        let source = Box::pin(stream::unfold(0usize, move |i| {
++            let stream_clock = stream_clock.clone();
++            let reclaimed_log = reclaimed_log.clone();
++            let item = payloads.get(i).cloned();
++            async move {
++                let bytes = item?;
++                if i == 1 {
++                    stream_clock.set(2 * TTL);
++                    let swept = write::sweep_expired_leases(meta_ref, 2 * TTL)
++                        .await
++                        .unwrap();
++                    reclaimed_log.borrow_mut().extend(swept);
++                }
++                Some((Ok(bytes), i + 1))
++            }
++        }));
++
++        let now_clock = clock.clone();
++        let now_fn = move || now_clock.get();
++        let mut cid = 0u128;
++        let mint = move || {
++            cid += 1;
++            cid
++        };
++
++        let result =
++            write::stream_write_data(&meta, &chunks, source, 4, EcScheme::None, now_fn, TTL, mint)
++                .await;
++
++        // The fault must actually have been injected: the mid-upload sweep tore out chunk 1's
++        // in-flight lease (id 1). If this is empty the test proves nothing.
++        assert_eq!(
++            *reclaimed.borrow(),
++            vec![1u128],
++            "the mid-upload sweep must reclaim chunk 1's in-flight pending lease",
++        );
++
++        // BINDING #1 — the upload must FAIL, not publish: renewal cannot resurrect the swept
++        // lease, so `stream_write_data` aborts instead of returning a committable plan.
++        // Pre-fix (blind renewal) this is `Ok(..)` → red.
++        assert!(
++            result.is_err(),
++            "a streaming upload whose in-flight lease lapsed mid-upload must abort, not \
++             produce a commit plan over reclaimed fragments",
++        );
++
++        // BINDING #2 — the swept `pending:1` entry must NOT be resurrected by the renewal.
++        // Pre-fix the blind `put` re-creates it → red.
++        let swept_key = metadata::pending_key(1);
++        let pending = meta.scan(b"pending:").await.unwrap();
++        assert!(
++            !pending.iter().any(|(k, _)| *k == swept_key),
++            "the renewal must not re-create the pending entry the sweep reclaimed; \
++             pending keys present = {:?}",
++            pending
++                .iter()
++                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
++                .collect::<Vec<_>>(),
++        );
++
++        // BINDING #3 — nothing was committed: no inode references the reclaimed chunk. The
++        // upload never reached its commit phase, so the object is not readable.
++        let got = wyrd_core::read::read_path(&meta, &chunks, 0, "lapsed")
++            .await
++            .unwrap();
++        assert!(
++            got.is_none(),
++            "a lapsed-lease upload must publish no object",
++        );
++    });
++}

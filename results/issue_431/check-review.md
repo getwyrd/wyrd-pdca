@@ -1,0 +1,15 @@
+Review of issue #431: ensure a foreground Reed-Solomon read that survives a permanent block read fault records a distinct shared-queue repair obligation without treating it as checksum corruption.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is decision-ready: successful degraded reconstruction, durable queue entry, and non-corruption attribution are independently observable at `crates/core/tests/read_block_fault_repair.rs:249`. |
+| C2 Reproduction (red pre-fix) | PASS | In a clean target-HEAD export with only the new test added, the read returned the object but the queue assertion failed as `[]` versus the expected chunk at `crates/core/tests/read_block_fault_repair.rs:260`. |
+| C3 Change | PASS | The affected production path uses the existing permanence decision point and records a separate obligation without widening generic transient handling at `crates/core/src/read.rs:396` and `crates/core/src/read.rs:475`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Accept aggregate verification only after `cargo xtask ci` runs on a host permitted to bind loopback — focused red→green passed independently, but this host stopped the unrelated gRPC test with `Operation not permitted` at `crates/chunkstore-grpc/tests/list_delete.rs:55`. |
+| C5 Causal adequacy | PASS | The repair obligation is attached at the durable-fault classification point rather than guarding an optional capability or retry symptom, so the missed producer is directly repaired at `crates/core/src/read.rs:396`. |
+| T1 Structure | PASS | The shared classifier, fault telemetry, and shared repair producer remain separated along their existing responsibilities at `crates/core/src/read.rs:396` and `crates/core/src/read.rs:475`. |
+| T2 Shape | PASS | Distinct collection and deduplication preserve the corruption/non-corruption contract while retaining the existing read result shape at `crates/core/src/read.rs:464`. |
+| T3 Runtime | PASS | The applied focused test executed successfully and demonstrated byte-identical RS(2,1) recovery plus the queued reason assertions at `crates/core/tests/read_block_fault_repair.rs:250` and `crates/core/tests/read_block_fault_repair.rs:284`. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether affected-path prior art is clear enough for contribution — local merged/all-ref history shows telemetry and corruption-repair predecessors but no equivalent block-fault fix, while closed/rejected remote work cannot be mechanically established from the supplied environment (`crates/core/src/read.rs:396`). |
+| T5 Judgment | PASS | No scope re-entry is owed: other transient failures remain deliberately unqueued and the block-fault reason remains distinct from corruption at `crates/core/src/read.rs:400` and `crates/core/src/read.rs:475`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the demonstrated in-process `BlockReadFault` topology sufficiently represents production block-layer failure propagation — this determines whether the queue behavior at `crates/core/tests/read_block_fault_repair.rs:250` is fit for operational sign-off. |
