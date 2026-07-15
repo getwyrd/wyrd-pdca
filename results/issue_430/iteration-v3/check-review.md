@@ -1,0 +1,15 @@
+Review of issue #430: reject fragments whose decoded index or EC tuple does not match the committed fragment identity before read, repair, or maintenance use.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is explicit and falsifiable: wrong-index and wrong-EC-tuple fragments must never become reconstruction input and must create a repair obligation (`crates/core/tests/fragment_identity.rs:140`). |
+| C2 Reproduction (red pre-fix) | NEEDS-HUMAN | Decide whether the asserted base failure is acceptable without an independent production-reverted run — the public-surface fixture is deterministic, but the configured `engine/scripts/run-verify.sh` is absent and this artifact-only review could not stash/revert the target (`crates/core/tests/fragment_identity.rs:146`). |
+| C3 Change | PASS | The shared admission predicate now covers chunk, requested index, scheme type, and stripe geometry, closing the identified backend-independent integrity boundary (`crates/core/src/repair.rs:58`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether focused green plus clean fmt/clippy/build is sufficient without a reproduced red and complete CI — all 3 public tests pass, while full `cargo xtask ci` stops only because the host forbids loopback bind, and the asserted wrapper is absent (`crates/core/tests/fragment_identity.rs:151`). |
+| C5 Causal adequacy | PASS | The decision is adequately resolved at fragment admission itself: invalid identity is rejected before decoder insertion, with no capability probe or downstream symptom guard (`crates/core/src/read.rs:330`). |
+| T1 Structure | PASS | The production boundary is centralized in core and the required public-surface regression suite is isolated in the new test file, matching the intended ownership split (`crates/core/src/repair.rs:58`; `crates/core/tests/fragment_identity.rs:151`). |
+| T2 Shape | PASS | The widened helper contract carries the exact expected `FragmentId` and committed `EcScheme`, so callers cannot validate against chunk id alone (`crates/core/src/repair.rs:95`). |
+| T3 Runtime | PASS | Applied-target execution passed all three wrong-identity cases, including the same-scheme-type RS geometry case that specifically exercises the `ec_k`/`ec_m` comparisons (`crates/core/tests/fragment_identity.rs:321`). |
+| T4 Contribution | NEEDS-HUMAN | Confirm no closed/rejected remote work already resolves these affected paths — merged/all-local-ref history by path shows only earlier chunk-only validation, but closed/rejected PR state is unavailable offline (`crates/core/src/read.rs:229`). |
+| T5 Judgment | PASS | No ambiguous scope or symptom-vs-root-cause tradeoff remains: the patch changes only the shared validation boundary, its necessary call sites, and fixtures affected by the stricter contract (`crates/custodian/src/scrub.rs:121`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the exercised adversarial in-process stores and host-limited CI provide sufficient operational confidence for the any-backend never-wrong-bytes assurance (`crates/core/tests/fragment_identity.rs:200`). |

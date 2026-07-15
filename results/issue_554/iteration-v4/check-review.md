@@ -1,0 +1,15 @@
+Review of issue #554: make the deployed custodian run garbage collection after grace while preserving live data and partial-fleet evidence.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief gives a falsifiable deployed-loop outcome, safety boundary, fleet-completeness rule, and explicit scope at `brief.md:5`. |
+| C2 Reproduction (red pre-fix) | NEEDS-HUMAN | Decide whether the recorded compile-error red is sufficient evidence — the supplied red/green runner is absent and an independent base-tree reconstruction exhausted sandbox quota, so I could not reproduce the red leg; the patched test is green at `crates/server/tests/custodian_gc.rs:415`. |
+| C3 Change | FAIL | Correct the factually stale grace rationale before acceptance — it still says there is “one timescale” although CLI and gateway use 60 s and 30 s respectively, leaving an explicit carry-forward obligation unmet at `crates/server/src/cli.rs:81`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Re-run the complete CI and red leg on a host with loopback and the gate scripts — focused GC (6/6), fmt, and clippy pass, but workspace tests stop at loopback `PermissionDenied` in `crates/chunkstore-grpc/tests/list_delete.rs:55`, and the asserted runner is unavailable. |
+| C5 Causal adequacy | NEEDS-HUMAN | Decide whether shipping GC before the #490 lease-liveness prerequisite is acceptable — deployed GC treats logical-zero CLI leases as expired, so an in-flight shared-backend write remains exposed at `crates/server/src/cli.rs:65`; this matters because the patch activates that collector. |
+| T1 Structure | PASS | The production entry threads the operator endpoint count through the backend seam to the role, preserving one authoritative fleet-completeness input at `crates/server/src/cli.rs:1039`. |
+| T2 Shape | PASS | The distinct fenced GC pass preserves scrub/reconstruction fault isolation and runs only after repair, at `crates/server/src/custodian.rs:569`. |
+| T3 Runtime | PASS | Independently run `custodian_gc` passed all six scenarios, including exact-boundary reclaim and both runtime- and startup-partial deferral, grounded at `crates/server/tests/custodian_gc.rs:415`. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether contribution overlap is clear — affected-path history finds #551/#461/#450, but closed/rejected work could not be mechanically queried here, so uniqueness beyond merged local history remains unsettled (`crates/server/src/custodian.rs:448`). |
+| T5 Judgment | NEEDS-HUMAN | Approve the 60 s unproven grace floor and whole-fleet outage policy — the value is a measurement call and one absent/decommissioned endpoint pauses all reclamation indefinitely at `crates/server/src/custodian.rs:90` and `crates/server/src/custodian.rs:421`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the in-process trait-store evidence is representative enough for deployed operation — it exercises production wiring but not a live backend/topology, which determines confidence in operational fitness (`crates/server/tests/custodian_gc.rs:13`). |
