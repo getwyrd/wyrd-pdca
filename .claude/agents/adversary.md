@@ -64,3 +64,17 @@ attention. Keep the plain `- NEEDS-HUMAN — ` form when the finding demands a h
 than the cause, the brief asked for the wrong thing, the toolchain was unavailable so the
 verdict is provisional. **When in doubt, omit `[impl]`**: an unmarked finding always reaches
 the human, a mismarked one buys a wasted rebuild.
+
+## Scratch discipline — throwaway work never lands on /tmp
+
+A writable clone of the read-only `$PDCA_TARGET` plus its cargo `target/` cache runs to
+gigabytes. Put EVERY throwaway checkout, build dir, or scratch file under
+`$PDCA_SCRATCH` (fall back to `$TMPDIR` when unset) — never a hard-coded `/tmp/...` path
+of your own choosing: on this host `/tmp` is a size-capped tmpfs, so dead build caches
+parked there sit in RAM until reboot (#134). Compose the path with the SHELL-SAFE
+fallback chain, so an unset `$PDCA_SCRATCH` degrades to the temp location instead of
+expanding to a filesystem-root `/pdca-...` dir. Name each dir `pdca-adversary-<issue>-*`
+(e.g. `"${PDCA_SCRATCH:-${TMPDIR:-/tmp}}/pdca-adversary-430-redleg"`) so an orphan is
+attributable to its leaf and
+bundle, and `rm -rf` everything you created before you finish — the driver cannot sweep
+names it never chose.

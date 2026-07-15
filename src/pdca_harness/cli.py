@@ -145,6 +145,64 @@ def _inhibit_suspend_and_reexec() -> None:
     os.execvpe(wrapped[0], wrapped, {**os.environ, "PDCA_FLOW_INHIBITED": "1"})
 
 
+def _export_scratch(cfg: Config, env: dict | None = None) -> Path | None:
+    """Create + export the configured scratch root, once, at CLI entry (issue #134).
+
+    The heavy /tmp users are the model leaves (red/green-leg clones of the target, cargo
+    ``target/`` caches), and on a tmpfs host those park gigabytes in RAM until reboot.
+    Setting BOTH variables here — before any leaf, gate, or verify subprocess spawns, and
+    before the first ``tempfile`` use (it caches its directory) — means every child
+    inherits the redirect with no per-call-site threading:
+
+      * ``PDCA_SCRATCH`` — the leaves' DESIGNATED scratch root; the agent definitions
+        instruct throwaway checkouts/builds go under it, named ``pdca-<leaf>-<issue>-*``.
+      * ``TMPDIR``       — so bare ``mktemp -d`` and Python ``tempfile`` (including the
+        harness's own review/advisory sandboxes) follow without knowing about the knob.
+
+    Unset ``scratch_dir`` ⇒ ``None``, byte-for-byte today's behavior. An uncreatable dir
+    warns and falls back to today's behavior rather than aborting the run (the knob is a
+    hygiene redirect, not a correctness gate). ``env`` is injected for tests; the real
+    call mutates ``os.environ`` and resets ``tempfile``'s cached directory.
+    """
+    if not cfg.scratch_dir:
+        return None
+    import tempfile
+    target = Path(cfg.scratch_dir).expanduser()
+    # Export an ABSOLUTE path (PR #137 review): the children this must redirect run with
+    # DIFFERENT cwds (builder in the worktree, reviewer in a temp sandbox, gates in the
+    # repo), so a relative value probed here would resolve somewhere else — or nowhere —
+    # in the leaf. A relative value is anchored at the project root, the one stable
+    # directory both config and operator can reason about.
+    if not target.is_absolute():
+        target = cfg.root / target
+    try:
+        # Inside the guard: resolve() itself can raise on a symlink loop or unreadable
+        # ancestry (OSError; RuntimeError on older Pythons), and that must take the
+        # documented fallback, not abort CLI startup.
+        target = target.resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        # Probe WRITABILITY, not mere existence: a pre-existing read-only dir passes
+        # mkdir(exist_ok=True), and exporting it would break every mktemp downstream
+        # instead of taking this documented fallback.
+        with tempfile.NamedTemporaryFile(dir=target):
+            pass
+    except (OSError, RuntimeError) as exc:
+        print(f"pdca: scratch_dir {target} is not usable ({exc}) — leaf scratch stays on "
+              f"the default temp location for this run.", file=sys.stderr)
+        # The rejected root may have ARRIVED via $PDCA_SCRATCH (Config.load copies the env
+        # override into cfg.scratch_dir). Falling back without clearing it would hand every
+        # leaf the bad path anyway — the role prompts tell them to PREFER $PDCA_SCRATCH.
+        # $TMPDIR is not ours to clear: a pre-set value belongs to the operator.
+        (os.environ if env is None else env).pop("PDCA_SCRATCH", None)
+        return None
+    e = os.environ if env is None else env
+    e["PDCA_SCRATCH"] = str(target)
+    e["TMPDIR"] = str(target)
+    if env is None:
+        tempfile.tempdir = None  # drop the cached location so gettempdir() re-reads TMPDIR
+    return target
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=_prog_name(), description="PDCA quality-cycle driver")
     # No subcommand → status (the bundle dashboard), the most-reached-for view (#88).
@@ -301,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:  # malformed pdca.toml (tomllib) or a bad config value
         print(f"pdca: invalid pdca.toml — {exc}", file=sys.stderr)
         return 2
+    # Redirect throwaway heavy leaf work off tmpfs /tmp (issue #134) — must precede every
+    # subprocess spawn and the first tempfile use, so one export covers them all.
+    _export_scratch(cfg)
 
     if not args.cmd:  # bare invocation → the status dashboard (#88)
         return _status(cfg, None)

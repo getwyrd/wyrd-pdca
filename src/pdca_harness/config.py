@@ -282,6 +282,17 @@ class Config:
     # invocations, not per-run). Below it, the flow skips Act with a hint. ``1`` restores
     # run-after-every-flow; ``--no-act`` always forces skip. ``[driver].act_cadence``.
     act_cadence: int = 5
+    # Scratch location for throwaway heavy work (issue #134). The model leaves clone the
+    # read-only $PDCA_TARGET to run their red/green legs, and with no direction they pick
+    # literal /tmp/... paths — which on a tmpfs host parks gigabytes of dead cargo caches
+    # in RAM until reboot. When set, the CLI entry creates this dir and exports it as BOTH
+    # ``$PDCA_SCRATCH`` (the leaves' designated scratch root, see the agent definitions)
+    # and ``$TMPDIR`` (so bare ``mktemp -d`` / Python ``tempfile`` — including the
+    # harness's own review/advisory sandboxes — follow it with no per-call-site
+    # threading). Point it somewhere DISK-BACKED with an aging policy (e.g. /var/tmp/pdca;
+    # systemd-tmpfiles ages stale entries out). "" (the default) ⇒ exactly today's
+    # behavior. ``[driver].scratch_dir``; ``PDCA_SCRATCH`` overrides for one run.
+    scratch_dir: str = ""
     # Close-disposition fast path (issue #60): the disposition-hint classes that mark a
     # bundle as close / no-fix, so the driver skips the builder + reviewer leaves and
     # routes it straight to sign-off. ``[driver].close_dispositions`` in pdca.toml; the
@@ -507,6 +518,8 @@ class Config:
         merge_method = driver_cfg.get("merge_method", "merge")  # merge | squash | rebase
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
+        # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.
+        scratch_dir = os.environ.get("PDCA_SCRATCH") or str(driver_cfg.get("scratch_dir", ""))
 
         # Close-disposition classes (issue #60): a configured list retunes the default
         # for an instance's tracker vocabulary; absent ⇒ the built-in default.
@@ -563,6 +576,7 @@ class Config:
             merge_method=merge_method,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
+            scratch_dir=scratch_dir,
             close_dispositions=close_dispositions,
             families={k.strip().lower(): dict(v)
                       for k, v in data.get("families", {}).items()},

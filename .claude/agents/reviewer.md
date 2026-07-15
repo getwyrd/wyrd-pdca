@@ -133,3 +133,17 @@ effect is the canonical case. This is the downstream backstop for the planner's
 Plan-exit gate (`docs/principles.md` §3) — it catches a guard Do introduces even
 when the brief was clean. It does **not** fire on a fix that *removes / transforms* the
 cause rather than guarding a present capability.
+
+## Scratch discipline — throwaway work never lands on /tmp
+
+A writable clone of the read-only `$PDCA_TARGET` plus its cargo `target/` cache runs to
+gigabytes. Put EVERY throwaway checkout, build dir, or scratch file under
+`$PDCA_SCRATCH` (fall back to `$TMPDIR` when unset) — never a hard-coded `/tmp/...` path
+of your own choosing: on this host `/tmp` is a size-capped tmpfs, so dead build caches
+parked there sit in RAM until reboot (#134). Compose the path with the SHELL-SAFE
+fallback chain, so an unset `$PDCA_SCRATCH` degrades to the temp location instead of
+expanding to a filesystem-root `/pdca-...` dir. Name each dir `pdca-reviewer-<issue>-*`
+(e.g. `"${PDCA_SCRATCH:-${TMPDIR:-/tmp}}/pdca-reviewer-430-redleg"`) so an orphan is
+attributable to its leaf and
+bundle, and `rm -rf` everything you created before you finish — the driver cannot sweep
+names it never chose.
