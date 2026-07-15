@@ -1159,14 +1159,16 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         # target is the upstream source, not build-notes.md.
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
-        if not profile.native_guard:
-            # STOP discipline for a NETWORKED reviewer (#135 / PR #136 review). With
-            # [leaves.sandbox] network_access open, an authenticated host `gh` is reachable
-            # from inside the leaf — and a family without its own PreToolUse hook has
-            # nothing mechanical stopping `gh pr ready` / `merge` / `review --approve`,
-            # which are the human's sign-off, never the reviewer's. Same guarded-`gh` PATH
-            # shim the builder and publisher get; a no-op when gh/guard are absent.
-            env = guard.shim_env(cfg, env)
+        # STOP discipline for a NETWORKED reviewer (#135 / PR #136 review). With
+        # [leaves.sandbox] network_access open, an authenticated host `gh` is reachable
+        # from inside the leaf, and `gh pr ready` / `merge` / `review --approve` are the
+        # human's sign-off, never the reviewer's. UNCONDITIONAL here — `native_guard`
+        # cannot be trusted from a temp cwd: the claude PreToolUse hook rides on the
+        # BUILDER/PUBLISHER agent frontmatter, and the reviewer/adversary/code-review
+        # agents declare none, so a sandboxed claude Check leaf is exactly as unguarded
+        # as a codex one (PR #136 review, 2nd pass). The PATH shim is vendor-neutral and
+        # harmless beside a native hook; a no-op when gh/guard are absent.
+        env = guard.shim_env(cfg, env)
         extra_argv = ([profile.grounding_flag, str(target)]
                       if target and profile.grounding_flag else [])
         # The confinement flag rides on `seeded` (a file that is not there must not cost
@@ -1457,8 +1459,9 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         seeded = _seed_sandbox_settings(cfg, sandbox, profile)
         target = _reviewer_target(d, cfg)
         env = {"PDCA_TARGET": str(target)} if target else None
-        if not profile.native_guard:
-            env = guard.shim_env(cfg, env)   # networked advisory leaf: see _run_review_sandboxed
+        # Unconditional for every sandboxed advisory family: see _run_review_sandboxed —
+        # the claude hook is builder/publisher frontmatter only, so it is absent here too.
+        env = guard.shim_env(cfg, env)
         extra = ([profile.grounding_flag, str(target)]
                  if target and profile.grounding_flag else [])
         extra += _sandbox_argv(cfg, profile, seeded=seeded)   # see _run_review_sandboxed

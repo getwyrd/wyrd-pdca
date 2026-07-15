@@ -1,12 +1,16 @@
 """The networked reviewer keeps the STOP discipline (#135, PR #136 review).
 
 With ``[leaves.sandbox] network_access = true`` an authenticated host ``gh`` is reachable
-from inside the reviewer/advisory leaves, and a family without a native PreToolUse hook
-(codex) previously ran them with an UNGUARDED PATH — so ``gh pr ready`` / ``merge`` /
-``review --approve`` would have reached GitHub, bypassing the mechanical STOP guard the
-builder and publisher already get. Both sandboxed leaf runners must apply the same
-guarded-``gh`` PATH shim (guard.shim_env) for non-native-guard families, and must NOT
-shim a native-guard family (claude's own hook already enforces the rules).
+from inside the reviewer/advisory leaves, which previously ran with an UNGUARDED PATH —
+so ``gh pr ready`` / ``merge`` / ``review --approve`` would have reached GitHub, bypassing
+the mechanical STOP guard the builder and publisher already get.
+
+The shim is UNCONDITIONAL in the sandboxed runners — ``native_guard`` cannot be trusted
+from a temp cwd: the claude PreToolUse hook rides on the builder/publisher agent
+frontmatter, and the reviewer/adversary/code-review agents declare none, so a sandboxed
+claude Check leaf is exactly as unguarded as a codex one (PR #136 review, 2nd pass). The
+builder/publisher paths keep their native_guard branch — they run in the project cwd,
+where the claude hook genuinely applies (see test_publish_slice).
 
 Offline: shim_env is mocked; no model CLIs. Run from root:
     PYTHONPATH=src python -m unittest discover -s tests
@@ -61,14 +65,16 @@ class ReviewerGhShim(unittest.TestCase):
             leaves._run_review_sandboxed(self.d, self.cfg)
         return captured["env"]
 
-    def test_non_native_guard_reviewer_gets_the_gh_shim(self) -> None:
+    def test_codex_reviewer_gets_the_gh_shim(self) -> None:
         env = self._env_passed("codex")
         self.assertIsNotNone(env)
         self.assertEqual(env.get("PATH"), "SHIMMED")
 
-    def test_native_guard_reviewer_is_not_shimmed(self) -> None:
+    def test_claude_reviewer_is_shimmed_too(self) -> None:
+        # native_guard is builder/publisher frontmatter; the sandboxed reviewer has no
+        # hook of its own, so the vendor-neutral PATH shim must apply here as well.
         env = self._env_passed("claude")
-        self.assertNotEqual((env or {}).get("PATH"), "SHIMMED")
+        self.assertEqual((env or {}).get("PATH"), "SHIMMED")
 
     def test_advisory_leaf_gets_the_gh_shim_too(self) -> None:
         leaf = LeafConfig(mode="command", family="codex", agent="adversary")
