@@ -173,6 +173,10 @@ class ScratchDiscipline(unittest.TestCase):
                 body = (ROOT / "agents" / f"{leaf}.md").read_text(encoding="utf-8")
                 self.assertIn("$PDCA_SCRATCH", body)
                 self.assertIn(f"pdca-{leaf}-<issue>-*", body)
+                # The worked example must use the shell-safe fallback chain: a bare
+                # `"$PDCA_SCRATCH/..."` with the variable unset expands to a
+                # filesystem-root `/pdca-...` path (PR #137 review).
+                self.assertIn("${PDCA_SCRATCH:-${TMPDIR:-/tmp}}", body)
 
 
 if __name__ == "__main__":
