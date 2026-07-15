@@ -749,7 +749,17 @@ class ConfigPlumbing(unittest.TestCase):
         self.assertLess(cfg.max_auto_iters, cfg.max_passes)
 
     def test_max_auto_iters_floor_of_one(self) -> None:
-        self.assertEqual(self._load("[driver]\nmax_passes = 1\nmax_auto_iters = 0\n").max_auto_iters, 1)
+        # The RAW value floors at 1 (a zero budget with auto-iterate on is a misconfig)…
+        self.assertEqual(
+            self._load("[driver]\nmax_passes = 5\nmax_auto_iters = 0\n").max_auto_iters, 1)
+        # …but the strictly-below clamp wins at a ONE-pass budget (#132): an auto-iterate
+        # there would spend the only allowed pass on an iterate-do that is never rebuilt,
+        # stranding the bundle at ITERATE_DO — the invariant the clamped-below test above
+        # asserts. Zero declines cleanly (flow's spent >= budget check).
+        self.assertEqual(
+            self._load("[driver]\nmax_passes = 1\nmax_auto_iters = 0\n").max_auto_iters, 0)
+        self.assertEqual(
+            self._load("[driver]\nmax_passes = 1\nmax_auto_iters = 3\n").max_auto_iters, 0)
 
     def test_cli_flag_opts_in(self) -> None:
         cfg = _stub_config(self.tmp)

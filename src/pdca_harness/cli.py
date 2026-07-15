@@ -400,7 +400,7 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
     if getattr(args, "lanes", None) is not None:
         cfg.lanes = max(1, args.lanes)
     if getattr(args, "max_passes", None) is not None:
-        cfg.max_passes = max(1, args.max_passes)   # issue #260
+        cfg.override_max_passes(args.max_passes)   # issue #260; re-clamps auto budget (#132)
     if getattr(args, "auto_iterate", False):
         cfg.auto_iterate = True                    # issue #264 (flag only opts IN)
     ids = list(args.issue_ids)
