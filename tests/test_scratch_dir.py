@@ -111,6 +111,31 @@ class ScratchExport(unittest.TestCase):
         self.assertEqual(env, {})
         self.assertIn("not usable", err.getvalue())
 
+    def test_relative_scratch_dir_is_anchored_at_root_and_exported_absolute(self) -> None:
+        # Children run with different cwds (worktree, temp sandbox); a relative value
+        # exported verbatim would resolve differently — or not at all — in the leaf.
+        env: dict = {}
+        got = cli._export_scratch(self._cfg("scratch/rel"), env)
+        expected = (self.tmp / "scratch" / "rel").resolve()
+        self.assertEqual(got, expected)
+        self.assertTrue(expected.is_dir())
+        self.assertTrue(Path(env["PDCA_SCRATCH"]).is_absolute())
+        self.assertEqual(env["PDCA_SCRATCH"], str(expected))
+        self.assertEqual(env["TMPDIR"], str(expected))
+
+    def test_symlink_loop_takes_the_fallback_not_a_crash(self) -> None:
+        # resolve() raises on a self-referential symlink; that must take the documented
+        # fail-open path (warn + None), never abort CLI startup.
+        loop = self.tmp / "loop"
+        loop.symlink_to(loop)
+        env: dict = {"PDCA_SCRATCH": str(loop / "sub")}
+        err = io.StringIO()
+        with redirect_stderr(err):
+            got = cli._export_scratch(self._cfg(str(loop / "sub")), env)
+        self.assertIsNone(got)
+        self.assertNotIn("PDCA_SCRATCH", env)
+        self.assertIn("not usable", err.getvalue())
+
     def test_rejected_env_override_is_cleared_on_fallback(self) -> None:
         # The bad root may have arrived via $PDCA_SCRATCH itself; falling back while the
         # variable survives hands every leaf the rejected path anyway (the role prompts

@@ -168,14 +168,25 @@ def _export_scratch(cfg: Config, env: dict | None = None) -> Path | None:
         return None
     import tempfile
     target = Path(cfg.scratch_dir).expanduser()
+    # Export an ABSOLUTE path (PR #137 review): the children this must redirect run with
+    # DIFFERENT cwds (builder in the worktree, reviewer in a temp sandbox, gates in the
+    # repo), so a relative value probed here would resolve somewhere else — or nowhere —
+    # in the leaf. A relative value is anchored at the project root, the one stable
+    # directory both config and operator can reason about.
+    if not target.is_absolute():
+        target = cfg.root / target
     try:
+        # Inside the guard: resolve() itself can raise on a symlink loop or unreadable
+        # ancestry (OSError; RuntimeError on older Pythons), and that must take the
+        # documented fallback, not abort CLI startup.
+        target = target.resolve()
         target.mkdir(parents=True, exist_ok=True)
         # Probe WRITABILITY, not mere existence: a pre-existing read-only dir passes
         # mkdir(exist_ok=True), and exporting it would break every mktemp downstream
         # instead of taking this documented fallback.
         with tempfile.NamedTemporaryFile(dir=target):
             pass
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         print(f"pdca: scratch_dir {target} is not usable ({exc}) — leaf scratch stays on "
               f"the default temp location for this run.", file=sys.stderr)
         # The rejected root may have ARRIVED via $PDCA_SCRATCH (Config.load copies the env
