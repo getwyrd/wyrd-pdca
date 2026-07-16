@@ -1,0 +1,2213 @@
+diff --git a/crates/metadata-fault-conformance/src/lib.rs b/crates/metadata-fault-conformance/src/lib.rs
+index c13b34b..5c62729 100644
+--- a/crates/metadata-fault-conformance/src/lib.rs
++++ b/crates/metadata-fault-conformance/src/lib.rs
+@@ -62,6 +62,8 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++pub mod nemesis;
++
+ use std::time::Duration;
+ 
+ use wyrd_testkit::{
+diff --git a/crates/metadata-fault-conformance/src/nemesis.rs b/crates/metadata-fault-conformance/src/nemesis.rs
+new file mode 100644
+index 0000000..c0ec6c6
+--- /dev/null
++++ b/crates/metadata-fault-conformance/src/nemesis.rs
+@@ -0,0 +1,889 @@
++//! The **composable nemesis** seam (#407, slice 4 of #329; ADR-0041 "nemesis first, then the
++//! checked artifact") — three fault classes over the real multi-node M4 metadata cluster, each
++//! behind ONE importable lifecycle seam usable by both the Tier-1 battery (`#442`) and #408's
++//! server-side checked workload.
++//!
++//! # Why here, and not on [`ClusterFault`](crate::ClusterFault)
++//!
++//! [`ClusterFault`](crate::ClusterFault) is **partition-shaped by contract** (`topology()`,
++//! peer-liveness, heal-rule completeness) and is the #442 battery's seam — it is deliberately
++//! NOT generalized (Design §1). The nemesis carries a *different* abstraction: a leg lifecycle
++//! (`plan → apply → confirm-materialized → heal → confirm-healed`) with **typed materialization
++//! evidence per leg**, so a partition, a clock-skew and a process-pause can all be driven by the
++//! same runner while each proves it bit in its OWN terms.
++//!
++//! # The #442 rule, per leg: a fault that did not bite is INCONCLUSIVE, never a silent pass
++//!
++//! Every leg carries a [`MaterializationEvidence`] whose `materialized()` is **pure decision
++//! logic over sampled observations** — the same code the live impls build from `docker` /
++//! `fdbcli status json` output AND the code the Check-time `nemesis_oracles` test exercises
++//! red→green. [`drive_leg`] refuses to run the workload (fails as inconclusive) when the
++//! evidence says the fault never materialized — a cut the cluster never noticed proves nothing.
++//!
++//! # The lifecycle ENCLOSES the workload, and never leaks fault state
++//!
++//! [`drive_leg`] runs the caller's `workload` **while the fault is still active** — between
++//! `confirm_materialized` (the pre-workload materialization gate) and `heal` — so the workload
++//! genuinely runs under the fault. It heals on *every* exit path: an `apply`/`confirm` failure
++//! (a partially-applied `iptables` cut, a half-done recreate), a non-materialized bail, AND a
++//! **panicking** workload (the checked #408 workload panics by design on a violation) — the last
++//! via `catch_unwind`, so the fault is torn down before the panic resumes. This mirrors
++//! `MasterIsolation`'s `Drop` guard (`tier1_metadata_consistency.rs:336-349`): no leg may leave a
++//! cut cluster, a paused container, or a skewed clock behind (Invariant B).
++//!
++//! # What is default-compiled vs deferred
++//!
++//! Everything in this module is an ordinary-`std` lib with **no `libfdb_c` linkage** (the leg
++//! impls are `std::process::Command` shell-outs to `docker` / `fdbcli`), so it compiles
++//! unconditionally and is importable by the battery's tests and by #408's
++//! `crates/server/tests/` scenario. The *live* three-leg runs against `deploy/fdb-multi-replica`
++//! are opt-in (`WYRD_TIER1=1`) and off-Check; the pure decision logic they turn on is unit-tested
++//! at Check.
++
++use std::cell::{Cell, RefCell};
++use std::panic::AssertUnwindSafe;
++use std::process::Command;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use wyrd_testkit::{fdb_peer_sees_target_live, heal_is_complete, partition_took_effect};
++
++/// Which of the three fault classes a nemesis leg injects. Both #408 and the battery import
++/// this to enumerate the campaign.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum NemesisLegKind {
++    /// Live-node **network partition** — an in-netns `iptables` DROP (the #399 technique) that
++    /// keeps the target container `running` while its peers lose it.
++    Partition,
++    /// **Clock skew** — a static per-leg offset applied to ONE cluster node via
++    /// container-scoped `libfaketime` (`LD_PRELOAD` + `FAKETIME`), the harness/client clock
++    /// left untouched (Design §3).
++    ClockSkew,
++    /// **Process pause** — a freezer-cgroup `docker pause`/`unpause`: the target serves before,
++    /// serves nothing while `paused`, and serves again after.
++    ProcessPause,
++}
++
++impl NemesisLegKind {
++    /// The three legs of the metadata nemesis campaign, in order. A leg dropped from this list
++    /// is a fault class the nemesis silently stopped exercising — the `nemesis_oracles` test
++    /// pins the set so that regression flips red, not merely absent (the born-at-tier bar).
++    pub const ALL: [NemesisLegKind; 3] = [
++        NemesisLegKind::Partition,
++        NemesisLegKind::ClockSkew,
++        NemesisLegKind::ProcessPause,
++    ];
++
++    /// A stable, human-readable slug — the fault-class name in diagnostics and (mirrored,
++    /// independently) in the xtask dispatch scenario-function names.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            NemesisLegKind::Partition => "partition",
++            NemesisLegKind::ClockSkew => "clock-skew",
++            NemesisLegKind::ProcessPause => "process-pause",
++        }
++    }
++}
++
++/// Typed evidence that a leg's fault **provably bit**, sampled while the fault is still active
++/// (the pre-workload gate). `materialized()` is the per-leg oracle: pure decision logic over
++/// recorded observations, so it is unit-checkable at Check and is the very code the live impl
++/// calls (a regression flips both). The *recovery* transition (the target serving again) is a
++/// separate heal-completeness check ([`heal_is_complete`]), not part of this gate — so the
++/// workload can run WHILE the fault is active without unpausing/healing to prove materialization.
++pub trait MaterializationEvidence: std::fmt::Debug {
++    /// The leg this evidence belongs to.
++    fn kind(&self) -> NemesisLegKind;
++    /// Whether the fault materialized. `false` ⇒ the run is **inconclusive** and MUST fail —
++    /// never pass silently (the #442 "a note is not a gate" rule).
++    fn materialized(&self) -> bool;
++    /// A human-readable reason a non-materialized run was rejected.
++    fn diagnosis(&self) -> String;
++}
++
++/// **Partition leg oracle** (Design §2): the survivors' reachability of the target **flips**
++/// (`partition_took_effect`: seen before, unseen during) WHILE the target container stays
++/// `running`. The running-state clause is what distinguishes a partition from a crash — a
++/// container that died is not the fault this leg claims to inject.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PartitionEvidence {
++    /// A survivor saw the target live BEFORE the cut (the pre-fault sample; must be `true` or a
++    /// broken oracle that always says "not live" could manufacture a fault).
++    pub peers_saw_target_before: bool,
++    /// A survivor still saw the target live DURING the cut. `true` after the whole window ⇒ a
++    /// no-op cut, and the leg is NOT materialized.
++    pub peers_saw_target_during: bool,
++    /// The target container was `running` throughout the window (a partition, not a crash).
++    pub target_running_during: bool,
++}
++
++impl PartitionEvidence {
++    /// The pure oracle: reachability flipped AND the target stayed up.
++    #[must_use]
++    pub fn materialized(&self) -> bool {
++        partition_took_effect(self.peers_saw_target_before, self.peers_saw_target_during)
++            && self.target_running_during
++    }
++}
++
++impl MaterializationEvidence for PartitionEvidence {
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::Partition
++    }
++    fn materialized(&self) -> bool {
++        PartitionEvidence::materialized(self)
++    }
++    fn diagnosis(&self) -> String {
++        format!(
++            "peers_saw_target before={} during={} (must flip true→false), target_running_during={} \
++             (must be true — a crash is not a partition)",
++            self.peers_saw_target_before, self.peers_saw_target_during, self.target_running_during,
++        )
++    }
++}
++
++/// **Process-pause leg oracle** (Design §2): the target served BEFORE the freeze and served
++/// NOTHING during the window WHILE `docker inspect` reported it `paused` (the freezer-cgroup
++/// state itself, distinguishing a pause from a crash). Never a single probe: a lone "not
++/// serving" sample cannot tell a pause from a partition or a crash — the `paused` inspect state
++/// is required.
++///
++/// The **third** transition (serving again after unpause) is proven by the leg's `heal` +
++/// [`NemesisLeg::confirm_healed`] and enforced by [`heal_is_complete`] in [`drive_leg`], NOT by
++/// this gate — so the workload runs WHILE the container is still paused (the pause encloses the
++/// workload) rather than after an early unpause.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PauseEvidence {
++    /// The target was observed serving before the freeze.
++    pub served_before: bool,
++    /// The target was observed serving during the freeze — MUST be `false` (sampled by a
++    /// settle-window poll, never a single immediate probe).
++    pub served_during: bool,
++    /// `docker inspect` reported the container `paused` during the window — the freezer-cgroup
++    /// state itself, not merely an absence of service (which a crash would also produce).
++    pub inspected_paused_during: bool,
++}
++
++impl PauseEvidence {
++    /// The pure oracle: served before, served nothing during, and the container was `paused`.
++    #[must_use]
++    pub fn materialized(&self) -> bool {
++        self.served_before && !self.served_during && self.inspected_paused_during
++    }
++}
++
++impl MaterializationEvidence for PauseEvidence {
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ProcessPause
++    }
++    fn materialized(&self) -> bool {
++        PauseEvidence::materialized(self)
++    }
++    fn diagnosis(&self) -> String {
++        format!(
++            "served before={} during={} (must be true/false), inspected_paused_during={} \
++             (must be true — absence of service without a `paused` state could be a crash)",
++            self.served_before, self.served_during, self.inspected_paused_during,
++        )
++    }
++}
++
++/// **Clock-skew leg oracle** (Design §2/§3): an in-container probe **sharing the target
++/// container's exact preload/env** shows the target's clock offset from the harness clock by at
++/// least the configured floor. A zero floor never materializes — no skew was asked for, so no
++/// skew is evidence.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SkewEvidence {
++    /// Observed signed offset (target clock − harness clock), in seconds — see
++    /// [`clock_offset_secs`]. The magnitude is what is compared to the floor; the leg may skew
++    /// forward or back.
++    pub observed_offset_secs: i64,
++    /// The configured floor magnitude, in seconds. A leg configured with `0` cannot materialize.
++    pub floor_secs: u64,
++}
++
++impl SkewEvidence {
++    /// The pure oracle: the offset magnitude clears a non-zero floor.
++    #[must_use]
++    pub fn materialized(&self) -> bool {
++        self.floor_secs > 0 && self.observed_offset_secs.unsigned_abs() >= self.floor_secs
++    }
++}
++
++impl MaterializationEvidence for SkewEvidence {
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ClockSkew
++    }
++    fn materialized(&self) -> bool {
++        SkewEvidence::materialized(self)
++    }
++    fn diagnosis(&self) -> String {
++        format!(
++            "|observed_offset|={}s must be ≥ floor={}s and floor must be non-zero",
++            self.observed_offset_secs.unsigned_abs(),
++            self.floor_secs,
++        )
++    }
++}
++
++/// The nemesis leg lifecycle — the ONE importable seam (Design §1). A leg is `plan`ned, its
++/// fault `apply`ed, `confirm_materialized` builds the typed evidence, then it `heal`s and
++/// confirms it healed. [`drive_leg`] wraps a caller's workload around this and enforces the two
++/// #442 gates (materialized-or-inconclusive, complete-heal). #408 consumes this WITHOUT
++/// reopening the lifecycle logic.
++///
++/// **Contract:** `apply` injects the fault (so a failed `apply`/`confirm` MUST be followed by
++/// `heal` — [`drive_leg`] does this). `confirm_materialized` samples the world WHILE the fault is
++/// active and MUST NOT remove it (no early unpause / no early recreate-without-override), because
++/// the workload runs after it, still under the fault. The recovery observation belongs to
++/// [`confirm_healed`].
++pub trait NemesisLeg {
++    /// The typed materialization evidence this leg produces.
++    type Evidence: MaterializationEvidence;
++
++    /// Which fault class this leg injects.
++    fn kind(&self) -> NemesisLegKind;
++
++    /// Block until the target is ready to take the workload (cluster up and serving). This
++    /// injects **no** fault — a `plan` failure must leave the cluster clean (Invariant B), so a
++    /// restart-shaped fault (the skew leg's recreate) is applied in [`apply`](NemesisLeg::apply),
++    /// never here.
++    fn plan(&self) -> Result<(), String>;
++
++    /// Inject the fault. Samples any pre-fault "before" observation the oracle needs first. For
++    /// the skew leg this is the recreate-with-override AND the wait for the cluster to
++    /// re-stabilize, so the measured workload never races the restart the recreate itself is
++    /// (Design §3).
++    fn apply(&self) -> Result<(), String>;
++
++    /// Sample the world and build the typed materialization evidence — WHILE the fault is still
++    /// active. MUST NOT remove the fault.
++    fn confirm_materialized(&self) -> Result<Self::Evidence, String>;
++
++    /// Remove the fault, returning the identifiers of what was actually undone (for
++    /// [`heal_is_complete`] — a partial heal must not read as healed). Idempotent: [`drive_leg`]
++    /// may call it after a failed `apply`, so a heal with nothing applied is a no-op `Ok`.
++    fn heal(&self) -> Result<Vec<String>, String>;
++
++    /// The fault identifiers that were applied, for the heal-completeness check.
++    fn applied_rules(&self) -> Vec<String>;
++
++    /// Poll for up to `timeout` until the target is confirmed serving again — the recovery side
++    /// of the #442 heal gate AND (for the pause leg) the third serve→pause→**serve** transition.
++    fn confirm_healed(&self, timeout: Duration) -> bool;
++}
++
++/// Drive one nemesis leg end-to-end around a caller-supplied `workload`, enforcing the two #442
++/// gates: a fault that did not bite FAILS as **inconclusive** (never runs the workload under a
++/// phantom fault), and an incomplete heal FAILS (no leaked fault state). This is the runner both
++/// the battery and #408 call; the workload is whatever the caller measures under the fault, and
++/// it runs WHILE the fault is active (the fault encloses the workload).
++///
++/// Heals on every exit path — a failed `apply`/`confirm`, a non-materialized bail, and a
++/// **panicking** workload (propagated after the heal via `resume_unwind`) — so no leg ever leaks
++/// a cut, a paused container, or a skewed clock (Invariant B; mirrors `MasterIsolation`'s `Drop`
++/// guard).
++///
++/// # Errors
++/// Returns the leg's own error on plan/apply/heal failure, an inconclusive error when the
++/// evidence says the fault never materialized, or a heal-incomplete error.
++///
++/// # Panics
++/// Re-raises a panic thrown by `workload` — AFTER healing the fault. If the heal ALSO failed or was
++/// incomplete, it re-raises a panic naming the **leaked fault** instead (a leaked cut/pause/skew is
++/// the graver failure and must never hide behind the workload's own panic).
++pub fn drive_leg<L, W, T>(leg: &L, workload: W) -> Result<T, String>
++where
++    L: NemesisLeg,
++    W: FnOnce() -> T,
++{
++    leg.plan()?;
++
++    // From here a fault may be (partially) applied; every early return must heal so a partial
++    // `iptables` cut or a half-done recreate never leaks (mirrors MasterIsolation's Drop guard).
++    if let Err(e) = leg.apply() {
++        let _ = leg.heal();
++        return Err(format!(
++            "nemesis `{}` leg apply failed: {e}",
++            leg.kind().as_str()
++        ));
++    }
++
++    let evidence = match leg.confirm_materialized() {
++        Ok(ev) => ev,
++        Err(e) => {
++            let _ = leg.heal();
++            return Err(format!(
++                "nemesis `{}` leg confirm_materialized failed: {e}",
++                leg.kind().as_str()
++            ));
++        }
++    };
++    if !evidence.materialized() {
++        // Heal before bailing so an un-materialized leg never leaks fault state.
++        let _ = leg.heal();
++        return Err(format!(
++            "nemesis `{}` leg did NOT materialize — inconclusive, refusing to run the workload \
++             under a fault that did not bite (#442): {}",
++            leg.kind().as_str(),
++            evidence.diagnosis(),
++        ));
++    }
++
++    // Run the workload UNDER the still-active fault. Catch a panic so a panicking workload (the
++    // checked #408 workload panics by design on a violation) still heals before the unwind
++    // resumes — the fault must never outlive the workload.
++    let outcome = std::panic::catch_unwind(AssertUnwindSafe(workload));
++
++    // Always heal, whatever the workload did — then evaluate heal completeness BEFORE deciding how
++    // to propagate the workload's outcome. A leaked fault (a failed/incomplete heal) is a graver
++    // failure than the workload's own panic and MUST NOT be silently dropped underneath a resuming
++    // unwind (the prior iteration's defect: `resume_unwind` ran before the heal check).
++    let heal_result = leg.heal();
++    let live_after = leg.confirm_healed(Duration::from_secs(60));
++    let leak = heal_incomplete_reason(leg, &heal_result, live_after);
++
++    match outcome {
++        Ok(result) => match leak {
++            Some(reason) => Err(reason),
++            None => Ok(result),
++        },
++        Err(panic) => match leak {
++            // The workload panicked AND the fault leaked: surface the leak loudly and escalate to
++            // a panic that names it, rather than resuming the original panic and hiding the leaked
++            // cut/pause/skew. A leaked fault is the invariant this whole seam exists to forbid.
++            Some(reason) => {
++                eprintln!("nemesis `{}` leg: {reason}", leg.kind().as_str());
++                panic!(
++                    "nemesis `{}` leg leaked fault state while the workload panicked — {reason}",
++                    leg.kind().as_str(),
++                );
++            }
++            // The workload panicked but the fault healed cleanly: propagate the original panic
++            // unchanged.
++            None => std::panic::resume_unwind(panic),
++        },
++    }
++}
++
++/// Why a heal did not fully undo the fault, or `None` when it did. `Some` ⇒ the leg leaked fault
++/// state (Invariant B): either `heal()` itself errored, or the applied rules were not all removed /
++/// the target never recovered ([`heal_is_complete`]). Kept as one helper so [`drive_leg`] applies
++/// the SAME leak verdict on both the happy and the panicking exit path.
++fn heal_incomplete_reason<L: NemesisLeg>(
++    leg: &L,
++    heal_result: &Result<Vec<String>, String>,
++    live_after: bool,
++) -> Option<String> {
++    match heal_result {
++        Err(e) => Some(format!(
++            "nemesis `{}` leg heal failed (fault may be leaked): {e}",
++            leg.kind().as_str(),
++        )),
++        Ok(healed) => (!heal_is_complete(&leg.applied_rules(), healed, live_after)).then(|| {
++            format!(
++                "nemesis `{}` leg did NOT heal completely (rules leaked or target still down) — \
++                 Invariant B forbids leaked fault state",
++                leg.kind().as_str(),
++            )
++        }),
++    }
++}
++
++// ─── Pure parse helpers the live impls build their evidence from ──────────────────────────
++//
++// Kept pure (string/int in, bool/int out) so the `nemesis_oracles` test binds the live impls'
++// decision logic without a container, exactly as `wyrd_testkit`'s partition parsers do.
++
++/// Whether `docker inspect --format '{{.State.Status}}'` output reports the container `paused`.
++#[must_use]
++pub fn inspected_status_is_paused(status: &str) -> bool {
++    status.trim() == "paused"
++}
++
++/// Whether `docker inspect --format '{{.State.Status}}'` output reports the container `running`.
++#[must_use]
++pub fn inspected_status_is_running(status: &str) -> bool {
++    status.trim() == "running"
++}
++
++/// The signed clock offset `container_epoch − harness_epoch`, in seconds — the magnitude the
++/// skew oracle compares to its floor. Positive ⇒ the container clock runs ahead of the harness.
++#[must_use]
++pub fn clock_offset_secs(container_epoch: i64, harness_epoch: i64) -> i64 {
++    container_epoch - harness_epoch
++}
++
++// ─── The three live-leg impls (default-compiled, docker shell-outs; off-Check) ─────────────
++
++fn run_docker(args: &[&str]) -> Result<String, String> {
++    let out = Command::new("docker")
++        .args(args)
++        .output()
++        .map_err(|e| format!("spawn `docker {}`: {e}", args.join(" ")))?;
++    if !out.status.success() {
++        return Err(format!(
++            "`docker {}` failed ({}): {}",
++            args.join(" "),
++            out.status,
++            String::from_utf8_lossy(&out.stderr).trim(),
++        ));
++    }
++    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
++}
++
++fn harness_epoch_secs() -> i64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_secs() as i64)
++        .unwrap_or(0)
++}
++
++/// A survivor's `fdbcli --exec "status json"` body, or `None` when the exec failed. Passes
++/// `--timeout 10` exactly as `support::status_json` does — an unbounded `fdbcli` against a
++/// half-cut cluster can hang the whole leg.
++fn survivor_status_json(survivor_container: &str) -> Option<String> {
++    run_docker(&[
++        "exec",
++        survivor_container,
++        "fdbcli",
++        "--timeout",
++        "10",
++        "--exec",
++        "status json",
++    ])
++    .ok()
++}
++
++/// `docker inspect --format {{.State.Status}} <container>`, trimmed.
++fn container_status(container: &str) -> Option<String> {
++    run_docker(&["inspect", "--format", "{{.State.Status}}", container])
++        .ok()
++        .map(|s| s.trim().to_string())
++}
++
++/// **Live-node network-partition leg** — re-implements the `MasterIsolation` technique
++/// (`crates/metadata-fdb/tests/tier1_metadata_consistency.rs:232`, test-binary-private, cannot
++/// be imported) here in the ordinary lib: an in-netns symmetric `iptables` DROP with a
++/// survivor-side `status json` reachability oracle. The target container stays `running`, so
++/// the oracle can tell the partition from a crash.
++pub struct PartitionLeg {
++    /// The isolated process's `<ip>:<port>` address, as `status json` names it.
++    pub target_addr: String,
++    /// Just the IP, for the `iptables -s/-d` rules.
++    pub target_ip: String,
++    /// The container owning the target's netns (where the rules are applied) and whose
++    /// lifecycle-state the oracle inspects.
++    pub target_container: String,
++    /// A **surviving** container the oracle runs `fdbcli` in — never the target.
++    pub survivor_container: String,
++    /// The privileged in-netns `iptables` image (`wyrd-iptables:local`).
++    pub iptables_image: String,
++    applied: RefCell<Vec<Vec<String>>>,
++    removed: RefCell<Vec<String>>,
++    saw_before: Cell<bool>,
++}
++
++impl PartitionLeg {
++    /// Construct a partition leg. `saw_before` is captured at [`apply`](NemesisLeg::apply).
++    #[must_use]
++    pub fn new(
++        target_addr: impl Into<String>,
++        target_ip: impl Into<String>,
++        target_container: impl Into<String>,
++        survivor_container: impl Into<String>,
++        iptables_image: impl Into<String>,
++    ) -> Self {
++        Self {
++            target_addr: target_addr.into(),
++            target_ip: target_ip.into(),
++            target_container: target_container.into(),
++            survivor_container: survivor_container.into(),
++            iptables_image: iptables_image.into(),
++            applied: RefCell::new(Vec::new()),
++            removed: RefCell::new(Vec::new()),
++            saw_before: Cell::new(false),
++        }
++    }
++
++    /// The symmetric rule set: DROP on both chains, on both selectors.
++    fn rules(&self) -> Vec<Vec<String>> {
++        let mut rules = Vec::new();
++        for chain in ["INPUT", "OUTPUT"] {
++            for sel in ["-s", "-d"] {
++                rules.push(vec![
++                    chain.to_string(),
++                    sel.to_string(),
++                    self.target_ip.clone(),
++                    "-j".to_string(),
++                    "DROP".to_string(),
++                ]);
++            }
++        }
++        rules
++    }
++
++    fn iptables(&self, args: &[String]) -> Result<(), String> {
++        let mut full = vec![
++            "run".to_string(),
++            "--rm".to_string(),
++            "--privileged".to_string(),
++            format!("--network=container:{}", self.target_container),
++            self.iptables_image.clone(),
++        ];
++        full.extend(args.iter().cloned());
++        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
++        run_docker(&refs).map(|_| ())
++    }
++
++    fn peers_see_target_live(&self) -> bool {
++        match survivor_status_json(&self.survivor_container) {
++            Some(status) => fdb_peer_sees_target_live(&status, &self.target_addr),
++            None => false,
++        }
++    }
++}
++
++impl NemesisLeg for PartitionLeg {
++    type Evidence = PartitionEvidence;
++
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::Partition
++    }
++
++    fn plan(&self) -> Result<(), String> {
++        let deadline = SystemTime::now() + Duration::from_secs(90);
++        while SystemTime::now() < deadline {
++            if self.peers_see_target_live() {
++                return Ok(());
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        Err("partition leg: cluster never reported the target live within 90s".into())
++    }
++
++    fn apply(&self) -> Result<(), String> {
++        // Sample the "before" view BEFORE cutting — the oracle's pre-fault reference.
++        self.saw_before.set(self.peers_see_target_live());
++        for rule in self.rules() {
++            let mut args = vec!["-I".to_string()];
++            args.extend(rule.iter().cloned());
++            self.iptables(&args)?;
++            self.applied.borrow_mut().push(rule);
++        }
++        Ok(())
++    }
++
++    fn confirm_materialized(&self) -> Result<PartitionEvidence, String> {
++        // Poll the survivors' view for up to 45s; `during == true` after the whole window is a
++        // no-op cut (recorded, not hidden). The container must stay `running` throughout.
++        let deadline = SystemTime::now() + Duration::from_secs(45);
++        let mut during = true;
++        while SystemTime::now() < deadline {
++            if !self.peers_see_target_live() {
++                during = false;
++                break;
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        let running = container_status(&self.target_container)
++            .map(|s| inspected_status_is_running(&s))
++            .unwrap_or(false);
++        Ok(PartitionEvidence {
++            peers_saw_target_before: self.saw_before.get(),
++            peers_saw_target_during: during,
++            target_running_during: running,
++        })
++    }
++
++    fn heal(&self) -> Result<Vec<String>, String> {
++        // Idempotent: skip a rule already removed (drive_leg may call heal twice on a failed
++        // apply). Only newly-removed rules are returned, but `applied_rules ⊆ removed` overall.
++        let mut healed = Vec::new();
++        for rule in self.applied.borrow().iter() {
++            let id = rule.join(" ");
++            if self.removed.borrow().contains(&id) {
++                healed.push(id);
++                continue;
++            }
++            let mut args = vec!["-D".to_string()];
++            args.extend(rule.iter().cloned());
++            self.iptables(&args)?;
++            self.removed.borrow_mut().push(id.clone());
++            healed.push(id);
++        }
++        Ok(healed)
++    }
++
++    fn applied_rules(&self) -> Vec<String> {
++        self.applied.borrow().iter().map(|r| r.join(" ")).collect()
++    }
++
++    fn confirm_healed(&self, timeout: Duration) -> bool {
++        let deadline = SystemTime::now() + timeout;
++        while SystemTime::now() < deadline {
++            if self.peers_see_target_live() {
++                return true;
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        false
++    }
++}
++
++/// **Process-pause leg** — `docker pause`/`unpause` of one cluster node. The pause **encloses the
++/// workload**: `apply` freezes and samples "served before", `confirm_materialized` proves the
++/// freeze bit (a settle-window poll shows the survivors lost the target WHILE `docker inspect`
++/// reports it `paused`) but does NOT unpause, the workload then runs under the still-frozen node,
++/// and `heal`/`confirm_healed` unpause and prove the third serve→pause→**serve** transition.
++/// "Serving" is read from a SURVIVOR's `status json` reachability of the target (never the
++/// paused node's own view).
++pub struct ProcessPauseLeg {
++    /// The `<ip>:<port>` address of the paused process, as `status json` names it.
++    pub target_addr: String,
++    /// The container to pause/unpause and inspect.
++    pub target_container: String,
++    /// A surviving container the serving oracle queries.
++    pub survivor_container: String,
++    served_before: Cell<bool>,
++    served_during: Cell<bool>,
++    paused_during: Cell<bool>,
++    paused: Cell<bool>,
++}
++
++impl ProcessPauseLeg {
++    /// Construct a pause leg.
++    #[must_use]
++    pub fn new(
++        target_addr: impl Into<String>,
++        target_container: impl Into<String>,
++        survivor_container: impl Into<String>,
++    ) -> Self {
++        Self {
++            target_addr: target_addr.into(),
++            target_container: target_container.into(),
++            survivor_container: survivor_container.into(),
++            served_before: Cell::new(false),
++            served_during: Cell::new(false),
++            paused_during: Cell::new(false),
++            paused: Cell::new(false),
++        }
++    }
++
++    fn target_served(&self) -> bool {
++        match survivor_status_json(&self.survivor_container) {
++            Some(status) => fdb_peer_sees_target_live(&status, &self.target_addr),
++            None => false,
++        }
++    }
++}
++
++impl NemesisLeg for ProcessPauseLeg {
++    type Evidence = PauseEvidence;
++
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ProcessPause
++    }
++
++    fn plan(&self) -> Result<(), String> {
++        let deadline = SystemTime::now() + Duration::from_secs(90);
++        while SystemTime::now() < deadline {
++            if self.target_served() {
++                return Ok(());
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        Err("pause leg: cluster never reported the target serving within 90s".into())
++    }
++
++    fn apply(&self) -> Result<(), String> {
++        self.served_before.set(self.target_served());
++        run_docker(&["pause", &self.target_container])?;
++        self.paused.set(true);
++        Ok(())
++    }
++
++    fn confirm_materialized(&self) -> Result<PauseEvidence, String> {
++        // Settle-window poll (mirrors PartitionLeg): the survivors' failure detector takes a few
++        // seconds to drop a frozen peer, so a single immediate probe is near-deterministically
++        // inconclusive. `during` stays `true` only if the target kept serving the WHOLE window
++        // (a no-op freeze). Crucially this does NOT unpause — the workload runs under the freeze.
++        let deadline = SystemTime::now() + Duration::from_secs(45);
++        let mut during = true;
++        while SystemTime::now() < deadline {
++            if !self.target_served() {
++                during = false;
++                break;
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        self.served_during.set(during);
++        self.paused_during.set(
++            container_status(&self.target_container)
++                .map(|s| inspected_status_is_paused(&s))
++                .unwrap_or(false),
++        );
++        Ok(PauseEvidence {
++            served_before: self.served_before.get(),
++            served_during: self.served_during.get(),
++            inspected_paused_during: self.paused_during.get(),
++        })
++    }
++
++    fn heal(&self) -> Result<Vec<String>, String> {
++        // Idempotent unpause — the fault was applied in `apply`, never in `confirm_materialized`.
++        if self.paused.get() {
++            run_docker(&["unpause", &self.target_container])?;
++            self.paused.set(false);
++        }
++        Ok(vec![format!("pause {}", self.target_container)])
++    }
++
++    fn applied_rules(&self) -> Vec<String> {
++        vec![format!("pause {}", self.target_container)]
++    }
++
++    fn confirm_healed(&self, timeout: Duration) -> bool {
++        // The third serve→pause→**serve** transition: the survivors see the target serving again.
++        let deadline = SystemTime::now() + timeout;
++        while SystemTime::now() < deadline {
++            if self.target_served() {
++                return true;
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        false
++    }
++}
++
++/// **Clock-skew leg** — a static per-leg offset applied to ONE fdbserver container via
++/// container-scoped `libfaketime` (`LD_PRELOAD` + `FAKETIME`), recreated through a compose
++/// override; heal recreates WITHOUT the override (Design §3). The materialization probe
++/// `docker exec`s `date +%s` in the SAME container, so it inherits the same fake clock — the
++/// oracle is that process, not an unrelated one. Only cluster-node clocks are skewed, never the
++/// harness/client (the #406 history's real-time order stays trustworthy).
++///
++/// The recreate is a restart-fault, so it runs in [`apply`](NemesisLeg::apply) (never `plan`, or
++/// a `plan` failure would leave a permanently skewed node) and waits for the node to become
++/// exec-able again BEFORE the measured workload window opens — the leg measures skew, never the
++/// restart. `service`, `target_container` and the override's target are supplied by ONE runner
++/// resolution, so they cannot disagree (the fdb wiring resolves the container FROM the service).
++pub struct ClockSkewLeg {
++    /// The compose file that declares the target service (the `deploy/fdb-multi-replica` stack).
++    pub compose_file: String,
++    /// The compose override that adds the `LD_PRELOAD`/`FAKETIME` env to the target service.
++    pub faketime_override: String,
++    /// The compose service name of the node to skew (must match the override's target service).
++    pub service: String,
++    /// The container name to `docker exec` the clock probe in — the SAME node named by `service`.
++    pub target_container: String,
++    /// The configured offset floor magnitude, in seconds.
++    pub floor_secs: u64,
++}
++
++impl ClockSkewLeg {
++    /// Construct a clock-skew leg.
++    #[must_use]
++    pub fn new(
++        compose_file: impl Into<String>,
++        faketime_override: impl Into<String>,
++        service: impl Into<String>,
++        target_container: impl Into<String>,
++        floor_secs: u64,
++    ) -> Self {
++        Self {
++            compose_file: compose_file.into(),
++            faketime_override: faketime_override.into(),
++            service: service.into(),
++            target_container: target_container.into(),
++            floor_secs,
++        }
++    }
++
++    fn container_epoch(&self) -> Option<i64> {
++        run_docker(&["exec", &self.target_container, "date", "+%s"])
++            .ok()
++            .and_then(|s| s.trim().parse::<i64>().ok())
++    }
++
++    fn recreate(&self, with_override: bool) -> Result<(), String> {
++        // The compose file carries `name: wyrd-fdb-tier1-metadata`, so the recreate resolves to
++        // the SAME project the runner brought up (no `-p` needed).
++        let mut args = vec!["compose", "-f", &self.compose_file];
++        if with_override {
++            args.push("-f");
++            args.push(&self.faketime_override);
++        }
++        args.extend(["up", "-d", "--force-recreate", &self.service]);
++        run_docker(&args).map(|_| ())
++    }
++
++    fn wait_execable(&self, timeout: Duration) -> Result<i64, String> {
++        let deadline = SystemTime::now() + timeout;
++        loop {
++            if let Some(epoch) = self.container_epoch() {
++                return Ok(epoch);
++            }
++            if SystemTime::now() >= deadline {
++                return Err("clock-skew leg: target container never became exec-able".into());
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++    }
++}
++
++impl NemesisLeg for ClockSkewLeg {
++    type Evidence = SkewEvidence;
++
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ClockSkew
++    }
++
++    fn plan(&self) -> Result<(), String> {
++        // Readiness only — NO fault here (a `plan` failure must leave the node un-skewed). The
++        // node must be up and exec-able before we recreate it with the fake clock.
++        self.wait_execable(Duration::from_secs(90)).map(|_| ())
++    }
++
++    fn apply(&self) -> Result<(), String> {
++        // The recreate IS the fault AND a restart, so it happens here and we wait for the node to
++        // re-stabilize (exec-able) BEFORE confirm/workload — the leg measures skew, never the
++        // restart (Design §3). A failed recreate is healed by drive_leg (recreate without the
++        // override), so a half-applied skew never leaks.
++        self.recreate(true)?;
++        self.wait_execable(Duration::from_secs(90)).map(|_| ())
++    }
++
++    fn confirm_materialized(&self) -> Result<SkewEvidence, String> {
++        let container_epoch = self
++            .container_epoch()
++            .ok_or_else(|| "clock-skew leg: could not read the container clock".to_string())?;
++        Ok(SkewEvidence {
++            observed_offset_secs: clock_offset_secs(container_epoch, harness_epoch_secs()),
++            floor_secs: self.floor_secs,
++        })
++    }
++
++    fn heal(&self) -> Result<Vec<String>, String> {
++        self.recreate(false)?;
++        Ok(vec![format!("faketime {}", self.service)])
++    }
++
++    fn applied_rules(&self) -> Vec<String> {
++        vec![format!("faketime {}", self.service)]
++    }
++
++    fn confirm_healed(&self, timeout: Duration) -> bool {
++        let deadline = SystemTime::now() + timeout;
++        while SystemTime::now() < deadline {
++            if let Some(epoch) = self.container_epoch() {
++                // Healed = the clock is back within the floor of the harness clock.
++                if clock_offset_secs(epoch, harness_epoch_secs()).unsigned_abs() < self.floor_secs {
++                    return true;
++                }
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        false
++    }
++}
+diff --git a/crates/metadata-fault-conformance/tests/nemesis_oracles.rs b/crates/metadata-fault-conformance/tests/nemesis_oracles.rs
+new file mode 100644
+index 0000000..8ee7552
+--- /dev/null
++++ b/crates/metadata-fault-conformance/tests/nemesis_oracles.rs
+@@ -0,0 +1,452 @@
++//! Check-time coverage for the **composable nemesis** seam (#407): the three leg kinds, each
++//! leg's **materialization oracle** — the pure decision logic over recorded observations that
++//! refuses to report a fault that did not bite (the #442 rule) — AND the central [`drive_leg`]
++//! rule itself (a fault that did not materialize FAILS, an incomplete heal FAILS, and the fault
++//! is healed on every path including a panicking workload).
++//!
++//! The oracle functions here are the same `materialized()` the live `docker`/`fdbcli` impls
++//! call, so a regression in the decision logic flips BOTH this test and the live leg. The
++//! [`drive_leg`] tests use a `MockLeg` — no `docker` — so the rule that "an un-materialized fault
++//! never passes silently" is GUARDED at Check, not left to a live run.
++//!
++//! Import-light on purpose: only the pure oracle arithmetic + enumeration + parse helpers + the
++//! mock-driven lifecycle, never `docker` — so it runs inside the unprivileged `cargo xtask ci`
++//! gate (the "deferred ≠ unbuilt" bar), while the live three-leg runs are opt-in (`WYRD_TIER1=1`),
++//! off-Check.
++
++use std::cell::Cell;
++use std::time::Duration;
++
++use wyrd_metadata_fault_conformance::nemesis::{
++    clock_offset_secs, drive_leg, inspected_status_is_paused, inspected_status_is_running,
++    MaterializationEvidence, NemesisLeg, NemesisLegKind, PartitionEvidence, PauseEvidence,
++    SkewEvidence,
++};
++
++#[test]
++fn the_nemesis_exposes_exactly_the_three_fault_classes() {
++    // The campaign must enumerate partition / clock-skew / process-pause — dropping any is a
++    // fault class the nemesis silently stopped exercising (the born-at-tier bar; not merely
++    // absent, but red).
++    let all = NemesisLegKind::ALL;
++    assert!(
++        all.contains(&NemesisLegKind::Partition),
++        "the nemesis must expose a network-partition leg: {all:?}"
++    );
++    assert!(
++        all.contains(&NemesisLegKind::ClockSkew),
++        "the nemesis must expose a clock-skew leg (the class nothing implemented before #407): {all:?}"
++    );
++    assert!(
++        all.contains(&NemesisLegKind::ProcessPause),
++        "the nemesis must expose a process-pause leg: {all:?}"
++    );
++
++    // Each leg carries a DISTINCT slug — collapsing two into one slug would silently merge two
++    // fault classes.
++    let slugs: std::collections::HashSet<&str> = all.iter().map(|k| k.as_str()).collect();
++    assert_eq!(
++        slugs.len(),
++        all.len(),
++        "each leg kind must carry its own slug, not share one: {all:?} -> {slugs:?}"
++    );
++}
++
++#[test]
++fn partition_oracle_needs_a_reachability_flip_while_the_target_stays_running() {
++    // Materialized: the survivors saw the target before, lost it during, and the container
++    // stayed `running` — a partition, not a crash.
++    let bit = PartitionEvidence {
++        peers_saw_target_before: true,
++        peers_saw_target_during: false,
++        target_running_during: true,
++    };
++    assert!(
++        bit.materialized(),
++        "a genuine reachability flip must materialize: {bit:?}"
++    );
++    assert_eq!(bit.kind(), NemesisLegKind::Partition);
++
++    // A no-op cut: the survivors still see the target through the whole window.
++    let noop = PartitionEvidence {
++        peers_saw_target_during: true,
++        ..bit
++    };
++    assert!(
++        !noop.materialized(),
++        "a cut the peers never noticed must be INCONCLUSIVE, not a silent pass: {noop:?}"
++    );
++
++    // A crash masquerading as a partition: reachability flipped but the container is NOT
++    // running. The oracle must reject it — this leg claims a partition specifically.
++    let crashed = PartitionEvidence {
++        target_running_during: false,
++        ..bit
++    };
++    assert!(
++        !crashed.materialized(),
++        "a crash (container not running) must not read as a partition: {crashed:?}"
++    );
++
++    // A broken oracle that always says "not live": the pre-fault sample fails, so no fault can
++    // be manufactured.
++    let broken = PartitionEvidence {
++        peers_saw_target_before: false,
++        peers_saw_target_during: false,
++        target_running_during: true,
++    };
++    assert!(
++        !broken.materialized(),
++        "if the peers never saw the target live even BEFORE the cut, no fault is provable: {broken:?}"
++    );
++}
++
++#[test]
++fn pause_oracle_needs_serve_then_frozen_paused_not_a_single_probe() {
++    // Served before, served NOTHING during, and the container inspected `paused`. The recovery
++    // transition (serving again) is proven by `confirm_healed` / `heal_is_complete`, NOT by this
++    // gate — so the workload can run WHILE the node is still paused.
++    let bit = PauseEvidence {
++        served_before: true,
++        served_during: false,
++        inspected_paused_during: true,
++    };
++    assert!(
++        bit.materialized(),
++        "serve→(frozen, paused) must materialize the pre-workload gate: {bit:?}"
++    );
++    assert_eq!(bit.kind(), NemesisLegKind::ProcessPause);
++
++    // Absence of service WITHOUT a `paused` inspect state could be a partition or a crash — a
++    // single "not serving" probe is not enough.
++    let not_inspected_paused = PauseEvidence {
++        inspected_paused_during: false,
++        ..bit
++    };
++    assert!(
++        !not_inspected_paused.materialized(),
++        "absence of service without a `paused` inspect state could be a crash/partition, not a pause: \
++         {not_inspected_paused:?}"
++    );
++
++    // Never served before the freeze: the "before" transition is unproven.
++    let no_before = PauseEvidence {
++        served_before: false,
++        ..bit
++    };
++    assert!(
++        !no_before.materialized(),
++        "must observe service BEFORE the freeze: {no_before:?}"
++    );
++
++    // Still serving during the freeze ⇒ the pause was a no-op.
++    let served_through = PauseEvidence {
++        served_during: true,
++        ..bit
++    };
++    assert!(
++        !served_through.materialized(),
++        "a target that kept serving through the freeze did not pause: {served_through:?}"
++    );
++}
++
++#[test]
++fn skew_oracle_clears_a_nonzero_floor_by_magnitude_forward_or_back() {
++    // Forward skew clears the floor.
++    let ahead = SkewEvidence {
++        observed_offset_secs: 120,
++        floor_secs: 60,
++    };
++    assert!(
++        ahead.materialized(),
++        "a +120s offset clears a 60s floor: {ahead:?}"
++    );
++    assert_eq!(ahead.kind(), NemesisLegKind::ClockSkew);
++
++    // Backward skew of the same magnitude also clears it — the leg may skew either direction.
++    let behind = SkewEvidence {
++        observed_offset_secs: -120,
++        ..ahead
++    };
++    assert!(
++        behind.materialized(),
++        "a -120s offset also clears a 60s floor by magnitude: {behind:?}"
++    );
++
++    // Below the floor ⇒ not materialized.
++    let too_small = SkewEvidence {
++        observed_offset_secs: 30,
++        floor_secs: 60,
++    };
++    assert!(
++        !too_small.materialized(),
++        "an offset under the floor must be INCONCLUSIVE: {too_small:?}"
++    );
++
++    // A zero floor never materializes — no skew was asked for, so no skew is evidence.
++    let no_floor = SkewEvidence {
++        observed_offset_secs: 9999,
++        floor_secs: 0,
++    };
++    assert!(
++        !no_floor.materialized(),
++        "a zero floor means no skew was requested; nothing can be evidence of it: {no_floor:?}"
++    );
++}
++
++#[test]
++fn parse_helpers_read_the_live_impls_observations() {
++    // `docker inspect --format {{.State.Status}}` outputs (with trailing newline) drive the
++    // pause oracle's running/paused observations.
++    assert!(inspected_status_is_running("running\n"));
++    assert!(!inspected_status_is_running("paused\n"));
++    assert!(inspected_status_is_paused("paused\n"));
++    assert!(!inspected_status_is_paused("running\n"));
++    assert!(
++        !inspected_status_is_paused("exited\n"),
++        "a crashed container is not paused"
++    );
++
++    // The clock offset the skew oracle keys off: container epoch minus harness epoch.
++    assert_eq!(clock_offset_secs(1_000_120, 1_000_000), 120);
++    assert_eq!(clock_offset_secs(999_880, 1_000_000), -120);
++}
++
++// ─── The central `drive_leg` rule, guarded with a mock leg (no docker) ──────────────────────
++
++/// A minimal [`MaterializationEvidence`] whose verdict is a plain bool — so a [`MockLeg`] can
++/// drive the un-materialized path without any container.
++#[derive(Debug)]
++struct MockEvidence {
++    materialized: bool,
++}
++impl MaterializationEvidence for MockEvidence {
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ProcessPause
++    }
++    fn materialized(&self) -> bool {
++        self.materialized
++    }
++    fn diagnosis(&self) -> String {
++        "mock".to_string()
++    }
++}
++
++/// A programmable [`NemesisLeg`] with no I/O: it records how many times `apply`/`heal` ran, and
++/// its `materialized` / `apply_ok` / `heal_complete` knobs let a test steer `drive_leg` down each
++/// path. `applied_rules()` is always one rule, so `heal_is_complete` fails iff `heal_complete` is
++/// false (heal returns nothing / the target never recovers).
++struct MockLeg {
++    materialized: bool,
++    apply_ok: bool,
++    heal_complete: bool,
++    apply_count: Cell<usize>,
++    heal_count: Cell<usize>,
++}
++
++impl MockLeg {
++    fn new(materialized: bool, apply_ok: bool, heal_complete: bool) -> Self {
++        Self {
++            materialized,
++            apply_ok,
++            heal_complete,
++            apply_count: Cell::new(0),
++            heal_count: Cell::new(0),
++        }
++    }
++}
++
++impl NemesisLeg for MockLeg {
++    type Evidence = MockEvidence;
++
++    fn kind(&self) -> NemesisLegKind {
++        NemesisLegKind::ProcessPause
++    }
++    fn plan(&self) -> Result<(), String> {
++        Ok(())
++    }
++    fn apply(&self) -> Result<(), String> {
++        self.apply_count.set(self.apply_count.get() + 1);
++        if self.apply_ok {
++            Ok(())
++        } else {
++            Err("mock apply failed".into())
++        }
++    }
++    fn confirm_materialized(&self) -> Result<MockEvidence, String> {
++        Ok(MockEvidence {
++            materialized: self.materialized,
++        })
++    }
++    fn heal(&self) -> Result<Vec<String>, String> {
++        self.heal_count.set(self.heal_count.get() + 1);
++        // A complete heal removes the one applied rule; an incomplete one removes nothing.
++        Ok(if self.heal_complete {
++            self.applied_rules()
++        } else {
++            Vec::new()
++        })
++    }
++    fn applied_rules(&self) -> Vec<String> {
++        vec!["mock-rule".to_string()]
++    }
++    fn confirm_healed(&self, _timeout: Duration) -> bool {
++        self.heal_complete
++    }
++}
++
++#[test]
++fn drive_leg_runs_the_workload_and_returns_it_on_the_happy_path() {
++    let leg = MockLeg::new(true, true, true);
++    let ran = Cell::new(false);
++    let result = drive_leg(&leg, || {
++        ran.set(true);
++        42
++    });
++    assert_eq!(
++        result,
++        Ok(42),
++        "a materialized, cleanly-healed leg must return the workload's value"
++    );
++    assert!(
++        ran.get(),
++        "the workload must run under a materialized fault"
++    );
++    assert!(leg.heal_count.get() >= 1, "the fault must be healed");
++}
++
++#[test]
++fn drive_leg_refuses_the_workload_when_the_fault_did_not_materialize() {
++    // This is the #442 rule under test: an un-materialized fault is INCONCLUSIVE, never a silent
++    // pass. Deleting the materialized-bail in `drive_leg` makes this test run the workload and
++    // return Ok — red.
++    let leg = MockLeg::new(false, true, true);
++    let ran = Cell::new(false);
++    let result = drive_leg(&leg, || {
++        ran.set(true);
++    });
++    assert!(
++        result.is_err(),
++        "an un-materialized fault must FAIL as inconclusive, not pass: {result:?}"
++    );
++    assert!(
++        result.unwrap_err().contains("did NOT materialize"),
++        "the failure must name the un-materialized fault"
++    );
++    assert!(
++        !ran.get(),
++        "the workload must NOT run under a fault that did not bite"
++    );
++    assert!(
++        leg.heal_count.get() >= 1,
++        "even an un-materialized leg must heal (never leak fault state)"
++    );
++}
++
++#[test]
++fn drive_leg_fails_an_incomplete_heal() {
++    // Deleting the `heal_is_complete` check in `drive_leg` makes this return Ok — red.
++    let leg = MockLeg::new(true, true, false);
++    let ran = Cell::new(false);
++    let result = drive_leg(&leg, || {
++        ran.set(true);
++    });
++    assert!(
++        result.is_err(),
++        "a leg that did not heal completely must FAIL: {result:?}"
++    );
++    assert!(
++        result.unwrap_err().contains("did NOT heal completely"),
++        "the failure must name the incomplete heal"
++    );
++    assert!(ran.get(), "the workload ran; only the heal was incomplete");
++}
++
++#[test]
++fn drive_leg_heals_when_apply_fails_and_never_runs_the_workload() {
++    // A partially-applied fault (e.g. one of four iptables rules landed) must be healed, and the
++    // workload must not run. Deleting the heal-on-apply-failure makes heal_count == 0 — red.
++    let leg = MockLeg::new(true, false, true);
++    let ran = Cell::new(false);
++    let result = drive_leg(&leg, || {
++        ran.set(true);
++    });
++    assert!(
++        result.is_err(),
++        "an apply failure must fail the leg: {result:?}"
++    );
++    assert!(!ran.get(), "the workload must not run when apply failed");
++    assert!(
++        leg.heal_count.get() >= 1,
++        "a failed apply must still heal any partial fault state"
++    );
++}
++
++#[test]
++fn drive_leg_heals_before_re_raising_a_panicking_workload() {
++    // The checked #408 workload panics by design on a consistency violation. The fault must be
++    // torn down BEFORE the panic propagates, or a red leaves a cut/paused/skewed cluster behind.
++    // Deleting the `catch_unwind` makes the panic skip the heal (heal_count == 0) — red.
++    let leg = MockLeg::new(true, true, true);
++    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        drive_leg(&leg, || panic!("workload blew up under the fault"))
++    }));
++    assert!(
++        outcome.is_err(),
++        "a panicking workload must re-raise the panic out of drive_leg"
++    );
++    assert!(
++        leg.heal_count.get() >= 1,
++        "the fault must be healed even when the workload panics"
++    );
++
++    // ...and when the workload panics, the ORIGINAL panic (not a leaked-fault escalation) must
++    // propagate, because the heal here completed cleanly.
++    let leg2 = MockLeg::new(true, true, true);
++    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        drive_leg(&leg2, || panic!("workload blew up under the fault"))
++    }))
++    .expect_err("the panic must propagate");
++    let msg = panic_message(payload.as_ref());
++    assert!(
++        msg.contains("workload blew up under the fault"),
++        "a clean heal must re-raise the workload's OWN panic, not a leaked-fault escalation: {msg:?}"
++    );
++}
++
++#[test]
++fn drive_leg_surfaces_a_leaked_fault_even_when_the_workload_panics() {
++    // The prior iteration's defect: `drive_leg` ran `resume_unwind` BEFORE checking the heal, so a
++    // heal that FAILED while the workload also panicked was dropped silently — a leaked cut/pause/
++    // skew hidden behind the panic. A leaked fault is the graver failure; it must be surfaced, not
++    // swallowed. `MockLeg::new(_, _, heal_complete=false)` heals into nothing and never recovers,
++    // so `heal_is_complete` is false — a leak. With the workload ALSO panicking, `drive_leg` must
++    // still panic (the failure is not hidden), and the panic must NAME the leaked fault rather than
++    // re-raise the workload's own message.
++    let leg = MockLeg::new(true, true, false);
++    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        drive_leg(&leg, || panic!("workload blew up under the fault"))
++    }))
++    .expect_err("a leaked fault under a panicking workload must still surface as a panic");
++    assert!(
++        leg.heal_count.get() >= 1,
++        "the leg must at least attempt to heal even on the panic path"
++    );
++    let msg = panic_message(payload.as_ref());
++    assert!(
++        msg.contains("leaked fault state"),
++        "the panic must name the LEAKED FAULT, not silently re-raise the workload panic: {msg:?}"
++    );
++}
++
++/// Best-effort human-readable text of a caught panic payload (`&str` / `String`), for asserting
++/// which panic propagated out of [`drive_leg`].
++fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
++    if let Some(s) = payload.downcast_ref::<&str>() {
++        (*s).to_string()
++    } else if let Some(s) = payload.downcast_ref::<String>() {
++        s.clone()
++    } else {
++        "<non-string panic payload>".to_string()
++    }
++}
+diff --git a/crates/metadata-fdb/tests/tier1_metadata_nemesis.rs b/crates/metadata-fdb/tests/tier1_metadata_nemesis.rs
+new file mode 100644
+index 0000000..5c93146
+--- /dev/null
++++ b/crates/metadata-fdb/tests/tier1_metadata_nemesis.rs
+@@ -0,0 +1,214 @@
++//! **Tier-1 metadata nemesis over a real FoundationDB cluster** — the live wiring of the three
++//! composable nemesis legs (#407, slice 4 of #329; ADR-0041 "nemesis first, then the checked
++//! artifact") into the fdb-feature Tier-1 scenario.
++//!
++//! Each leg is one of `wyrd-metadata-fault-conformance`'s three fault classes
++//! (`nemesis::{PartitionLeg, ClockSkewLeg, ProcessPauseLeg}`), resolved against the live
++//! `deploy/fdb-multi-replica` cluster and driven by `nemesis::drive_leg`, which enforces the two
++//! #442 gates: a fault that did not bite FAILS as inconclusive, and an incomplete heal FAILS.
++//! The workload run *under* each fault here is a minimal production-path commit round-trip
++//! through `FdbMetadataStore` — proof the majority side keeps serving under the fault. Because
++//! `drive_leg` runs the workload WHILE the fault is still active (the fault encloses the
++//! workload) and heals on every path (including a panicking workload), a red here is a real
++//! violation, never a leaked cut. #408 composes the *checked* Elle-history workload under these
++//! same legs.
++//!
++//! **Off-Check by construction.** These functions are `#[ignore]`d and need a live 3-process FDB
++//! cluster + `libfdb_c` + privileged in-netns `iptables` (partition) + `libfaketime` (skew).
++//! They run only under the opt-in Tier-1 runner (`WYRD_TIER1=1 cargo xtask metadata-nemesis`,
++//! and the future #409 CI job), which is the runnable entry point that stands up the cluster,
++//! resolves the topology, and exports the fault env this file reads. Absent an
++//! `WYRD_FDB_CLUSTER_FILE` they skip cleanly, so `cargo xtask ci` stays green. The pure decision
++//! logic they turn on is unit-tested at Check in `wyrd-metadata-fault-conformance`'s
++//! `nemesis_oracles` and `xtask`'s `nemesis_orchestration`.
++//!
++//! The scenario-function NAMES are pinned by `xtask::nemesis::NemesisLegKind::scenario_fn`
++//! (`nemesis_metadata_under_{network_partition,clock_skew,process_pause}`) — the runner selects
++//! each with `--exact` and REFUSES a leg that ran zero tests
++//! (`xtask::nemesis::nemesis_leg_ran_exactly_one`), so renaming one here without updating that
++//! dispatch fails the leg loudly instead of passing as a silent green no-op.
++
++#[cfg(feature = "fdb")]
++mod support;
++
++/// The FDB cluster file, or `None` when FDB is not configured (clean-skip gate).
++fn cluster_file() -> Option<String> {
++    match std::env::var("WYRD_FDB_CLUSTER_FILE") {
++        Ok(raw) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
++        _ => None,
++    }
++}
++
++#[test]
++#[ignore = "privileged Tier-1: live 3-process FDB cluster + in-netns iptables (cargo xtask metadata-nemesis)"]
++fn nemesis_metadata_under_network_partition() {
++    let Some(cluster_file) = cluster_file() else {
++        eprintln!("wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE not set — skipping the partition nemesis leg.");
++        return;
++    };
++    run_partition(cluster_file);
++}
++
++#[test]
++#[ignore = "privileged Tier-1: live 3-process FDB cluster + libfaketime (cargo xtask metadata-nemesis)"]
++fn nemesis_metadata_under_clock_skew() {
++    let Some(cluster_file) = cluster_file() else {
++        eprintln!("wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE not set — skipping the clock-skew nemesis leg.");
++        return;
++    };
++    run_clock_skew(cluster_file);
++}
++
++#[test]
++#[ignore = "privileged Tier-1: live 3-process FDB cluster + docker pause (cargo xtask metadata-nemesis)"]
++fn nemesis_metadata_under_process_pause() {
++    let Some(cluster_file) = cluster_file() else {
++        eprintln!("wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE not set — skipping the process-pause nemesis leg.");
++        return;
++    };
++    run_process_pause(cluster_file);
++}
++
++#[cfg(feature = "fdb")]
++fn run_partition(cluster_file: String) {
++    use std::time::Duration;
++    use wyrd_metadata_fault_conformance::nemesis::{drive_leg, PartitionLeg};
++
++    let all = support::processes().expect("WYRD_TIER1_NETNS_MAP must name the cluster processes");
++    // Cut the master — an arbitrary node is outcome-neutral (FDB keeps quorum on the majority).
++    let target = support::resolve_role_holder(&all, "master", Duration::from_secs(90))
++        .expect("resolve the master process to cut");
++    let survivor = support::survivor(&all, &target).expect("a survivor other than the target");
++    let iptables_image = std::env::var("WYRD_TIER1_IPTABLES_IMAGE")
++        .unwrap_or_else(|_| "wyrd-iptables:local".to_string());
++
++    let leg = PartitionLeg::new(
++        target.addr.clone(),
++        target.ip.clone(),
++        target.container.clone(),
++        survivor.container.clone(),
++        iptables_image,
++    );
++    drive_leg(&leg, || cluster_still_serves(&cluster_file))
++        .expect("partition leg must materialize, keep the majority serving, and heal completely");
++}
++
++#[cfg(feature = "fdb")]
++fn run_process_pause(cluster_file: String) {
++    use std::time::Duration;
++    use wyrd_metadata_fault_conformance::nemesis::{drive_leg, ProcessPauseLeg};
++
++    let all = support::processes().expect("WYRD_TIER1_NETNS_MAP must name the cluster processes");
++    let target = support::resolve_role_holder(&all, "master", Duration::from_secs(90))
++        .expect("resolve the master process to pause");
++    let survivor = support::survivor(&all, &target).expect("a survivor other than the target");
++
++    let leg = ProcessPauseLeg::new(
++        target.addr.clone(),
++        target.container.clone(),
++        survivor.container.clone(),
++    );
++    // `drive_leg` runs the workload WHILE the node is still paused (the pause encloses the
++    // workload) and unpauses only in `heal`, then proves the serve→pause→serve recovery.
++    drive_leg(&leg, || cluster_still_serves(&cluster_file)).expect(
++        "pause leg must serve→freeze→serve, keep the majority serving, and heal completely",
++    );
++}
++
++#[cfg(feature = "fdb")]
++fn run_clock_skew(cluster_file: String) {
++    use wyrd_metadata_fault_conformance::nemesis::{drive_leg, ClockSkewLeg};
++
++    // Service, container, compose file and override are all resolved by the runner
++    // (`fdb_faults::run_metadata_nemesis`) from ONE service name, so the recreate, the compose
++    // override, and the in-container probe all agree on which node is skewed — no default-run
++    // triple-mismatch. Crucially the runner exports `WYRD_TIER1_SKEW_CONTAINER` as the STABLE
++    // compose container NAME (`fdb_faults::container_name_of`), not an ephemeral id: the leg's
++    // `apply()` force-recreates the node, which mints a new id but keeps the name, so the
++    // post-recreate `docker exec <container> date +%s` probe still resolves. The recreate restarts
++    // the node regardless of whether it holds the master role; `drive_leg`/`apply` waits for the
++    // cluster to re-stabilize BEFORE the measured workload, so no "non-master" precondition is
++    // needed.
++    let service = std::env::var("WYRD_TIER1_SKEW_SERVICE")
++        .expect("WYRD_TIER1_SKEW_SERVICE must name the node the faketime override targets");
++    let target_container = std::env::var("WYRD_TIER1_SKEW_CONTAINER").expect(
++        "WYRD_TIER1_SKEW_CONTAINER must be the STABLE compose container NAME of \
++         WYRD_TIER1_SKEW_SERVICE (stable across the leg's force-recreate)",
++    );
++    let compose_file = std::env::var("WYRD_TIER1_COMPOSE_FILE").expect(
++        "WYRD_TIER1_COMPOSE_FILE must point at deploy/fdb-multi-replica/docker-compose.yml",
++    );
++    let faketime_override = std::env::var("WYRD_TIER1_FAKETIME_OVERRIDE")
++        .expect("WYRD_TIER1_FAKETIME_OVERRIDE must point at docker-compose.faketime.yml");
++    let floor_secs = std::env::var("WYRD_TIER1_SKEW_FLOOR_SECS")
++        .ok()
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(60);
++
++    let leg = ClockSkewLeg::new(
++        compose_file,
++        faketime_override,
++        service,
++        target_container,
++        floor_secs,
++    );
++    drive_leg(&leg, || cluster_still_serves(&cluster_file))
++        .expect("clock-skew leg must offset the node clock past the floor, keep serving, and heal");
++}
++
++/// Without `--features fdb` the crate cannot link `libfdb_c`, so the leg bodies are compiled out;
++/// these stubs keep the test binary building under the default `cargo xtask ci` gate and skip
++/// loudly if a cluster file is somehow set. (Same shape as `tier1_metadata_consistency`'s `run`
++/// stub.)
++#[cfg(not(feature = "fdb"))]
++fn run_partition(cluster_file: String) {
++    skip_without_fdb(cluster_file);
++}
++#[cfg(not(feature = "fdb"))]
++fn run_clock_skew(cluster_file: String) {
++    skip_without_fdb(cluster_file);
++}
++#[cfg(not(feature = "fdb"))]
++fn run_process_pause(cluster_file: String) {
++    skip_without_fdb(cluster_file);
++}
++#[cfg(not(feature = "fdb"))]
++fn skip_without_fdb(cluster_file: String) {
++    let _ = cluster_file;
++    eprintln!(
++        "wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE is set but the crate was built without \
++         `--features fdb` — skipping the nemesis legs. Run via `cargo xtask metadata-nemesis`."
++    );
++}
++
++/// The minimal production-path workload run UNDER each fault: a commit round-trip through the
++/// real `FdbMetadataStore`, proving the majority side keeps serving. #408 replaces this with the
++/// checked Elle-history workload.
++#[cfg(feature = "fdb")]
++fn cluster_still_serves(cluster_file: &str) {
++    use wyrd_traits::{CommitOutcome, MetadataStore, WriteBatch};
++
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()
++        .expect("tokio runtime");
++    runtime.block_on(async {
++        let prefix = format!("wyrd-nemesis/{}/", std::process::id()).into_bytes();
++        let store = wyrd_metadata_fdb::FdbMetadataStore::open(cluster_file)
++            .expect("open the FoundationDB metadata store")
++            .with_prefix(prefix);
++        let key = b"probe".to_vec();
++        assert_eq!(
++            store
++                .commit(WriteBatch::new().put(key.clone(), b"served".to_vec()))
++                .await
++                .expect("a commit on the majority side must not fault under the nemesis"),
++            CommitOutcome::Committed,
++            "the majority side must keep serving commits under the nemesis leg",
++        );
++        store
++            .commit(WriteBatch::new().delete(key))
++            .await
++            .expect("cleanup must not fault");
++    });
++}
+diff --git a/deploy/fdb-multi-replica/docker-compose.faketime.yml b/deploy/fdb-multi-replica/docker-compose.faketime.yml
+new file mode 100644
+index 0000000..8e63799
+--- /dev/null
++++ b/deploy/fdb-multi-replica/docker-compose.faketime.yml
+@@ -0,0 +1,47 @@
++# Clock-skew override for the M4 metadata **nemesis** (#407, slice 4 of #329) — the additive
++# deploy delta the skew leg needs (Design §3/§5). Applied ON TOP of `docker-compose.yml` for
++# exactly ONE fdbserver node (`fdb2`, the node `xtask metadata-nemesis` skews by default),
++# recreating it with a container-scoped fake clock:
++#
++#   docker compose \
++#     -f deploy/fdb-multi-replica/docker-compose.yml \
++#     -f deploy/fdb-multi-replica/docker-compose.faketime.yml \
++#     up -d --force-recreate fdb2
++#
++# and healed by recreating WITHOUT this file. The recreate is itself a restart-fault, so the
++# nemesis leg applies it in `apply()` (never `plan()`) and waits for the cluster to re-stabilize
++# BEFORE the measured workload window opens (the leg measures skew, never the restart).
++#
++# **The target node is pinned to `fdb2` on ALL three sides** (this override, the runner's
++# `WYRD_TIER1_SKEW_SERVICE`/`WYRD_TIER1_SKEW_CONTAINER`, and the in-container probe), so the
++# default run cannot skew one node and measure another — the runner resolves the container FROM
++# this service name, so override/recreate/probe cannot disagree.
++#
++# **Why `libfaketime`, and why container-scoped** (Alternatives considered). `date -s` /
++# CAP_SYS_TIME would mutate the shared kernel clock on the CI host in some runtimes and is not
++# per-process. `libfaketime` is per-container, reversible, and skews ONLY this node's clock —
++# never the harness/client process, so the #406 history's real-time order (stamped by the
++# harness, `crates/server/src/consistency_observable.rs:66-68`) stays trustworthy while the
++# system under test runs on a lying clock. A `docker exec fdb2 date +%s` probe inherits the
++# same fake clock, which IS the leg's materialization oracle (an in-container probe sharing the
++# target's exact preload/env), not an unrelated process.
++#
++# The stock `foundationdb/foundationdb:7.3.77` image (docker-compose.yml:97) has no custom
++# entrypoint; the faketime preload is provided as a bind-mount of the host's libfaketime shared
++# object (installed by the deploy delta — `apt-get install libfaketime`, then bind-mount its
++# `.so`). Override `FAKETIME` (default `+2h`) and `WYRD_TIER1_SKEW_SO` (the host path to the
++# preload) at run time; the node still advertises its own IP, so the cluster re-forms normally.
++
++services:
++  fdb2:
++    environment:
++      # Container-scoped libfaketime. `FAKETIME` is a STATIC per-leg offset (v1 has no dynamic
++      # mid-run control — out of scope); `+2h` clears any reasonable skew floor.
++      LD_PRELOAD: /usr/lib/faketime/libfaketime.so.1
++      FAKETIME: "${FAKETIME:-+2h}"
++      # Real-time (not monotonic) faketime, applied cluster-node-only.
++      FAKETIME_DONT_FAKE_MONOTONIC: "1"
++    volumes:
++      # Bind the host's libfaketime preload into the stock image (no custom entrypoint / image
++      # rebuild). `WYRD_TIER1_SKEW_SO` overrides the host path per environment.
++      - "${WYRD_TIER1_SKEW_SO:-/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1}:/usr/lib/faketime/libfaketime.so.1:ro"
+diff --git a/xtask/src/fdb_faults.rs b/xtask/src/fdb_faults.rs
+index fe07813..d903946 100644
+--- a/xtask/src/fdb_faults.rs
++++ b/xtask/src/fdb_faults.rs
+@@ -343,6 +343,205 @@ fn docker_available() -> bool {
+         .unwrap_or(false)
+ }
+ 
++/// The compose override the clock-skew nemesis leg recreates the target node with (Design §3/§5).
++const FDB_TIER1_FAKETIME_OVERRIDE: &str = "deploy/fdb-multi-replica/docker-compose.faketime.yml";
++/// The node the skew leg recreates with a fake clock — MUST match the service the faketime
++/// override targets (`docker-compose.faketime.yml`), so override/recreate/probe cannot disagree.
++const FDB_TIER1_SKEW_SERVICE: &str = "fdb2";
++
++/// The **stable compose container name** of a service (`docker compose ps --format '{{.Name}}'`),
++/// as opposed to the ephemeral container **id** [`container_of`] returns (`ps -q`).
++///
++/// The distinction is load-bearing for the nemesis and is the fix for the two prior iterations'
++/// live-skew defect: the clock-skew leg `--force-recreate`s its target node, which mints a **new
++/// container id** but keeps the **same compose name** (`<project>-<service>-<index>`, deterministic
++/// and reused on recreate). A campaign that resolved the skew target — or the whole netns map — as
++/// an id ONCE, pre-campaign, would then `docker exec`/`docker pause` a container that no longer
++/// exists after the recreate (id invalidated), and every later leg would fail to materialize. A
++/// name survives the recreate, and `docker exec|pause|inspect <name>` and
++/// `docker run --network=container:<name>` all accept it. We still ASK compose for the name rather
++/// than hard-code the convention, so a compose naming change cannot silently point us at nothing.
++fn container_name_of(service: &str) -> Result<String, String> {
++    let out = Command::new("docker")
++        .args([
++            "compose",
++            "-p",
++            FDB_TIER1_PROJECT,
++            "-f",
++            FDB_TIER1_COMPOSE,
++            "ps",
++            "--format",
++            "{{.Name}}",
++            service,
++        ])
++        .current_dir(workspace_root())
++        .output()
++        .map_err(|e| format!("failed to spawn docker compose ps: {e}"))?;
++    // Take the first non-empty line: with one replica `ps --format '{{.Name}}'` prints exactly the
++    // container name; guard against a trailing blank line or a stray header.
++    let name = String::from_utf8_lossy(&out.stdout)
++        .lines()
++        .map(str::trim)
++        .find(|l| !l.is_empty())
++        .unwrap_or_default()
++        .to_string();
++    if name.is_empty() {
++        return Err(format!(
++            "compose service `{service}` has no running container — the FDB Tier-1 cluster did \
++             not come up"
++        ));
++    }
++    Ok(name)
++}
++
++/// The nemesis's ip→container **name** map — the same shape as [`netns_map`] but resolved to stable
++/// compose names, not ephemeral ids, so it stays valid after the clock-skew leg force-recreates its
++/// node (see [`container_name_of`]). A separate builder from the #442 battery's [`netns_map`] so
++/// the battery's proven id-based path is left untouched.
++fn nemesis_netns_map() -> Result<String, String> {
++    let mut pairs = Vec::new();
++    for (service, ip) in FDB_TIER1_NODES {
++        pairs.push(format!("{ip}={}", container_name_of(service)?));
++    }
++    Ok(pairs.join(","))
++}
++
++/// **The composable-nemesis runner** (#407): stand up `deploy/fdb-multi-replica`, then drive each
++/// of the three nemesis legs (partition / clock-skew / process-pause) through
++/// `wyrd-metadata-fault-conformance`'s `drive_leg`, which enforces the #442 gates
++/// (materialized-or-inconclusive, complete-heal). This is the runnable entry point that makes the
++/// brief's sign-off open question — one witnessed `WYRD_TIER1=1` run of the three legs —
++/// satisfiable; #408 composes the *checked* workload under these same legs.
++///
++/// Tears the stack down unconditionally (including on a panic), so a failed leg never leaves a
++/// cut / paused / skewed cluster behind — the same panic-safe teardown as
++/// [`run_fdb_metadata_tier1`].
++pub fn run_metadata_nemesis() -> Result<(), String> {
++    if std::env::var("WYRD_TIER1").as_deref() != Ok("1") {
++        println!(
++            "xtask metadata-nemesis: DEFERRED — set WYRD_TIER1=1 to run the privileged M4 metadata \
++             nemesis (#407). It stands up a 3-process FoundationDB cluster and partitions / \
++             skews / pauses it, and needs Docker (plus `libfaketime` for the skew leg)."
++        );
++        return Ok(());
++    }
++    if !docker_available() {
++        // Opted in but the tool is missing: a HARD error — a nemesis that quietly did not run is
++        // worse than one that failed (the same rule as the #442 battery).
++        return Err(
++            "WYRD_TIER1=1 but `docker` is not available — the metadata nemesis cannot run, and \
++             skipping it silently would report a verdict that was never tested"
++                .into(),
++        );
++    }
++
++    build_fault_agent()?;
++    compose(&["up", "-d"])?;
++
++    let result = crate::finalize_panic_safe(
++        || {
++            configure_database()?;
++            let cluster_file = write_cluster_file()?;
++            // Resolve the topology by STABLE COMPOSE NAME, never ephemeral id: the clock-skew leg
++            // force-recreates its node mid-campaign, which invalidates ids but keeps names, so a
++            // name map (and skew target) stays valid for every later leg (the prior iterations'
++            // live-skew defect).
++            let netns_map = nemesis_netns_map()?;
++            let skew_container = container_name_of(FDB_TIER1_SKEW_SERVICE)?;
++            println!("xtask metadata-nemesis: netns map = {netns_map}");
++            println!(
++                "xtask metadata-nemesis: skew target = {FDB_TIER1_SKEW_SERVICE} ({skew_container})"
++            );
++            for leg in xtask::nemesis::metadata_nemesis_legs() {
++                run_nemesis_leg(leg, &cluster_file, &netns_map, &skew_container)?;
++            }
++            Ok(())
++        },
++        |result| {
++            let _ = compose(&["down", "-v", "--remove-orphans"]);
++            result
++        },
++    );
++
++    result?;
++    println!(
++        "\nxtask metadata-nemesis: FoundationDB survived the three-leg composable nemesis (#407) \
++         — a live-node partition, a clock skew, and a process pause, each proven materialized and \
++         healed"
++    );
++    Ok(())
++}
++
++/// Run one nemesis leg's `#[ignore]`d scenario function with the `fdb` feature on and the fault
++/// env exported. Captures the output so the leg is failed unless `cargo test` reports it ran
++/// **exactly one** test — closing the `--exact` name-drift hole (a renamed scenario function runs
++/// 0 tests and exits 0, a silent green no-op).
++fn run_nemesis_leg(
++    leg: xtask::nemesis::NemesisLegKind,
++    cluster_file: &str,
++    netns_map: &str,
++    skew_container: &str,
++) -> Result<(), String> {
++    let exact_fn = leg.scenario_fn();
++    let args = xtask::nemesis::nemesis_scenario_args(
++        xtask::nemesis::METADATA_NEMESIS_SCENARIO_TEST,
++        exact_fn,
++    );
++    print_step(
++        &std::iter::once("cargo")
++            .chain(args.iter().copied())
++            .collect::<Vec<_>>(),
++    );
++
++    let compose_file = workspace_root()
++        .join(FDB_TIER1_COMPOSE)
++        .to_string_lossy()
++        .to_string();
++    let faketime_override = workspace_root()
++        .join(FDB_TIER1_FAKETIME_OVERRIDE)
++        .to_string_lossy()
++        .to_string();
++
++    let output = Command::new("cargo")
++        .args(args)
++        .current_dir(workspace_root())
++        .env("WYRD_FDB_CLUSTER_FILE", cluster_file)
++        .env("WYRD_TIER1_NETNS_MAP", netns_map)
++        .env("WYRD_TIER1_FDB_PORT", FDB_TIER1_PORT)
++        .env("WYRD_TIER1_IPTABLES_IMAGE", IPTABLES_IMAGE)
++        .env("WYRD_TIER1_COMPOSE_FILE", compose_file)
++        .env("WYRD_TIER1_FAKETIME_OVERRIDE", faketime_override)
++        .env("WYRD_TIER1_SKEW_SERVICE", FDB_TIER1_SKEW_SERVICE)
++        .env("WYRD_TIER1_SKEW_CONTAINER", skew_container)
++        .output()
++        .map_err(|e| format!("failed to spawn cargo test: {e}"))?;
++
++    let combined = format!(
++        "{}{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr),
++    );
++    print!("{combined}");
++
++    if !output.status.success() {
++        return Err(format!(
++            "metadata nemesis leg `{}` ({exact_fn}) failed with {}",
++            leg.as_str(),
++            output.status,
++        ));
++    }
++    if !xtask::nemesis::nemesis_leg_ran_exactly_one(&combined) {
++        return Err(format!(
++            "metadata nemesis leg `{}` reported {:?} tests run, not exactly one — the scenario \
++             function `{exact_fn}` was probably renamed on one side of the dispatch (a `--exact` \
++             filter that matches nothing exits 0, a silent green no-op)",
++            leg.as_str(),
++            xtask::nemesis::parse_tests_run(&combined),
++        ));
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/xtask/src/lib.rs b/xtask/src/lib.rs
+index 5bd719a..e576972 100644
+--- a/xtask/src/lib.rs
++++ b/xtask/src/lib.rs
+@@ -17,6 +17,7 @@ pub mod deploy_guard;
+ pub mod disk_faults;
+ pub mod fdb_doctor;
+ pub mod metadata_faults;
++pub mod nemesis;
+ 
+ /// Opt the `tikv` feature's type-check into `cargo xtask ci`. Set only by the privileged
+ /// Tier CI job that has the pre-1.0 `tikv-client` build toolchain (grpcio/protoc).
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 10b6e05..83bca38 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -32,6 +32,13 @@
+ //!   `xtask::fdb_doctor`'s (environment facts in, verdict out); `run_fdb_conformance`
+ //!   *is* a call to `fdb_doctor::run_gated_conformance`, so the same client-library
+ //!   row fails the job fast.
++//! - `metadata-nemesis` — the M4 composable-nemesis runner (#407, slice 4 of #329): stand
++//!   up `deploy/fdb-multi-replica` and drive the three nemesis legs (live-node network
++//!   partition / clock skew / process pause) through
++//!   `wyrd-metadata-fault-conformance::nemesis::drive_leg`, each proven materialized and
++//!   healed (the #442 gates). Privileged and opt-in (`WYRD_TIER1=1`), never part of `ci`;
++//!   the pure leg-enumeration / dispatch / oracle logic is unit-tested in `ci`. #408
++//!   composes the *checked* Elle-history workload under these same legs.
+ //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
+ //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
+ //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
+@@ -81,6 +88,7 @@ fn main() -> ExitCode {
+         Some("fdb-conformance") => run_fdb_conformance(),
+         Some("fdb-doctor") => run_fdb_doctor(),
+         Some("fdb-metadata-tier1") => fdb_faults::run_fdb_metadata_tier1(),
++        Some("metadata-nemesis") => fdb_faults::run_metadata_nemesis(),
+         Some("etcd-conformance") => run_etcd_conformance(),
+         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
+         Some("disk-faults") => faults::run_disk_faults(),
+@@ -112,7 +120,7 @@ fn main() -> ExitCode {
+ fn print_usage() {
+     eprintln!(
+         "usage: cargo xtask \
+-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
++         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+     );
+ }
+ 
+diff --git a/xtask/src/nemesis.rs b/xtask/src/nemesis.rs
+new file mode 100644
+index 0000000..d416f2e
+--- /dev/null
++++ b/xtask/src/nemesis.rs
+@@ -0,0 +1,151 @@
++//! Tier-1 **metadata nemesis** orchestration (#407, slice 4 of #329; ADR-0041 "nemesis first,
++//! then the checked artifact"). The **host-independent** leg-enumeration + dispatch-routing +
++//! runner-argument decisions for the three-class nemesis over the real multi-node M4 metadata
++//! cluster, as pure functions with no privileged I/O (no `docker`, no `iptables`, no cluster).
++//!
++//! This is the metadata-nemesis sibling of [`crate::faults`]'s `tier1_jepsen_isolation_legs`
++//! (`xtask/src/faults.rs:245`) and [`crate::metadata_faults`]'s `metadata_tier_dispatch`: the
++//! privileged legs that stand up the ≥3-process FoundationDB cluster and partition / skew /
++//! pause it are **deferred / off-Check** (opt-in `WYRD_TIER1=1`), but the *routing decisions*
++//! they turn on are pure and unit-tested inside the unprivileged `cargo xtask ci` gate — the
++//! "deferred ≠ unbuilt" bar.
++//!
++//! The leg **lifecycle**, the typed materialization **evidence**, the per-leg **oracle
++//! arithmetic** and the live-leg **impls** live in `wyrd-metadata-fault-conformance` (Design
++//! §1, importable by both the battery and #408). This module deliberately keeps `xtask` at
++//! **zero new dependencies** (`xtask/Cargo.toml:11-14`): it owns ONLY the leg-kind enum, the
++//! dispatch routing to each leg's scenario function, the runner-argument building, and the pure
++//! "the leg actually ran" guard the runner reads off `cargo test`'s output.
++//!
++//! The runnable entry point that consumes this module is `xtask fdb_faults::run_metadata_nemesis`
++//! (the `cargo xtask metadata-nemesis` subcommand): it stands up `deploy/fdb-multi-replica`,
++//! resolves the topology, and drives each leg. That is what makes the brief's sign-off open
++//! question — one witnessed `WYRD_TIER1=1` run of the three legs — satisfiable.
++
++// ─── Leg kinds (mirrors faults::IsolationNemesis) ──────────────────────────────────────────
++
++/// Which fault class a metadata nemesis leg injects. Modeled as a value with all three
++/// alternatives representable — mirroring [`crate::faults`]'s `IsolationNemesis` born-at-tier
++/// pattern — so that dropping a fault class (collapsing the campaign) is catchable by a
++/// Check-time unit test (`xtask/tests/nemesis_orchestration.rs`), not merely absent.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum NemesisLegKind {
++    /// Live-node **network partition** — an in-netns `iptables` DROP (the #399 technique) that
++    /// keeps the target `running` while its peers lose it.
++    NetworkPartition,
++    /// **Clock skew** — a static per-leg `libfaketime` offset on ONE cluster node, the
++    /// harness/client clock untouched.
++    ClockSkew,
++    /// **Process pause** — a freezer-cgroup `docker pause`/`unpause` of one cluster node.
++    ProcessPause,
++}
++
++impl NemesisLegKind {
++    /// The `#[ignore]`d scenario function (inside the fdb-feature Tier-1 nemesis binary) that
++    /// injects this leg. Each leg routes to its **own** function so a regression that points two
++    /// legs at one function silently collapses them — the orchestration test catches that with a
++    /// distinct-function-names assertion.
++    ///
++    /// **Name-drift safety.** `cargo test --exact <fn>` for a name that matches nothing runs ZERO
++    /// tests and exits 0 — a silent green no-op. So renaming the scenario function here without
++    /// updating the fdb test (or vice versa) is NOT caught by exit status; the runner instead
++    /// reads the executed-test count off the output ([`parse_tests_run`]) and fails a leg that
++    /// ran 0 tests.
++    #[must_use]
++    pub fn scenario_fn(self) -> &'static str {
++        match self {
++            NemesisLegKind::NetworkPartition => "nemesis_metadata_under_network_partition",
++            NemesisLegKind::ClockSkew => "nemesis_metadata_under_clock_skew",
++            NemesisLegKind::ProcessPause => "nemesis_metadata_under_process_pause",
++        }
++    }
++
++    /// A stable, human-readable slug for diagnostics (the runner names the failing leg by it).
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            NemesisLegKind::NetworkPartition => "network-partition",
++            NemesisLegKind::ClockSkew => "clock-skew",
++            NemesisLegKind::ProcessPause => "process-pause",
++        }
++    }
++}
++
++/// Which nemesis legs the Tier-1 metadata campaign runs, and in what order, once
++/// `run_metadata_nemesis` routes to the in-repo scenario. Pure — a plain `Vec` the orchestration
++/// unit test inspects directly (not a downstream argv helper), so a regression that drops the
++/// clock-skew leg (the fault class nothing implemented before #407) — or any leg — flips the test
++/// red rather than resting red on non-existence.
++#[must_use]
++pub fn metadata_nemesis_legs() -> Vec<NemesisLegKind> {
++    vec![
++        NemesisLegKind::NetworkPartition,
++        NemesisLegKind::ClockSkew,
++        NemesisLegKind::ProcessPause,
++    ]
++}
++
++/// The in-repo fdb-feature Tier-1 nemesis scenario test binary (the `cargo test --test <name>`
++/// target). The legs wire into this feature-gated scenario under `crates/metadata-fdb/tests/`
++/// (type-checked under the privileged `WYRD_FDB_TOOLCHAIN` opt-in), each `#[ignore]`d and
++/// selected by [`NemesisLegKind::scenario_fn`].
++pub const METADATA_NEMESIS_SCENARIO_TEST: &str = "tier1_metadata_nemesis";
++
++/// The `cargo test --features fdb --test <name> -- --ignored --exact <fn>` argv that runs one
++/// nemesis leg's scenario function inside the in-repo `test` binary. Downstream of
++/// [`metadata_nemesis_legs`] (which leg) and [`NemesisLegKind::scenario_fn`] (which function).
++///
++/// The nemesis drives the real FoundationDB metadata path behind the unchanged trait, so — like
++/// the #442 battery legs — the argv MUST carry `--features fdb` (the backend is off by default,
++/// so the whole-tree gate compiles the empty skeleton) and target the `wyrd-metadata-fdb` crate.
++#[must_use]
++pub fn nemesis_scenario_args<'a>(test: &'a str, exact_fn: &'a str) -> [&'a str; 12] {
++    [
++        "test",
++        "-p",
++        "wyrd-metadata-fdb",
++        "--features",
++        "fdb",
++        "--test",
++        test,
++        "--",
++        "--ignored",
++        "--exact",
++        exact_fn,
++        "--nocapture",
++    ]
++}
++
++/// The number of tests `cargo test` reported it **ran**, parsed off its `running N test(s)` line,
++/// or `None` when the line is absent. The runner uses this to close the `--exact` name-drift hole:
++/// a leg that ran 0 tests (a scenario function renamed on one side of the dispatch but not the
++/// other) is a silent green no-op under exit status alone, so the runner refuses a leg unless it
++/// ran **exactly one** test.
++///
++/// `cargo test` prints `running 0 tests` / `running 1 test` / `running 2 tests`; the count is the
++/// token after `running`.
++#[must_use]
++pub fn parse_tests_run(cargo_test_output: &str) -> Option<usize> {
++    cargo_test_output.lines().find_map(|line| {
++        let line = line.trim();
++        let rest = line.strip_prefix("running ")?;
++        let count = rest.split_whitespace().next()?;
++        // Only accept the EXACT "running N test" / "running N tests" shape cargo prints (singular
++        // for one test, plural otherwise), never an unrelated line that merely begins "running ".
++        // `matches!(tail, "test" | "tests")` — not `starts_with("test")`, which would also swallow
++        // "running 1 testbed …".
++        let tail = rest[count.len()..].trim();
++        matches!(tail, "test" | "tests")
++            .then(|| count.parse::<usize>().ok())
++            .flatten()
++    })
++}
++
++/// Whether a leg's `cargo test` output proves the scenario function actually executed — exactly
++/// one test ran. `false` when the `--exact` filter matched nothing (name drift) or matched more
++/// than one. This is the guard `run_metadata_nemesis` gates each leg on, so a renamed scenario
++/// function fails the leg loudly instead of reporting a green run nobody exercised.
++#[must_use]
++pub fn nemesis_leg_ran_exactly_one(cargo_test_output: &str) -> bool {
++    parse_tests_run(cargo_test_output) == Some(1)
++}
+diff --git a/xtask/tests/nemesis_orchestration.rs b/xtask/tests/nemesis_orchestration.rs
+new file mode 100644
+index 0000000..92a0e91
+--- /dev/null
++++ b/xtask/tests/nemesis_orchestration.rs
+@@ -0,0 +1,154 @@
++//! Unit tests for the metadata **nemesis** leg-enumeration / dispatch-routing / runner-argument
++//! decisions (`xtask::nemesis` — the Check-time flippable coverage, #407, slice 4 of #329;
++//! ADR-0041).
++//!
++//! **Why these tests exist.** The live nemesis legs stand up a ≥3-process FoundationDB cluster
++//! and partition / skew / pause it, which needs a container runtime and privileged networking,
++//! so they are skipped in the unprivileged `cargo xtask ci` gate. "Deferred" means the *green
++//! run* is off-Check; it does NOT mean the harness is unbuilt. The *routing decisions* the legs
++//! turn on are pure, and this file exercises them at Check — mirroring the
++//! `tier1_jepsen_isolation_legs` / `metadata_tier_dispatch` precedents. Each assertion uses an
++//! independent expectation, not the literal the function returns.
++//!
++//! These tests run inside `cargo xtask ci`'s `cargo test --workspace` and go **RED** when a leg
++//! is dropped, when two legs collapse onto one scenario function, when the runner argv stops
++//! building the real fdb-feature scenario invocation, or when the name-drift guard stops
++//! rejecting a leg that ran zero tests.
++
++use xtask::nemesis::{
++    metadata_nemesis_legs, nemesis_leg_ran_exactly_one, nemesis_scenario_args, parse_tests_run,
++    NemesisLegKind, METADATA_NEMESIS_SCENARIO_TEST,
++};
++
++#[test]
++fn campaign_runs_all_three_fault_classes_not_a_subset() {
++    let legs = metadata_nemesis_legs();
++    assert!(
++        legs.contains(&NemesisLegKind::NetworkPartition),
++        "the nemesis campaign must include the live-node network-partition leg (#399 technique); \
++         got legs={legs:?}"
++    );
++    assert!(
++        legs.contains(&NemesisLegKind::ClockSkew),
++        "the nemesis campaign must include the clock-skew leg — the fault class nothing \
++         implemented before #407; got legs={legs:?}"
++    );
++    assert!(
++        legs.contains(&NemesisLegKind::ProcessPause),
++        "the nemesis campaign must include the process-pause leg; got legs={legs:?}"
++    );
++}
++
++#[test]
++fn each_leg_routes_to_its_own_scenario_function() {
++    let legs = metadata_nemesis_legs();
++    // Sharing one scenario function between two legs would silently collapse a fault class into
++    // another — the dispatch must be injective over the campaign.
++    let fns: std::collections::HashSet<&str> = legs.iter().map(|k| k.scenario_fn()).collect();
++    assert_eq!(
++        fns.len(),
++        legs.len(),
++        "each nemesis leg must route to its OWN scenario function, not share one: {legs:?} -> {fns:?}"
++    );
++
++    // The dispatch names each fault it injects — a routing swap flips these behaviourally, not
++    // by a compile error over a renamed constant.
++    assert!(
++        NemesisLegKind::NetworkPartition
++            .scenario_fn()
++            .contains("network_partition"),
++        "the partition leg's function must name the partition it injects: {}",
++        NemesisLegKind::NetworkPartition.scenario_fn()
++    );
++    assert!(
++        NemesisLegKind::ClockSkew
++            .scenario_fn()
++            .contains("clock_skew"),
++        "the clock-skew leg's function must name the skew it injects: {}",
++        NemesisLegKind::ClockSkew.scenario_fn()
++    );
++    assert!(
++        NemesisLegKind::ProcessPause
++            .scenario_fn()
++            .contains("process_pause"),
++        "the pause leg's function must name the pause it injects: {}",
++        NemesisLegKind::ProcessPause.scenario_fn()
++    );
++}
++
++#[test]
++fn runner_argv_carries_the_fdb_feature_and_the_ignored_exact_leg() {
++    // The nemesis drives the real FoundationDB metadata path, so — like the #442 battery legs —
++    // the argv MUST enable `--features fdb` (the backend is off by default) and run the
++    // #[ignore]d scenario function in wyrd-metadata-fdb.
++    let exact = NemesisLegKind::ClockSkew.scenario_fn();
++    let args = nemesis_scenario_args(METADATA_NEMESIS_SCENARIO_TEST, exact);
++    assert_eq!(
++        args[0], "test",
++        "must be a `cargo test` invocation: {args:?}"
++    );
++    let flat = args.join(" ");
++    assert!(
++        flat.contains("wyrd-metadata-fdb"),
++        "must target the metadata-fdb crate: {flat}"
++    );
++    assert!(
++        flat.contains("--features fdb"),
++        "must enable the fdb backend feature so the real store is built: {flat}"
++    );
++    assert!(
++        flat.contains(METADATA_NEMESIS_SCENARIO_TEST),
++        "must run the nemesis scenario binary: {flat}"
++    );
++    assert!(
++        flat.contains("--ignored") && flat.contains("--exact") && flat.contains(exact),
++        "must run exactly the #[ignore]d {exact} leg function: {flat}"
++    );
++}
++
++#[test]
++fn the_name_drift_guard_rejects_a_leg_that_ran_zero_tests() {
++    // `cargo test --exact <fn>` for a name that matches nothing runs ZERO tests and exits 0 — a
++    // silent green no-op. The runner reads the executed count off the output and refuses a leg
++    // unless EXACTLY one test ran, so renaming a scenario function on one side of the dispatch
++    // fails the leg loudly. These are the exact shapes `cargo test` prints.
++    let zero =
++        "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 1 filtered out\n";
++    let one = "\nrunning 1 test\ntest nemesis_metadata_under_clock_skew ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
++    let two = "\nrunning 2 tests\n\ntest result: ok. 2 passed; 0 failed\n";
++
++    assert_eq!(
++        parse_tests_run(zero),
++        Some(0),
++        "a `--exact` filter that matched nothing ran 0 tests"
++    );
++    assert_eq!(parse_tests_run(one), Some(1));
++    assert_eq!(parse_tests_run(two), Some(2));
++
++    // A line whose tail merely BEGINS with "test" but is not cargo's exact "test"/"tests" token
++    // (e.g. a scenario that logged "running 5 testbeds") must NOT be read as a test count. The
++    // loose `tail.starts_with("test")` the parser used to carry would wrongly return Some(5) here;
++    // the tightened `matches!(tail, "test" | "tests")` returns None.
++    assert_eq!(
++        parse_tests_run("running 5 testbeds before the suite\n"),
++        None,
++        "a `running N test…`-lookalike line must not be read as cargo's test count"
++    );
++    assert!(
++        !nemesis_leg_ran_exactly_one("running 5 testbeds before the suite\n"),
++        "a `running N test…`-lookalike line is not evidence the leg's single scenario function ran"
++    );
++
++    assert!(
++        !nemesis_leg_ran_exactly_one(zero),
++        "a leg that ran 0 tests (name drift) must be REJECTED, not read as a green no-op"
++    );
++    assert!(
++        nemesis_leg_ran_exactly_one(one),
++        "a leg that ran exactly its one #[exact] scenario function is accepted"
++    );
++    assert!(
++        !nemesis_leg_ran_exactly_one(two),
++        "a filter that matched more than one test is not the single leg we asked for"
++    );
++}

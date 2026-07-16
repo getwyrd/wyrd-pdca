@@ -29,6 +29,102 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-16 — cycles considered: issue_407, issue_408 (new since 07-10) + issue_399, issue_406, issue_469, issue_470 (froze around the 07-10 review without a narrative entry; issue_438's signals were part of the 07-10 FDB-batch ledger sweep)
+
+## What the cycles' records exposed
+
+- **RECURRING & ACTIONABLE — unregistered host prerequisites discovered at sign-off, third
+  occurrence of the class; the strongest evidence yet that the upstream forcing function
+  (eduralph/pdca-harness#263, filed 07-07, unimplemented) is overdue.** #407 §10: the witnessed
+  `WYRD_TIER1=1 cargo xtask metadata-nemesis` run was **blocked at sign-off** on two missing host
+  packages — `foundationdb-clients` (libfdb_c / fdb_c.h / fdb.options / fdbcli; a *provisioning*
+  miss — the doctor rows for it already exist, added with #438/#492) and `libfaketime` (the skew
+  leg's `WYRD_TIER1_SKEW_SO` bind-mount, `deploy/fdb-multi-replica/docker-compose.faketime.yml:44`
+  — never registered). #408 §6/§10: `unzip` is a hard preflight failure for the consistency
+  runner (`unzip -p` reads the elle-cli version from the jar; elle-cli 0.1.9 has no `--version`),
+  was asked for as a doctor row in **that same issue's v4 carry-forward, and still never landed**
+  — a within-cycle registration ask slipping through is exactly the failure mode #263's forcing
+  function exists to prevent. Prior occurrences: docker/openssl #252-254 (registered reactively,
+  getwyrd/wyrd-pdca#96); protoc #365 (registered at the 07-04 review). The instance-owned half is
+  a delta this review APPLIES (below); the forcing function stays upstream at #263.
+- **The already-routed leaf-sandbox capability classes recurred as predicted — watch items now
+  confirmed overdue, no new delta.** Loopback-bind denial (harness#261) again forced C4 to
+  provisional in #407 (`list_delete.rs:55`) and #408 (`consistency_observable.rs:62`); Docker-API
+  denial (harness#276) is the T3 story of #438/#469/#470 (and #399's NET_ADMIN Jepsen leg);
+  the no-network prior-art tax (harness#277) forced T4/T5 NEEDS-HUMAN in every one of the seven.
+  Each was read correctly by the reviewer as provisional-not-defect; the fixes are upstream.
+- **Working well — record as evidence, no delta.** (a) #406's §6 shows the intended lifecycle of
+  sandbox-artifact NEEDS-HUMAN rows: the human re-ran the full Check on a capable box and marked
+  each row **CLEARED** inline with the re-run evidence — the class retired properly instead of
+  accumulating. (b) #408's adversary ran fully **execution-backed** ("none provisional": re-ran
+  the pinned elle-cli jar, reproduced both live verdicts, mutated the history to prove verdict
+  sensitivity, byte-diffed the committed report against the runner artifact) — the strongest
+  Check in the record, showing the toolchain-provisioning chain (ensure-cargo.sh, #236, doctor
+  rows) paying off where the leaf sandbox permits execution. (c) #407's iteration-2/3
+  carry-forward defects were each verified fixed on the target by the adversary — the
+  iteration loop converging as designed.
+- **Fitness-to-purpose (V) NEEDS-HUMAN in all seven — always-human by design** (INTEGRATION.md
+  §4); #408's absorbed-fault question ("the materialized fault never touched a single op — is
+  this the checked-run-under-failure #329 intends?") is the model of the class: disclosed by the
+  artifact itself, decided by the human, follow-up routed to the tracker (below). Structural — no
+  delta, consistent with every prior review.
+
+## Process deltas
+
+- **Instance config (this repo): two new `pdca doctor` prerequisite rows** — `unzip (elle-cli
+  jar preflight)` (`unzip -v`; the #408 consistency-run preflight hard-fails without it; the
+  twice-asked v4 carry-forward, now landed) and `libfaketime (Tier-1 skew leg)`
+  (`test -f "${WYRD_TIER1_SKEW_SO:-/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1}"`; the
+  #407 skew-leg bind-mount, discovered missing at sign-off). Both WARN, group `engine`, same
+  posture as the docker/openssl/protoc/fdb rows: only the opt-in off-Check legs need them.
+  (`pdca.toml` — after the elle-cli row, ~`pdca.toml:722-751`.) The uncommitted `java` +
+  `elle-cli` rows added at the #408 sign-off are recorded here as part of the same registration
+  wave and land in the same commit.
+- **No spec-template / ruleset / gate / agent-skill delta warranted.** The recurring signals are
+  either upstream capability gaps already filed (#261/#276/#277/#278), the unimplemented upstream
+  forcing function (#263 — reinforced by the #408 unzip evidence, not re-filed), or always-human
+  classes working as designed. A forced change would be worse than none.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Tracker (Wyrd, #408 §10 + adversary finding) — witnessed consistency-run under a
+  client-visible / quorum-costing fault.** The #408 report's fault was fully absorbed by FDB's
+  quorum (720/720 ops ok, `info: 0`), so the checked histories are observationally identical to
+  healthy-cluster ones; the follow-up run must let the fault escape the tolerance envelope so the
+  history itself carries it (`info > 0`). Post-0.1-alpha, alongside the real-hardware /
+  long-duration campaign. → **FILED getwyrd/wyrd#573** (2026-07-16).
+- **Upstream reinforcement (no new issue) — harness#263.** The #408 unzip case (a doctor-row ask
+  carried forward *within* the same issue's iterations and still unlanded at sign-off) is direct
+  evidence the registration must be a forcing function, not a convention. Recorded here; fold the
+  case into #263 when it is implemented.
+- **No routing needed for #399/#406/#438/#469/#470** — every §6/§10 signal maps onto an
+  already-filed item (#261 loopback, #276 Docker API, #277 gh network, #278 infra-empty leaf,
+  getwyrd/wyrd#442 FDB go/no-go).
+
+## Still open (carried)
+
+- Upstream harness: **#261** (loopback bind), **#276** (Docker API), **#277** (gh network),
+  **#278** (infra-empty advisory), **#262** (base parser), **#263** (doctor forcing function —
+  reinforced this review) — all recurred or stayed load-bearing this batch; confirm progress
+  next review.
+- **issue_115** (ACCEPTED, 2026-06-20) and **issue_153** (discontinued, 2026-06-21) remain absent
+  from the frozen index → carried.
+- Prior reviews' carried items unchanged: getwyrd/wyrd#426 (shared-conformance-pin governance),
+  #442 (FDB go/no-go — #407/#408 build directly on its battery; watch it record before the FDB
+  default flips), #367 (first-deployment gate convergence), the #455/#256/#364/#365 tracker
+  follow-ups.
+
+## How effectiveness will be judged
+
+- The next off-Check witnessed run (nemesis, consistency-run, or the #442 battery) should find
+  its host prerequisites **preflighted by `pdca doctor`**, not discovered at sign-off — a fourth
+  occurrence of the class after these rows land means the instance-side registration is not
+  enough and #263 must be prioritized.
+- **getwyrd/wyrd#573** should appear scheduled (post-0.1-alpha) at the next review; the #408
+  report's absorbed-fault caveat stays auditable through it.
+- The upstream capability items (#261/#276/#277) recurring for a third consecutive review would
+  make them the dominant standing tax on Check — escalate priority upstream if so.
+
 # Act review — 2026-07-15 — cycles considered: issue_398, issue_399, issue_406, issue_430, issue_431, issue_469, issue_470, issue_490, issue_554
 
 > The nine frozen cycles the ledger had not yet counted (58 → 67): #469/#470 froze 2026-07-10
