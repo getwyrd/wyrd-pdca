@@ -1,4 +1,12 @@
-# Issue 407 — UNPLANNED (no brief.md this cycle)
+# Issue 407 — UNPLANNED (no brief.md this cycle) — **SUPERSEDED 2026-07-15**
+
+> **SUPERSEDED by this bundle's `brief.md` (Plan, 2026-07-15).** Both blocking gaps below
+> have closed since 2026-07-07: gap 1 — #257, #256 and #406 are all CLOSED on the tracker
+> (#406 via getwyrd/wyrd PR #479; the #442 battery, commit 60469a4, additionally landed the
+> shared fault scenario + live FDB multi-replica runner); gap 2 — the brief scopes the
+> binding criterion to the Check-testable core (`xtask/tests/nemesis_orchestration.rs`,
+> the established `metadata_faults.rs` flippable-seam pattern) with the live legs opt-in
+> off-Check, so RED is producible on the environment Do gets. Kept for the record.
 
 > This is **not** a brief. The driver keys off `brief.md`; its absence leaves 407
 > unplanned. This note records *why*, per the Plan leaf's instruction to leave a

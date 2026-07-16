@@ -1,0 +1,1802 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d60d242..2aceba6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5194,6 +5194,7 @@ dependencies = [
+  "wyrd-custodian",
+  "wyrd-gateway-core",
+  "wyrd-gateway-s3",
++ "wyrd-metadata-fault-conformance",
+  "wyrd-metadata-fdb",
+  "wyrd-metadata-redb",
+  "wyrd-metadata-tikv",
+diff --git a/crates/server/Cargo.toml b/crates/server/Cargo.toml
+index 4f89722..2d0e6c2 100644
+--- a/crates/server/Cargo.toml
++++ b/crates/server/Cargo.toml
+@@ -104,6 +104,12 @@ tower.workspace = true
+ [dev-dependencies]
+ wyrd-chunk-format.workspace = true
+ wyrd-testkit.workspace = true
++# The #407 composable-nemesis lifecycle seam (`nemesis::{NemesisLeg, drive_leg, PartitionLeg,
++# ClockSkewLeg, ProcessPauseLeg}`), consumed as-is by the #408 live checked-consistency
++# scenario (`tests/consistency_run_fdb.rs`, `fdb`-feature-gated). Trait-only + `docker`
++# shell-outs (no `libfdb_c` linkage of its own), so it is a normal dev-dependency here — it
++# does not widen the default build graph.
++wyrd-metadata-fault-conformance.workspace = true
+ tempfile.workspace = true
+ # `test-util` adds the `start_paused` virtual clock so the alloc_inode budget test
+ # auto-advances through its backoff sleeps instead of waiting the real budget.
+diff --git a/crates/server/tests/consistency_run_fdb.rs b/crates/server/tests/consistency_run_fdb.rs
+new file mode 100644
+index 0000000..c51b762
+--- /dev/null
++++ b/crates/server/tests/consistency_run_fdb.rs
+@@ -0,0 +1,352 @@
++//! **The live checked-consistency run under a #407 nemesis leg** (#408, slice 5 of #329;
++//! ADR-0041 "nemesis first, then the checked artifact"). Hosts the production server + S3
++//! gateway on a loopback listener — the composition `s3_http_wire.rs`'s `start_gateway` and
++//! #405's `consistency_observable.rs` test already mirror — backed by the real
++//! `FdbMetadataStore` pointed at the live `deploy/fdb-multi-replica` cluster (`crates/server/src/cli.rs:122,141`,
++//! `crates/server/Cargo.toml:31`). It drives the #406 checked register + directory workload
++//! (`consistency_observable::ObservableS3Client`, `consistency_workload::{MultiProcessHistory,
++//! DirectoryHistory}`) through concurrent clients, injects a #407 nemesis leg mid-window via
++//! `wyrd_metadata_fault_conformance::nemesis::drive_leg` — consumed **as-is**, never reopening
++//! its lifecycle logic (the brief's Ordering note) — and writes the Elle-EDN histories plus a
++//! machine-readable **run summary** under `$WYRD_CONSISTENCY_OUTPUT_DIR`
++//! (`target/consistency-run/` by default): the seam `xtask::consistency_run` (Design §2)
++//! derives the non-vacuity gate / elle-cli verdict / report from, entirely off this file.
++//!
++//! **Off-Check by construction.** `#[ignore]`d, `fdb`-feature-gated, and env-gated: absent
++//! `WYRD_FDB_CLUSTER_FILE` it skips cleanly (mirrors `crates/metadata-fdb/tests/
++//! tier1_metadata_nemesis.rs`'s clean-skip shape), so `cargo xtask ci` stays green with no FDB,
++//! no Docker, no JVM (the test-graph constraint: this file is compiled only under `--features
++//! fdb`, never in the default build graph the named xtask orchestration test's crate lives in).
++//! Launched only by `WYRD_TIER1=1 cargo xtask consistency-run`
++//! (`xtask/src/consistency_run_runner.rs`), which resolves the fault topology, exports every
++//! env var this file reads, and derives the verdict/report from the summary + elle-cli output —
++//! this file never shells `java` (ADR-0041's own MUST).
++
++/// The FDB cluster file, or `None` when FDB is not configured (clean-skip gate — mirrors
++/// `tier1_metadata_nemesis.rs::cluster_file`).
++fn cluster_file() -> Option<String> {
++    match std::env::var("WYRD_FDB_CLUSTER_FILE") {
++        Ok(raw) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
++        _ => None,
++    }
++}
++
++#[test]
++#[ignore = "privileged #408: live 3-process FDB cluster + a #407 nemesis leg (cargo xtask consistency-run)"]
++fn consistency_run_fdb() {
++    let Some(cluster_file) = cluster_file() else {
++        eprintln!(
++            "wyrd-server: WYRD_FDB_CLUSTER_FILE not set — skipping the #408 checked consistency \
++             run."
++        );
++        return;
++    };
++    run(cluster_file);
++}
++
++/// Without `--features fdb` the crate cannot link `libfdb_c`, so the live body is compiled out;
++/// this stub keeps the test binary building under the default `cargo xtask ci` gate and skips
++/// loudly if a cluster file is somehow set (mirrors `tier1_metadata_nemesis.rs`'s
++/// `skip_without_fdb`).
++#[cfg(not(feature = "fdb"))]
++fn run(cluster_file: String) {
++    let _ = cluster_file;
++    eprintln!(
++        "wyrd-server: WYRD_FDB_CLUSTER_FILE is set but the crate was built without `--features \
++         fdb` — skipping the #408 checked consistency run. Run via `cargo xtask consistency-run`."
++    );
++}
++
++#[cfg(feature = "fdb")]
++fn run(cluster_file: String) {
++    use std::net::SocketAddr;
++    use std::path::PathBuf;
++    use std::sync::Arc;
++
++    use wyrd_chunkstore_fs::FsChunkStore;
++    use wyrd_coordination_mem::MemCoordination;
++    use wyrd_gateway_s3::sigv4::Credentials;
++    use wyrd_gateway_s3::{S3Config, S3Gateway};
++    use wyrd_metadata_fault_conformance::nemesis::{
++        drive_leg, ClockSkewLeg, PartitionLeg, ProcessPauseLeg,
++    };
++    use wyrd_metadata_fdb::FdbMetadataStore;
++    use wyrd_server::Gateway;
++
++    const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++    const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++
++    type Backend = Gateway<FdbMetadataStore, FsChunkStore, MemCoordination>;
++
++    fn required_env(name: &str) -> String {
++        std::env::var(name).unwrap_or_else(|_| {
++            panic!("{name} must be set by the runner (cargo xtask consistency-run)")
++        })
++    }
++
++    let leg_kind = std::env::var("WYRD_CONSISTENCY_NEMESIS")
++        .unwrap_or_else(|_| "network-partition".to_string());
++    let target_addr = required_env("WYRD_CONSISTENCY_TARGET_ADDR");
++    let target_ip = required_env("WYRD_CONSISTENCY_TARGET_IP");
++    let target_service = required_env("WYRD_CONSISTENCY_TARGET_SERVICE");
++    let target_container = required_env("WYRD_CONSISTENCY_TARGET_CONTAINER");
++    let survivor_container = required_env("WYRD_CONSISTENCY_SURVIVOR_CONTAINER");
++    let iptables_image = std::env::var("WYRD_CONSISTENCY_IPTABLES_IMAGE")
++        .unwrap_or_else(|_| "wyrd-iptables:local".to_string());
++    let compose_file = required_env("WYRD_CONSISTENCY_COMPOSE_FILE");
++    let faketime_override = required_env("WYRD_CONSISTENCY_FAKETIME_OVERRIDE");
++    let output_dir = PathBuf::from(required_env("WYRD_CONSISTENCY_OUTPUT_DIR"));
++    std::fs::create_dir_all(&output_dir).expect("create the consistency-run output dir");
++
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()
++        .expect("tokio runtime");
++
++    // ── Bring-up: the production server + S3 gateway on loopback, backed by the real
++    // FdbMetadataStore (the `s3_http_wire.rs` / #405 composition, over the live cluster). The
++    // spawned `serve` task keeps running on `runtime` across the later `block_on` calls below —
++    // including the one made WHILE the nemesis fault is active.
++    let addr: SocketAddr = runtime.block_on(async {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let prefix = format!("wyrd-consistency-run/{}/", std::process::id()).into_bytes();
++        let store = FdbMetadataStore::open(&cluster_file)
++            .expect("open the FoundationDB metadata store")
++            .with_prefix(prefix);
++        let gateway: Arc<Backend> = Arc::new(Gateway::new(
++            store,
++            FsChunkStore::open(dir.path()).expect("fs store"),
++            MemCoordination::new(),
++        ));
++        let config = S3Config::new(vec![Credentials {
++            access_key_id: ACCESS_KEY.to_string(),
++            secret_access_key: SECRET_KEY.to_string(),
++        }]);
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++            .await
++            .expect("bind");
++        let addr = listener.local_addr().expect("addr");
++        let server = S3Gateway::new(Arc::clone(&gateway), config);
++        tokio::spawn(async move {
++            server.serve(listener).await.expect("serve");
++        });
++        // The chunk-store tempdir must outlive the whole scenario process; a short-lived,
++        // opt-in, single-shot process leaking one tempdir is the same trade `s3_http_wire.rs`
++        // makes by RETURNING its `TempDir` guard to the caller — here there is no caller to
++        // hold it, so it is deliberately forgotten rather than dropped mid-run.
++        std::mem::forget(dir);
++        addr
++    });
++
++    // ── Drive the checked workload UNDER the still-active fault (`drive_leg` encloses it) ──
++    // Each arm builds the SAME leg kind #407 defined, resolved from fully-qualified env the
++    // runner computed — never re-deriving the compose ip/container table here.
++    let outcome = match leg_kind.as_str() {
++        "network-partition" | "partition" => {
++            let leg = PartitionLeg::new(
++                target_addr,
++                target_ip,
++                target_container,
++                survivor_container,
++                iptables_image,
++            );
++            drive_leg(&leg, || runtime.block_on(drive_checked_workload(addr))).expect(
++                "partition leg must materialize, drive the checked workload, and heal completely",
++            )
++        }
++        "clock-skew" => {
++            let floor_secs = std::env::var("WYRD_CONSISTENCY_SKEW_FLOOR_SECS")
++                .ok()
++                .and_then(|v| v.parse::<u64>().ok())
++                .unwrap_or(60);
++            let leg = ClockSkewLeg::new(
++                compose_file,
++                faketime_override,
++                target_service,
++                target_container,
++                survivor_container,
++                floor_secs,
++            );
++            drive_leg(&leg, || runtime.block_on(drive_checked_workload(addr))).expect(
++                "clock-skew leg must offset the node clock past the floor, drive the checked \
++                 workload, and heal completely",
++            )
++        }
++        "process-pause" => {
++            let leg = ProcessPauseLeg::new(target_addr, target_container, survivor_container);
++            drive_leg(&leg, || runtime.block_on(drive_checked_workload(addr))).expect(
++                "pause leg must serve→freeze→serve, drive the checked workload, and heal \
++                 completely",
++            )
++        }
++        other => panic!(
++            "unknown WYRD_CONSISTENCY_NEMESIS leg `{other}` (expected `network-partition` \
++             [default], `clock-skew`, or `process-pause`)"
++        ),
++    };
++    let (register, directory) = outcome;
++
++    // `drive_leg`'s own contract (`nemesis.rs`: the workload runs only WHILE
++    // `evidence.materialized()` is true, and a non-materialized leg fails BEFORE the workload
++    // ever runs) means reaching this line already IS the materialization witness — this
++    // scenario does not re-derive or re-check the leg's own oracle, only records that its
++    // guarantee held.
++    let nemesis_materialized = true;
++    let genuinely_concurrent = register.is_genuinely_concurrent();
++    let register_ops = register.ops().len();
++    let directory_ops = directory.ops().len();
++
++    std::fs::write(
++        output_dir.join("register-history.edn"),
++        register.to_elle_edn(),
++    )
++    .expect("write register-history.edn");
++    std::fs::write(
++        output_dir.join("directory-history.edn"),
++        directory.to_elle_edn(),
++    )
++    .expect("write directory-history.edn");
++
++    let workload_description =
++        "register overwrite PUT/GET (2 processes: writer, reader) + directory create/delete/\
++         probe (2 processes: creator/deleter, prober), over the S3 wire against the live FDB \
++         cluster";
++    let summary = format!(
++        "{{\"workload\":\"{workload_description}\",\"nemesis_leg\":\"{leg_kind}\",\"genuinely_concurrent\":{genuinely_concurrent},\"nemesis_materialized\":{nemesis_materialized},\"register_ops\":{register_ops},\"directory_ops\":{directory_ops}}}"
++    );
++    std::fs::write(output_dir.join("run-summary.json"), summary).expect("write run-summary.json");
++
++    assert!(
++        genuinely_concurrent,
++        "the checked register workload produced NO genuinely concurrent (#406 INV-2) overlap — \
++         the run summary would be vacuous and the runner's non-vacuity gate would refuse a \
++         verdict; register ops recorded: {register_ops}"
++    );
++    assert!(
++        register_ops > 0 && directory_ops > 0,
++        "both the register and directory histories must be non-empty (register: {register_ops}, \
++         directory: {directory_ops})"
++    );
++}
++
++/// Drive the #406 checked register + directory workload over the real S3 wire and return the
++/// merged, real-time-ordered histories — called from INSIDE the nemesis fault window (the
++/// `drive_leg` workload closure), so every op genuinely races the fault.
++#[cfg(feature = "fdb")]
++async fn drive_checked_workload(
++    addr: std::net::SocketAddr,
++) -> (
++    wyrd_server::consistency_workload::MultiProcessHistory,
++    wyrd_server::consistency_workload::DirectoryHistory,
++) {
++    use wyrd_gateway_s3::sigv4::Credentials;
++    use wyrd_server::consistency_observable::{ObservableS3Client, OpKind};
++    use wyrd_server::consistency_workload::{
++        DirOpKind, DirRecord, DirectoryHistory, MultiProcessHistory,
++    };
++
++    const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++    const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++    const REGION: &str = "us-east-1";
++    const BUCKET: &str = "wyrd-consistency-run";
++    const ROUNDS: u64 = 60;
++
++    fn client(addr: std::net::SocketAddr) -> ObservableS3Client {
++        let creds = Credentials {
++            access_key_id: ACCESS_KEY.to_string(),
++            secret_access_key: SECRET_KEY.to_string(),
++        };
++        ObservableS3Client::new(addr, BUCKET, creds, REGION)
++    }
++
++    // ── Register model: process 0 the sole writer overwriting a shared key, process 1 a
++    // concurrent reader — the SAME positive-witness shape #406's own
++    // `concurrent_workload_records_a_nonvacuous_genuinely_concurrent_history` test proves
++    // produces a real-time-overlapping same-key read↔write pair across distinct processes
++    // (INV-2), driven here against the LIVE cluster instead of the in-memory redb backend.
++    let register_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
++    let writer = {
++        let mut c = client(addr);
++        let barrier = register_barrier.clone();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for v in 1..=ROUNDS {
++                let _ = c.put("checked-register", v).await;
++            }
++            c.into_history()
++        })
++    };
++    let reader = {
++        let mut c = client(addr);
++        let barrier = register_barrier.clone();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for _ in 0..ROUNDS {
++                let _ = c.get("checked-register").await;
++            }
++            c.into_history()
++        })
++    };
++    let register_histories = vec![
++        writer.await.expect("writer task"),
++        reader.await.expect("reader task"),
++    ];
++    let register = MultiProcessHistory::merge(&register_histories);
++
++    // ── Directory-as-set model: process 0 creates then deletes members, process 1 probes them
++    // concurrently. Over this S3 floor, create=PUT / delete=DELETE / membership=GET-probe ARE
++    // the wire calls `ObservableS3Client::put/delete/get` already drives
++    // (`consistency_workload.rs:18-20`) — so the SAME real wire round trips are reinterpreted
++    // as directory ops below, rather than adding new production wire-calling code.
++    let dir_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
++    let mutator = {
++        let mut c = client(addr);
++        let barrier = dir_barrier.clone();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for i in 0..ROUNDS {
++                let member = format!("dir/member-{i}");
++                let _ = c.put(&member, 1).await; // create
++                let _ = c.delete(&member).await; // delete
++            }
++            c.into_history()
++        })
++    };
++    let prober = {
++        let mut c = client(addr);
++        let barrier = dir_barrier.clone();
++        tokio::spawn(async move {
++            barrier.wait().await;
++            for i in 0..ROUNDS {
++                let member = format!("dir/member-{i}");
++                let _ = c.get(&member).await; // membership probe
++            }
++            c.into_history()
++        })
++    };
++    let mutator_history = mutator.await.expect("mutator task");
++    let prober_history = prober.await.expect("prober task");
++
++    let mut dir_records: Vec<DirRecord> = Vec::new();
++    for (process, history) in [mutator_history, prober_history].iter().enumerate() {
++        for op in history.ops() {
++            let op_kind = match op.kind {
++                OpKind::Put => DirOpKind::Create,
++                OpKind::Delete => DirOpKind::Delete,
++                OpKind::Get => DirOpKind::Probe,
++            };
++            dir_records.push(DirRecord {
++                process,
++                op: op_kind,
++                member: op.key.clone(),
++                status: op.status,
++                start: op.start,
++                end: op.end,
++            });
++        }
++    }
++    dir_records.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
++    let directory = DirectoryHistory::from_records(dir_records);
++
++    (register, directory)
++}
+diff --git a/xtask/src/consistency_run.rs b/xtask/src/consistency_run.rs
+new file mode 100644
+index 0000000..170ba76
+--- /dev/null
++++ b/xtask/src/consistency_run.rs
+@@ -0,0 +1,449 @@
++//! **The checked consistency run + public credibility artifact** (#408, slice 5 of #329;
++//! ADR-0041). The **host-independent** run-orchestration plan, the summary-based inconclusive
++//! gate, the pinned elle-cli invocation builder, the verdict parser, the report renderer, and
++//! the opted-in-but-missing-environment error paths — all pure functions with no privileged I/O
++//! (no `docker`, no `java`, no `libfdb_c`), mirroring [`crate::metadata_faults`] and
++//! [`crate::nemesis`]: the privileged live run is deferred / off-Check (`WYRD_TIER1=1`), but the
++//! *decisions* it turns on are pure and unit-tested inside the unprivileged `cargo xtask ci`
++//! gate — the "deferred ≠ unbuilt" bar.
++//!
++//! # The seam (Design §2)
++//!
++//! The **run summary** is the seam between the server-side live scenario
++//! (`crates/server/tests/consistency_run_fdb.rs`, feature-gated `fdb`, off-Check) and this
++//! module: the scenario writes a JSON summary carrying the #406 INV-2 concurrency witness
++//! ([`consistency_workload::MultiProcessHistory::is_genuinely_concurrent`], not importable
++//! here) and the #407 nemesis materialization evidence, and this module derives
++//! inconclusive/verdict/report from the summary + checker output alone — never from
++//! `wyrd-server` types. That is exactly what keeps the gate arithmetic testable at Check
++//! without `xtask` gaining a `wyrd-server`/FDB/JVM dependency (Design §1).
++//!
++//! # The checker contract, pinned (Design §3)
++//!
++//! `java -jar $WYRD_ELLE_CLI_JAR --model rw-register <register-history.edn>` /
++//! `--model set-full <directory-history.edn>`. Verdict = the per-file `true`/`false` line +
++//! exit status; `false`, a non-zero exit, or unparseable output is a run FAILURE, **never** a
++//! silent pass ([`parse_checker_output`]).
++//!
++//! # Non-vacuity is a gate, not a note (Design §4)
++//!
++//! [`evaluate_summary`] refuses a verdict unless the run summary attests BOTH a genuinely
++//! concurrent history (INV-2) AND a materialized nemesis fault — the #250 failure mode
++//! (a vacuous history slipping through) this issue exists to bury.
++//!
++//! # What is default-compiled vs deferred
++//!
++//! Everything here is an ordinary `std` + `serde_json` module with **no** `wyrd-server`, FDB,
++//! Docker, Java, or elle-cli dependency, so it compiles unconditionally and is imported by
++//! `xtask/tests/consistency_run_orchestration.rs` (the Check-time flippable coverage) AND by
++//! the impure runner (`xtask/src/consistency_run_runner.rs`, wired from `main.rs`, which does
++//! the actual bring-up / shell-out / JVM invocation, off-Check).
++
++use crate::nemesis::NemesisLegKind;
++
++// ─── Run-orchestration plan (Design §2) ────────────────────────────────────────────────
++
++/// The ordered stages one checked consistency run passes through: bring the cluster up, drive
++/// the #406 workload, open the #407 nemesis window (enclosing the workload, per
++/// `nemesis::drive_leg`), heal the fault, export the Elle-EDN histories + run summary, obtain
++/// the checker verdict, and render the report. A stage dropped from this list is a pipeline
++/// step the runner silently stopped performing — [`run_plan`] is what
++/// `consistency_run_orchestration.rs` pins so that regression flips red, not merely absent.
++pub const RUN_STAGES: [&str; 7] = [
++    "bring-up",
++    "workload",
++    "nemesis-window",
++    "heal",
++    "export",
++    "check",
++    "report",
++];
++
++/// The run-orchestration plan, in order (Design §2). Pure — a plain slice the orchestration
++/// unit test inspects directly.
++#[must_use]
++pub fn run_plan() -> &'static [&'static str] {
++    &RUN_STAGES
++}
++
++/// The in-repo fdb-feature checked-consistency scenario test binary (the `cargo test --test
++/// <name>` target), launched by the runner exactly as the FDB fault battery launches its
++/// scenarios (Design §1: `xtask` shells out to `cargo test -p wyrd-server --features fdb`, so
++/// `xtask` itself gains no `wyrd-server`/FDB/JVM dependency).
++pub const CONSISTENCY_RUN_SCENARIO_TEST: &str = "consistency_run_fdb";
++
++/// The `cargo test -p wyrd-server --features fdb --test <name> -- --ignored --nocapture` argv
++/// that runs the live checked-consistency scenario. Mirrors
++/// [`crate::metadata_faults::metadata_scenario_args`] / `fdb_faults::run_leg`'s literal argv —
++/// the scenario drives the real `FdbMetadataStore` behind the unchanged trait, so the argv MUST
++/// carry `--features fdb` (off by default, so the whole-tree gate compiles the empty skeleton).
++#[must_use]
++pub fn consistency_run_scenario_args(test: &str) -> [&str; 10] {
++    [
++        "test",
++        "-p",
++        "wyrd-server",
++        "--features",
++        "fdb",
++        "--test",
++        test,
++        "--",
++        "--ignored",
++        "--nocapture",
++    ]
++}
++
++// ─── Nemesis-leg selection (Design §2: "partition first; skew/pause selectable") ───────
++
++/// Resolve which #407 nemesis leg the checked run injects, from the `WYRD_CONSISTENCY_NEMESIS`
++/// env value (or its absence). **Partition is the default** (Design §2), never a silent "no
++/// fault" — an unrecognized value is a hard configuration error, not a fallback, so a typo'd
++/// leg name cannot silently downgrade the run to an easier fault. Reuses
++/// [`crate::nemesis::NemesisLegKind`] rather than re-deriving a second leg enum (the seam is
++/// ONE importable lifecycle, Design §1) — #408 selects among the SAME three legs #407 defined,
++/// it does not invent a fourth.
++///
++/// # Errors
++/// An unrecognized leg name.
++pub fn selected_leg(raw: Option<&str>) -> Result<NemesisLegKind, String> {
++    match raw.map(str::trim) {
++        None | Some("") | Some("partition") | Some("network-partition") => {
++            Ok(NemesisLegKind::NetworkPartition)
++        }
++        Some("clock-skew") => Ok(NemesisLegKind::ClockSkew),
++        Some("process-pause") => Ok(NemesisLegKind::ProcessPause),
++        Some(other) => Err(format!(
++            "unknown WYRD_CONSISTENCY_NEMESIS leg `{other}` (expected `partition` [default], \
++             `clock-skew`, or `process-pause`)"
++        )),
++    }
++}
++
++// ─── The run summary — the seam (Design §2) ────────────────────────────────────────────
++
++/// The machine-readable run summary the live scenario writes under
++/// `target/consistency-run/run-summary.json` — the seam between the server-side scenario and
++/// this xtask runner (Design §2). Carries exactly what the non-vacuity gate and the report need:
++/// the #406 INV-2 witness, the #407 materialization evidence, and the per-model history sizes.
++#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct RunSummary {
++    /// A human-readable description of the workload driven (report field 1).
++    pub workload: String,
++    /// The #407 nemesis leg injected, as [`NemesisLegKind::as_str`] (report field 2).
++    pub nemesis_leg: String,
++    /// The #406 INV-2 witness: `MultiProcessHistory::is_genuinely_concurrent()` over the merged
++    /// register history. `false` ⇒ the run is inconclusive (Design §4).
++    pub genuinely_concurrent: bool,
++    /// The #407 typed materialization evidence's `materialized()` — whether the injected fault
++    /// provably bit. `false` ⇒ the run is inconclusive (Design §4, the #442 "a note is not a
++    /// gate" rule).
++    pub nemesis_materialized: bool,
++    /// Register-history op count (report field 3, register half).
++    pub register_ops: usize,
++    /// Directory-history op count (report field 3, directory half).
++    pub directory_ops: usize,
++}
++
++/// Parse a run summary from its JSON text. Malformed JSON (a missing field, a type mismatch) is
++/// a hard error — never a default-filled summary that could accidentally read as conclusive.
++///
++/// # Errors
++/// The JSON is malformed or missing a required field.
++pub fn parse_run_summary(json: &str) -> Result<RunSummary, String> {
++    serde_json::from_str(json).map_err(|e| format!("malformed run summary JSON: {e}"))
++}
++
++/// Why a run is **inconclusive** (Design §4) — non-vacuity is a gate, not a note. Both variants
++/// are independent (checked in order, but either alone is sufficient to block a verdict).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum InconclusiveReason {
++    /// The #406 INV-2 witness did not hold: no same-key read↔write overlap across distinct
++    /// processes, so the history proves nothing about concurrent behavior (the #250 failure
++    /// mode).
++    NotGenuinelyConcurrent,
++    /// The #407 nemesis leg did not provably materialize — the run never actually exercised a
++    /// fault, so a verdict over it would be a "note", not a gate.
++    NemesisNotMaterialized,
++}
++
++impl InconclusiveReason {
++    /// A human-readable diagnosis for the report / stderr.
++    #[must_use]
++    pub fn message(self) -> &'static str {
++        match self {
++            InconclusiveReason::NotGenuinelyConcurrent => {
++                "the run summary does not attest a genuinely concurrent history (#406 INV-2 \
++                 witness) — a vacuous history proves nothing, refusing to report a verdict"
++            }
++            InconclusiveReason::NemesisNotMaterialized => {
++                "the run summary does not attest a materialized #407 nemesis fault — a fault \
++                 that never bit proves nothing, refusing to report a verdict"
++            }
++        }
++    }
++}
++
++/// **The non-vacuity gate (Design §4).** Before any verdict is reported, the run summary MUST
++/// attest BOTH: (a) the INV-2 concurrency witness held, and (b) the nemesis fault materialized.
++/// Failing either makes the run **inconclusive** — this is xtask-side arithmetic over the
++/// summary alone, never a re-derivation of the checker's own linearizability decision.
++///
++/// # Errors
++/// [`InconclusiveReason`] naming which attestation is missing.
++pub fn evaluate_summary(summary: &RunSummary) -> Result<(), InconclusiveReason> {
++    if !summary.genuinely_concurrent {
++        return Err(InconclusiveReason::NotGenuinelyConcurrent);
++    }
++    if !summary.nemesis_materialized {
++        return Err(InconclusiveReason::NemesisNotMaterialized);
++    }
++    Ok(())
++}
++
++// ─── The checker contract, pinned (Design §3) ──────────────────────────────────────────
++
++/// The register-history model name (`--model rw-register`), for the main leg (Design §3, ADR-0041
++/// §Decision 1).
++pub const MODEL_REGISTER: &str = "rw-register";
++/// The directory-as-set history model name (`--model set-full`), for the secondary leg
++/// (Design §3, ADR-0041 §Decision 2).
++pub const MODEL_DIRECTORY_SET: &str = "set-full";
++
++/// Build the `java -jar $WYRD_ELLE_CLI_JAR --model <model> <history_path>` argv (Design §3) —
++/// pure so the pinned invocation shape is unit-tested without a JVM. The runner passes this to
++/// `Command::new("java").args(...)`.
++#[must_use]
++pub fn elle_invocation(jar: &str, model: &str, history_path: &str) -> Vec<String> {
++    vec![
++        "-jar".to_string(),
++        jar.to_string(),
++        "--model".to_string(),
++        model.to_string(),
++        history_path.to_string(),
++    ]
++}
++
++/// The verdict-or-failure a checker invocation resolved to. There is deliberately **no**
++/// third "unknown, treat as pass" state — [`parse_checker_output`] only ever returns [`Pass`]
++/// when the pinned contract is fully satisfied (Design §3: "never a silent pass").
++///
++/// [`Pass`]: CheckOutcome::Pass
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CheckOutcome {
++    /// The checker's trailing verdict line was `true` AND the process exited successfully.
++    Pass,
++    /// A run failure, naming why: the checker returned `false`, exited non-zero, or the output
++    /// could not be parsed at all.
++    Fail(String),
++}
++
++impl CheckOutcome {
++    /// `true` iff this is [`CheckOutcome::Pass`] — the ONLY state the fixtures self-check and
++    /// the report may render as a pass.
++    #[must_use]
++    pub fn is_pass(&self) -> bool {
++        matches!(self, CheckOutcome::Pass)
++    }
++}
++
++/// Parse one elle-cli invocation's stdout + exit status into a [`CheckOutcome`], per the pinned
++/// contract (Design §3): the verdict is the per-file `true`/`false` **trailing** line + exit
++/// status. `false`, a non-zero exit, or unparseable output is a run FAILURE — never a silent
++/// pass. Blank trailing lines are skipped so a checker that pads its output with a trailing
++/// newline is still read correctly.
++#[must_use]
++pub fn parse_checker_output(stdout: &str, exit_success: bool) -> CheckOutcome {
++    let trailing = stdout.lines().map(str::trim).rev().find(|l| !l.is_empty());
++    match trailing {
++        Some("false") => CheckOutcome::Fail(
++            "the checker's trailing verdict line was `false` — a genuine consistency violation"
++                .to_string(),
++        ),
++        Some("true") if exit_success => CheckOutcome::Pass,
++        Some("true") => CheckOutcome::Fail(
++            "the checker's trailing verdict line was `true` but the process exited non-zero — \
++             the exit status is authoritative, never overridden by a stray `true` line"
++                .to_string(),
++        ),
++        Some(other) => CheckOutcome::Fail(format!(
++            "unparseable checker output — the trailing non-blank line was `{other}`, neither \
++             `true` nor `false`; never a silent pass"
++        )),
++        None => CheckOutcome::Fail(
++            "unparseable checker output — no trailing true/false verdict line; never a silent \
++             pass"
++                .to_string(),
++        ),
++    }
++}
++
++// ─── Fixtures self-check (Design §4) ───────────────────────────────────────────────────
++
++/// Whether a fixture's checker-output parse matches what a well-behaved elle-cli SHOULD say
++/// about it: the known-good fixture must parse [`CheckOutcome::Pass`], the known-bad fixture
++/// must parse a [`CheckOutcome::Fail`]. Pure comparison over [`parse_checker_output`]'s own
++/// result, so it is unit-tested at Check against committed fixture outputs (Design §4's
++/// Check-time half of the two-tier fixtures); the off-Check runner reuses this SAME function
++/// against the REAL elle-cli's output for the fixtures self-check (checker-acceptance
++/// demonstrated where the JVM is allowed to exist).
++#[must_use]
++pub fn self_check_matches(expected_pass: bool, actual: &CheckOutcome) -> bool {
++    actual.is_pass() == expected_pass
++}
++
++// ─── Golden EDN vocabulary (Design §4 / §e) ────────────────────────────────────────────
++
++/// The Elle operation-history vocabulary [`consistency_workload::MultiProcessHistory::to_elle_edn`]
++/// / `DirectoryHistory::to_elle_edn` emit (`crates/server/src/consistency_workload.rs:311-369,
++/// 549-571`) — pinned here as plain tokens (not by importing `wyrd-server`, which the test-graph
++/// constraint forbids) so a committed golden EDN fixture can be checked against the vocabulary
++/// the checker actually expects.
++pub const EDN_HISTORY_VOCABULARY: [&str; 5] = [":process", ":type", ":f", ":value", ":time"];
++
++/// Whether `edn` is a bracketed EDN vector (`[...]`, [`consistency_workload::render_history`]'s
++/// wrapping) carrying every token in [`EDN_HISTORY_VOCABULARY`] — the golden-file vocabulary
++/// pin. Does not attempt a full EDN parse (that is the checker's job); it pins the SHAPE a
++/// regression to the serializer would break.
++#[must_use]
++pub fn edn_history_has_expected_vocabulary(edn: &str) -> bool {
++    let trimmed = edn.trim();
++    trimmed.starts_with('[')
++        && trimmed.ends_with(']')
++        && EDN_HISTORY_VOCABULARY.iter().all(|tok| edn.contains(tok))
++}
++
++// ─── Opted-in-but-missing-environment error paths (External dependencies) ─────────────
++
++/// The `run_fdb_metadata_tier1`-shaped hard-error rule (`xtask/src/fdb_faults.rs:286`): opted in
++/// (`WYRD_TIER1=1`) but missing Docker, Java, or the elle-cli jar is a **hard error**, never a
++/// silent skip — a checked run that quietly did not run would be recorded as a verdict nobody
++/// earned. Not opted in ⇒ always `Ok` (deferred, not an error).
++///
++/// # Errors
++/// Names every missing piece of the opted-in environment.
++pub fn preflight(
++    opted_in: bool,
++    docker: bool,
++    java: bool,
++    jar_present: bool,
++) -> Result<(), String> {
++    if !opted_in {
++        return Ok(());
++    }
++    let mut missing = Vec::new();
++    if !docker {
++        missing.push("docker");
++    }
++    if !java {
++        missing.push("java");
++    }
++    if !jar_present {
++        missing.push("the elle-cli standalone jar ($WYRD_ELLE_CLI_JAR)");
++    }
++    if missing.is_empty() {
++        Ok(())
++    } else {
++        Err(format!(
++            "WYRD_TIER1=1 but missing: {} — the checked consistency run cannot obtain a real \
++             Elle verdict, and skipping it silently would report a verdict that was never \
++             tested",
++            missing.join(", "),
++        ))
++    }
++}
++
++// ─── The report renderer (Design §5) ───────────────────────────────────────────────────
++
++/// The five fields the issue names, rendered into the report. Kept as owned `String`s so the
++/// runner can build them from live run data OR from a witnessed-run write-up, alike.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ReportInputs {
++    /// What was driven (workload parameters).
++    pub workload: String,
++    /// The nemesis leg + its materialization evidence.
++    pub nemesis: String,
++    /// The per-model history size (ops).
++    pub history_size: String,
++    /// The model(s) checked (checker + version + jar SHA-256 belong here too).
++    pub model: String,
++    /// The verdict.
++    pub verdict: String,
++}
++
++/// Render the Markdown report body carrying the five fields the issue names (Design §5):
++/// workload, nemesis, history size, model, verdict. Pure — the runner writes this under
++/// `target/consistency-run/report.md` (every run) and, for the first witnessed run, the SAME
++/// text is committed under `docs/design/reviews/` (precedent: `m4-fdb-go-no-go.md`).
++#[must_use]
++pub fn render_report(inputs: &ReportInputs) -> String {
++    format!(
++        "# Checked consistency run report (#408)\n\n\
++         - **Workload:** {}\n\
++         - **Nemesis:** {}\n\
++         - **History size:** {}\n\
++         - **Model:** {}\n\
++         - **Verdict:** {}\n",
++        inputs.workload, inputs.nemesis, inputs.history_size, inputs.model, inputs.verdict,
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn run_plan_visits_the_nemesis_window_between_workload_and_heal() {
++        let plan = run_plan();
++        let workload = plan.iter().position(|s| *s == "workload").unwrap();
++        let window = plan.iter().position(|s| *s == "nemesis-window").unwrap();
++        let heal = plan.iter().position(|s| *s == "heal").unwrap();
++        assert!(workload < window && window < heal);
++    }
++
++    #[test]
++    fn default_leg_is_partition() {
++        assert_eq!(
++            selected_leg(None).unwrap(),
++            NemesisLegKind::NetworkPartition
++        );
++        assert_eq!(
++            selected_leg(Some("partition")).unwrap(),
++            NemesisLegKind::NetworkPartition
++        );
++    }
++
++    #[test]
++    fn evaluate_summary_requires_both_attestations() {
++        let ok = RunSummary {
++            workload: "w".into(),
++            nemesis_leg: "partition".into(),
++            genuinely_concurrent: true,
++            nemesis_materialized: true,
++            register_ops: 1,
++            directory_ops: 1,
++        };
++        assert!(evaluate_summary(&ok).is_ok());
++
++        let mut vacuous = ok.clone();
++        vacuous.genuinely_concurrent = false;
++        assert_eq!(
++            evaluate_summary(&vacuous),
++            Err(InconclusiveReason::NotGenuinelyConcurrent)
++        );
++
++        let mut phantom = ok.clone();
++        phantom.nemesis_materialized = false;
++        assert_eq!(
++            evaluate_summary(&phantom),
++            Err(InconclusiveReason::NemesisNotMaterialized)
++        );
++    }
++
++    #[test]
++    fn checker_output_never_silently_passes() {
++        assert!(!parse_checker_output("true", false).is_pass());
++        assert!(!parse_checker_output("garbage", true).is_pass());
++        assert!(!parse_checker_output("", true).is_pass());
++        assert!(parse_checker_output("Everything looks good!\ntrue\n", true).is_pass());
++    }
++}
+diff --git a/xtask/src/consistency_run_runner.rs b/xtask/src/consistency_run_runner.rs
+new file mode 100644
+index 0000000..2ef37c7
+--- /dev/null
++++ b/xtask/src/consistency_run_runner.rs
+@@ -0,0 +1,492 @@
++//! **The checked-consistency-run runner** (#408, slice 5 of #329; ADR-0041): the impure
++//! bring-up / shell-out / JVM-invocation glue behind `WYRD_TIER1=1 cargo xtask
++//! consistency-run`. Mirrors `fdb_faults::run_fdb_metadata_tier1`'s discipline (self-contained
++//! bring-up of `deploy/fdb-multi-replica`, unconditional teardown, hard error when opted in
++//! without its environment) and `fdb_faults::run_metadata_nemesis`'s shape (shell out to the
++//! `#[ignore]`d scenario with the fault env exported).
++//!
++//! Everything **decision-shaped** here (leg selection, the vacuity gate, the elle-cli
++//! invocation, the verdict parser, the report renderer, the preflight) is a call into
++//! [`xtask::consistency_run`] — the pure, Check-tested core (Design §1). This module owns only
++//! the I/O: `docker compose`, `java -jar`, and the `cargo test` shell-out to the live scenario
++//! (`crates/server/tests/consistency_run_fdb.rs`, `fdb`-feature-gated).
++//!
++//! Off-Check by construction: opted in only via `WYRD_TIER1=1`, needs Docker + Java +
++//! `$WYRD_ELLE_CLI_JAR`, and `cargo xtask ci` never calls this module.
++
++use std::path::PathBuf;
++use std::process::Command;
++
++use xtask::consistency_run::{
++    consistency_run_scenario_args, elle_invocation, evaluate_summary, parse_checker_output,
++    parse_run_summary, preflight, render_report, selected_leg, self_check_matches, CheckOutcome,
++    ReportInputs, RunSummary, CONSISTENCY_RUN_SCENARIO_TEST, MODEL_DIRECTORY_SET, MODEL_REGISTER,
++};
++
++use crate::{print_step, workspace_root};
++
++/// A distinct compose project from `fdb-tier1-metadata` / `metadata-nemesis`'s, so a checked
++/// run never collides with a concurrently-running Tier-1 battery or nemesis campaign.
++const PROJECT: &str = "wyrd-consistency-run";
++const COMPOSE_FILE: &str = "deploy/fdb-multi-replica/docker-compose.yml";
++/// Mirrors `fdb_faults::FDB_TIER1_NODES` — the same fixed 3-node topology
++/// `deploy/fdb-multi-replica/docker-compose.yml` declares.
++const NODES: [(&str, &str); 3] = [
++    ("fdb0", "172.30.58.11"),
++    ("fdb1", "172.30.58.12"),
++    ("fdb2", "172.30.58.13"),
++];
++const FDB_PORT: &str = "4500";
++const IPTABLES_IMAGE: &str = "wyrd-iptables:local";
++const IPTABLES_AGENT_DIR: &str = "deploy/tikv-multi-replica/iptables-agent";
++/// The partition/pause leg's target and survivor — an arbitrary coordinator is outcome-neutral
++/// for the checked workload (unlike the #442 battery, this run does not need the master
++/// specifically: it proves the register/directory history survives a real cluster fault, not a
++/// commit-point re-check at the coordinator holding a particular role).
++const TARGET_SERVICE: &str = "fdb0";
++const SURVIVOR_SERVICE: &str = "fdb1";
++
++fn output_dir() -> PathBuf {
++    workspace_root().join("target/consistency-run")
++}
++
++fn cluster_file_contents() -> String {
++    let coordinators: Vec<String> = NODES
++        .iter()
++        .map(|(_, ip)| format!("{ip}:{FDB_PORT}"))
++        .collect();
++    format!("docker:docker@{}", coordinators.join(","))
++}
++
++fn compose(args: &[&str]) -> Result<(), String> {
++    let mut full = vec!["compose", "-p", PROJECT, "-f", COMPOSE_FILE];
++    full.extend_from_slice(args);
++    print_step(&{
++        let mut display = vec!["docker"];
++        display.extend_from_slice(&full);
++        display
++    });
++    let status = Command::new("docker")
++        .args(&full)
++        .current_dir(workspace_root())
++        .status()
++        .map_err(|e| format!("failed to spawn docker compose: {e}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "docker compose {} failed with {status}",
++            args.join(" ")
++        ))
++    }
++}
++
++fn docker_available() -> bool {
++    Command::new("docker")
++        .args(["version"])
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .status()
++        .map(|s| s.success())
++        .unwrap_or(false)
++}
++
++fn java_available() -> bool {
++    Command::new("java")
++        .args(["-version"])
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .status()
++        .map(|s| s.success())
++        .unwrap_or(false)
++}
++
++/// `configure new double ssd` once, then poll `status minimal` — mirrors
++/// `fdb_faults::configure_database` (readiness read from the TEXT, never the exit status; see
++/// that function's comment for why `status.success()` is not a health predicate).
++fn configure_database() -> Result<(), String> {
++    let _ = compose(&[
++        "exec",
++        "-T",
++        "fdb0",
++        "fdbcli",
++        "--exec",
++        "configure new double ssd",
++    ]);
++    let mut last_seen = String::new();
++    for attempt in 1..=45 {
++        let output = Command::new("docker")
++            .args([
++                "compose",
++                "-p",
++                PROJECT,
++                "-f",
++                COMPOSE_FILE,
++                "exec",
++                "-T",
++                "fdb0",
++                "fdbcli",
++                "--timeout",
++                "5",
++                "--exec",
++                "status minimal",
++            ])
++            .current_dir(workspace_root())
++            .output()
++            .map_err(|e| format!("failed to spawn docker: {e}"))?;
++        let text = format!(
++            "{}{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr),
++        );
++        if xtask::fdb_doctor::cluster_status_is_healthy(&text) {
++            return Ok(());
++        }
++        last_seen = text.trim().to_string();
++        eprintln!(
++            "xtask consistency-run: cluster not available yet (attempt {attempt}/45): {last_seen}"
++        );
++        std::thread::sleep(std::time::Duration::from_secs(2));
++    }
++    Err(format!(
++        "the FoundationDB cluster did not report `database is available` within 90s; last \
++         status was: {last_seen}"
++    ))
++}
++
++fn write_cluster_file() -> Result<String, String> {
++    let dir = workspace_root().join("target/consistency-run-fdb");
++    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
++    let path = dir.join("fdb.cluster");
++    std::fs::write(&path, cluster_file_contents())
++        .map_err(|e| format!("{}: {e}", path.display()))?;
++    Ok(path.to_string_lossy().to_string())
++}
++
++fn build_fault_agent() -> Result<(), String> {
++    let dir = workspace_root()
++        .join(IPTABLES_AGENT_DIR)
++        .to_string_lossy()
++        .to_string();
++    let args = ["build", "-t", IPTABLES_IMAGE, dir.as_str()];
++    print_step(&{
++        let mut display = vec!["docker"];
++        display.extend_from_slice(&args);
++        display
++    });
++    let status = Command::new("docker")
++        .args(args)
++        .status()
++        .map_err(|e| format!("failed to spawn docker build for the fault agent: {e}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!("fault-agent image build failed with {status}"))
++    }
++}
++
++/// The stable compose container **name** of a service (never the ephemeral id — mirrors
++/// `fdb_faults::container_name_of`).
++fn container_name_of(service: &str) -> Result<String, String> {
++    let out = Command::new("docker")
++        .args([
++            "compose",
++            "-p",
++            PROJECT,
++            "-f",
++            COMPOSE_FILE,
++            "ps",
++            "--format",
++            "{{.Name}}",
++            service,
++        ])
++        .current_dir(workspace_root())
++        .output()
++        .map_err(|e| format!("failed to spawn docker compose ps: {e}"))?;
++    if !out.status.success() {
++        return Err(format!(
++            "`docker compose ps {service}` failed ({}): {}",
++            out.status,
++            String::from_utf8_lossy(&out.stderr).trim(),
++        ));
++    }
++    let name = String::from_utf8_lossy(&out.stdout)
++        .lines()
++        .map(str::trim)
++        .find(|l| !l.is_empty())
++        .unwrap_or_default()
++        .to_string();
++    if name.is_empty() {
++        return Err(format!(
++            "compose service `{service}` has no running container — the checked-run cluster did \
++             not come up"
++        ));
++    }
++    Ok(name)
++}
++
++/// The static IP `deploy/fdb-multi-replica/docker-compose.yml` gives a declared service.
++fn ip_of(service: &str) -> Result<&'static str, String> {
++    NODES
++        .iter()
++        .find(|(s, _)| *s == service)
++        .map(|(_, ip)| *ip)
++        .ok_or_else(|| format!("`{service}` is not a declared consistency-run node"))
++}
++
++/// Run the live scenario (`cargo test -p wyrd-server --features fdb --test
++/// consistency_run_fdb -- --ignored --nocapture`) with the fault + output env exported. The
++/// target/survivor are resolved to FULLY-QUALIFIED addr/ip/container-name/service HERE (never
++/// left for the scenario to re-derive from a raw netns map), mirroring
++/// `fdb_faults::run_nemesis_leg`'s fully-resolved env — so the scenario, the compose ip table,
++/// and the fault the runner actually cut cannot disagree.
++fn run_scenario(cluster_file: &str, leg: &str) -> Result<(), String> {
++    let target_ip = ip_of(TARGET_SERVICE)?;
++    let target_addr = format!("{target_ip}:{FDB_PORT}");
++    let target_container = container_name_of(TARGET_SERVICE)?;
++    let survivor_container = container_name_of(SURVIVOR_SERVICE)?;
++    let compose_file = workspace_root()
++        .join(COMPOSE_FILE)
++        .to_string_lossy()
++        .to_string();
++    let faketime_override = workspace_root()
++        .join("deploy/fdb-multi-replica/docker-compose.faketime.yml")
++        .to_string_lossy()
++        .to_string();
++
++    let args = consistency_run_scenario_args(CONSISTENCY_RUN_SCENARIO_TEST);
++    print_step(
++        &std::iter::once("cargo")
++            .chain(args.iter().copied())
++            .collect::<Vec<_>>(),
++    );
++    let status = Command::new("cargo")
++        .args(args)
++        .current_dir(workspace_root())
++        .env("WYRD_FDB_CLUSTER_FILE", cluster_file)
++        .env("WYRD_CONSISTENCY_NEMESIS", leg)
++        .env("WYRD_CONSISTENCY_TARGET_ADDR", &target_addr)
++        .env("WYRD_CONSISTENCY_TARGET_IP", target_ip)
++        .env("WYRD_CONSISTENCY_TARGET_SERVICE", TARGET_SERVICE)
++        .env("WYRD_CONSISTENCY_TARGET_CONTAINER", &target_container)
++        .env("WYRD_CONSISTENCY_SURVIVOR_CONTAINER", &survivor_container)
++        .env("WYRD_CONSISTENCY_IPTABLES_IMAGE", IPTABLES_IMAGE)
++        .env("WYRD_CONSISTENCY_COMPOSE_FILE", &compose_file)
++        .env("WYRD_CONSISTENCY_FAKETIME_OVERRIDE", &faketime_override)
++        .env(
++            "WYRD_CONSISTENCY_OUTPUT_DIR",
++            output_dir().to_string_lossy().to_string(),
++        )
++        .status()
++        .map_err(|e| format!("failed to spawn cargo test: {e}"))?;
++    if status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "the checked-consistency-run scenario failed with {status}"
++        ))
++    }
++}
++
++fn read_run_summary() -> Result<RunSummary, String> {
++    let path = output_dir().join("run-summary.json");
++    let text = std::fs::read_to_string(&path)
++        .map_err(|e| format!("could not read the run summary at {}: {e}", path.display()))?;
++    parse_run_summary(&text)
++}
++
++/// Run one elle-cli invocation (Design §3) and parse its verdict.
++fn run_checker(jar: &str, model: &str, history_path: &str) -> Result<CheckOutcome, String> {
++    let argv = elle_invocation(jar, model, history_path);
++    print_step(
++        &std::iter::once("java")
++            .chain(argv.iter().map(String::as_str))
++            .collect::<Vec<_>>(),
++    );
++    let output = Command::new("java")
++        .args(&argv)
++        .output()
++        .map_err(|e| format!("failed to spawn java for elle-cli: {e}"))?;
++    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
++    print!("{stdout}");
++    eprint!("{}", String::from_utf8_lossy(&output.stderr));
++    Ok(parse_checker_output(&stdout, output.status.success()))
++}
++
++/// The two-tier fixtures self-check (Design §4): feed the SAME committed golden fixtures Check
++/// pins through the real elle-cli and confirm known-bad comes back `false`, known-good `true` —
++/// demonstrating checker-acceptance where the JVM is allowed to exist. Recorded in the report.
++fn fixtures_self_check(jar: &str) -> Result<String, String> {
++    let fixtures_dir = workspace_root().join("xtask/tests/fixtures/consistency-run");
++    let good = fixtures_dir.join("register-history-known-good.edn");
++    let bad = fixtures_dir.join("register-history-known-bad.edn");
++    let good_outcome = run_checker(jar, MODEL_REGISTER, &good.to_string_lossy())?;
++    let bad_outcome = run_checker(jar, MODEL_REGISTER, &bad.to_string_lossy())?;
++    if !self_check_matches(true, &good_outcome) {
++        return Err(format!(
++            "fixtures self-check FAILED: the known-good fixture did not come back a pass \
++             ({good_outcome:?}) — the real elle-cli disagrees with the pinned parser"
++        ));
++    }
++    if !self_check_matches(false, &bad_outcome) {
++        return Err(format!(
++            "fixtures self-check FAILED: the known-bad fixture did not come back a fail \
++             ({bad_outcome:?}) — the real elle-cli disagrees with the pinned parser"
++        ));
++    }
++    Ok(format!(
++        "fixtures self-check PASSED: known-good -> {good_outcome:?}, known-bad -> {bad_outcome:?}"
++    ))
++}
++
++fn write_report(
++    summary: &RunSummary,
++    register_verdict: &CheckOutcome,
++    directory_verdict: &CheckOutcome,
++    jar: &str,
++    self_check_note: &str,
++) -> Result<(), String> {
++    let jar_sha256 = sha256_of_file(jar).unwrap_or_else(|e| format!("<could not hash jar: {e}>"));
++    let report = render_report(&ReportInputs {
++        workload: summary.workload.clone(),
++        nemesis: format!(
++            "{} (materialized: {})",
++            summary.nemesis_leg, summary.nemesis_materialized
++        ),
++        history_size: format!(
++            "register: {} ops; directory: {} ops",
++            summary.register_ops, summary.directory_ops
++        ),
++        model: format!(
++            "rw-register (register), set-full (directory) — elle-cli jar sha256={jar_sha256}. \
++             {self_check_note}"
++        ),
++        verdict: format!("register: {register_verdict:?}; directory: {directory_verdict:?}"),
++    });
++    let path = output_dir().join("report.md");
++    std::fs::create_dir_all(output_dir())
++        .map_err(|e| format!("{}: {e}", output_dir().display()))?;
++    std::fs::write(&path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
++    println!(
++        "xtask consistency-run: report written to {}",
++        path.display()
++    );
++    Ok(())
++}
++
++fn sha256_of_file(path: &str) -> Result<String, String> {
++    let out = Command::new("sha256sum")
++        .arg(path)
++        .output()
++        .map_err(|e| format!("failed to spawn sha256sum: {e}"))?;
++    if !out.status.success() {
++        return Err(format!("sha256sum {path} failed: {}", out.status));
++    }
++    let text = String::from_utf8_lossy(&out.stdout);
++    Ok(text.split_whitespace().next().unwrap_or("").to_string())
++}
++
++/// **The checked-consistency-run runner** (`WYRD_TIER1=1 cargo xtask consistency-run`): stand up
++/// `deploy/fdb-multi-replica`, drive the live #406 workload under a #407 nemesis leg (partition
++/// by default; `WYRD_CONSISTENCY_NEMESIS=clock-skew|process-pause` selectable), export the
++/// Elle-EDN histories + run summary, gate on non-vacuity (Design §4), obtain the elle-cli
++/// verdict (Design §3), run the fixtures self-check, and render the report (Design §5). Tears
++/// the stack down unconditionally, including on a panic — mirrors
++/// `fdb_faults::run_fdb_metadata_tier1`.
++pub fn run_consistency_check() -> Result<(), String> {
++    if std::env::var("WYRD_TIER1").as_deref() != Ok("1") {
++        println!(
++            "xtask consistency-run: DEFERRED — set WYRD_TIER1=1 to run the privileged #408 \
++             checked consistency run (the #329 credibility artifact). It stands up a 3-process \
++             FoundationDB cluster, drives the checked #406 workload under a #407 nemesis leg, \
++             and needs Docker, Java, and $WYRD_ELLE_CLI_JAR (the elle-cli standalone jar)."
++        );
++        return Ok(());
++    }
++
++    let jar = std::env::var("WYRD_ELLE_CLI_JAR").unwrap_or_default();
++    let jar_present = !jar.trim().is_empty() && std::path::Path::new(&jar).is_file();
++    preflight(true, docker_available(), java_available(), jar_present)?;
++
++    let leg = selected_leg(std::env::var("WYRD_CONSISTENCY_NEMESIS").ok().as_deref())?;
++
++    build_fault_agent()?;
++    compose(&["up", "-d"])?;
++
++    let result = crate::finalize_panic_safe(
++        || {
++            configure_database()?;
++            let cluster_file = write_cluster_file()?;
++            run_scenario(&cluster_file, leg.as_str())?;
++
++            let summary = read_run_summary()?;
++            evaluate_summary(&summary).map_err(|reason| {
++                format!(
++                    "checked consistency run INCONCLUSIVE: {} — refusing to report a verdict",
++                    reason.message()
++                )
++            })?;
++
++            let register_path = output_dir()
++                .join("register-history.edn")
++                .to_string_lossy()
++                .to_string();
++            let directory_path = output_dir()
++                .join("directory-history.edn")
++                .to_string_lossy()
++                .to_string();
++            let register_verdict = run_checker(&jar, MODEL_REGISTER, &register_path)?;
++            let directory_verdict = run_checker(&jar, MODEL_DIRECTORY_SET, &directory_path)?;
++            let self_check_note = fixtures_self_check(&jar)?;
++            println!("xtask consistency-run: {self_check_note}");
++
++            write_report(
++                &summary,
++                &register_verdict,
++                &directory_verdict,
++                &jar,
++                &self_check_note,
++            )?;
++
++            if !register_verdict.is_pass() || !directory_verdict.is_pass() {
++                return Err(format!(
++                    "checked consistency run FAILED — register verdict: {register_verdict:?}, \
++                     directory verdict: {directory_verdict:?}"
++                ));
++            }
++            Ok(())
++        },
++        |result| {
++            let _ = compose(&["down", "-v", "--remove-orphans"]);
++            result
++        },
++    );
++
++    result?;
++    println!(
++        "\nxtask consistency-run: PASS — the #406 checked register + directory workload, under \
++         a #407 `{}` nemesis leg, obtained a non-vacuous Elle verdict (#329 DoD item 2)",
++        leg.as_str()
++    );
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The cluster file names every declared coordinator — the same drift guard
++    /// `fdb_faults::tests::the_cluster_file_names_every_declared_coordinator` pins for its own
++    /// table, over THIS module's independent table.
++    #[test]
++    fn the_cluster_file_names_every_declared_coordinator() {
++        let contents = cluster_file_contents();
++        assert!(contents.starts_with("docker:docker@"));
++        for (_, ip) in NODES {
++            assert!(
++                contents.contains(&format!("{ip}:{FDB_PORT}")),
++                "the cluster file must name coordinator {ip}: {contents}"
++            );
++        }
++    }
++}
+diff --git a/xtask/src/lib.rs b/xtask/src/lib.rs
+index e576972..c04bae9 100644
+--- a/xtask/src/lib.rs
++++ b/xtask/src/lib.rs
+@@ -13,6 +13,7 @@
+ 
+ #![forbid(unsafe_code)]
+ 
++pub mod consistency_run;
+ pub mod deploy_guard;
+ pub mod disk_faults;
+ pub mod fdb_doctor;
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 83bca38..ef9c368 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -39,6 +39,19 @@
+ //!   healed (the #442 gates). Privileged and opt-in (`WYRD_TIER1=1`), never part of `ci`;
+ //!   the pure leg-enumeration / dispatch / oracle logic is unit-tested in `ci`. #408
+ //!   composes the *checked* Elle-history workload under these same legs.
++//! - `consistency-run` — the #408 checked consistency run + public credibility artifact
++//!   (slice 5 of #329, ADR-0041 §Decision): stand up `deploy/fdb-multi-replica`, drive the
++//!   #406 checked register + directory workload against it, under a #407 nemesis leg
++//!   (partition by default), export the Elle-EDN histories + a machine-readable run summary,
++//!   gate on non-vacuity over that summary (a genuinely concurrent history AND a materialized
++//!   fault, or the run is INCONCLUSIVE — never a silent pass), obtain the verdict from the
++//!   pinned checker contract (`elle-cli`, off-Check), run the fixtures self-check, and render
++//!   the report (`target/consistency-run/report.md`). Privileged and opt-in
++//!   (`WYRD_TIER1=1 cargo xtask consistency-run`), needs Docker, Java, and
++//!   `$WYRD_ELLE_CLI_JAR`; never part of `ci` (ADR-0041: no JVM in `cargo xtask ci`). The
++//!   host-independent orchestration plan / vacuity gate / invocation building / verdict
++//!   parser / report renderer / preflight are unit-tested in `ci`
++//!   (`xtask::consistency_run`, `xtask/tests/consistency_run_orchestration.rs`).
+ //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
+ //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
+ //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
+@@ -65,6 +78,7 @@
+ #![forbid(unsafe_code)]
+ 
+ mod conformance;
++mod consistency_run_runner;
+ mod faults;
+ mod fdb_faults;
+ mod kill_reconstruct;
+@@ -89,6 +103,7 @@ fn main() -> ExitCode {
+         Some("fdb-doctor") => run_fdb_doctor(),
+         Some("fdb-metadata-tier1") => fdb_faults::run_fdb_metadata_tier1(),
+         Some("metadata-nemesis") => fdb_faults::run_metadata_nemesis(),
++        Some("consistency-run") => consistency_run_runner::run_consistency_check(),
+         Some("etcd-conformance") => run_etcd_conformance(),
+         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
+         Some("disk-faults") => faults::run_disk_faults(),
+@@ -120,7 +135,7 @@ fn main() -> ExitCode {
+ fn print_usage() {
+     eprintln!(
+         "usage: cargo xtask \
+-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
++         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+     );
+ }
+ 
+diff --git a/xtask/tests/consistency_run_orchestration.rs b/xtask/tests/consistency_run_orchestration.rs
+new file mode 100644
+index 0000000..7933439
+--- /dev/null
++++ b/xtask/tests/consistency_run_orchestration.rs
+@@ -0,0 +1,344 @@
++//! Unit tests for the checked-consistency-run **orchestration** (`xtask::consistency_run` —
++//! the Check-time flippable coverage, #408, slice 5 of #329; ADR-0041).
++//!
++//! **Why these tests exist.** The live checked run stands up the ≥3-process
++//! `deploy/fdb-multi-replica` cluster, drives the #406 workload under a #407 nemesis leg, and
++//! shells `java -jar elle-cli.jar` — none of which the unprivileged `cargo xtask ci` gate may
++//! touch (ADR-0041's own MUST: no JVM in `cargo xtask ci`). "Deferred" means the *live green
++//! run* is off-Check (`WYRD_TIER1=1`); it does NOT mean the pipeline is unbuilt. This file
++//! exercises, at Check, exactly what the brief's Success criterion names: the run-orchestration
++//! plan, the summary-based inconclusive gate (Design §4 — "non-vacuity is a gate, not a note"),
++//! the pinned elle-cli invocation building (Design §3), the verdict parser against **committed
++//! fixture checker outputs** (golden files, `xtask/tests/fixtures/consistency-run/`), the golden
++//! EDN vocabulary those same fixtures pin, the report renderer (the five fields the issue
++//! names), and the runner's opted-in-but-missing-environment error paths (never a silent skip).
++//!
++//! Everything imported here is default-compiled: no `wyrd-server`, no FDB, no Docker, no Java,
++//! no elle-cli in the build graph (the test-graph constraint, Verification posture) — the module
++//! is `pub` and wired from `xtask/src/lib.rs`, mirroring the `metadata_faults` /
++//! `nemesis_orchestration` precedent. These tests run inside `cargo xtask ci`'s `cargo test
++//! --workspace` and go **RED** when the orchestration, the vacuity gate, the invocation builder,
++//! the parser, the fixtures, or the report renderer are regressed or removed.
++
++use xtask::consistency_run::{
++    consistency_run_scenario_args, edn_history_has_expected_vocabulary, elle_invocation,
++    evaluate_summary, parse_checker_output, parse_run_summary, preflight, render_report, run_plan,
++    selected_leg, self_check_matches, CheckOutcome, InconclusiveReason, ReportInputs, RunSummary,
++    CONSISTENCY_RUN_SCENARIO_TEST, MODEL_DIRECTORY_SET, MODEL_REGISTER,
++};
++use xtask::nemesis::NemesisLegKind;
++
++// ─── Golden fixtures (Design §4/§e: known-good/known-bad EDN + captured checker outputs) ──
++
++const REGISTER_KNOWN_GOOD_EDN: &str =
++    include_str!("fixtures/consistency-run/register-history-known-good.edn");
++const REGISTER_KNOWN_BAD_EDN: &str =
++    include_str!("fixtures/consistency-run/register-history-known-bad.edn");
++const CHECKER_OUTPUT_PASS: &str = include_str!("fixtures/consistency-run/checker-output-pass.txt");
++const CHECKER_OUTPUT_FAIL: &str = include_str!("fixtures/consistency-run/checker-output-fail.txt");
++const CHECKER_OUTPUT_ERROR: &str =
++    include_str!("fixtures/consistency-run/checker-output-error.txt");
++
++// ─── (1) The run-orchestration plan ────────────────────────────────────────────────────
++
++#[test]
++fn run_plan_carries_bring_up_through_report_in_order() {
++    let plan = run_plan();
++    let want = [
++        "bring-up",
++        "workload",
++        "nemesis-window",
++        "heal",
++        "export",
++        "check",
++        "report",
++    ];
++    assert_eq!(
++        plan, want,
++        "a stage dropped or reordered here is a pipeline step the runner silently stopped \
++         performing (or now performs out of order): {plan:?}"
++    );
++}
++
++#[test]
++fn scenario_argv_targets_wyrd_server_with_the_fdb_feature_and_ignored_flag() {
++    let args = consistency_run_scenario_args(CONSISTENCY_RUN_SCENARIO_TEST);
++    assert_eq!(
++        args[0], "test",
++        "must be a `cargo test` invocation: {args:?}"
++    );
++    let flat = args.join(" ");
++    assert!(
++        flat.contains("wyrd-server"),
++        "the live scenario lives in crates/server/tests/ (Design §1): {flat}"
++    );
++    assert!(
++        flat.contains("--features fdb"),
++        "the scenario drives the real FdbMetadataStore, so the argv MUST enable the fdb \
++         feature (off by default): {flat}"
++    );
++    assert!(
++        flat.contains(CONSISTENCY_RUN_SCENARIO_TEST) && flat.contains("--ignored"),
++        "must run the #[ignore]d {CONSISTENCY_RUN_SCENARIO_TEST} scenario: {flat}"
++    );
++}
++
++// ─── (2) Nemesis-leg selection: partition first, skew/pause selectable ────────────────
++
++#[test]
++fn the_default_leg_is_partition_never_a_silent_no_fault() {
++    assert_eq!(
++        selected_leg(None).expect("default"),
++        NemesisLegKind::NetworkPartition,
++        "Design §2 pins partition as the default leg"
++    );
++    assert_eq!(
++        selected_leg(Some("partition")).expect("explicit partition"),
++        NemesisLegKind::NetworkPartition
++    );
++}
++
++#[test]
++fn skew_and_pause_are_selectable_by_name() {
++    assert_eq!(
++        selected_leg(Some("clock-skew")).expect("clock-skew"),
++        NemesisLegKind::ClockSkew
++    );
++    assert_eq!(
++        selected_leg(Some("process-pause")).expect("process-pause"),
++        NemesisLegKind::ProcessPause
++    );
++}
++
++#[test]
++fn an_unrecognized_leg_name_is_a_hard_error_not_a_silent_fallback() {
++    let err = selected_leg(Some("typo'd-leg")).unwrap_err();
++    assert!(
++        err.contains("typo'd-leg"),
++        "the error must name the bad value so a typo is diagnosable: {err}"
++    );
++}
++
++// ─── (3) The summary-based inconclusive gate (Design §4) ──────────────────────────────
++
++fn attesting_summary() -> RunSummary {
++    RunSummary {
++        workload: "register overwrite PUT/GET/DELETE + directory create/delete/probe".into(),
++        nemesis_leg: NemesisLegKind::NetworkPartition.as_str().to_string(),
++        genuinely_concurrent: true,
++        nemesis_materialized: true,
++        register_ops: 320,
++        directory_ops: 80,
++    }
++}
++
++#[test]
++fn a_summary_attesting_both_witnesses_evaluates_conclusive() {
++    assert!(evaluate_summary(&attesting_summary()).is_ok());
++}
++
++#[test]
++fn a_summary_missing_the_inv2_witness_is_inconclusive() {
++    let mut summary = attesting_summary();
++    summary.genuinely_concurrent = false;
++    assert_eq!(
++        evaluate_summary(&summary),
++        Err(InconclusiveReason::NotGenuinelyConcurrent),
++        "a vacuous history (no genuine concurrency) must NEVER reach a verdict — the #250 \
++         failure mode this issue exists to bury"
++    );
++}
++
++#[test]
++fn a_summary_missing_fault_materialization_is_inconclusive() {
++    let mut summary = attesting_summary();
++    summary.nemesis_materialized = false;
++    assert_eq!(
++        evaluate_summary(&summary),
++        Err(InconclusiveReason::NemesisNotMaterialized),
++        "a nemesis that never bit must NEVER reach a verdict — a note is not a gate (#442)"
++    );
++}
++
++#[test]
++fn the_run_summary_is_parsed_from_json_not_assumed() {
++    let json = r#"{
++        "workload": "w",
++        "nemesis_leg": "partition",
++        "genuinely_concurrent": true,
++        "nemesis_materialized": true,
++        "register_ops": 10,
++        "directory_ops": 2
++    }"#;
++    let summary = parse_run_summary(json).expect("valid summary JSON parses");
++    assert!(evaluate_summary(&summary).is_ok());
++
++    let malformed = parse_run_summary("{ not json");
++    assert!(
++        malformed.is_err(),
++        "malformed JSON must be a hard parse error, never a default-filled (accidentally \
++         conclusive) summary"
++    );
++}
++
++// ─── (4) The pinned elle-cli invocation (Design §3) ────────────────────────────────────
++
++#[test]
++fn the_register_invocation_uses_the_rw_register_model() {
++    let argv = elle_invocation("elle-cli.jar", MODEL_REGISTER, "register-history.edn");
++    assert_eq!(
++        argv,
++        vec![
++            "-jar".to_string(),
++            "elle-cli.jar".to_string(),
++            "--model".to_string(),
++            "rw-register".to_string(),
++            "register-history.edn".to_string(),
++        ]
++    );
++}
++
++#[test]
++fn the_directory_invocation_uses_the_set_full_model() {
++    let argv = elle_invocation("elle-cli.jar", MODEL_DIRECTORY_SET, "directory-history.edn");
++    assert!(argv.contains(&"set-full".to_string()));
++    assert!(argv.contains(&"directory-history.edn".to_string()));
++}
++
++// ─── (5) The verdict parser against committed fixture checker outputs (golden files) ──
++
++#[test]
++fn a_captured_pass_output_parses_to_pass() {
++    let outcome = parse_checker_output(CHECKER_OUTPUT_PASS, true);
++    assert_eq!(outcome, CheckOutcome::Pass);
++}
++
++#[test]
++fn a_captured_fail_output_parses_to_fail_even_with_exit_zero() {
++    // The fixture's trailing line is `false`; the parser must treat that as a failure
++    // regardless of what the exit status happens to be (Design §3: false is ALWAYS a failure).
++    let outcome = parse_checker_output(CHECKER_OUTPUT_FAIL, true);
++    assert!(!outcome.is_pass());
++    assert!(matches!(outcome, CheckOutcome::Fail(_)));
++}
++
++#[test]
++fn a_captured_error_output_parses_to_fail_never_a_silent_pass() {
++    let outcome = parse_checker_output(CHECKER_OUTPUT_ERROR, false);
++    assert!(
++        !outcome.is_pass(),
++        "unparseable / crashed checker output must NEVER read as a pass"
++    );
++}
++
++#[test]
++fn a_nonzero_exit_overrides_a_stray_true_line() {
++    let outcome = parse_checker_output("true", false);
++    assert!(
++        !outcome.is_pass(),
++        "the exit status is authoritative — a `true` line with a non-zero exit must fail"
++    );
++}
++
++// ─── (6) The fixtures self-check comparison (Design §4, the off-Check half's pure core) ──
++
++#[test]
++fn the_self_check_confirms_known_good_parses_pass_and_known_bad_parses_fail() {
++    let good_outcome = parse_checker_output(CHECKER_OUTPUT_PASS, true);
++    let bad_outcome = parse_checker_output(CHECKER_OUTPUT_FAIL, true);
++    assert!(
++        self_check_matches(true, &good_outcome),
++        "the known-good fixture's checker output must parse as a pass"
++    );
++    assert!(
++        self_check_matches(false, &bad_outcome),
++        "the known-bad fixture's checker output must parse as a fail"
++    );
++    // And the cross products must NOT match — otherwise the self-check could never catch a
++    // parser regression that flips pass/fail.
++    assert!(!self_check_matches(false, &good_outcome));
++    assert!(!self_check_matches(true, &bad_outcome));
++}
++
++// ─── (7) The golden EDN vocabulary (Design §4/§e) ──────────────────────────────────────
++
++#[test]
++fn the_known_good_and_known_bad_register_histories_carry_the_expected_edn_vocabulary() {
++    assert!(
++        edn_history_has_expected_vocabulary(REGISTER_KNOWN_GOOD_EDN),
++        "known-good register history must carry the full :process/:type/:f/:value/:time \
++         vocabulary the checker expects: {REGISTER_KNOWN_GOOD_EDN}"
++    );
++    assert!(
++        edn_history_has_expected_vocabulary(REGISTER_KNOWN_BAD_EDN),
++        "known-bad register history must carry the same vocabulary — it is a bad HISTORY, not \
++         a malformed one: {REGISTER_KNOWN_BAD_EDN}"
++    );
++}
++
++#[test]
++fn a_missing_field_fails_the_vocabulary_pin() {
++    let missing_time = REGISTER_KNOWN_GOOD_EDN.replace(":time", ":nope");
++    assert!(
++        !edn_history_has_expected_vocabulary(&missing_time),
++        "the vocabulary pin must actually be load-bearing, not a tautology"
++    );
++}
++
++// ─── (8) The opted-in-but-missing-environment error paths (never a silent skip) ───────
++
++#[test]
++fn not_opted_in_is_always_ok_deferred_not_an_error() {
++    assert!(preflight(false, false, false, false).is_ok());
++}
++
++#[test]
++fn opted_in_with_a_full_environment_is_ok() {
++    assert!(preflight(true, true, true, true).is_ok());
++}
++
++#[test]
++fn opted_in_but_missing_any_piece_is_a_hard_error_naming_it() {
++    let err = preflight(true, false, true, true).unwrap_err();
++    assert!(err.contains("docker"), "must name the missing piece: {err}");
++
++    let err = preflight(true, true, false, true).unwrap_err();
++    assert!(err.contains("java"), "must name the missing piece: {err}");
++
++    let err = preflight(true, true, true, false).unwrap_err();
++    assert!(
++        err.contains("elle-cli") || err.contains("WYRD_ELLE_CLI_JAR"),
++        "must name the missing piece: {err}"
++    );
++}
++
++#[test]
++fn opted_in_with_nothing_present_names_every_missing_piece() {
++    let err = preflight(true, false, false, false).unwrap_err();
++    assert!(err.contains("docker") && err.contains("java") && err.contains("elle-cli"));
++}
++
++// ─── (9) The report renderer — the five fields the issue names ────────────────────────
++
++#[test]
++fn the_report_renders_all_five_named_fields() {
++    let report = render_report(&ReportInputs {
++        workload: "register overwrite PUT/GET/DELETE + directory create/delete/probe".into(),
++        nemesis: "partition (materialized: peers lost the target, container stayed running)".into(),
++        history_size: "register: 320 ops; directory: 80 ops".into(),
++        model: "rw-register (register), set-full (directory) — elle-cli 0.1.9".into(),
++        verdict: "PASS".into(),
++    });
++    for needle in [
++        "register overwrite",
++        "partition",
++        "320 ops",
++        "rw-register",
++        "PASS",
++    ] {
++        assert!(
++            report.contains(needle),
++            "report must render `{needle}`: {report}"
++        );
++    }
++}
+diff --git a/xtask/tests/fixtures/consistency-run/checker-output-error.txt b/xtask/tests/fixtures/consistency-run/checker-output-error.txt
+new file mode 100644
+index 0000000..edcaed2
+--- /dev/null
++++ b/xtask/tests/fixtures/consistency-run/checker-output-error.txt
+@@ -0,0 +1,3 @@
++Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
++	at elle.rw_register$check.invoke(rw_register.clj:142)
++	at elle_cli.main$_main.invoke(main.clj:58)
+diff --git a/xtask/tests/fixtures/consistency-run/checker-output-fail.txt b/xtask/tests/fixtures/consistency-run/checker-output-fail.txt
+new file mode 100644
+index 0000000..4afd211
+--- /dev/null
++++ b/xtask/tests/fixtures/consistency-run/checker-output-fail.txt
+@@ -0,0 +1,4 @@
++INFO  elle-cli - analyzing history: register-history-known-bad.edn
++INFO  elle-cli - model: rw-register
++Found a violation of linearizability: process 1 read a stale value of "reg-a"
++false
+diff --git a/xtask/tests/fixtures/consistency-run/checker-output-pass.txt b/xtask/tests/fixtures/consistency-run/checker-output-pass.txt
+new file mode 100644
+index 0000000..c3db5ba
+--- /dev/null
++++ b/xtask/tests/fixtures/consistency-run/checker-output-pass.txt
+@@ -0,0 +1,4 @@
++INFO  elle-cli - analyzing history: register-history-known-good.edn
++INFO  elle-cli - model: rw-register
++Everything looks good!
++true
+diff --git a/xtask/tests/fixtures/consistency-run/register-history-known-bad.edn b/xtask/tests/fixtures/consistency-run/register-history-known-bad.edn
+new file mode 100644
+index 0000000..9b9e7fa
+--- /dev/null
++++ b/xtask/tests/fixtures/consistency-run/register-history-known-bad.edn
+@@ -0,0 +1,6 @@
++[{:process 0, :type :invoke, :f :write, :key "reg-a", :value 1, :time 0}
++ {:process 0, :type :ok, :f :write, :key "reg-a", :value 1, :time 100}
++ {:process 0, :type :invoke, :f :write, :key "reg-a", :value 2, :time 200}
++ {:process 0, :type :ok, :f :write, :key "reg-a", :value 2, :time 300}
++ {:process 1, :type :invoke, :f :read, :key "reg-a", :value nil, :time 400}
++ {:process 1, :type :ok, :f :read, :key "reg-a", :value 1, :time 500}]
+diff --git a/xtask/tests/fixtures/consistency-run/register-history-known-good.edn b/xtask/tests/fixtures/consistency-run/register-history-known-good.edn
+new file mode 100644
+index 0000000..c937b7d
+--- /dev/null
++++ b/xtask/tests/fixtures/consistency-run/register-history-known-good.edn
+@@ -0,0 +1,4 @@
++[{:process 0, :type :invoke, :f :write, :key "reg-a", :value 1, :time 0}
++ {:process 0, :type :ok, :f :write, :key "reg-a", :value 1, :time 100}
++ {:process 1, :type :invoke, :f :read, :key "reg-a", :value nil, :time 200}
++ {:process 1, :type :ok, :f :read, :key "reg-a", :value 1, :time 300}]
