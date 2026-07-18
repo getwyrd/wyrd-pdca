@@ -79,6 +79,41 @@ class ResolvedStateTest(unittest.TestCase):
             self.assertFalse(state.is_resolved(d))
             self.assertEqual(state.state(d), state.UNPLANNED)
 
+    def test_iterated_cycle_left_briefless_is_not_resolved(self) -> None:
+        # `iterate-to-Plan` archives brief.md (+ downstream) into iteration-vN/, leaving a
+        # REAL rejected cycle briefless and awaiting a re-plan. Even with a stray `resolved`
+        # key it must stay UNPLANNED (in the resume set), never RESOLVED (Codex P2 on #150).
+        d = _bundle(self.root, "issue_iter")
+        (d / "iteration-v1").mkdir()
+        (d / "iteration-v1" / "brief.md").write_text("# archived brief\n", encoding="utf-8")
+        (d / "notes.json").write_text(
+            json.dumps({"resolved": {"github_state": "closed"}}), encoding="utf-8"
+        )
+        self.assertFalse(state.is_resolved(d))
+        self.assertEqual(state.state(d), state.UNPLANNED)
+
+    def test_briefless_with_any_downstream_artifact_is_not_resolved(self) -> None:
+        # ANY artifact in DOWNSTREAM_OF_BRIEF — not just patch.diff — means a cycle touched
+        # this bundle, so a resolved key cannot short-circuit it to terminal. Covers the
+        # ones a hand-picked subset would miss (build-notes.md, check-review.md, …).
+        for artifact in state.DOWNSTREAM_OF_BRIEF:
+            d = _bundle(self.root, f"issue_stray_{artifact.replace('.', '_')}")
+            (d / artifact).write_text("x\n", encoding="utf-8")
+            (d / "notes.json").write_text(
+                json.dumps({"resolved": {"github_state": "closed"}}), encoding="utf-8"
+            )
+            self.assertFalse(
+                state.is_resolved(d), f"{artifact} present must block RESOLVED"
+            )
+            self.assertEqual(state.state(d), state.UNPLANNED)
+
+    def test_downstream_of_brief_is_the_shared_source_of_truth(self) -> None:
+        # driver re-exports state's list — one source, so is_resolved and the iterate
+        # archive can never diverge on "which files mean a cycle ran".
+        from pdca_harness import driver
+
+        self.assertIs(driver.DOWNSTREAM_OF_BRIEF, state.DOWNSTREAM_OF_BRIEF)
+
     def test_resolved_is_a_flow_terminal_state(self) -> None:
         # RESOLVED must count as terminal to the flow driver, else the batch sweep would
         # pick a resolved notes-tracker back up as "work in flight".

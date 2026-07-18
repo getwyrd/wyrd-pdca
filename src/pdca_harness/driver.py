@@ -28,19 +28,13 @@ def _say(msg: str) -> None:
 def _headless_note(leaf) -> str:
     return " (headless Claude — no live output, may take minutes)" if leaf.mode == "command" else ""
 
-# Everything Do and Check write, i.e. everything downstream of brief.md. Includes the
-# close marker (issue #60) so an iterate archives it too — reopening a close bundle to a
-# fix path then clears the marker and runs the real Do+Check band.
-DOWNSTREAM_OF_BRIEF = [
-    "patch.diff",
-    "build-notes.md",
-    state.CLOSE_MARKER,
-    "MANUAL-VERIFICATION.md",
-    "check-gates.json",
-    "check-gates.md",
-    "check-review.md",
-    "SUMMARY.md",
-]
+# Everything Do and Check write, i.e. everything downstream of brief.md — the set the
+# driver archives on iterate. Defined in `state` (the single source of truth: "which files
+# mean a cycle ran" is a state question, also used by `state.is_resolved`); re-exported
+# here under the name the archive logic and tests already use. Includes the close marker
+# (issue #60) so an iterate archives it too — reopening a close bundle to a fix path then
+# clears the marker and runs the real Do+Check band.
+DOWNSTREAM_OF_BRIEF = state.DOWNSTREAM_OF_BRIEF
 
 
 def advance(d: Path, cfg: Config) -> None:
