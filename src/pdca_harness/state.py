@@ -8,6 +8,7 @@ and inspectable (``ls`` answers the question).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from . import brief, signoff
@@ -24,9 +25,10 @@ ITERATE_DO = "ITERATE_DO"  # sign-off chose iterate-to-Do
 ITERATE_PLAN = "ITERATE_PLAN"  # sign-off chose iterate-to-Plan
 COMPLETE = "COMPLETE"  # sign-off accepted — bundle frozen
 DISCONTINUED = "DISCONTINUED"  # sign-off chose discontinue — deliberately abandoned, no transition
+RESOLVED = "RESOLVED"  # a notes-only tracker whose issue was resolved OUTSIDE a cycle — terminal
 
 # States where the driver does nothing (human work, or done).
-HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED}
+HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
 
 # Close-disposition fast path (issue #60): a bundle whose Plan concluded a close /
 # no-fix outcome never builds a patch. Its close marker is the Do artifact — the
@@ -44,11 +46,40 @@ _OUTCOME_TO_STATE = {
 }
 
 
+def is_resolved(d: Path) -> bool:
+    """True iff this is a **notes-only tracker** (an open-question / research issue
+    logged as ``notes.json`` but never carried through a PDCA cycle — no ``brief.md``)
+    whose tracking issue was **resolved outside the cycle**, recorded by a top-level
+    ``resolved`` object in ``notes.json`` (github state + close date + a note that the
+    question was decided in-issue).
+
+    Such a tracker has no result to sign off, so it can never reach COMPLETE/DISCONTINUED
+    through the normal transitions and would otherwise sit in the pending UNPLANNED list
+    forever. The ``resolved`` record makes it terminal ([`RESOLVED`]). Scoped to
+    briefless bundles so a real cycle bundle is never reclassified by a stray key. A
+    malformed / unreadable ``notes.json`` is "not resolved", never a crash (every bundle
+    file is possibly-absent/garbled, same defensive contract as the rest of this module).
+    """
+    p = d / "notes.json"
+    if not p.exists():
+        return False
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return False
+    # A top-level array / string / number / null is valid JSON but not a notes object —
+    # guard the type before `.get` so it can never raise (the "never a crash" contract).
+    return isinstance(data, dict) and isinstance(data.get("resolved"), dict)
+
+
 def state(d: Path) -> str:
     """Return the bundle's state from the files present (docs 03 §state)."""
     bp = d / "brief.md"
     if not bp.exists():
-        return UNPLANNED
+        # A briefless bundle is UNPLANNED — UNLESS it is a notes-only tracker whose issue
+        # was resolved outside a cycle: that is terminal, not pending work waiting on a
+        # Plan.
+        return RESOLVED if is_resolved(d) else UNPLANNED
     # Do is done when there's a patch — OR, on the close-disposition fast path, the
     # close marker that stands in for it (a close bundle never builds a patch.diff).
     if not (d / "patch.diff").exists() and not (d / CLOSE_MARKER).exists():
