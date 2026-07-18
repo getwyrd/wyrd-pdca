@@ -1,0 +1,1876 @@
+diff --git a/crates/gateway-s3/src/lib.rs b/crates/gateway-s3/src/lib.rs
+index 4521301..e1c8967 100644
+--- a/crates/gateway-s3/src/lib.rs
++++ b/crates/gateway-s3/src/lib.rs
+@@ -67,7 +67,7 @@ use axum::Router;
+ use futures_util::StreamExt;
+ use tracing::Instrument;
+ use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectRead};
+-use wyrd_traits::BoxError;
++use wyrd_traits::{BoxError, ErrorClass};
+ 
+ use crate::request_id::{RequestId, RequestIds};
+ use crate::sigv4::Credentials;
+@@ -115,6 +115,7 @@ impl S3Config {
+ pub struct S3Gateway<G> {
+     gateway: Arc<G>,
+     config: Arc<S3Config>,
++    metrics: Option<tracing::Dispatch>,
+ }
+ 
+ struct AppState<G> {
+@@ -123,6 +124,12 @@ struct AppState<G> {
+     /// This process's request-id minter (#529). Shared, not per-request: the monotonic
+     /// half of the id must be drawn from one counter.
+     request_ids: Arc<RequestIds>,
++    /// The `tracing` dispatch the **request plane's RED metrics** are emitted into
++    /// (observability floor, proposal 0010 item 4) — see
++    /// [`S3Gateway::with_metrics_dispatch`]. `None` ⇒ emit into the ambient subscriber,
++    /// which is what a library caller and this crate's own tests get: the emission is
++    /// unconditional, only the *sink* is a role's choice.
++    metrics: Option<tracing::Dispatch>,
+ }
+ 
+ // `Arc` makes the state cheap to clone regardless of the gateway type, so avoid a
+@@ -133,6 +140,9 @@ impl<G> Clone for AppState<G> {
+             gateway: Arc::clone(&self.gateway),
+             config: Arc::clone(&self.config),
+             request_ids: Arc::clone(&self.request_ids),
++            // `Dispatch` is itself a cheap handle (an `Arc` inside), so cloning the state
++            // per request does not clone the subscriber.
++            metrics: self.metrics.clone(),
+         }
+     }
+ }
+@@ -146,16 +156,40 @@ where
+         Self {
+             gateway,
+             config: Arc::new(config),
++            metrics: None,
+         }
+     }
+ 
++    /// Emit this front door's **request-plane RED metrics** into `dispatch` (observability
++    /// floor, proposal 0010 §"Scope boundary" item 4): a per-op latency histogram and an
++    /// error counter keyed by op **and** the typed failure class.
++    ///
++    /// The dispatch is the role's metrics sink — `wyrd_telemetry::DurabilityTelemetry::
++    /// metrics_dispatch()`, composed at the `wyrd s3` role entry (`cli::cmd_s3`) with the
++    /// export surface chosen by `ExporterConfig`. This crate takes a plain
++    /// [`tracing::Dispatch`] and never names a telemetry backend: the whole OpenTelemetry /
++    /// Prometheus / OTLP stack stays behind the shared seam at the composition root
++    /// (ADR-0012; 0010's "no concrete telemetry backend leaks into a leaf crate").
++    ///
++    /// It is carried rather than scoped because `axum::serve` spawns a task per connection,
++    /// which does not inherit a scoped dispatch — see `DurabilityTelemetry::metrics_dispatch`.
++    /// Unset, the metrics are emitted into the ambient subscriber (today's behaviour).
++    pub fn with_metrics_dispatch(mut self, dispatch: tracing::Dispatch) -> Self {
++        self.metrics = Some(dispatch);
++        self
++    }
++
+     /// The axum router: every method/path routes through the `handle` dispatcher, which
+     /// verifies the SigV4 signature first and then dispatches by verb.
+     pub fn router(self) -> Router {
++        // Mint every RED series this front door can ever report, at zero, before it serves
++        // anything — see [`preregister_red`].
++        preregister_red(self.metrics.as_ref());
+         let state = AppState {
+             gateway: self.gateway,
+             config: self.config,
+             request_ids: Arc::new(RequestIds::new()),
++            metrics: self.metrics,
+         };
+         Router::new().fallback(handle::<G>).with_state(state)
+     }
+@@ -167,6 +201,117 @@ where
+     }
+ }
+ 
++// ---- the request plane (observability floor, proposal 0010 §"Scope boundary" item 4) ----
++//
++// RED for the S3 front door: a per-op latency histogram and an error counter keyed by op and
++// by the typed failure class. Counters, not traces — the ratified floor shape (0010
++// §Alternatives: "adequate, not elegant"); a span graph is deferred to its own ADR.
++//
++// Emitted as `tracing` metric events so the shared `MetricsLayer` bridge carries them to
++// whichever export surface the role wired (ADR-0012 dual export, no backend hardcoded). That
++// is the one instrumentation path this workspace has (ADR-0012): the custodian's durability
++// plane raises `monotonic_counter.` / `gauge.` events the same way
++// (`crates/core/src/read.rs:191-200`, `crates/custodian/src/rebalance.rs:320-326`), and
++// minting OTel meters directly here would fork a second path around the seam.
++//
++// The **rate** half of RED is deliberately not a separate counter: the OTel→Prometheus
++// exporter renders a histogram's own `_count` series, so `s3_request_duration_ms_count` is the
++// per-op request rate and a parallel `s3_requests_total` could only drift from it.
++
++/// Every op label the request plane can report. A **bounded** label space (0010 §Open
++/// questions: op + class only — no per-key / per-tenant labels): the front door dispatches
++/// PUT / GET / DELETE, answers HEAD body-lessly, and refuses everything else as `other`, so a
++/// client sending `TRACE` mints no new series. Enumerated here so [`preregister_red`] can
++/// raise the whole space up front.
++const OPS: [&str; 5] = ["put", "get", "delete", "head", "other"];
++
++/// The op label for `method` — the request plane's stable, low-cardinality key.
++fn op_label(method: &Method) -> &'static str {
++    match *method {
++        Method::PUT => "put",
++        Method::GET => "get",
++        Method::DELETE => "delete",
++        Method::HEAD => "head",
++        _ => "other",
++    }
++}
++
++/// Run `f` — which raises `tracing` metric events — against the role's metrics sink.
++///
++/// `Some` ⇒ the role configured a metrics dispatch ([`S3Gateway::with_metrics_dispatch`]);
++/// enter it for the emission. `None` ⇒ emit into the ambient subscriber, which is what a
++/// library caller gets. Entering a dispatch is sound from *any* task (it is a thread-local
++/// set for the closure's duration), which is exactly why the sink is carried rather than
++/// scoped around the serve future: `axum::serve` spawns a task per connection.
++///
++/// `f` must do nothing but emit — it runs with a metrics-only subscriber current, so an
++/// ordinary log line raised inside it would land nowhere.
++fn emit_into(dispatch: Option<&tracing::Dispatch>, f: impl FnOnce()) {
++    match dispatch {
++        Some(dispatch) => tracing::dispatcher::with_default(dispatch, f),
++        None => f(),
++    }
++}
++
++/// Raise every error **counter** series this front door can ever report, at **zero**, before
++/// it serves a request.
++///
++/// A counter that only learns a label the first time that fault fires reports *nothing at
++/// all* until something breaks — so a dashboard reads "no data" both when the gateway is
++/// healthy and when it was never wired, and an alert on `rate(s3_request_errors[5m])` cannot
++/// distinguish "no errors" from "no metric". #577 minted [`ErrorClass::ALL`] for exactly this
++/// (its doc names this issue): a **closed** class set with a **stable** label form, so the
++/// whole op × class space is enumerable up front rather than discovered during an incident.
++///
++/// **Only the counter.** The latency histogram is deliberately NOT pre-registered, and the
++/// asymmetry is not an oversight: `add(0)` on a counter is value-neutral, but `record(0)` on
++/// a histogram is a real observation — it would seed every op's distribution with a phantom
++/// 0ms sample, dragging p50 toward zero and reporting a front door faster than it is. A
++/// latency series that does not exist until the first request is served is the honest
++/// alternative, and it costs nothing: unlike an error, a request arriving is the normal case,
++/// so the series appears immediately in any deployment that is doing anything at all.
++fn preregister_red(dispatch: Option<&tracing::Dispatch>) {
++    emit_into(dispatch, || {
++        for op in OPS {
++            for class in ErrorClass::ALL {
++                tracing::info!(
++                    monotonic_counter.s3_request_errors = 0_u64,
++                    op = op,
++                    class = class.as_str(),
++                );
++            }
++        }
++    });
++}
++
++/// Raise one request's RED sample: always its latency, and — when the request failed — one
++/// error keyed by op **and** the failure class.
++///
++/// The `class` label is #577's [`ErrorClass::as_str`], a value the seam **exports** with a
++/// stable, bounded label form. It is *consumed*, never re-derived: `wyrd_traits::classify` is
++/// the seam's one classifier (`gateway_error_response` runs it over the error's whole
++/// `source()` chain and hands the verdict here through a response extension), so this counter
++/// cannot drift from what the rest of the system calls the same fault — the whole point of
++/// keying item 4's counter on item 6's typed class.
++fn emit_request_red(
++    dispatch: Option<&tracing::Dispatch>,
++    op: &'static str,
++    class: ErrorClass,
++    duration_ms: u64,
++    errored: bool,
++) {
++    emit_into(dispatch, || {
++        tracing::info!(histogram.s3_request_duration_ms = duration_ms, op = op);
++        if errored {
++            tracing::info!(
++                monotonic_counter.s3_request_errors = 1_u64,
++                op = op,
++                class = class.as_str(),
++            );
++        }
++    });
++}
++
+ /// The S3 subresource / multipart query keys this object-only floor does not implement.
+ /// A request carrying any of them is refused (501) rather than falling through to a plain
+ /// object PUT/GET/DELETE, which would mishandle it — destructively for `PUT ?partNumber`
+@@ -266,15 +411,31 @@ struct AccessLogged<S> {
+     declared: Option<u64>,
+     finished: bool,
+     span: tracing::Span,
++    /// The request plane's op label and failure class, carried to the completion point so
++    /// the RED sample is raised from the same place — and at the same moment — as the
++    /// access row (see [`record_access`]).
++    op: &'static str,
++    class: ErrorClass,
++    metrics: Option<tracing::Dispatch>,
+ }
+ 
+-/// Write ONE access row — the single place it is emitted, so the body-carrying and body-less
+-/// paths cannot drift in what they record.
++/// Write ONE access row **and raise this request's RED sample** — the single place both are
++/// emitted, so the body-carrying and body-less paths cannot drift in what they record, and the
++/// log row and the metric can never disagree about how an op ended.
+ ///
+ /// `request_id` is a field of the EVENT, not merely inherited from `span`: a target-scoped
+ /// directive (`RUST_LOG=wyrd.gateway.s3.access=info` — the natural way to keep the access plane
+ /// and quieten the rest) enables this event without enabling the span, whose target is the module
+ /// path, so inheriting alone would lose the join key under exactly that directive.
++///
++/// **The RED sample rides here, and that placement is the whole point.** This function is called
++/// when the transfer actually ENDS, not when the head is built (`finish_response`) — a GET's body
++/// is polled after the handler returns, so a latency measured at head time would report a
++/// near-zero duration for a transfer that may still run for seconds, truncate, or fail. The
++/// access row already made that argument for `duration_ms`; the histogram is the same number, so
++/// it belongs at the same point. It is also why a caller reading the metric back must first drain
++/// the response body.
++#[allow(clippy::too_many_arguments)]
+ fn record_access(
+     span: &tracing::Span,
+     request_id: RequestId,
+@@ -282,6 +443,9 @@ fn record_access(
+     status: u16,
+     bytes: u64,
+     outcome: &'static str,
++    op: &'static str,
++    class: ErrorClass,
++    metrics: Option<&tracing::Dispatch>,
+ ) {
+     let duration_ms = started.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+     span.in_scope(|| {
+@@ -295,6 +459,14 @@ fn record_access(
+             "request served",
+         );
+     });
++    // What counts as an ERROR for RED is the request's *observed* fate, not just its status
++    // line. A 4xx/5xx is a failed request. So is a `200` head whose body then errored
++    // (`failed`) or ended short of its declared length (`truncated`): the client did not get
++    // the object, and counting it a success would be the "confident, wrong answer" this
++    // module's own body-wrapping exists to prevent. `aborted` is NOT an error — that is a
++    // client that hung up, which is not the gateway failing.
++    let errored = status >= 400 || matches!(outcome, "failed" | "truncated");
++    emit_request_red(metrics, op, class, duration_ms as u64, errored);
+ }
+ 
+ impl<S> AccessLogged<S> {
+@@ -312,6 +484,9 @@ impl<S> AccessLogged<S> {
+             self.status,
+             self.bytes,
+             outcome,
++            self.op,
++            self.class,
++            self.metrics.as_ref(),
+         );
+     }
+ }
+@@ -385,12 +560,16 @@ impl<S> Drop for AccessLogged<S> {
+ ///   would send every successful DELETE, which answers `204`, straight to the `Drop` arm and
+ ///   record it as `aborted` — a systematic lie about the most ordinary success there is, and one
+ ///   that would read as a fleet of clients hanging up mid-download. (Codex review of #532.)
++#[allow(clippy::too_many_arguments)]
+ fn finish_response(
+     response: Response,
+     method: &Method,
+     span: &tracing::Span,
+     request_id: RequestId,
+     started: SystemTime,
++    op: &'static str,
++    class: ErrorClass,
++    metrics: Option<tracing::Dispatch>,
+ ) -> Response {
+     let status = response.status();
+     // Hyper never polls the body of a `204`/`304`/`1xx` (HTTP forbids one), and it SUPPRESSES the
+@@ -400,7 +579,17 @@ fn finish_response(
+     let bodyless =
+         matches!(status.as_u16(), 204 | 304) || status.is_informational() || method == Method::HEAD;
+     if bodyless {
+-        record_access(span, request_id, started, status.as_u16(), 0, "complete");
++        record_access(
++            span,
++            request_id,
++            started,
++            status.as_u16(),
++            0,
++            "complete",
++            op,
++            class,
++            metrics.as_ref(),
++        );
+         return response;
+     }
+     let declared = response
+@@ -418,6 +607,9 @@ fn finish_response(
+             declared,
+             finished: false,
+             span: span.clone(),
++            op,
++            class,
++            metrics,
+         })
+     })
+ }
+@@ -429,6 +621,10 @@ where
+     let request_id = state.request_ids.mint();
+     let started = SystemTime::now();
+     let method = req.method().clone();
++    // The request plane's op label + metrics sink, read before `state` is moved into the
++    // dispatcher below.
++    let op = op_label(&method);
++    let metrics = state.metrics.clone();
+     let span = tracing::info_span!(
+         "s3.request",
+         request_id = %request_id,
+@@ -439,6 +635,25 @@ where
+         .instrument(span.clone())
+         .await;
+ 
++    // **The failure class, as the seam classified it — not as this layer guesses it.**
++    // `gateway_error_response` runs #577's `wyrd_traits::classify` over the error's whole
++    // `source()` chain and stamps the verdict onto the response, so the RED counter keys on
++    // the same typed class the retry policies and the audit log read (0010 item 4: "keyed by
++    // the typed failure class from item 6").
++    //
++    // No extension ⇒ the response carries no seam error at all: the request was refused by
++    // this layer before any backend was touched (an unsigned request's 403, an unparsable
++    // path's 400, an unsupported subresource's 501, an absent key's 404, a bad verb's 405).
++    // Those default to `Terminal`, which is not a fallback so much as the SAME answer
++    // `classify` gives — its documented fail-safe default for anything it cannot otherwise
++    // name — and it is correct here on the merits: retrying an unsigned request or a missing
++    // key cannot help.
++    let class = response
++        .extensions()
++        .get::<ErrorClass>()
++        .copied()
++        .unwrap_or(ErrorClass::Terminal);
++
+     // **The access line — without it the id is a promise this crate does not keep.**
+     //
+     // A span is not a log record: the `fmt` layer attaches a span's fields to the *events*
+@@ -463,7 +678,9 @@ where
+     // fail mid-stream — a row that is actively misleading in exactly the field-diagnosis case the
+     // id exists for. The body is wrapped so the row carries the *observed* outcome: bytes
+     // actually sent, the real duration, and whether the transfer completed (#529 review).
+-    let mut response = finish_response(response, &method, &span, request_id, started);
++    let mut response = finish_response(
++        response, &method, &span, request_id, started, op, class, metrics,
++    );
+ 
+     // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
+     // reporting, so the tester who hits the failure can quote the id without any
+@@ -815,7 +1032,19 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
+             "the gateway refused the request",
+         );
+     }
+-    error_response(request_id, status, code, &message)
++    let mut response = error_response(request_id, status, code, &message);
++    // **Carry the typed failure class out to the request plane.** The class is derived HERE,
++    // where the backend's error still exists, by the seam's own classifier (#577's
++    // `wyrd_traits::classify`, which walks the `source()` chain so a wrapped fault is still
++    // named) — and it is stamped on the response rather than re-derived from the status code
++    // at the completion point. Re-deriving would be a second, divergent classifier: the S3
++    // status mapping above deliberately answers `500 InternalError` for BOTH a transient
++    // fault and a may-have-landed commit, so the wire status simply does not carry the
++    // distinction the counter is supposed to report.
++    response
++        .extensions_mut()
++        .insert(wyrd_traits::classify(err.as_ref()));
++    response
+ }
+ 
+ /// The error → (status, S3 code, client message) mapping, split out so the *classification*
+@@ -1507,6 +1736,11 @@ mod tests {
+                 declared,
+                 finished: false,
+                 span: tracing::info_span!("s3.request"),
++                // This test drives the ACCESS ROW, not the RED metrics: no sink, so the
++                // metric event falls through to the ambient subscriber (#575).
++                op: "get",
++                class: ErrorClass::Terminal,
++                metrics: None,
+             };
+             let body = Body::from_stream(logged);
+             if drain {
+@@ -1602,6 +1836,9 @@ mod tests {
+                 declared: Some(5),
+                 finished: false,
+                 span: tracing::info_span!("s3.request"),
++                op: "get",
++                class: ErrorClass::Terminal,
++                metrics: None,
+             };
+             let _ = futures_util::StreamExt::next(&mut logged).await; // the 5 declared bytes
+             drop(logged); // hyper stops here: no EOF poll
+@@ -1654,6 +1891,9 @@ mod tests {
+                 &span,
+                 RequestIds::new().mint(),
+                 SystemTime::now(),
++                op_label(&method),
++                ErrorClass::Terminal,
++                None,
+             );
+             if drain {
+                 let _ = axum::body::to_bytes(finished.into_body(), usize::MAX).await;
+diff --git a/crates/server/src/cli.rs b/crates/server/src/cli.rs
+index 97931ca..44ab1bb 100644
+--- a/crates/server/src/cli.rs
++++ b/crates/server/src/cli.rs
+@@ -363,7 +363,7 @@ fn usage() {
+     eprintln!("usage:");
+     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
+     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
+-    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
++    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
+     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
+     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
+     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
+@@ -374,7 +374,7 @@ fn usage() {
+     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
+     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
+     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
+-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
++    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
+     eprintln!("  wyrd demo");
+     eprintln!();
+     eprintln!("  every command also accepts:");
+@@ -666,6 +666,16 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
+         ..dserver::AdmissionControl::default()
+     };
+ 
++    // The export surface, selected exactly as `cmd_custodian` selects its own
++    // (`cli.rs:797-802`): Prometheus always, plus OTLP push when `--otlp-endpoint` names a
++    // collector. No backend hardcoded (ADR-0012).
++    let exporter = match parsed.flag("otlp-endpoint") {
++        Some(endpoint) => ExporterConfig::Both {
++            otlp_endpoint: endpoint.to_string(),
++        },
++        None => ExporterConfig::Prometheus,
++    };
++
+     let chunk_dir = Path::new(data_dir).join("chunks");
+     let store = FsChunkStore::open(&chunk_dir)?;
+ 
+@@ -680,19 +690,26 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
+     let runtime = tokio::runtime::Builder::new_multi_thread()
+         .enable_all()
+         .build()?;
+-    let params = DServerParams {
+-        bind,
+-        advertise_addr,
+-        dserver_id,
+-        failure_domain,
+-        admission,
+-        group: group.to_string(),
+-        lease_ttl,
+-        renew_interval,
+-        data_dir: data_dir.to_string(),
+-    };
+     runtime.block_on(async move {
+-        match coordination {
++        // **The metrics provider this role was missing** — the item-3 enabler. `init_global`
++        // gives every role the LOG layers (#527); until now only `cmd_custodian` built a
++        // `DurabilityTelemetry`, so the d-server's admission decisions had nowhere to land
++        // even once instrumented. Built inside the runtime (the OTLP exporter's tonic
++        // transport is constructed there).
++        let telemetry = DurabilityTelemetry::new(exporter)?;
++        let params = DServerParams {
++            bind,
++            advertise_addr,
++            dserver_id,
++            failure_domain,
++            admission,
++            group: group.to_string(),
++            lease_ttl,
++            renew_interval,
++            data_dir: data_dir.to_string(),
++            metrics: Some(telemetry.metrics_dispatch()),
++        };
++        let served = match coordination {
+             CoordinationBackend::Mem => {
+                 run_d_server(Arc::new(MemCoordination::new()), store, params).await
+             }
+@@ -700,7 +717,11 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
+             CoordinationBackend::Etcd => {
+                 run_d_server(Arc::new(open_etcd_coordination().await?), store, params).await
+             }
+-        }
++        };
++        // Hold the handle for the role's whole life: it owns the export readers the
++        // capacity-plane metrics are exported through.
++        drop(telemetry);
++        served
+     })?;
+     Ok(ExitCode::SUCCESS)
+ }
+@@ -1353,6 +1374,9 @@ struct DServerParams {
+     lease_ttl: Duration,
+     renew_interval: Duration,
+     data_dir: String,
++    /// The role's metrics sink, which the capacity plane emits its admission signals into
++    /// (proposal 0010 item 5). `None` ⇒ the ambient subscriber (an in-process caller).
++    metrics: Option<tracing::Dispatch>,
+ }
+ 
+ /// Host the local filesystem `ChunkStore` over gRPC and register through the given
+@@ -1375,6 +1399,9 @@ where
+     if let Some(advertise_addr) = params.advertise_addr {
+         server = server.with_advertise_addr(advertise_addr);
+     }
++    if let Some(metrics) = params.metrics {
++        server = server.with_metrics_dispatch(metrics);
++    }
+     eprintln!(
+         "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
+         server.endpoint(),
+@@ -1744,8 +1771,27 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
+         secret_access_key: secret_key,
+     }];
+ 
++    // The export surface, selected exactly as `cmd_custodian` selects its own
++    // (`cli.rs:797-802`): a Prometheus registry is always wired (in-process read-back);
++    // `--otlp-endpoint` additionally pushes to a collector (the production path). No backend
++    // is hardcoded (ADR-0012) — the role picks, the emitting crates never name one.
++    let exporter = match parsed.flag("otlp-endpoint") {
++        Some(endpoint) => ExporterConfig::Both {
++            otlp_endpoint: endpoint.to_string(),
++        },
++        None => ExporterConfig::Prometheus,
++    };
++
+     let runtime = tokio_runtime()?;
+     runtime.block_on(async move {
++        // **The metrics provider this role was missing.** `init_global` (`cli.rs:358`)
++        // installs the LOG layers at every role entry (#527), but a metrics provider was
++        // wired only in `cmd_custodian` — so the S3 front door's instrumentation, however
++        // complete, emitted into a subscriber with no bridge and reported nothing. This is
++        // the item-3 enabler items 4-5 need to be observable at all. Built inside the runtime
++        // because the OTLP exporter's tonic transport is constructed there.
++        let telemetry = DurabilityTelemetry::new(exporter)?;
++        let metrics = telemetry.metrics_dispatch();
+         let listener = tokio::net::TcpListener::bind(listen).await?;
+         eprintln!(
+             "wyrd s3: serving S3-compatible HTTP on {} (data-dir {data_dir})",
+@@ -1771,7 +1817,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
+             dservers = endpoints.as_deref().map_or(0, <[String]>::len),
+             "role started",
+         );
+-        serve_s3_role(
++        let served = serve_s3_role(
+             backend,
+             coordination,
+             data_dir,
+@@ -1779,8 +1825,14 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
+             credentials,
+             region,
+             listener,
++            Some(metrics),
+         )
+-        .await
++        .await;
++        // Hold the handle for the role's whole life: it owns the readers (the Prometheus
++        // registry and the OTLP `PeriodicReader`) that the emitted metrics are exported
++        // through.
++        drop(telemetry);
++        served
+     })?;
+     Ok(ExitCode::SUCCESS)
+ }
+@@ -1800,6 +1852,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
+ ///
+ /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
+ /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
++#[allow(clippy::too_many_arguments)]
+ pub async fn serve_s3_role(
+     backend: MetadataBackend,
+     coordination: CoordinationBackend,
+@@ -1808,6 +1861,7 @@ pub async fn serve_s3_role(
+     credentials: Vec<s3::sigv4::Credentials>,
+     region: String,
+     listener: tokio::net::TcpListener,
++    metrics: Option<tracing::Dispatch>,
+ ) -> Result<(), BoxError> {
+     match endpoints {
+         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
+@@ -1823,6 +1877,7 @@ pub async fn serve_s3_role(
+                 credentials,
+                 region,
+                 listener,
++                metrics,
+             )
+             .await
+         }
+@@ -1838,6 +1893,7 @@ pub async fn serve_s3_role(
+                 credentials,
+                 region,
+                 listener,
++                metrics,
+             )
+             .await
+         }
+@@ -1851,6 +1907,7 @@ pub async fn serve_s3_role(
+ /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
+ /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
+ /// production `tikv` + `etcd` arms build under their respective cargo features.
++#[allow(clippy::too_many_arguments)]
+ async fn serve_s3_dispatch<C>(
+     backend: MetadataBackend,
+     coordination: CoordinationBackend,
+@@ -1859,6 +1916,7 @@ async fn serve_s3_dispatch<C>(
+     credentials: Vec<s3::sigv4::Credentials>,
+     region: String,
+     listener: tokio::net::TcpListener,
++    metrics: Option<tracing::Dispatch>,
+ ) -> Result<(), BoxError>
+ where
+     C: PlacementChunkStore + Send + Sync + 'static,
+@@ -1867,40 +1925,40 @@ where
+         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
+             let meta = open_local_meta_redb(data_dir)?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+         #[cfg(feature = "tikv")]
+         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
+             let meta = open_tikv_meta().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+         #[cfg(feature = "etcd")]
+         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
+             let meta = open_local_meta_redb(data_dir)?;
+             let coord = open_etcd_coordination().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+         #[cfg(all(feature = "tikv", feature = "etcd"))]
+         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
+             let meta = open_tikv_meta().await?;
+             let coord = open_etcd_coordination().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+         #[cfg(feature = "fdb")]
+         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
+             let meta = open_fdb_meta().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+         #[cfg(all(feature = "fdb", feature = "etcd"))]
+         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
+             let meta = open_fdb_meta().await?;
+             let coord = open_etcd_coordination().await?;
+             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+-            serve_s3(gateway, credentials, region, listener).await
++            serve_s3(gateway, credentials, region, listener, metrics).await
+         }
+     }
+ }
+@@ -1916,6 +1974,7 @@ pub async fn serve_s3<M, C, Co>(
+     credentials: Vec<s3::sigv4::Credentials>,
+     region: String,
+     listener: tokio::net::TcpListener,
++    metrics: Option<tracing::Dispatch>,
+ ) -> Result<(), BoxError>
+ where
+     M: MetadataStore + Send + Sync + 'static,
+@@ -1930,7 +1989,13 @@ where
+     gateway.recover().await?;
+     let mut config = s3::S3Config::new(credentials);
+     config.region = region;
+-    let server = s3::S3Gateway::new(gateway, config);
++    // The request plane's sink (observability floor, item 4 + the item-3 role wiring): the
++    // front door emits its RED metrics into the role's telemetry handle. `None` leaves them on
++    // the ambient subscriber -- the composition an in-process caller gets.
++    let mut server = s3::S3Gateway::new(gateway, config);
++    if let Some(metrics) = metrics {
++        server = server.with_metrics_dispatch(metrics);
++    }
+     server.serve(listener).await?;
+     Ok(())
+ }
+diff --git a/crates/server/src/dserver.rs b/crates/server/src/dserver.rs
+index 000f8a5..895225a 100644
+--- a/crates/server/src/dserver.rs
++++ b/crates/server/src/dserver.rs
+@@ -14,8 +14,10 @@
+ 
+ use std::future::Future;
+ use std::net::SocketAddr;
+-use std::sync::Arc;
+-use std::time::Duration;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex};
++use std::task::{Context, Poll};
++use std::time::{Duration, Instant};
+ 
+ use bytes::Bytes;
+ use serde::{Deserialize, Serialize};
+@@ -23,10 +25,12 @@ use tokio::net::TcpListener;
+ use tokio_stream::wrappers::TcpListenerStream;
+ use tonic::transport::Server;
+ use tower::limit::GlobalConcurrencyLimitLayer;
++use tower::load_shed::error::Overloaded;
+ use tower::load_shed::LoadShedLayer;
++use tower::{Layer, Service};
+ use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
+ use wyrd_core::placement::Topology;
+-use wyrd_traits::{ChunkStore, Coordination, DServerId, Lease, Result};
++use wyrd_traits::{BoxError, ChunkStore, Coordination, DServerId, Lease, Result};
+ 
+ /// The discovery group under which D servers register their gRPC endpoints.
+ pub const DSERVER_GROUP: &str = "chunkstore";
+@@ -129,6 +133,318 @@ impl Default for AdmissionControl {
+     }
+ }
+ 
++// ---- the capacity plane (observability floor, proposal 0010 §"Scope boundary" item 5) ----
++//
++// The admission stack above decides, per request, whether the server takes the work. Until
++// now it did so **silently**: an over-limit request was shed with a `RESOURCE_EXHAUSTED` the
++// CLIENT saw and the server never recorded, so "are we shedding load?" — the first question
++// of any overload post-mortem — was answerable only from client-side evidence, if anyone had
++// kept it. These types make each admission decision an event on the shared telemetry seam.
++//
++// **Emission only.** Nothing here changes what is admitted, shed, or cut: every layer
++// forwards its inner service's outcome unaltered, and the `Server::builder()` options that
++// set the actual policy are untouched. The observers are *positioned* around the existing
++// stack rather than replacing any part of it.
++
++/// The capacity plane's shared state: where its metric events go, and the live count of
++/// admitted-and-not-yet-finished requests.
++///
++/// Cloned into every layer and (by tonic) per connection, so the in-flight count MUST be
++/// shared — an `Arc<AtomicI64>` — or each connection would report only its own share of a
++/// bound that is explicitly server-wide.
++#[derive(Clone)]
++struct CapacityPlane {
++    /// The role's metrics sink (`DurabilityTelemetry::metrics_dispatch()`, composed at the
++    /// `wyrd d-server` role entry). `None` ⇒ the ambient subscriber: the emission is
++    /// unconditional, only the SINK is a role's choice, so a library caller / an existing
++    /// test that never wires telemetry is unaffected.
++    dispatch: Option<tracing::Dispatch>,
++    /// The in-flight level. A `Mutex`, not an atomic, because the level and its *emission*
++    /// must move together — see [`CapacityPlane::record_in_flight`].
++    in_flight: Arc<Mutex<i64>>,
++}
++
++impl CapacityPlane {
++    fn new(dispatch: Option<tracing::Dispatch>) -> Self {
++        Self {
++            dispatch,
++            in_flight: Arc::new(Mutex::new(0)),
++        }
++    }
++
++    /// Emit `f`'s metric events into the role's sink. Entering a dispatch is a thread-local
++    /// set for the closure's duration, so it is sound from any task — which is why the sink
++    /// is carried here rather than scoped around `serve`: tonic spawns a task per connection
++    /// (`tonic-0.14.6` `src/transport/server/mod.rs:925`) and a spawned task does not
++    /// inherit a scoped dispatch.
++    fn emit(&self, f: impl FnOnce()) {
++        match &self.dispatch {
++            Some(dispatch) => tracing::dispatcher::with_default(dispatch, f),
++            None => f(),
++        }
++    }
++
++    /// Raise every capacity series at **zero** before the server accepts anything, so a
++    /// dashboard reads "0 shed" rather than "no data" on a healthy server — the two are
++    /// indistinguishable for a counter that only appears once it first fires (the same
++    /// argument #577's `ErrorClass::ALL` makes for the request plane's class labels).
++    fn preregister(&self) {
++        self.emit(|| {
++            tracing::info!(monotonic_counter.capacity_requests_admitted = 0_u64);
++            tracing::info!(monotonic_counter.capacity_requests_shed = 0_u64);
++            tracing::info!(monotonic_counter.capacity_requests_timed_out = 0_u64);
++            tracing::info!(monotonic_counter.capacity_requests_cancelled = 0_u64);
++            tracing::info!(gauge.capacity_requests_in_flight = 0_i64);
++        });
++    }
++
++    /// Move the in-flight level by `delta`, run `also`, and report the new level — all
++    /// **atomically with respect to other emitters**.
++    ///
++    /// The lock spans the *emission*, not merely the arithmetic, and that is the whole point.
++    /// With a bare atomic the read and the record are two steps: two requests finishing
++    /// concurrently compute their levels (1, then 0) and can then emit them in the OPPOSITE
++    /// order, latching a last-value gauge at 1. The server is idle and the gauge says one
++    /// request is in flight — forever, or until the next request happens to move it. That is
++    /// exactly the "rises but never returns to zero" defect this signal exists to rule out,
++    /// and it is invisible to any test that drives one request at a time.
++    ///
++    /// The critical section is an integer update plus one or two `tracing` events — no I/O, no
++    /// await — taken twice per RPC, on a path that already acquires an admission semaphore,
++    /// parses HTTP/2, and touches a disk. A poisoned lock is recovered rather than propagated:
++    /// telemetry must not take a storage server down, and this runs inside a `Drop`, where a
++    /// panic during unwind would abort the process.
++    fn record_in_flight(&self, delta: i64, also: impl FnOnce()) {
++        let mut in_flight = self
++            .in_flight
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        *in_flight += delta;
++        let level = *in_flight;
++        self.emit(|| {
++            also();
++            tracing::info!(gauge.capacity_requests_in_flight = level);
++        });
++    }
++
++    /// A request cleared the server-wide admission bound and is now in flight.
++    fn admitted(&self) {
++        self.record_in_flight(1, || {
++            tracing::info!(monotonic_counter.capacity_requests_admitted = 1_u64);
++        });
++    }
++
++    /// An admitted request left the stack (completed, cut, or cancelled) — it no longer
++    /// holds a slot.
++    fn finished(&self) {
++        self.record_in_flight(-1, || {});
++    }
++
++    /// A request was refused by the server-wide bound.
++    fn shed(&self) {
++        self.emit(|| tracing::info!(monotonic_counter.capacity_requests_shed = 1_u64));
++    }
++
++    /// An admitted request was cut before it produced a response: by the request timeout
++    /// (`timed_out`) or by its caller going away (`cancelled`). Kept as two series because
++    /// the operator response differs — a rising timeout rate is the SERVER failing to make
++    /// progress within its own deadline, while cancellations are clients leaving.
++    fn cut(&self, timed_out: bool) {
++        self.emit(|| {
++            if timed_out {
++                tracing::info!(monotonic_counter.capacity_requests_timed_out = 1_u64);
++            } else {
++                tracing::info!(monotonic_counter.capacity_requests_cancelled = 1_u64);
++            }
++        });
++    }
++}
++
++/// Decrements the in-flight count and reports how an admitted request ended — **whatever**
++/// ends it.
++///
++/// A guard, not a match arm, because the interesting ending is the one with no return value:
++/// tonic's request timeout is applied OUTSIDE this whole layer stack (`GrpcTimeout` wraps the
++/// user's `Server::layer` stack — `tonic-0.14.6` `src/transport/server/mod.rs:1234-1239`), so
++/// when the deadline fires it returns its own error and simply **drops** the inner future.
++/// The cut is therefore never observable as a `Poll::Ready(Err(..))` from in here; it is only
++/// observable as a drop.
++struct AdmissionGuard {
++    plane: CapacityPlane,
++    /// Stamped at `call` — which runs inside `GrpcTimeout::call`, and specifically *before*
++    /// it arms its own `sleep` (that struct literal evaluates `inner: self.inner.call(req)`
++    /// first). So this instant is never later than the deadline's start, and when the
++    /// deadline fires `elapsed >= request_timeout` holds — tokio's `sleep` is documented to
++    /// wait at least its duration, never less. That ordering is what makes the timeout /
++    /// cancellation split below exact rather than a guess about wall-clock.
++    started: Instant,
++    request_timeout: Duration,
++    completed: bool,
++}
++
++impl AdmissionGuard {
++    fn enter(plane: CapacityPlane, request_timeout: Duration) -> Self {
++        plane.admitted();
++        Self {
++            plane,
++            started: Instant::now(),
++            request_timeout,
++            completed: false,
++        }
++    }
++}
++
++impl Drop for AdmissionGuard {
++    fn drop(&mut self) {
++        self.plane.finished();
++        if !self.completed {
++            // Dropped without a response: the request was cut. It was cut by the SERVER's
++            // deadline iff it lived at least that long (see `started`). A shorter life means
++            // something else took it away — the client hung up, the connection died, or the
++            // client's own `grpc-timeout` header set a deadline tighter than ours, which
++            // tonic honours by taking the minimum. Attributing that to the server's request
++            // timeout would be a lie about whose deadline fired.
++            self.plane
++                .cut(self.started.elapsed() >= self.request_timeout);
++        }
++    }
++}
++
++/// Counts requests the **server-wide** bound refused.
++///
++/// It must sit OUTSIDE [`LoadShedLayer`] to see anything: load-shed is what turns the
++/// concurrency limit's backpressure into a rejection, so a shed request never reaches any
++/// layer below it. `tower`'s `Overloaded` error is that rejection, and it is forwarded
++/// unchanged — tonic still maps it to the same retryable `RESOURCE_EXHAUSTED` the client got
++/// before.
++///
++/// It observes only the server-wide shed, which is the bound `AdmissionControl` documents as
++/// binding and the one an operator tunes. The secondary *per-connection* cap is applied by
++/// tonic outside the user layer stack entirely, so its shed is not reachable from here.
++#[derive(Clone)]
++struct ShedObserver<S> {
++    inner: S,
++    plane: CapacityPlane,
++}
++
++#[derive(Clone)]
++struct ShedObserverLayer {
++    plane: CapacityPlane,
++}
++
++impl<S> Layer<S> for ShedObserverLayer {
++    type Service = ShedObserver<S>;
++
++    fn layer(&self, inner: S) -> Self::Service {
++        ShedObserver {
++            inner,
++            plane: self.plane.clone(),
++        }
++    }
++}
++
++impl<S, R> Service<R> for ShedObserver<S>
++where
++    S: Service<R>,
++    S::Error: Into<BoxError>,
++    S::Future: Send + 'static,
++    S::Response: 'static,
++{
++    type Response = S::Response;
++    type Error = BoxError;
++    // Boxed rather than a hand-written future: projecting a pinned inner future without a
++    // `pin-project` dependency would need `unsafe`, which this crate forbids. It costs one
++    // allocation per request on a path that already boxes per request inside tonic
++    // (`BoxCloneService`) and then does fragment I/O, and it changes no behaviour.
++    type Future = Pin<Box<dyn Future<Output = std::result::Result<S::Response, BoxError>> + Send>>;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
++        self.inner.poll_ready(cx).map_err(Into::into)
++    }
++
++    fn call(&mut self, req: R) -> Self::Future {
++        let plane = self.plane.clone();
++        let inner = self.inner.call(req);
++        Box::pin(async move {
++            match inner.await {
++                Ok(response) => Ok(response),
++                Err(err) => {
++                    let err: BoxError = err.into();
++                    if err.is::<Overloaded>() {
++                        plane.shed();
++                    }
++                    Err(err)
++                }
++            }
++        })
++    }
++}
++
++/// Reports admission, the in-flight level, and how each admitted request ended.
++///
++/// It must sit INSIDE [`GlobalConcurrencyLimitLayer`], and that placement is what makes
++/// "admitted" mean admitted: `tower`'s concurrency limit acquires its semaphore permit in
++/// `poll_ready` and only then calls inner, so reaching this layer's `call` *is* holding a
++/// slot. An observer placed outside the limit could not tell an admitted request from one
++/// about to be shed, and would have to count both before retracting one — which is exactly
++/// how an in-flight gauge starts reporting load that was never accepted.
++#[derive(Clone)]
++struct AdmissionObserver<S> {
++    inner: S,
++    plane: CapacityPlane,
++    request_timeout: Duration,
++}
++
++#[derive(Clone)]
++struct AdmissionObserverLayer {
++    plane: CapacityPlane,
++    request_timeout: Duration,
++}
++
++impl<S> Layer<S> for AdmissionObserverLayer {
++    type Service = AdmissionObserver<S>;
++
++    fn layer(&self, inner: S) -> Self::Service {
++        AdmissionObserver {
++            inner,
++            plane: self.plane.clone(),
++            request_timeout: self.request_timeout,
++        }
++    }
++}
++
++impl<S, R> Service<R> for AdmissionObserver<S>
++where
++    S: Service<R>,
++    S::Future: Send + 'static,
++    S::Response: 'static,
++    S::Error: 'static,
++{
++    type Response = S::Response;
++    type Error = S::Error;
++    type Future = Pin<Box<dyn Future<Output = std::result::Result<S::Response, S::Error>> + Send>>;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: R) -> Self::Future {
++        // The guard is built HERE, not inside the async block, for two reasons. Its `started`
++        // must be stamped before `GrpcTimeout` arms its deadline (see `AdmissionGuard`), and
++        // moving it into the block means a future that is dropped without ever being polled
++        // still releases its in-flight slot — otherwise the gauge would leak upward and never
++        // return to zero.
++        let guard = AdmissionGuard::enter(self.plane.clone(), self.request_timeout);
++        let inner = self.inner.call(req);
++        Box::pin(async move {
++            let mut guard = guard;
++            let response = inner.await;
++            guard.completed = true;
++            response
++        })
++    }
++}
++
+ /// What a D server publishes through `Coordination::register` (proposal 0005, "The
+ /// placement record", `0005:194-196`): its **stable id**, its current dialable
+ /// **endpoint**, and its opaque **failure-domain label**. Keyed on the stable id
+@@ -174,6 +490,9 @@ pub struct DServer<S> {
+     id: DServerId,
+     failure_domain: String,
+     admission: AdmissionControl,
++    /// The sink this server's **capacity-plane** signals are emitted into (proposal 0010
++    /// item 5) — see [`DServer::with_metrics_dispatch`].
++    metrics: Option<tracing::Dispatch>,
+ }
+ 
+ impl<S: ChunkStore + 'static> DServer<S> {
+@@ -194,9 +513,28 @@ impl<S: ChunkStore + 'static> DServer<S> {
+             id: 0,
+             failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
+             admission: AdmissionControl::default(),
++            metrics: None,
+         })
+     }
+ 
++    /// Emit this server's **capacity-plane** signals into `dispatch` (observability floor,
++    /// proposal 0010 §"Scope boundary" item 5): admitted / shed / timed-out / cancelled
++    /// events and the in-flight RPC gauge, raised around the existing admission stack.
++    ///
++    /// The dispatch is the role's metrics sink (`wyrd_telemetry::DurabilityTelemetry::
++    /// metrics_dispatch()`), composed at the `wyrd d-server` role entry (`cli::cmd_d_server`)
++    /// with the export surface chosen by `ExporterConfig` — so no telemetry backend is named
++    /// here (ADR-0012). It is carried rather than scoped because tonic serves each connection
++    /// on its own spawned task, which does not inherit a scoped dispatch.
++    ///
++    /// Unset, the signals are emitted into the ambient subscriber (today's behaviour). This
++    /// changes **no** admission behaviour either way: what is admitted and what is shed is
++    /// [`AdmissionControl`]'s business, and the observers only watch.
++    pub fn with_metrics_dispatch(mut self, dispatch: tracing::Dispatch) -> Self {
++        self.metrics = Some(dispatch);
++        self
++    }
++
+     /// Set this server's **stable id** and opaque **failure-domain label** — the
+     /// placement-relevant facts its registration carries (proposal 0005,
+     /// `0005:194-196`, §"Failure-domain-aware placement"). Distinct labels are what
+@@ -285,7 +623,20 @@ impl<S: ChunkStore + 'static> DServer<S> {
+     {
+         let service = ChunkStoreService::new(self.store);
+         let admission = self.admission;
++        // The capacity plane (proposal 0010 item 5). Built once, outside the builder, so the
++        // in-flight count is shared by BOTH observers and by every per-connection clone of
++        // the layer stack — the gauge tracks the same server-wide population the admission
++        // bound does.
++        let plane = CapacityPlane::new(self.metrics);
++        plane.preregister();
+         let serve = Server::builder()
++            // OBSERVE the shed (0010 item 5). Outermost, so it sees the `Overloaded`
++            // rejection the load-shed layer below raises — the shed that until now was
++            // visible ONLY as a client-side `RESOURCE_EXHAUSTED`. It forwards that error
++            // untouched; nothing about what gets shed moves.
++            .layer(ShedObserverLayer {
++                plane: plane.clone(),
++            })
+             // Fail-closed admission, SERVER-WIDE (architecture §8.9). Applied via
+             // `.layer()`, the layer stack is built once and *cloned* per connection,
+             // so a `GlobalConcurrencyLimitLayer` (which holds one `Arc<Semaphore>`)
+@@ -305,6 +656,14 @@ impl<S: ChunkStore + 'static> DServer<S> {
+             .layer(GlobalConcurrencyLimitLayer::new(
+                 admission.max_concurrent_requests,
+             ))
++            // OBSERVE admission + the in-flight level (0010 item 5). INSIDE the concurrency
++            // limit, so it is reached only by a request that already holds a permit — which
++            // is what makes "admitted" mean admitted and keeps a shed request off the
++            // in-flight gauge entirely.
++            .layer(AdmissionObserverLayer {
++                plane: plane.clone(),
++                request_timeout: admission.request_timeout,
++            })
+             // Secondary, per-connection caps: a single connection cannot monopolise
+             // the budget, and `load_shed` makes its over-limit excess shed too. The
+             // server-wide layer above is the binding fail-closed bound; these only
+diff --git a/crates/server/tests/request_capacity_planes.rs b/crates/server/tests/request_capacity_planes.rs
+new file mode 100644
+index 0000000..4134b45
+--- /dev/null
++++ b/crates/server/tests/request_capacity_planes.rs
+@@ -0,0 +1,683 @@
++//! **The request and capacity planes, observed through their own export surface**
++//! (observability floor, proposal 0010 §"Scope boundary" items 4–5; issue #575).
++//!
++//! The custodian's *durability* plane has been watchable since #450/#527. These two were
++//! dark: nothing reported a failing or slow request, and a load-shed was silent — visible
++//! only as a client-side `RESOURCE_EXHAUSTED`, which is to say visible only to whoever kept
++//! the client's logs. This file closes that gap by driving the **real roles** and reading the
++//! metrics back off `DurabilityTelemetry::gather_prometheus` (`crates/telemetry/src/lib.rs`),
++//! the in-process assertion seam 0010 §DST names.
++//!
++//! **Both planes are driven over a real loopback listener, and that is load-bearing rather
++//! than thoroughness.** The instrumentation emits from tonic's and axum's *per-connection
++//! spawned tasks* (`tonic-0.14.6` `src/transport/server/mod.rs:925`), and a spawned task does
++//! not inherit a scoped `tracing` dispatch. A test that drove the router in-process, on its
++//! own task, would pass against wiring that emits **nothing** in production. So each test
++//! stands the role up exactly as its CLI entry does — `S3Gateway::with_metrics_dispatch` +
++//! `serve` for `wyrd s3` (`cli::serve_s3`), `DServer::with_metrics_dispatch` + `serve` for
++//! `wyrd d-server` (`cli::run_d_server`) — and reads back from the same handle the role wired.
++//!
++//! What is asserted, each separately:
++//!
++//! 1. [`the_request_plane_records_per_op_latency_for_a_put_and_a_get`] — a PUT and a GET
++//!    through the real router over a real `Gateway` backend each land a latency sample under
++//!    their own `op` label. The GET's body is **fully drained** first: op completion is
++//!    deliberately deferred to body completion (`crates/gateway-s3/src/lib.rs`), because a
++//!    duration measured when the head was built would report ~0ms for a transfer that has not
++//!    happened yet.
++//! 2. [`the_request_plane_counts_a_failing_op_by_op_and_by_the_typed_class`] — a GET whose
++//!    backend raises a `wyrd_traits::TransientFault` is counted on
++//!    `s3_request_errors{op="get",class="transient"}`. The class is #577's exported value,
++//!    consumed — the fault is a real seam type and the gateway runs the seam's own
++//!    `classify` over it.
++//! 3. [`the_capacity_plane_reports_admission_and_the_in_flight_gauge_returns_to_zero`] — two
++//!    requests held open in the handler raise the admitted counter and drive the in-flight
++//!    gauge to 2; releasing them returns it to **0**.
++//! 4. [`the_capacity_plane_reports_a_forced_load_shed`] — a request over the server-wide
++//!    admission bound is shed, and the shed is an EVENT on the server, not just a status on
++//!    the client (0010 PR-sequence item 5 DoD).
++//! 5. [`the_capacity_plane_reports_a_request_cut_by_the_request_timeout`] — a handler past
++//!    `request_timeout` raises the timed-out counter.
++//!
++//! RED on the base: none of these metric families exist — no per-op or admission metric is
++//! emitted anywhere, and the `s3` / `d-server` roles have no metrics provider at all — so
++//! every read-back below finds nothing and every assertion fails.
++//!
++//! Its own test binary, deliberately: `tracing` caches per-callsite interest in process-global
++//! state, so these callsites must not be raced by a no-subscriber sibling (the
++//! `custodian_day_one.rs` discipline).
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::{Duration, Instant, SystemTime};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use futures_util::Stream;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use tokio::sync::{mpsc, oneshot, Semaphore};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::GrpcChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_core::{ContentHash, ObjectGateway, ObjectRead};
++use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::dserver::{AdmissionControl, DServer, DSERVER_GROUP};
++use wyrd_server::Gateway;
++use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
++use wyrd_traits::{BoxError, ChunkId, ChunkStore, FragmentId, Health, Result, TransientFault};
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++
++// ---- callsite interest ---------------------------------------------------------------
++
++/// Install a permissive global `tracing` default **once**, before any metric callsite is hit.
++///
++/// `tracing` caches each callsite's interest in a process-global table the first time it is
++/// hit, and a first hit that races a no-subscriber default can latch the callsite
++/// `Interest::never` — after which the read-back silently sees nothing and the test is flaky
++/// rather than wrong. Registering against an always-enabling default first makes every
++/// registration agree; each server's own metrics dispatch still routes its events into its own
++/// provider. (The proven pattern from `crates/server/tests/custodian_day_one.rs:338`.)
++fn enable_metric_callsites() {
++    use std::sync::Once;
++    static INIT: Once = Once::new();
++    INIT.call_once(|| {
++        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++    });
++}
++
++// ---- reading the export surface back -------------------------------------------------
++
++/// Every exported sample of `metric`, as `(label block, value)`.
++///
++/// Splits the value off the **last** whitespace rather than taking the second field, so a
++/// label value containing a space cannot shift the parse. Robust to the exporter's own scope
++/// decoration (`otel_scope_name`, …), which rides in the same label block.
++fn samples<'a>(exposed: &'a str, metric: &str) -> Vec<(&'a str, f64)> {
++    exposed
++        .lines()
++        .filter(|line| !line.starts_with('#'))
++        .filter_map(|line| {
++            let (key, value) = line.rsplit_once(char::is_whitespace)?;
++            let value: f64 = value.trim().parse().ok()?;
++            let (name, labels) = match key.split_once('{') {
++                Some((name, rest)) => (name, rest.strip_suffix('}').unwrap_or(rest)),
++                None => (key, ""),
++            };
++            (name == metric).then_some((labels, value))
++        })
++        .collect()
++}
++
++/// The summed value of every sample of `metric` whose label block carries all of `labels`.
++fn metric_sum(exposed: &str, metric: &str, labels: &[(&str, &str)]) -> f64 {
++    samples(exposed, metric)
++        .into_iter()
++        .filter(|(block, _)| {
++            labels
++                .iter()
++                .all(|(k, v)| block.contains(&format!("{k}=\"{v}\"")))
++        })
++        .map(|(_, value)| value)
++        .sum()
++}
++
++/// A `monotonic_counter`'s total. The OTel→Prometheus exporter suffixes a counter `_total`;
++/// accept either spelling (the `custodian_day_one.rs:441` convention).
++fn counter(exposed: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
++    metric_sum(exposed, name, labels) + metric_sum(exposed, &format!("{name}_total"), labels)
++}
++
++/// A gauge's current value — the last sample exported for it, or `None` if it was never
++/// emitted.
++fn gauge(exposed: &str, name: &str) -> Option<f64> {
++    samples(exposed, name).last().map(|(_, value)| *value)
++}
++
++/// Gather the export surface, retrying until `settled` holds or a budget elapses.
++///
++/// The metric is raised on the SERVER's connection task, which tonic/axum spawn: the client's
++/// last byte can land a scheduling tick before that task finishes emitting. Polling the real
++/// surface — rather than sleeping a guessed interval — keeps a green run fast and keeps a RED
++/// run honest: with the production reverted `settled` never holds, the budget elapses, and the
++/// caller's assertion fails on the (empty) text this returns.
++async fn gather_until(telemetry: &DurabilityTelemetry, settled: impl Fn(&str) -> bool) -> String {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    loop {
++        telemetry.flush().expect("flush the meter provider");
++        let exposed = telemetry
++            .gather_prometheus()
++            .expect("Prometheus surface configured");
++        if settled(&exposed) || Instant::now() >= deadline {
++            return exposed;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++}
++
++fn prometheus_telemetry() -> DurabilityTelemetry {
++    DurabilityTelemetry::new(ExporterConfig::Prometheus).expect("build the telemetry seam")
++}
++
++// ---- (a) the request plane -----------------------------------------------------------
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++/// A gateway whose GET always fails with a **transient** seam fault — the shape an
++/// unreachable D-server fleet raises. It is a real `wyrd_traits::TransientFault`, so the
++/// gateway's own `wyrd_traits::classify` (#577) classifies it exactly as it would in
++/// production: the test injects the fault, it does not assert the classification.
++struct FaultyGateway;
++
++impl ObjectGateway for FaultyGateway {
++    async fn put_object_streaming<S>(
++        &self,
++        _key: &str,
++        _source: S,
++        _expected: ContentHash,
++    ) -> Result<()>
++    where
++        S: Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
++    {
++        Err(transient_fault())
++    }
++
++    async fn get_object_streaming(self: Arc<Self>, _key: &str) -> Result<Option<ObjectRead>> {
++        Err(transient_fault())
++    }
++
++    async fn delete_object(&self, _key: &str) -> Result<bool> {
++        Err(transient_fault())
++    }
++}
++
++/// A transient fault wrapping a backend error, as a real backend raises it (#577: the seam
++/// class WRAPS the producer's error rather than replacing it, so `classify` walks the chain).
++fn transient_fault() -> BoxError {
++    Box::new(TransientFault::with_source(
++        "the D-server fleet is unreachable",
++        Box::<dyn std::error::Error + Send + Sync>::from("connection refused"),
++    ))
++}
++
++fn build_gateway(dir: &std::path::Path) -> Arc<Backend> {
++    Arc::new(
++        Gateway::new(
++            RedbMetadataStore::in_memory().expect("redb"),
++            FsChunkStore::open(dir).expect("fs store"),
++            MemCoordination::new(),
++        )
++        // A small chunk size, so a modest object still spans several chunks and the GET
++        // really streams (the case whose latency a head-time measurement would misreport).
++        .with_chunk_size(8),
++    )
++}
++
++/// Serve `gateway` over an ephemeral loopback port with `telemetry` wired as the role's
++/// metrics sink — the composition `cli::serve_s3` builds for `wyrd s3`.
++async fn start_s3<G>(gateway: Arc<G>, telemetry: &DurabilityTelemetry) -> SocketAddr
++where
++    G: ObjectGateway,
++{
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server =
++        S3Gateway::new(gateway, config).with_metrics_dispatch(telemetry.metrics_dispatch());
++    tokio::spawn(async move {
++        let _ = server.serve(listener).await;
++    });
++    addr
++}
++
++fn signed_headers(method: &str, path: &str, host: &str, body: &[u8]) -> Vec<(String, String)> {
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let amz_date = format_amz_date(SystemTime::now());
++    let signed = sign(
++        method, path, "", host, &amz_date, body, &creds, REGION, "s3",
++    );
++    vec![
++        ("authorization".to_string(), signed.authorization),
++        ("x-amz-date".to_string(), signed.amz_date),
++        ("x-amz-content-sha256".to_string(), signed.content_sha256),
++    ]
++}
++
++/// Send one signed HTTP/1.1 request over a fresh connection and **read the response to EOF**
++/// — which fully drains a streaming GET's body. That is required, not incidental: the op's
++/// latency sample is raised when the transfer actually ends, so a caller that read only the
++/// head would read the metric back before it existed.
++async fn send(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> u16 {
++    let host = addr.to_string();
++    let headers = signed_headers(method, path, &host, body);
++    let mut request = format!("{method} {path} HTTP/1.1\r\n");
++    request.push_str(&format!("host: {host}\r\n"));
++    for (name, value) in &headers {
++        request.push_str(&format!("{name}: {value}\r\n"));
++    }
++    request.push_str(&format!("content-length: {}\r\n", body.len()));
++    request.push_str("connection: close\r\n\r\n");
++
++    let mut stream = TcpStream::connect(addr).await.expect("connect");
++    stream
++        .write_all(request.as_bytes())
++        .await
++        .expect("write head");
++    stream.write_all(body).await.expect("write body");
++    stream.flush().await.expect("flush");
++
++    let mut raw = Vec::new();
++    stream.read_to_end(&mut raw).await.expect("read response");
++    let split = raw
++        .windows(4)
++        .position(|w| w == b"\r\n\r\n")
++        .expect("response has a header terminator");
++    String::from_utf8_lossy(&raw[..split])
++        .lines()
++        .next()
++        .expect("status line")
++        .split_whitespace()
++        .nth(1)
++        .expect("status code")
++        .parse()
++        .expect("numeric status")
++}
++
++/// 0010 item 4: each S3 op records a **latency measurement keyed by op**, off the role's own
++/// export surface. Pre-fix no `s3_request_duration_ms` family exists at all (and the `s3` role
++/// has no metrics provider to carry one), so both reads are `0`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn the_request_plane_records_per_op_latency_for_a_put_and_a_get() {
++    enable_metric_callsites();
++    let telemetry = prometheus_telemetry();
++    let dir = tempfile::tempdir().expect("temp dir");
++    let addr = start_s3(build_gateway(dir.path()), &telemetry).await;
++
++    let object = b"observe this object's request plane, every byte of it".to_vec();
++    assert_eq!(
++        send(addr, "PUT", "/bucket/red-object", &object).await,
++        200,
++        "the signed PUT is stored"
++    );
++    // The GET's body is read to EOF — the op is not complete until it is.
++    assert_eq!(
++        send(addr, "GET", "/bucket/red-object", b"").await,
++        200,
++        "the signed GET returns the object"
++    );
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        metric_sum(exposed, "s3_request_duration_ms_count", &[("op", "get")]) >= 1.0
++    })
++    .await;
++
++    // EXACTLY one sample per op — one PUT was sent, one GET was sent. An exact count is what
++    // makes this bind the measurement rather than the metric's mere existence: a `>= 1` here
++    // would also be satisfied by a series minted at registration time, which is precisely how
++    // a latency assertion passes against a gateway that measures nothing.
++    assert_eq!(
++        metric_sum(&exposed, "s3_request_duration_ms_count", &[("op", "put")]),
++        1.0,
++        "the PUT records exactly one latency sample under op=\"put\"; got:\n{exposed}"
++    );
++    assert_eq!(
++        metric_sum(&exposed, "s3_request_duration_ms_count", &[("op", "get")]),
++        1.0,
++        "the GET records exactly one latency sample under op=\"get\", once its body has \
++         drained; got:\n{exposed}"
++    );
++    // The ops are keyed apart, not summed into one series — "which op is slow" is the whole
++    // point of a per-op measurement.
++    assert_eq!(
++        metric_sum(
++            &exposed,
++            "s3_request_duration_ms_count",
++            &[("op", "delete")]
++        ),
++        0.0,
++        "no DELETE was sent, so op=\"delete\" measures nothing — the op label is a real key, \
++         not decoration; got:\n{exposed}"
++    );
++}
++
++/// 0010 item 4: a failing op is counted on an error counter keyed by **op** and by the
++/// **typed failure class** #577 exports. Pre-fix no `s3_request_errors` family exists.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn the_request_plane_counts_a_failing_op_by_op_and_by_the_typed_class() {
++    enable_metric_callsites();
++    let telemetry = prometheus_telemetry();
++    let addr = start_s3(Arc::new(FaultyGateway), &telemetry).await;
++
++    // A signed, well-formed GET whose BACKEND fails transiently — a real fault through the
++    // real router, not a hand-made status code.
++    assert_eq!(
++        send(addr, "GET", "/bucket/unreachable", b"").await,
++        500,
++        "a transient backend fault is answered 500 (the S3 contract has no `unknown` code)"
++    );
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        counter(
++            exposed,
++            "s3_request_errors",
++            &[("op", "get"), ("class", "transient")],
++        ) >= 1.0
++    })
++    .await;
++
++    assert!(
++        counter(
++            &exposed,
++            "s3_request_errors",
++            &[("op", "get"), ("class", "transient")]
++        ) >= 1.0,
++        "the failing GET is counted under op=\"get\" AND the stable class label #577 exports \
++         for a TransientFault; got:\n{exposed}"
++    );
++    // The class must be the SEAM's verdict, not the wire status. A 500 maps from both a
++    // transient fault and a may-have-landed commit, so a counter keyed off the status could
++    // never have told these apart — which is why item 4 keys on item 6's typed class.
++    assert_eq!(
++        counter(
++            &exposed,
++            "s3_request_errors",
++            &[("op", "get"), ("class", "terminal")]
++        ),
++        0.0,
++        "a transient fault is NOT counted as terminal — the class comes from wyrd_traits::classify \
++         walking the error's source chain, not from the 500 on the wire; got:\n{exposed}"
++    );
++}
++
++// ---- (b) the capacity plane ----------------------------------------------------------
++
++/// A `ChunkStore` whose `get_fragment` gates: it signals that a request was admitted into the
++/// handler, then parks until the test releases it — so an admitted request holds its
++/// admission slot for exactly as long as the test needs. (The `dserver.rs:176` fixture.)
++struct GateStore {
++    inner: FsChunkStore,
++    entered: mpsc::UnboundedSender<()>,
++    gate: Arc<Semaphore>,
++}
++
++#[async_trait]
++impl ChunkStore for GateStore {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.inner.put_fragment(id, fragment).await
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        let _ = self.entered.send(());
++        let _permit = self.gate.acquire().await.expect("gate not closed");
++        self.inner.get_fragment(id).await
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        self.inner.list_fragments().await
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.inner.delete_fragment(id).await
++    }
++
++    async fn health(&self) -> Result<Health> {
++        self.inner.health().await
++    }
++}
++
++fn fid(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// Bind, register and serve one D server over a gated store with `admission` in force and
++/// `telemetry` wired as the role's metrics sink — the composition `cli::run_d_server` builds
++/// for `wyrd d-server`.
++async fn serve_gated(
++    admission: AdmissionControl,
++    telemetry: &DurabilityTelemetry,
++) -> (
++    String,
++    Arc<Semaphore>,
++    mpsc::UnboundedReceiver<()>,
++    oneshot::Sender<()>,
++    tokio::task::JoinHandle<Result<()>>,
++    tempfile::TempDir,
++) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let store = FsChunkStore::open(dir.path()).expect("open store");
++    let (entered_tx, entered_rx) = mpsc::unbounded_channel();
++    let gate = Arc::new(Semaphore::new(0)); // closed: handlers park until released
++    let gate_store = GateStore {
++        inner: store,
++        entered: entered_tx,
++        gate: gate.clone(),
++    };
++
++    let coord = Arc::new(MemCoordination::new());
++    let server = DServer::bind(gate_store, "127.0.0.1:0".parse().unwrap())
++        .await
++        .expect("bind")
++        .with_admission_control(admission)
++        .with_metrics_dispatch(telemetry.metrics_dispatch());
++    let endpoint = server.endpoint().to_string();
++    let lease = server
++        .register(&*coord, DSERVER_GROUP, Duration::from_secs(3600))
++        .await
++        .expect("register");
++    let (tx, rx) = oneshot::channel();
++    let handle = tokio::spawn(
++        server.serve(coord, lease, Duration::from_secs(3600), async move {
++            let _ = rx.await;
++        }),
++    );
++    (endpoint, gate, entered_rx, tx, handle, dir)
++}
++
++/// 0010 item 5: the admitted event fires on the happy path, and the **in-flight RPC gauge
++/// rises while requests are held open and RETURNS TO ZERO** once they complete.
++///
++/// A gauge is load-bearing here for the reason the durability backlog needed one: in-flight is
++/// a *level*, and only a gauge comes back down through an accumulating Prometheus registry — a
++/// monotonic counter would export `..._total` and stay pinned at its peak forever.
++///
++/// Pre-fix no `capacity_requests_*` family exists, so the gauge reads `None`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn the_capacity_plane_reports_admission_and_the_in_flight_gauge_returns_to_zero() {
++    enable_metric_callsites();
++    let telemetry = prometheus_telemetry();
++    // A roomy bound: nothing is shed here, so the ONLY thing under test is admission itself.
++    let admission = AdmissionControl {
++        max_concurrent_requests: 8,
++        request_timeout: Duration::from_secs(60),
++        ..AdmissionControl::default()
++    };
++    let (endpoint, gate, mut entered_rx, shutdown, handle, _dir) =
++        serve_gated(admission, &telemetry).await;
++
++    let client_a = GrpcChunkStore::connect(endpoint.clone())
++        .await
++        .expect("connect A");
++    let client_b = GrpcChunkStore::connect(endpoint).await.expect("connect B");
++    let id = fid(0x1_F1E, 0);
++
++    // TWO requests admitted and held open in the handler — each holds a real admission slot.
++    let held_a = tokio::spawn(async move { client_a.get_fragment(id).await });
++    let held_b = tokio::spawn(async move { client_b.get_fragment(id).await });
++    entered_rx.recv().await.expect("first request admitted");
++    entered_rx.recv().await.expect("second request admitted");
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        gauge(exposed, "capacity_requests_in_flight") == Some(2.0)
++    })
++    .await;
++    assert!(
++        counter(&exposed, "capacity_requests_admitted", &[]) >= 2.0,
++        "each admitted request raises an admitted event; got:\n{exposed}"
++    );
++    assert_eq!(
++        gauge(&exposed, "capacity_requests_in_flight"),
++        Some(2.0),
++        "the in-flight gauge RISES to 2 while both requests are held open in the handler; \
++         got:\n{exposed}"
++    );
++
++    // Release the gate: both requests complete and give their slots back.
++    gate.add_permits(8);
++    let _ = held_a.await.expect("join A");
++    let _ = held_b.await.expect("join B");
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        gauge(exposed, "capacity_requests_in_flight") == Some(0.0)
++    })
++    .await;
++    assert_eq!(
++        gauge(&exposed, "capacity_requests_in_flight"),
++        Some(0.0),
++        "and it RETURNS TO ZERO once they complete — the level comes back down, which is the \
++         whole reason it is a gauge and not a counter; got:\n{exposed}"
++    );
++    assert_eq!(
++        counter(&exposed, "capacity_requests_shed", &[]),
++        0.0,
++        "nothing was shed: the bound was never reached, so admission behaviour is unchanged"
++    );
++
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
++
++/// 0010 item 5 DoD: a **forced load-shed is observable as an EVENT**, not merely as a status
++/// code the client happened to keep. This is the signal the d-server never had — it sheds
++/// today with no server-side record at all.
++///
++/// The overload is driven across two SEPARATE connections against a server-wide bound of 1,
++/// so what is shed is the binding server-wide limit (`AdmissionControl::max_concurrent_requests`)
++/// rather than a per-connection cap. Pre-fix no `capacity_requests_shed` family exists.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn the_capacity_plane_reports_a_forced_load_shed() {
++    enable_metric_callsites();
++    let telemetry = prometheus_telemetry();
++    // Server-wide bound of 1, a roomy per-connection cap, and a long timeout — so the shed is
++    // the only thing that can answer the excess request.
++    let admission = AdmissionControl {
++        max_concurrent_requests: 1,
++        max_concurrent_requests_per_connection: 64,
++        request_timeout: Duration::from_secs(60),
++        ..AdmissionControl::default()
++    };
++    let (endpoint, gate, mut entered_rx, shutdown, handle, _dir) =
++        serve_gated(admission, &telemetry).await;
++
++    let client_a = GrpcChunkStore::connect(endpoint.clone())
++        .await
++        .expect("connect A");
++    let client_b = GrpcChunkStore::connect(endpoint).await.expect("connect B");
++    let id = fid(0x5_1ED, 0);
++
++    // A holds the one slot.
++    let admitted = tokio::spawn(async move { client_a.get_fragment(id).await });
++    entered_rx.recv().await.expect("A holds the single slot");
++
++    // B is over the server-wide bound: it is shed, promptly.
++    let excess = tokio::time::timeout(Duration::from_secs(5), client_b.get_fragment(id))
++        .await
++        .expect("the over-limit request is answered (shed) within the budget");
++    excess.expect_err("an over-limit request is shed, not served a value");
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        counter(exposed, "capacity_requests_shed", &[]) >= 1.0
++    })
++    .await;
++    assert!(
++        counter(&exposed, "capacity_requests_shed", &[]) >= 1.0,
++        "the forced load-shed is raised as a server-side EVENT — pre-fix it was visible only \
++         as the client's RESOURCE_EXHAUSTED; got:\n{exposed}"
++    );
++    // The shed request was never admitted, so it must never have touched the in-flight
++    // gauge: the observer sits INSIDE the concurrency limit precisely so a rejected request
++    // cannot show up as load the server accepted.
++    assert_eq!(
++        counter(&exposed, "capacity_requests_admitted", &[]),
++        1.0,
++        "exactly ONE request was admitted (A); the shed request B was not; got:\n{exposed}"
++    );
++
++    gate.add_permits(8);
++    let _ = admitted.await;
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
++
++/// 0010 item 5: a request that exceeds `request_timeout` raises a **timed-out** event.
++///
++/// The handler parks forever (the gate is never opened) under a short, operator-tunable
++/// timeout, so the cut is deterministic rather than a race. Pre-fix no
++/// `capacity_requests_timed_out` family exists.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn the_capacity_plane_reports_a_request_cut_by_the_request_timeout() {
++    enable_metric_callsites();
++    let telemetry = prometheus_telemetry();
++    // A short request timeout; a wide admission bound so nothing is shed — the deadline cut
++    // is the only thing that can answer.
++    let admission = AdmissionControl {
++        max_concurrent_requests: 64,
++        request_timeout: Duration::from_millis(200),
++        ..AdmissionControl::default()
++    };
++    let (endpoint, _gate, mut entered_rx, shutdown, handle, _dir) =
++        serve_gated(admission, &telemetry).await;
++
++    let client = GrpcChunkStore::connect(endpoint).await.expect("connect");
++    let outcome = tokio::time::timeout(Duration::from_secs(5), client.get_fragment(fid(0xDEAD, 0)))
++        .await
++        .expect("a hung handler is cut by the request timeout within the budget");
++    outcome.expect_err("a timed-out request returns an error status, not a value");
++    // It really was in-flight when the deadline cut it — it reached the handler and parked.
++    entered_rx
++        .recv()
++        .await
++        .expect("the request reached the handler before being cut");
++
++    let exposed = gather_until(&telemetry, |exposed| {
++        counter(exposed, "capacity_requests_timed_out", &[]) >= 1.0
++    })
++    .await;
++    assert!(
++        counter(&exposed, "capacity_requests_timed_out", &[]) >= 1.0,
++        "a handler past request_timeout raises a timed-out event; got:\n{exposed}"
++    );
++    // A request the SERVER's deadline cut is a timeout, not a client walking away — the two
++    // are separate series because the operator response differs.
++    assert_eq!(
++        counter(&exposed, "capacity_requests_cancelled", &[]),
++        0.0,
++        "the cut is attributed to the server's request timeout, not to a cancellation; \
++         got:\n{exposed}"
++    );
++    // The cut request released its slot: a timeout that leaked the gauge would defeat the
++    // point of a bound whose whole job is that a hung handler cannot pin one.
++    let exposed = gather_until(&telemetry, |exposed| {
++        gauge(exposed, "capacity_requests_in_flight") == Some(0.0)
++    })
++    .await;
++    assert_eq!(
++        gauge(&exposed, "capacity_requests_in_flight"),
++        Some(0.0),
++        "the cut request freed its admission slot, so the in-flight gauge returns to zero; \
++         got:\n{exposed}"
++    );
++
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
+diff --git a/crates/server/tests/s3_gateway_cluster.rs b/crates/server/tests/s3_gateway_cluster.rs
+index 3401af6..cf97f4c 100644
+--- a/crates/server/tests/s3_gateway_cluster.rs
++++ b/crates/server/tests/s3_gateway_cluster.rs
+@@ -156,6 +156,9 @@ async fn s3_gateway_composed_over_cluster_backends_lands_fragments_on_dservers()
+             credentials,
+             REGION.to_string(),
+             listener,
++            // This test asserts the CLUSTER composition, not the request plane: no metrics
++            // sink, so the RED events go to the ambient subscriber as before (#575).
++            None,
+         )
+         .await
+     });
+diff --git a/crates/telemetry/src/lib.rs b/crates/telemetry/src/lib.rs
+index 473719a..b48f533 100644
+--- a/crates/telemetry/src/lib.rs
++++ b/crates/telemetry/src/lib.rs
+@@ -29,6 +29,7 @@ use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+ use prometheus::Encoder;
+ use tracing_opentelemetry::MetricsLayer;
++use tracing_subscriber::layer::SubscriberExt;
+ 
+ /// The instrumentation scope name the durability-plane meters live under. Other
+ /// planes (request / capacity) attach their own scope through the same provider.
+@@ -130,6 +131,34 @@ impl DurabilityTelemetry {
+         MetricsLayer::new(self.provider.clone())
+     }
+ 
++    /// A **metrics-only** `tracing` [`Dispatch`](tracing::Dispatch) over this handle's
++    /// bridge — the sink a *server* role hands to instrumentation running in tasks the
++    /// role does not own.
++    ///
++    /// [`metrics_layer`](Self::metrics_layer) is composed into a role's own subscriber when
++    /// the role drives the instrumented code itself: the custodian wraps each reconciliation
++    /// pass in one scoped dispatch (`crates/server/src/custodian.rs:310`), and a scoped
++    /// dispatch is a thread-local that a pass inherits because the pass *is* the task. A
++    /// server role cannot do that. `tonic` and `axum` `tokio::spawn` a task **per
++    /// connection** (`tonic-0.14.6` `src/transport/server/mod.rs:925`), and a spawned task
++    /// does not inherit the spawner's scoped dispatch — so a `with_subscriber` around the
++    /// serve future would reach no handler, and the request/capacity planes would emit into
++    /// whatever global subscriber happened to be installed. Instead they **carry** this
++    /// dispatch and enter it around each (synchronous) metric emission, which works from any
++    /// task and keeps each server's telemetry its own — the same per-provider isolation the
++    /// custodian's read-back tests rely on.
++    ///
++    /// It is metrics-**only** on purpose, and that is the difference from
++    /// `CustodianService::with_logging`'s log+metrics dispatch. That one is *current* for a
++    /// whole pass, so it must carry the log layers or it would swallow the pass's audit
++    /// lines. This one is current for exactly one `tracing` metric event, so composing a
++    /// `fmt` layer in would only echo every metric onto stderr as a second log row — one
++    /// extra line per request on a hot path. Everything else a role logs keeps going to the
++    /// process-global subscriber (#527), untouched.
++    pub fn metrics_dispatch(&self) -> tracing::Dispatch {
++        tracing::Dispatch::new(tracing_subscriber::registry().with(self.metrics_layer()))
++    }
++
+     /// Force the meter provider to flush its readers (collect + export). Returns the
+     /// first flush error, if any.
+     pub fn flush(&self) -> Result<(), TelemetryError> {

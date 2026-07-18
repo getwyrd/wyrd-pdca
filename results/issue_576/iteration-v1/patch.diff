@@ -1,0 +1,779 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2aceba6..6669d2b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4070,6 +4070,7 @@ dependencies = [
+  "futures-core",
+  "pin-project-lite",
+  "tokio",
++ "tokio-util",
+ ]
+ 
+ [[package]]
+@@ -4281,6 +4282,19 @@ dependencies = [
+  "syn 2.0.118",
+ ]
+ 
++[[package]]
++name = "tonic-health"
++version = "0.14.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
++dependencies = [
++ "prost 0.14.4",
++ "tokio",
++ "tokio-stream",
++ "tonic 0.14.6",
++ "tonic-prost",
++]
++
+ [[package]]
+ name = "tonic-prost"
+ version = "0.14.6"
+@@ -5182,6 +5196,7 @@ dependencies = [
+  "tokio",
+  "tokio-stream",
+  "tonic 0.14.6",
++ "tonic-health",
+  "tower 0.5.3",
+  "tracing",
+  "tracing-subscriber",
+diff --git a/Cargo.toml b/Cargo.toml
+index f34d645..b2b1110 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -158,6 +158,14 @@ tokio-stream = { version = "0.1", features = ["net"] }
+ # and madsim-tonic 0.6.0+0.14 (added in M2.6) tracks tonic 0.14 — so the
+ # deterministic-simulation DST runs the *real* wire code, no in-sim fake (ADR-0009).
+ tonic = "0.14"
++# The standard gRPC health-checking protocol (`grpc.health.v1`, proposal 0010
++# §"Scope boundary" item 7, issue #576): liveness/readiness probes for the d-server
++# role, reusing the standard proto rather than a bespoke service ("no bespoke
++# service" — 0010 §Crate touch-points). Version-matched to `tonic` (both `0.14`;
++# `tonic-health` 0.14.6 depends on `tonic` `0.14`, confirmed against its published
++# `Cargo.toml`). New dependency: ADR-0003 three-test audit + `deny.toml` allowlist
++# review is a NEEDS-HUMAN at sign-off (INTEGRATION §4).
++tonic-health = "0.14"
+ # Tower middleware for the d-server's admission control (issue #205, architecture
+ # §8.9 fail-closed-under-pressure). `tonic` already pulls `tower` transitively; we
+ # depend on it directly to apply a SERVER-WIDE (shared-semaphore) concurrency bound
+diff --git a/crates/server/Cargo.toml b/crates/server/Cargo.toml
+index c386af1..0398add 100644
+--- a/crates/server/Cargo.toml
++++ b/crates/server/Cargo.toml
+@@ -96,6 +96,9 @@ tokio.workspace = true
+ tokio-stream.workspace = true
+ # The transport that hosts the gRPC ChunkStore service for the `d-server` role.
+ tonic.workspace = true
++# The standard `grpc.health.v1` liveness/readiness probe surface the d-server role
++# registers alongside `ChunkStoreServer` (proposal 0010 item 7, issue #576).
++tonic-health.workspace = true
+ # Tower middleware for the d-server's fail-closed admission control (issue #205,
+ # architecture §8.9): a server-wide concurrency bound + load-shedding applied to
+ # the tonic service stack via `Server::layer`.
+diff --git a/crates/server/src/dserver.rs b/crates/server/src/dserver.rs
+index 895225a..bca4358 100644
+--- a/crates/server/src/dserver.rs
++++ b/crates/server/src/dserver.rs
+@@ -23,14 +23,16 @@ use bytes::Bytes;
+ use serde::{Deserialize, Serialize};
+ use tokio::net::TcpListener;
+ use tokio_stream::wrappers::TcpListenerStream;
++use tonic::server::NamedService;
+ use tonic::transport::Server;
++use tonic_health::ServingStatus;
+ use tower::limit::GlobalConcurrencyLimitLayer;
+ use tower::load_shed::error::Overloaded;
+ use tower::load_shed::LoadShedLayer;
+ use tower::{Layer, Service};
+ use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
+ use wyrd_core::placement::Topology;
+-use wyrd_traits::{BoxError, ChunkStore, Coordination, DServerId, Lease, Result};
++use wyrd_traits::{BoxError, ChunkStore, Coordination, DServerId, Health, Lease, Result};
+ 
+ /// The discovery group under which D servers register their gRPC endpoints.
+ pub const DSERVER_GROUP: &str = "chunkstore";
+@@ -68,6 +70,15 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
+ /// stranded behind a silently dead peer.
+ pub const DEFAULT_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+ 
++/// Default cadence at which the readiness-refresh task re-reads the store's
++/// [`ChunkStore::health()`] and updates the `grpc.health.v1.Health` readiness status
++/// (proposal 0010 §"Scope boundary" item 7). An operator-visible constant rather than
++/// "whenever" (Design, §"Freshness") — a few seconds is a reasonable default staleness
++/// bound for a readiness probe; override with
++/// [`with_health_refresh_interval`](DServer::with_health_refresh_interval) for a
++/// deployment that wants tighter freshness (or a test that wants a fast, bounded wait).
++pub const DEFAULT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
++
+ /// Admission-control and backpressure configuration for the d-server's gRPC
+ /// transport — the knobs that make the request-admission path **fail closed under
+ /// pressure** (architecture §8.9,
+@@ -486,19 +497,30 @@ impl DServerRegistration {
+ pub struct DServer<S> {
+     store: S,
+     listener: TcpListener,
++    /// A second listener, bound alongside `listener`, that hosts ONLY the
++    /// `grpc.health.v1.Health` service (proposal 0010 item 7) — see
++    /// [`DServer::serve`] §"the health probe surface" for why it is a separate
++    /// listener rather than a second service on `listener`'s own tonic server.
++    health_listener: TcpListener,
+     endpoint: String,
++    health_endpoint: String,
+     id: DServerId,
+     failure_domain: String,
+     admission: AdmissionControl,
+     /// The sink this server's **capacity-plane** signals are emitted into (proposal 0010
+     /// item 5) — see [`DServer::with_metrics_dispatch`].
+     metrics: Option<tracing::Dispatch>,
++    /// Cadence of the readiness-refresh task — see [`DEFAULT_HEALTH_REFRESH_INTERVAL`].
++    health_refresh_interval: Duration,
+ }
+ 
+ impl<S: ChunkStore + 'static> DServer<S> {
+     /// Bind the gRPC listener on `bind` (use port 0 for an ephemeral port) over
+-    /// `store`. The advertised endpoint defaults to the bound address (today's
+-    /// loopback behaviour); a wildcard/NAT'd/containerized bind can override it with
++    /// `store`, plus a second, ephemeral-port listener (same host) that will serve
++    /// ONLY the `grpc.health.v1.Health` probe surface — see
++    /// [`health_endpoint`](DServer::health_endpoint). The advertised data-plane
++    /// endpoint defaults to the bound address (today's loopback behaviour); a
++    /// wildcard/NAT'd/containerized bind can override it with
+     /// [`with_advertise_addr`](DServer::with_advertise_addr) — split-horizon
+     /// advertisement, decoupled from the listen socket. The server starts with a
+     /// default stable id and the default failure domain; set them with
+@@ -506,14 +528,23 @@ impl<S: ChunkStore + 'static> DServer<S> {
+     pub async fn bind(store: S, bind: SocketAddr) -> Result<Self> {
+         let listener = TcpListener::bind(bind).await?;
+         let addr = listener.local_addr()?;
++        // The health listener rides an EPHEMERAL port on the same host as the data
++        // listener — a supervisor probing health is normally co-located with (or has
++        // direct network access to) the node, so no separate advertise/NAT story is
++        // needed the way the data endpoint's has (`with_advertise_addr`).
++        let health_listener = TcpListener::bind(SocketAddr::new(addr.ip(), 0)).await?;
++        let health_addr = health_listener.local_addr()?;
+         Ok(Self {
+             store,
+             listener,
++            health_listener,
+             endpoint: format!("http://{addr}"),
++            health_endpoint: format!("http://{health_addr}"),
+             id: 0,
+             failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
+             admission: AdmissionControl::default(),
+             metrics: None,
++            health_refresh_interval: DEFAULT_HEALTH_REFRESH_INTERVAL,
+         })
+     }
+ 
+@@ -573,11 +604,28 @@ impl<S: ChunkStore + 'static> DServer<S> {
+         &self.admission
+     }
+ 
++    /// Set the cadence at which the readiness-refresh task re-reads the store's
++    /// `health()` (default [`DEFAULT_HEALTH_REFRESH_INTERVAL`]) — the operator-visible
++    /// freshness bound the readiness status is refreshed against (Design,
++    /// §"Freshness"). A shorter interval tightens how quickly an unhealthy store's
++    /// readiness flip becomes observable, at the cost of polling `health()` more often.
++    pub fn with_health_refresh_interval(mut self, interval: Duration) -> Self {
++        self.health_refresh_interval = interval;
++        self
++    }
++
+     /// The dialable endpoint this server advertises (e.g. `http://127.0.0.1:50051`).
+     pub fn endpoint(&self) -> &str {
+         &self.endpoint
+     }
+ 
++    /// The dialable endpoint the `grpc.health.v1.Health` probe surface listens on
++    /// (proposal 0010 item 7) — deliberately a **separate** port from
++    /// [`endpoint`](DServer::endpoint), see [`DServer::serve`] for why.
++    pub fn health_endpoint(&self) -> &str {
++        &self.health_endpoint
++    }
++
+     /// This server's stable D-server id.
+     pub fn id(&self) -> DServerId {
+         self.id
+@@ -607,21 +655,30 @@ impl<S: ChunkStore + 'static> DServer<S> {
+         coord.register(group, Bytes::from(value), ttl).await
+     }
+ 
+-    /// Serve the gRPC `ChunkStore` until `shutdown` resolves, renewing `lease`
+-    /// every `renew_interval` so the registration stays live. On a clean shutdown
+-    /// the lease is revoked so discovery converges promptly; if renewal ever
+-    /// fails (the lease was lost), the server stops serving.
++    /// Serve the gRPC `ChunkStore` (plus the `grpc.health.v1.Health` probe surface,
++    /// proposal 0010 item 7) until `shutdown` resolves, renewing `lease` every
++    /// `renew_interval` so the registration stays live. On a clean shutdown the lease
++    /// is revoked so discovery converges promptly; if renewal ever fails (the lease
++    /// was lost), the server stops serving.
+     pub async fn serve<Co>(
+         self,
+         coord: Arc<Co>,
+         lease: Lease,
+         renew_interval: Duration,
+-        shutdown: impl Future<Output = ()>,
++        shutdown: impl Future<Output = ()> + Send + 'static,
+     ) -> Result<()>
+     where
+         Co: Coordination + 'static,
+     {
+-        let service = ChunkStoreService::new(self.store);
++        // The store is shared (`Arc`) rather than moved wholesale into
++        // `ChunkStoreService`, because the readiness-refresh task below (the health
++        // probe surface) needs to poll the SAME store instance the data plane serves —
++        // probing a different store instance would defeat the whole point of deriving
++        // readiness from `health()`. `ChunkStoreService::from_arc` is the existing
++        // affordance for exactly this (`crates/chunkstore-grpc/src/server.rs:57-61`,
++        // "a store already behind an Arc").
++        let store = Arc::new(self.store);
++        let service = ChunkStoreService::from_arc(Arc::clone(&store));
+         let admission = self.admission;
+         // The capacity plane (proposal 0010 item 5). Built once, outside the builder, so the
+         // in-flight count is shared by BOTH observers and by every per-connection clone of
+@@ -629,6 +686,76 @@ impl<S: ChunkStore + 'static> DServer<S> {
+         // bound does.
+         let plane = CapacityPlane::new(self.metrics);
+         plane.preregister();
++
++        // ---- the health probe surface (observability floor, proposal 0010 item 7) ----
++        //
++        // `tonic_health::server::health_reporter()` returns a `HealthReporter` (the write
++        // side) linked to a `HealthServer` (the gRPC service). The overall (empty-name "")
++        // service is the LIVENESS signal and is deliberately left at its tonic-health
++        // default (`Serving`, set the moment the reporter exists) — that default already
++        // *is* "the process answers at all" (Design, §"Startup / shutdown" /
++        // "The overall (empty-name) service is the liveness signal"); nothing here writes
++        // to it. READINESS is a distinct, named status keyed on the `ChunkStoreServer`'s
++        // own registered name (`<ChunkStoreServer<_> as NamedService>::NAME`,
++        // `"wyrd.v0.ChunkStore"`) — reusing the data-plane service's own name rather than
++        // inventing a bespoke identifier, and set to `NotServing` here, before anything is
++        // served, so a probe that lands before the first `health()` read below completes
++        // reads fail-closed NOT_SERVING (Design, §"Startup / shutdown") rather than
++        // `NOT_FOUND` (what an never-registered service name reads as).
++        let (health_reporter, health_server) = tonic_health::server::health_reporter();
++        health_reporter
++            .set_not_serving::<ChunkStoreServer<ChunkStoreService<S>>>()
++            .await;
++
++        // Refresh the readiness status every `health_refresh_interval` (a bounded,
++        // operator-visible cadence, Design §"Freshness") by re-reading the store's own
++        // `health()`. `Healthy`/`Degraded` both read SERVING (a degraded store still
++        // serves); `Unhealthy` and `Err(_)` both read NOT_SERVING — the latter is the
++        // fail-closed case: a store that cannot even report its health must not read as
++        // ready (Design, §"Mapping"). `tokio::time::interval`'s first tick fires
++        // immediately, so the first real reading happens promptly rather than after a
++        // full `health_refresh_interval` of NOT_SERVING.
++        let health_refresh_task = {
++            let store = Arc::clone(&store);
++            let reporter = health_reporter.clone();
++            let interval = self.health_refresh_interval;
++            tokio::spawn(async move {
++                let mut ticker = tokio::time::interval(interval);
++                loop {
++                    ticker.tick().await;
++                    let status = match store.health().await {
++                        Ok(Health::Healthy | Health::Degraded) => ServingStatus::Serving,
++                        Ok(Health::Unhealthy) | Err(_) => ServingStatus::NotServing,
++                    };
++                    reporter
++                        .set_service_status(
++                            <ChunkStoreServer<ChunkStoreService<S>> as NamedService>::NAME,
++                            status,
++                        )
++                        .await;
++                }
++            })
++        };
++
++        // Fan the single `shutdown` future out to both tonic servers below (the data
++        // plane and the health probe each own a `serve_with_incoming_shutdown` call, and
++        // a bare `impl Future` can only be awaited once). A `watch` channel that starts
++        // unfired and is sent exactly once when `shutdown` resolves gives both receivers
++        // the same one-shot signal tonic's own graceful-shutdown wiring uses internally
++        // (verified against tonic-0.14.6 `transport/server/mod.rs:827`, the same pattern).
++        let (shutdown_tx, mut chunk_shutdown_rx) = tokio::sync::watch::channel(());
++        let mut health_shutdown_rx = chunk_shutdown_rx.clone();
++        tokio::spawn(async move {
++            shutdown.await;
++            let _ = shutdown_tx.send(());
++        });
++        let chunk_shutdown = async move {
++            let _ = chunk_shutdown_rx.changed().await;
++        };
++        let health_shutdown = async move {
++            let _ = health_shutdown_rx.changed().await;
++        };
++
+         let serve = Server::builder()
+             // OBSERVE the shed (0010 item 5). Outermost, so it sees the `Overloaded`
+             // rejection the load-shed layer below raises — the shed that until now was
+@@ -652,6 +779,18 @@ impl<S: ChunkStore + 'static> DServer<S> {
+             // Order matters: the FIRST `.layer()` is the OUTERMOST, so load-shed
+             // wraps the concurrency limit and sheds when the shared semaphore is
+             // exhausted (verified against tower 0.5 `ServiceBuilder`/`Stack`).
++            //
++            // This layer stack — and everything else this ONE `Server::builder()` sets —
++            // applies to every service `.add_service()`d to it (verified against
++            // tonic-0.14.6 `transport/server/mod.rs`: `serve_internal` runs
++            // `self.service_builder.service(svc)` once, over the single merged `Routes`
++            // all `.add_service()` calls accumulate into; there is no per-service escape
++            // hatch on one builder). That is exactly why the health service below is
++            // NOT `.add_service()`d here: the Design's overload policy requires it to
++            // answer through an overloaded data plane (§"Overload policy"), so it is
++            // served by its OWN, unlayered `Server::builder()` on `health_listener`
++            // instead — a second builder is what makes "outside that stack" exact
++            // rather than approximate.
+             .layer(LoadShedLayer::new())
+             .layer(GlobalConcurrencyLimitLayer::new(
+                 admission.max_concurrent_requests,
+@@ -680,7 +819,29 @@ impl<S: ChunkStore + 'static> DServer<S> {
+             .tcp_nodelay(admission.tcp_nodelay)
+             .http2_keepalive_interval(admission.http2_keepalive_interval)
+             .add_service(ChunkStoreServer::new(service))
+-            .serve_with_incoming_shutdown(TcpListenerStream::new(self.listener), shutdown);
++            .serve_with_incoming_shutdown(TcpListenerStream::new(self.listener), chunk_shutdown);
++
++        // The health probe's OWN `Server::builder()` — no admission layers, no
++        // per-connection concurrency/load-shed/timeout tuning, nothing shared with the
++        // data-plane builder above. Its listener is `health_listener`
++        // (`DServer::health_endpoint`), bound at [`DServer::bind`] time.
++        let health_serve = Server::builder()
++            .add_service(health_server)
++            .serve_with_incoming_shutdown(
++                TcpListenerStream::new(self.health_listener),
++                health_shutdown,
++            );
++
++        // Both servers must run — and both must be given the chance to drain and stop —
++        // for `serve` to be "done"; `tokio::join!` (not `select!`) waits for BOTH rather
++        // than returning (and dropping the other mid-flight) the moment either finishes.
++        let servers = async {
++            let (chunk_res, health_res) = tokio::join!(serve, health_serve);
++            let chunk_res: Result<()> = chunk_res.map_err(Into::into);
++            let health_res: Result<()> = health_res.map_err(Into::into);
++            chunk_res?;
++            health_res
++        };
+ 
+         let renew = {
+             let coord = Arc::clone(&coord);
+@@ -697,9 +858,14 @@ impl<S: ChunkStore + 'static> DServer<S> {
+         };
+ 
+         let result = tokio::select! {
+-            res = serve => res.map_err(Into::into),
++            res = servers => res,
+             _ = renew => Err("d-server lease lost (renewal failed)".into()),
+         };
++        // The refresher must not outlive `serve` (Design, §"Startup / shutdown": "any
++        // refresher task ends with `serve` — no leaked task after shutdown"). It has no
++        // natural end (it loops until cancelled), so it is aborted explicitly rather than
++        // joined.
++        health_refresh_task.abort();
+         // Best-effort: withdraw the registration so discovery converges promptly.
+         let _ = coord.revoke(lease).await;
+         result
+diff --git a/crates/server/tests/health_probe.rs b/crates/server/tests/health_probe.rs
+new file mode 100644
+index 0000000..051d39c
+--- /dev/null
++++ b/crates/server/tests/health_probe.rs
+@@ -0,0 +1,396 @@
++//! Issue #576 / proposal 0010 §"Scope boundary" item 7: the d-server role answers the
++//! standard gRPC health-checking protocol (`grpc.health.v1.Health/Check`), with
++//! readiness reflecting the backing `ChunkStore`'s own `health()` — fail-closed on
++//! `Err(_)` — rather than a supervisor's only signal being process existence.
++//!
++//! Three success criteria, each its own test:
++//! (a) `Check` reports SERVING while the store is healthy;
++//! (b) `Check` reports NOT_SERVING within a bounded wait once the store goes
++//!     `Health::Unhealthy` **or** once `health()` returns `Err` (fail-closed — both
++//!     asserted);
++//! (c) the health check still answers (not shed with `RESOURCE_EXHAUSTED`) while the
++//!     data plane is saturated at its admission bound.
++//!
++//! Driven in-process over real loopback gRPC (the same shape as
++//! `crates/chunkstore-grpc/tests/round_trip.rs`), against the real `DServer::serve`
++//! composition — not a stand-in.
++
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tokio::sync::{mpsc, oneshot, Semaphore};
++use tonic::server::NamedService;
++use tonic_health::pb::health_check_response::ServingStatus as WireServingStatus;
++use tonic_health::pb::health_client::HealthClient;
++use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
++use wyrd_chunk_format::{encode, FragmentHeader};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::{ChunkStoreServer, GrpcChunkStore};
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_server::dserver::{AdmissionControl, DServer, DSERVER_GROUP};
++use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health, Result};
++
++fn fid(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// A valid v1 fragment whose header records `id`'s chunk and index.
++fn fragment(id: FragmentId, payload: &[u8]) -> Bytes {
++    let mut header = FragmentHeader::new_v1(id.chunk, payload.len() as u64);
++    header.ec_fragment_index = id.index;
++    Bytes::from(encode(&header, payload))
++}
++
++fn fs_store() -> (FsChunkStore, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let store = FsChunkStore::open(dir.path()).expect("open store");
++    (store, dir)
++}
++
++/// What [`ControllableStore::health`] reports — set by the test at will, read by the
++/// production readiness-refresh task inside `DServer::serve`.
++#[derive(Clone, Copy, Debug)]
++enum HealthMode {
++    Healthy,
++    Unhealthy,
++    /// `health()` itself fails — the fail-closed case (Design, §"Mapping":
++    /// "`Err(_)` from `health()` ⇒ NOT_SERVING").
++    Erroring,
++}
++
++/// A `ChunkStore` whose `health()` the test controls at runtime, and whose
++/// `get_fragment` can optionally **gate** (announce entry via `entered`, then park on
++/// `gate`) so a data-plane request can be made to hold its admission slot for as long
++/// as criterion (c) needs. `put`/`list`/`delete` always delegate straight through.
++struct ControllableStore {
++    inner: FsChunkStore,
++    health: Arc<Mutex<HealthMode>>,
++    entered: Option<mpsc::UnboundedSender<()>>,
++    gate: Option<Arc<Semaphore>>,
++}
++
++#[async_trait]
++impl ChunkStore for ControllableStore {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.inner.put_fragment(id, fragment).await
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        if let Some(entered) = &self.entered {
++            let _ = entered.send(());
++        }
++        if let Some(gate) = &self.gate {
++            let _permit = gate.acquire().await.expect("gate not closed");
++        }
++        self.inner.get_fragment(id).await
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        self.inner.list_fragments().await
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.inner.delete_fragment(id).await
++    }
++
++    async fn health(&self) -> Result<Health> {
++        match *self.health.lock().unwrap() {
++            HealthMode::Healthy => Ok(Health::Healthy),
++            HealthMode::Unhealthy => Ok(Health::Unhealthy),
++            HealthMode::Erroring => Err("store cannot report its own health".into()),
++        }
++    }
++}
++
++/// The `grpc.health.v1` service name the readiness status is keyed on — the
++/// `ChunkStoreServer`'s own registered name (`DServer::serve` sets readiness there,
++/// not on the empty-name overall/liveness service). `ChunkStoreServer<T>`'s
++/// `NamedService::NAME` does not depend on `T`, so any instantiation gives the same
++/// constant.
++fn readiness_service_name() -> &'static str {
++    <ChunkStoreServer<()> as NamedService>::NAME
++}
++
++/// Bind, register, and serve one D server over `store` with the given admission
++/// posture and health-refresh cadence; return its data endpoint, its health endpoint,
++/// a shutdown trigger, and the serve task.
++async fn serve_controllable(
++    store: ControllableStore,
++    admission: AdmissionControl,
++    health_refresh_interval: Duration,
++) -> (
++    String,
++    String,
++    oneshot::Sender<()>,
++    tokio::task::JoinHandle<Result<()>>,
++) {
++    let coord = Arc::new(MemCoordination::new());
++    let server = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
++        .await
++        .expect("bind")
++        .with_admission_control(admission)
++        .with_health_refresh_interval(health_refresh_interval);
++    let endpoint = server.endpoint().to_string();
++    let health_endpoint = server.health_endpoint().to_string();
++    let lease = server
++        .register(&*coord, DSERVER_GROUP, Duration::from_secs(3600))
++        .await
++        .expect("register");
++    let (tx, rx) = oneshot::channel();
++    let handle = tokio::spawn(
++        server.serve(coord, lease, Duration::from_secs(3600), async move {
++            let _ = rx.await;
++        }),
++    );
++    (endpoint, health_endpoint, tx, handle)
++}
++
++/// Dial `endpoint`'s `grpc.health.v1.Health` service.
++async fn health_client(endpoint: &str) -> HealthClient<tonic::transport::Channel> {
++    let channel = tonic::transport::Endpoint::try_from(endpoint.to_string())
++        .expect("valid endpoint")
++        .connect()
++        .await
++        .expect("connect to the health endpoint");
++    HealthClient::new(channel)
++}
++
++/// Poll `Check` for `service` until it reports `expected`, bounded by `budget` —
++/// the "within a bounded wait" criterion (b)/(a) name, without coupling the test to
++/// the production refresh cadence's exact timing.
++async fn wait_for_check(
++    client: &mut HealthClient<tonic::transport::Channel>,
++    service: &str,
++    expected: WireServingStatus,
++    budget: Duration,
++) -> HealthCheckResponse {
++    tokio::time::timeout(budget, async {
++        loop {
++            let resp = client
++                .check(HealthCheckRequest {
++                    service: service.to_string(),
++                })
++                .await
++                .expect("Check RPC succeeds (the health service is registered)")
++                .into_inner();
++            if resp.status == expected as i32 {
++                return resp;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap_or_else(|_| panic!("service {service:?} did not reach {expected:?} within {budget:?}"))
++}
++
++/// Success criterion (a): `Check` reports SERVING while the backing store's
++/// `health()` is `Health::Healthy`.
++///
++/// Red pre-fix: `main` registers no `grpc.health.v1.Health` service (repro:
++/// `crates/server/src/dserver.rs` `add_service` registers only `ChunkStoreServer`), so
++/// a `Check` against it returns `UNIMPLEMENTED` — this assertion fails. Reverting the
++/// production change also removes the `tonic-health` dependency and the
++/// `with_health_refresh_interval` / `health_endpoint` methods this test calls, so the
++/// red leg is a compile failure on the base toolchain, which the gate equally counts
++/// as red (Falsifiability).
++#[tokio::test]
++async fn check_reports_serving_while_the_store_is_healthy() {
++    let (store, _dir) = fs_store();
++    let health = Arc::new(Mutex::new(HealthMode::Healthy));
++    let controllable = ControllableStore {
++        inner: store,
++        health,
++        entered: None,
++        gate: None,
++    };
++    let (_endpoint, health_endpoint, shutdown, handle) = serve_controllable(
++        controllable,
++        AdmissionControl::default(),
++        Duration::from_millis(20),
++    )
++    .await;
++
++    let mut client = health_client(&health_endpoint).await;
++    let resp = wait_for_check(
++        &mut client,
++        readiness_service_name(),
++        WireServingStatus::Serving,
++        Duration::from_secs(5),
++    )
++    .await;
++    assert_eq!(
++        resp.status,
++        WireServingStatus::Serving as i32,
++        "a healthy store reads SERVING",
++    );
++
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
++
++/// Success criterion (b): `Check` reports NOT_SERVING within a bounded wait once the
++/// store reports `Health::Unhealthy` **or** once `health()` returns `Err` — both
++/// asserted (fail-closed).
++///
++/// Red pre-fix: same as (a) — no health service is registered (behavioural red) or the
++/// build does not compile (the dependency/method red the Falsifiability note accepts).
++#[tokio::test]
++async fn check_reports_not_serving_once_unhealthy_or_erroring() {
++    let (store, _dir) = fs_store();
++    let health = Arc::new(Mutex::new(HealthMode::Healthy));
++    let controllable = ControllableStore {
++        inner: store,
++        health: Arc::clone(&health),
++        entered: None,
++        gate: None,
++    };
++    let (_endpoint, health_endpoint, shutdown, handle) = serve_controllable(
++        controllable,
++        AdmissionControl::default(),
++        Duration::from_millis(20),
++    )
++    .await;
++    let mut client = health_client(&health_endpoint).await;
++    let name = readiness_service_name();
++
++    // Baseline: converges to SERVING once the refresher's first read lands.
++    wait_for_check(
++        &mut client,
++        name,
++        WireServingStatus::Serving,
++        Duration::from_secs(5),
++    )
++    .await;
++
++    // Half (a): an `Health::Unhealthy` store flips readiness to NOT_SERVING.
++    *health.lock().unwrap() = HealthMode::Unhealthy;
++    wait_for_check(
++        &mut client,
++        name,
++        WireServingStatus::NotServing,
++        Duration::from_secs(5),
++    )
++    .await;
++
++    // Recover, confirming the flip is not one-directional...
++    *health.lock().unwrap() = HealthMode::Healthy;
++    wait_for_check(
++        &mut client,
++        name,
++        WireServingStatus::Serving,
++        Duration::from_secs(5),
++    )
++    .await;
++
++    // ...then half (b): `health()` itself erroring ALSO flips readiness to
++    // NOT_SERVING — the fail-closed case (a store that cannot even report its health
++    // must not read as ready).
++    *health.lock().unwrap() = HealthMode::Erroring;
++    wait_for_check(
++        &mut client,
++        name,
++        WireServingStatus::NotServing,
++        Duration::from_secs(5),
++    )
++    .await;
++
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
++
++/// Success criterion (c): the health check still answers — rather than being shed
++/// with `RESOURCE_EXHAUSTED` — while the data plane is saturated at its admission
++/// bound (`max_concurrent_requests` held by an in-flight data RPC).
++///
++/// Red pre-fix: on `main` there is no separate, unlayered path for a health probe at
++/// all (no health service is registered); once the production change under test wires
++/// one INSIDE the same admission-layered `Server::builder()` chain (the wrong
++/// composition this criterion rules out), a held data-plane slot sheds the health
++/// check exactly like a data request — RESOURCE_EXHAUSTED — failing this assertion.
++/// Green requires the health service to be composed genuinely outside the admission
++/// stack (Design, §"Overload policy").
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn health_check_answers_while_the_data_plane_is_saturated() {
++    let (store, _dir) = fs_store();
++    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
++    let gate = Arc::new(Semaphore::new(0)); // closed: the held request parks until released
++    let health = Arc::new(Mutex::new(HealthMode::Healthy));
++    let controllable = ControllableStore {
++        inner: store,
++        health,
++        entered: Some(entered_tx),
++        gate: Some(gate.clone()),
++    };
++    // Server-wide admission limit of 1 — the same shape as
++    // `crates/server/tests/dserver.rs`'s `overload_across_connections_sheds_excess_with_a_retryable_status`,
++    // adapted here to prove the HEALTH check is exempt from it, not that the data
++    // plane sheds (that is already covered there).
++    let admission = AdmissionControl {
++        max_concurrent_requests: 1,
++        ..AdmissionControl::default()
++    };
++    let (endpoint, health_endpoint, shutdown, handle) =
++        serve_controllable(controllable, admission, Duration::from_millis(20)).await;
++
++    let mut client = health_client(&health_endpoint).await;
++    let name = readiness_service_name();
++    // Converge to SERVING first, so the later assertion is unambiguous: a NOT_SERVING
++    // read would also (trivially) not be RESOURCE_EXHAUSTED, which would not actually
++    // prove the bypass.
++    wait_for_check(
++        &mut client,
++        name,
++        WireServingStatus::Serving,
++        Duration::from_secs(5),
++    )
++    .await;
++
++    // Saturate the one server-wide admission slot with a held data-plane request.
++    let data_client = GrpcChunkStore::connect(endpoint)
++        .await
++        .expect("connect data client");
++    let id = fid(0x5_1ED, 0);
++    let frag = fragment(
++        id,
++        b"a fragment that never gets read while the slot is held",
++    );
++    data_client
++        .put_fragment(id, frag)
++        .await
++        .expect("seed the fragment");
++    let admitted = tokio::spawn(async move { data_client.get_fragment(id).await });
++    entered_rx
++        .recv()
++        .await
++        .expect("the data request is admitted and holds the one admission slot");
++
++    // The health check must still answer — promptly, and with a real serving status,
++    // not RESOURCE_EXHAUSTED — while that slot is held.
++    let outcome = tokio::time::timeout(
++        Duration::from_secs(5),
++        client.check(HealthCheckRequest {
++            service: name.to_string(),
++        }),
++    )
++    .await
++    .expect(
++        "the health check must be answered within the budget, not left to queue or be shed \
++         behind the saturated data-plane admission bound",
++    );
++    let resp = outcome
++        .expect("the health check succeeds (not shed with RESOURCE_EXHAUSTED)")
++        .into_inner();
++    assert_eq!(
++        resp.status,
++        WireServingStatus::Serving as i32,
++        "the store is still healthy throughout — overload is not unreadiness (Design, \
++         §\"Overload policy\")",
++    );
++
++    gate.add_permits(8);
++    let _ = admitted.await;
++    let _ = shutdown.send(());
++    let _ = handle.await;
++}
