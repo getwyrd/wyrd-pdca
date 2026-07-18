@@ -29,6 +29,49 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act addendum — 2026-07-18 — cycles considered: issue_505, issue_430, issue_407 (out-of-band, recurring publish-time signal; no disposition re-decided)
+
+## What the cycles' records exposed
+- Three published PRs opened **red on the host's always-on `typos` CI status** —
+  wyrd#595 (issue_505: the RFC 4648 `"fo"` base64 vector), wyrd#564 (issue_430:
+  `misencoded` split as a `mis` prefix), wyrd#569 (issue_407: backtick-split
+  prose like `` `plan`ned ``) — plus one pre-window occurrence (wyrd#394, `RTO`,
+  origin of the `typos.toml` `rto` allowlist entry). Each needed a human
+  follow-up commit after the PR opened. It is the **only** gate class the
+  pipeline has ever missed.
+- Root cause is structural, not a leaf-prompt lapse: the one gating CI-parity
+  check (`C4-ci`) delegates wholesale to the host's single-sourced runner
+  (`cargo xtask ci`), but the host ran `typos` and `docs-check` as **separate
+  always-on CI jobs outside that runner**, and the INTEGRATION §4/§10 mapping
+  was silent on both — so no leaf, gate, or re-gate could ever see them. The
+  `T4` publish slot cannot serve either: it runs pre-apply at `cfg.root`, and
+  the failing prose arrives in `patch.diff`.
+
+## Process deltas
+- Gates: prose gates moved INTO the delegated runner — `typos` + docs
+  lint/render now run as the first steps of `cargo xtask ci`
+  (`../wyrd/xtask/src/main.rs`, wyrd#598 / PR wyrd#599; machete-style
+  required-in-CI / warn-skip-locally), so `C4-ci` inherits them with no gate
+  row added here (ADR-0016 single-sourcing preserved).
+- Ruleset: INTEGRATION §4 C4 row + §10 composition table now name the prose
+  gates and record that `docs-immutability` stays host-only by decision
+  (docs/INTEGRATION.md §4, §10).
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+- Harness/driver issue: host CI jobs outside the delegated runner are
+  structurally invisible to the pipeline (no "declared host-only CI commands"
+  pre-publish gate against the patched tree; no composition audit) — filed
+  upstream eduralph/pdca-harness#311.
+- Host repo change: wyrd#598 (PR wyrd#599), awaiting merge by the maintainer.
+
+## How effectiveness will be judged
+- The next 5 published PRs (one act cadence, `act_cadence = 5`) must open with
+  the `typos` and `docs-check` statuses green on the first push — zero
+  post-open remediation commits of this class; judge at the next scheduled Act
+  review. A recurrence means the host runner and its CI jobs drifted
+  again; re-check the §10 composition table against
+  `../wyrd/.github/workflows/` before the next review.
+
 # Act addendum — 2026-07-17 — cycles considered: issue_366 (out-of-band, post-freeze record correction; no disposition re-decided)
 
 > Not a scheduled review — a single-cycle addendum recording a defect in the frozen
