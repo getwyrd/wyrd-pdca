@@ -29,6 +29,80 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act addendum — 2026-07-17 — cycles considered: issue_366 (out-of-band, post-freeze record correction; no disposition re-decided)
+
+> Not a scheduled review — a single-cycle addendum recording a defect in the frozen
+> issue_366 record found 2026-07-17, the corrections applied to the external tracker, and
+> one process-delta candidate for the next full review to weigh.
+
+## What the cycle's record exposed
+
+- **A milestone-scoped bundle shipped a whole-issue closing keyword, and nothing in the
+  process could have caught it.** issue_366's brief is explicitly milestone-scoped ("does
+  not fit one `patch.diff`"; keystone = floor items 1–2, "remaining items as follow-on
+  slices"), yet its pr-description.md and commit-msg.txt both end in a bare `Fixes #366` —
+  because the pr-description template **mandates** exactly that
+  (`templates/pr-description.md.tpl:43-50`), the publisher role prompt repeats it
+  (`.claude/agents/publisher.md:41,72-76`), and the contribution gate **lints for** the
+  strictly-bare closing line. There is no scope-conditional branch (`Part of #<id>`), so
+  the template forced an overclaim: GitHub recorded PR getwyrd/wyrd#450 as *the closing PR*
+  of the six-item floor issue #366. Only a GitHub technicality (the PR merged into
+  `feat/m4-production-metadata-backend`, not the default branch) kept #366 open.
+- **The local COMPLETE silently retired the milestone id.** `pdca status` shows issue_366
+  COMPLETE (merged-wider, 2026-07-04) while GitHub #366's checklist stood at 0/6 and floor
+  items 4–6 (request-plane RED + capacity emission, tonic-health probes, typed errors) had
+  **no bundle, no issue, nothing** — the brief's "follow-on slices" were never instantiated.
+  Item 1 was even re-discovered later as a fresh defect (#527, closed via PR #531) rather
+  than ticked off the milestone. Deferred-≠-unbuilt held *inside* the bundle (§6/§10 were
+  honest) but there was no cross-bundle owner for the remainder.
+- **Corrections applied 2026-07-17 (record hygiene, not process deltas):** PR #450 body
+  edited `Fixes #366` → `Part of #366`; #366's checklist reconciled — items 1–3 ticked with
+  pointers (#450 seam + custodian; #527/PR #531 subscriber + operational logging;
+  #528–#530 error-detail), items 4–6 pointed at newly filed issues (below).
+- **Two residual hazards, neither fixable by edit:** (a) the *manual* Development-section
+  link (added 2026-07-06) still registers PR #450 as closing #366 — GitHub exposes no API
+  to remove it; the human must unlink it in the Development sidebar. (b) the **merged
+  commit** `9cf4e8e` carries `Fixes #366` in its message — un-editable history; when the M4
+  integration branch merges to the default branch, GitHub will auto-close #366 off that
+  commit. Mitigation is procedural: squash-merge the integration branch, or re-open #366
+  (items 4–6 still open) immediately after the merge — noted on the #367 convergence watch.
+
+## Process deltas
+
+- **None applied in-band; one candidate RECORDED for the next full Act review:** a
+  scope-conditional closing line — a milestone-scoped brief (multi-slice, keystone-only
+  delivery) must emit `Part of #<id>`, never `Fixes #<id>`, in BOTH pr-description.md and
+  commit-msg.txt. Spans template-provided artifacts: `templates/pr-description.md.tpl:43-50`,
+  `templates/commit-msg.txt.tpl` (same trailer), `.claude/agents/publisher.md:41,72-76`, and
+  the contribution-gate lint that today *requires* the bare `Fixes`. Needs a machine-readable
+  scope signal in brief.md (the Difficulty/"does not fit one patch.diff" declaration is prose
+  today) so the gate can check it rather than trust the leaf. Template machinery → likely
+  routes upstream (eduralph/pdca-harness) with an instance-side interim rule; the next full
+  review decides the split.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- **Tracker (Wyrd) — the un-bundled remainder of the #366 milestone, filed 2026-07-17:**
+  **getwyrd/wyrd#575** (floor item 4, request-plane RED + capacity-plane emission),
+  **getwyrd/wyrd#576** (item 5, tonic-health liveness/readiness reflecting `health()`),
+  **getwyrd/wyrd#577** (item 6, typed transient/terminal errors extending `IntegrityFault`;
+  the #255 sequencing ratified at the issue_366 sign-off — after M4, adapt TiKV — is
+  restated in its body). → owner: Eduard; plan as PDCA bundles when scheduled.
+- **Human (one click, no API):** remove the manual PR #450 ↔ #366 Development link.
+- **#367 convergence watch (carried, sharpened):** before/at the M4→default merge, guard
+  against `9cf4e8e`'s `Fixes #366` auto-closing the milestone with items 4–6 open.
+
+## How effectiveness will be judged
+
+- The next milestone-scoped bundle's publish artifacts should carry `Part of #<id>`;
+  another whole-milestone `Fixes` on a slice PR means the candidate delta is overdue and
+  must be applied, not re-recorded.
+- #575/#576/#577 should appear scheduled (or explicitly deferred) at the next review — the
+  test of whether milestone remainders now get owners instead of vanishing under a
+  COMPLETE bundle id.
+- #366 should still be OPEN (or knowingly closed with items 4–6 re-homed) after the M4
+  integration branch lands on the default branch.
+
 # Act review — 2026-07-16 — cycles considered: issue_407, issue_408 (new since 07-10) + issue_399, issue_406, issue_469, issue_470 (froze around the 07-10 review without a narrative entry; issue_438's signals were part of the 07-10 FDB-batch ledger sweep)
 
 ## What the cycles' records exposed
