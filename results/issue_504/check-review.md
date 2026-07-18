@@ -1,0 +1,15 @@
+Review of issue #504: refuse S3 CopyObject-form PUTs before body storage so an unsupported copy cannot erase the destination object.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is decision-complete: reject the unsupported header form with S3 `NotImplemented`, preserve existing bytes, and leave ordinary PUT behavior intact (`crates/server/tests/s3_copy_object_guard.rs:163`). |
+| C2 Reproduction (red pre-fix) | PASS | Independent base run reproduced the data-loss path: the preservation test received 200 instead of 501 while the ordinary-PUT control passed (`crates/server/tests/s3_copy_object_guard.rs:192`). |
+| C3 Change | PASS | The change stays within the specified refusal slice and executes before body consumption, so no server-side-copy or SigV4 policy expansion needs approval (`crates/gateway-s3/src/lib.rs:577`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether independently confirmed targeted red→green plus clean format and affected-package Clippy is sufficient — both patched tests passed, but the asserted aggregate `./engine/xtask.sh ci` entry point is absent from the supplied target and could not be rerun (`crates/server/tests/s3_copy_object_guard.rs:167`). |
+| C5 Causal adequacy | PASS | Refusing the distinct request form at dispatch removes the destructive fall-through before storage rather than masking its post-write symptom; no capability-probe smell requires root-cause adjudication (`crates/gateway-s3/src/lib.rs:563`). |
+| T1 Structure | PASS | The production guard remains in the existing method-dispatch boundary and the wire regression is a standalone integration test, matching the repository's applicable seams (`crates/gateway-s3/src/lib.rs:563`; `crates/server/tests/s3_copy_object_guard.rs:166`). |
+| T2 Shape | PASS | The observable contract is covered at its boundaries: 501 plus S3 error code, byte-identical destination preservation, and an unaffected ordinary PUT control (`crates/server/tests/s3_copy_object_guard.rs:191`). |
+| T3 Runtime | PASS | The in-process TCP test exercised the production signing and gateway path; patched execution passed both cases without an external service (`crates/server/tests/s3_copy_object_guard.rs:167`). |
+| T4 Contribution | PASS | Affected-path history across all available local/remote refs, pickaxe for `x-amz-copy-source`, and closed GitHub PR searches for both `CopyObject` and the header found no superseding prior or rejected work (`crates/gateway-s3/src/lib.rs:577`). |
+| T5 Judgment | PASS | The refusal is a reversible safety boundary with no ambiguous scope or upstream semantic dependency; full copy semantics remain explicitly outside this decision (`crates/gateway-s3/src/lib.rs:574`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether refusal-until-full-copy is the right product behavior for S3 clients — it prevents data loss but intentionally returns 501 for CopyObject workflows (`crates/gateway-s3/src/lib.rs:580`). |

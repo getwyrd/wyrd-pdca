@@ -1,0 +1,2066 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2aceba6..7253693 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5072,6 +5072,7 @@ version = "0.0.0"
+ dependencies = [
+  "axum 0.8.9",
+  "bytes",
++ "crc32c",
+  "futures-util",
+  "hmac",
+  "sha2",
+@@ -5173,6 +5174,7 @@ dependencies = [
+  "aws-smithy-runtime-api",
+  "aws-smithy-types",
+  "bytes",
++ "crc32c",
+  "futures-util",
+  "pollster",
+  "serde",
+diff --git a/crates/gateway-s3/Cargo.toml b/crates/gateway-s3/Cargo.toml
+index 15f76d1..16cabfa 100644
+--- a/crates/gateway-s3/Cargo.toml
++++ b/crates/gateway-s3/Cargo.toml
+@@ -26,6 +26,11 @@ futures-util.workspace = true
+ # SHA-256 (payload + canonical-request digest) and HMAC-SHA256 (the signing MAC).
+ hmac.workspace = true
+ sha2.workspace = true
++# CRC-32C (Castagnoli) for the `x-amz-checksum-crc32c` streaming trailer (issue #505):
++# already vetted/allowlisted (root Cargo.toml, already used by `wyrd-chunk-format`), so
++# no new ADR-0003 audit. Plain `x-amz-checksum-crc32` is a DIFFERENT polynomial this
++# crate does not compute — see `checksum.rs` for the in-tree table-driven IEEE CRC-32.
++crc32c.workspace = true
+ # The runtime that hosts the listener and the bounded-channel decode/read tasks.
+ tokio.workspace = true
+ tokio-stream.workspace = true
+diff --git a/crates/gateway-s3/src/checksum.rs b/crates/gateway-s3/src/checksum.rs
+new file mode 100644
+index 0000000..d0a9f94
+--- /dev/null
++++ b/crates/gateway-s3/src/checksum.rs
+@@ -0,0 +1,251 @@
++//! The `x-amz-checksum-*` streaming-trailer checksums (issue #505): the `aws-chunked`
++//! `-TRAILER` framings a stock modern SDK (boto3 / aws-sdk / aws-cli) **defaults** to
++//! carry a declared checksum trailer after the terminating zero-length chunk, and the
++//! gateway must actually validate it against the streamed content — never
++//! consume-and-ignore it (that would be the same half-accept `sigv4.rs` refuses today, in
++//! new clothes).
++//!
++//! # Algorithm set (brief #505 scope)
++//! At minimum `crc32`, `crc32c`, and `sha256` — what a stock SDK actually sends:
++//! * `crc32c` is the workspace's already-vetted `crc32c` crate (root `Cargo.toml`, already
++//!   used by `wyrd-chunk-format`) — no new dependency, no ADR-0003 audit.
++//! * `sha256` reuses [`crate::crypto::Sha256`], already vetted for the SigV4 boundary.
++//! * plain `crc32` (IEEE 802.3, what default aws-cli/boto3 send) is a **different**
++//!   polynomial the `crc32c` crate does not compute, and is small enough (a 256-entry
++//!   table + an XOR loop) to keep **in-tree** rather than pull a new crate — a new
++//!   dependency here would trigger ADR-0003's three-test audit + `deny.toml` allowlist,
++//!   a human-only sign-off item (INTEGRATION §4), for a few dozen lines of well-known,
++//!   independently-checkable arithmetic.
++//!
++//! `x-amz-checksum-crc64nvme` is out of scope for this slice (brief #505): a `-TRAILER`
++//! declaration naming it is refused up front by [`ChecksumAlgorithm::from_trailer_name`]
++//! returning `None`, before any body is read — the same "refuse, never half-accept" rule
++//! as an unrecognised streaming sentinel.
++
++use crate::crypto;
++
++/// A checksum algorithm the gateway can compute and verify against a declared
++/// `x-amz-checksum-<algo>` streaming trailer.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ChecksumAlgorithm {
++    /// CRC-32 (IEEE 802.3) — the aws-cli / boto3 **default**.
++    Crc32,
++    /// CRC-32C (Castagnoli).
++    Crc32c,
++    /// SHA-256.
++    Sha256,
++}
++
++impl ChecksumAlgorithm {
++    /// Recognise a declared `x-amz-trailer` value as one of the algorithms this gateway
++    /// can verify, case-insensitively. `None` for anything else — including
++    /// `x-amz-checksum-crc64nvme` (out of scope) and any non-checksum trailer name — so
++    /// the caller refuses rather than half-accepts a trailer it cannot validate.
++    pub fn from_trailer_name(name: &str) -> Option<Self> {
++        match name.to_ascii_lowercase().as_str() {
++            "x-amz-checksum-crc32" => Some(ChecksumAlgorithm::Crc32),
++            "x-amz-checksum-crc32c" => Some(ChecksumAlgorithm::Crc32c),
++            "x-amz-checksum-sha256" => Some(ChecksumAlgorithm::Sha256),
++            _ => None,
++        }
++    }
++}
++
++/// An incremental checksum over the DECODED (de-framed) object bytes as they stream past —
++/// so the declared trailer value is checked against what was **actually** written, never
++/// the client's unverified claim (issue #505's invariant: "consumed but not validated
++/// would be the same half-accept in new clothes").
++pub enum RunningChecksum {
++    Crc32(u32),
++    Crc32c(u32),
++    Sha256(crypto::Sha256),
++}
++
++impl RunningChecksum {
++    /// A fresh accumulator over the empty input for `algorithm`.
++    pub fn new(algorithm: ChecksumAlgorithm) -> Self {
++        match algorithm {
++            ChecksumAlgorithm::Crc32 => RunningChecksum::Crc32(0),
++            ChecksumAlgorithm::Crc32c => RunningChecksum::Crc32c(0),
++            ChecksumAlgorithm::Sha256 => RunningChecksum::Sha256(crypto::Sha256::new()),
++        }
++    }
++
++    /// Feed `data` into the running digest.
++    pub fn update(&mut self, data: &[u8]) {
++        match self {
++            RunningChecksum::Crc32(crc) => *crc = crc32_ieee_append(*crc, data),
++            RunningChecksum::Crc32c(crc) => *crc = crc32c::crc32c_append(*crc, data),
++            RunningChecksum::Sha256(hasher) => hasher.update(data),
++        }
++    }
++
++    /// The final checksum, as the raw bytes AWS's `x-amz-checksum-*` trailer base64-encodes
++    /// (a big-endian 4-byte CRC for `crc32`/`crc32c`, the 32-byte digest for `sha256`).
++    pub fn finalize(self) -> Vec<u8> {
++        match self {
++            RunningChecksum::Crc32(crc) => crc.to_be_bytes().to_vec(),
++            RunningChecksum::Crc32c(crc) => crc.to_be_bytes().to_vec(),
++            RunningChecksum::Sha256(hasher) => hasher.finalize().to_vec(),
++        }
++    }
++}
++
++/// The standard CRC-32 (IEEE 802.3, reflected polynomial `0xEDB88320`) lookup table —
++/// generated once, ahead of time, rather than at runtime (no `OnceLock`/`lazy_static`
++/// needed for a fixed 256-entry table). Reproduces the standard `crc32` check value for
++/// `"123456789"` (`0xCBF43926`, pinned in `tests::crc32_ieee_check_value`).
++#[rustfmt::skip]
++const CRC32_IEEE_TABLE: [u32; 256] = [
++    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
++    0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
++    0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
++    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
++    0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
++    0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
++    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
++    0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924, 0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
++    0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
++    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
++    0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
++    0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
++    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
++    0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
++    0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
++    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
++    0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
++    0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
++    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
++    0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
++    0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
++    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
++    0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236, 0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
++    0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
++    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
++    0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
++    0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
++    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
++    0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
++    0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
++    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
++    0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
++];
++
++/// CRC-32 (IEEE 802.3) of `data`, chained from a previous `crc` (`0` for a fresh start) —
++/// the table-driven counterpart to [`crc32c::crc32c_append`], kept in-tree (see module docs).
++fn crc32_ieee_append(crc: u32, data: &[u8]) -> u32 {
++    let mut crc = !crc;
++    for &byte in data {
++        crc = CRC32_IEEE_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
++    }
++    !crc
++}
++
++/// Decode a **standard** (`+`/`/`, `=`-padded) base64 string to raw bytes — the encoding
++/// AWS uses for every `x-amz-checksum-*` trailer value. `None` on anything malformed
++/// (wrong alphabet, wrong length, bad padding), so the caller refuses a declared checksum
++/// that is not even well-formed base64 rather than half-parsing it.
++pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
++    let bytes = s.as_bytes();
++    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
++        return None;
++    }
++    let value_of = |b: u8| -> Option<u8> {
++        match b {
++            b'A'..=b'Z' => Some(b - b'A'),
++            b'a'..=b'z' => Some(b - b'a' + 26),
++            b'0'..=b'9' => Some(b - b'0' + 52),
++            b'+' => Some(62),
++            b'/' => Some(63),
++            _ => None,
++        }
++    };
++    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
++    for group in bytes.chunks_exact(4) {
++        // Padding (`=`) is only valid in the LAST two positions of the LAST group; treat it
++        // as "value 0, drop from output" and reject any other placement/count.
++        let pad = group.iter().rev().take_while(|&&b| b == b'=').count();
++        if pad > 2 || group[..4 - pad].contains(&b'=') {
++            return None;
++        }
++        let mut vals = [0u8; 4];
++        for (i, &b) in group.iter().enumerate() {
++            vals[i] = if b == b'=' { 0 } else { value_of(b)? };
++        }
++        let n = (u32::from(vals[0]) << 18)
++            | (u32::from(vals[1]) << 12)
++            | (u32::from(vals[2]) << 6)
++            | u32::from(vals[3]);
++        out.push((n >> 16) as u8);
++        if pad < 2 {
++            out.push((n >> 8) as u8);
++        }
++        if pad < 1 {
++            out.push(n as u8);
++        }
++    }
++    Some(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The standard CRC-32 (IEEE 802.3) check value for the canonical `"123456789"`
++    /// vector — the independent oracle every from-scratch CRC-32 implementation is
++    /// checked against.
++    #[test]
++    fn crc32_ieee_check_value() {
++        assert_eq!(crc32_ieee_append(0, b"123456789"), 0xcbf4_3926);
++    }
++
++    // Cross-checked independently against a bit-by-bit reference implementation and
++    // Python's `zlib.crc32` (both agree): `crc32("a") == 0xe8b7be43`, whose big-endian
++    // bytes base64-encode to `6Le+Qw==` — the shape a real `x-amz-checksum-crc32` trailer
++    // value takes.
++    #[test]
++    fn crc32_ieee_matches_a_second_known_answer() {
++        assert_eq!(crc32_ieee_append(0, b"a"), 0xe8b7_be43);
++    }
++
++    /// The running accumulator agrees with a one-shot call, for arbitrary split points —
++    /// the streaming trailer-checksum path feeds it whatever piece sizes the wire delivers.
++    #[test]
++    fn crc32_running_matches_split_points() {
++        let data: Vec<u8> = (0..500u32).map(|i| (i * 7 + 3) as u8).collect();
++        let whole = crc32_ieee_append(0, &data);
++        for split in [0usize, 1, 63, 250, 499, 500] {
++            let a = crc32_ieee_append(0, &data[..split]);
++            let b = crc32_ieee_append(a, &data[split..]);
++            assert_eq!(b, whole, "split at {split}");
++        }
++    }
++
++    /// RFC 4648 §10 test vectors — the published base64 known answers.
++    #[test]
++    fn base64_decode_rfc4648_vectors() {
++        assert_eq!(base64_decode("").as_deref(), None); // empty is not a valid group
++        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
++        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
++        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
++        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
++        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
++        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
++    }
++
++    /// The real-world shape: a base64-encoded CRC-32C trailer value, matching the AWS
++    /// published `aws-c-auth` trailing-header integration example (`x-amz-checksum-crc32c:
++    /// wdBDMA==` for the 1-byte payload `"a"`) — decodes to the CRC-32C big-endian bytes.
++    #[test]
++    fn base64_decode_matches_aws_crc32c_trailer_example() {
++        let decoded = base64_decode("wdBDMA==").unwrap();
++        assert_eq!(decoded, crc32c::crc32c(b"a").to_be_bytes());
++    }
++
++    #[test]
++    fn base64_decode_rejects_malformed_input() {
++        assert!(base64_decode("not base64!!").is_none());
++        assert!(base64_decode("Zg=").is_none()); // wrong length
++        assert!(base64_decode("=g==").is_none()); // padding before data
++    }
++}
+diff --git a/crates/gateway-s3/src/lib.rs b/crates/gateway-s3/src/lib.rs
+index 4521301..1e12f56 100644
+--- a/crates/gateway-s3/src/lib.rs
++++ b/crates/gateway-s3/src/lib.rs
+@@ -20,7 +20,12 @@
+ //! `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`; that body is de-framed and
+ //! its per-chunk signatures verified as it streams ([`streaming::decode`]), so a real SDK
+ //! upload round-trips byte-identical rather than being refused (issue #364 carry-forward,
+-//! real-SDK streaming interop).
++//! real-SDK streaming interop). A **default-configured** stock SDK actually goes further and
++//! sends the checksum-**trailer** framing (`STREAMING-UNSIGNED-PAYLOAD-TRAILER` /
++//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, a declared `x-amz-checksum-*` trailer after
++//! the terminating zero-length chunk) — also de-framed, trailer-signature-verified (signed
++//! variant) and checksum-validated ([`checksum`]) as it streams, so that default upload is
++//! accepted too rather than 403-ing (issue #505).
+ //!
+ //! # Crate boundary (issue #364 carry-forward, T5-a — extracted, ratified)
+ //! This wire surface is its **own crate** (`wyrd-gateway-s3`, architecture §5:132's named
+@@ -51,6 +56,7 @@
+ //! decision the listener is exercised over loopback and an operator/#367 fronts it with
+ //! the public-TLS terminator ([`S3Gateway::serve`] takes an already-bound listener).
+ 
++pub mod checksum;
+ pub mod crypto;
+ pub mod request_id;
+ pub mod sigv4;
+@@ -869,6 +875,18 @@ fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
+                 "InvalidRequest",
+                 format!("malformed aws-chunked streaming body: {what}"),
+             ),
++            // A declared `x-amz-checksum-*` streaming trailer that does not match the
++            // bytes actually streamed (issue #505) — a content-integrity failure, S3's own
++            // code for a checksum mismatch (distinct from `SignatureDoesNotMatch`: the
++            // unsigned `-TRAILER` variant has no signature to fail, only a checksum to
++            // mismatch). The object is never committed (`streaming::decode` aborts the
++            // write on this `Err` before `put_object_streaming` ever sees a commit).
++            streaming::StreamingError::ChecksumMismatch => (
++                StatusCode::BAD_REQUEST,
++                "BadDigest",
++                "the declared x-amz-checksum-* trailer does not match the streamed body"
++                    .to_string(),
++            ),
+         };
+     }
+     match err.downcast_ref::<GatewayError>() {
+diff --git a/crates/gateway-s3/src/sigv4.rs b/crates/gateway-s3/src/sigv4.rs
+index 31e3cbd..ac6325f 100644
+--- a/crates/gateway-s3/src/sigv4.rs
++++ b/crates/gateway-s3/src/sigv4.rs
+@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ use axum::http::HeaderMap;
+ 
++use crate::checksum::ChecksumAlgorithm;
+ use crate::crypto;
+ 
+ /// The `x-amz-date` freshness window (S3's default 15 minutes): a request whose signed
+@@ -85,6 +86,31 @@ pub struct StreamingContext {
+     /// chunk-by-chunk; an unsigned one is de-framed but not chunk-authenticated (its
+     /// integrity rides the seed signature + transport, the same posture as `UNSIGNED-PAYLOAD`).
+     pub signed: bool,
++    /// The `-TRAILER` framing's declaration (`None` for the plain, no-trailer
++    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`): what the decoder ([`super::streaming`]) must
++    /// find — and validate — in the trailer section after the terminating zero-length
++    /// chunk. Built by [`verify`] from `x-amz-trailer` / `x-amz-decoded-content-length`
++    /// **before** any body is read, so an unverifiable declaration (an unrecognised
++    /// checksum algorithm, a missing declaration) is refused up front rather than
++    /// consumed-and-ignored deeper in the pipeline (issue #505; the same "no half-accept"
++    /// invariant as `streaming_variant`).
++    pub trailer: Option<TrailerDeclaration>,
++}
++
++/// A `-TRAILER` streaming framing's declared trailer: the ONE `x-amz-checksum-*` header
++/// this slice validates (brief #505 scope — the single checksum trailer a stock SDK
++/// sends), plus the declared decoded byte count if the client sent one.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TrailerDeclaration {
++    /// The declared trailer header name, lower-cased (e.g. `x-amz-checksum-crc32`) — what
++    /// the decoder must find in the wire trailer section; anything else there is a trailer
++    /// name not declared in `x-amz-trailer` and is refused (400), never silently accepted.
++    pub name: String,
++    /// The checksum algorithm `name` names.
++    pub algorithm: ChecksumAlgorithm,
++    /// `x-amz-decoded-content-length`, if the client sent one — the decoder checks the
++    /// number of DE-FRAMED object bytes against it once the trailer is consumed.
++    pub decoded_content_length: Option<u64>,
+ }
+ 
+ /// Why a request's signature was refused. Every variant maps to HTTP 403; the
+@@ -473,13 +499,24 @@ pub fn verify(
+         PayloadHash::Unsigned
+     } else if is_hex_sha256(claimed) {
+         PayloadHash::Signed(claimed.to_string())
+-    } else if let Some(signed) = streaming_variant(claimed) {
++    } else if let Some((signed, has_trailer)) = streaming_variant(claimed) {
++        // A `-TRAILER` framing's declaration headers are part of the contract, not
++        // decoration (brief #505 scope): parsed and validated here, before any body is
++        // read, so an unverifiable declaration (a missing `x-amz-trailer`, an unrecognised
++        // checksum algorithm) is refused up front rather than admitted and only later
++        // discovered unconsumable deeper in the decoder.
++        let trailer = if has_trailer {
++            Some(parse_trailer_declaration(headers)?)
++        } else {
++            None
++        };
+         PayloadHash::Streaming(StreamingContext {
+             seed_signature: expected,
+             signing_key: signing_key(&cred.secret_access_key, &authz.date, region, service),
+             date_time: amz_date.to_string(),
+             scope: format!("{}/{region}/{service}/aws4_request", authz.date),
+             signed,
++            trailer,
+         })
+     } else {
+         // Not UNSIGNED-PAYLOAD, not a hex digest, not a streaming sentinel the decoder
+@@ -492,28 +529,66 @@ pub fn verify(
+ }
+ 
+ /// The `aws-chunked` streaming sentinels the decoder ([`super::streaming`]) can actually
+-/// de-frame, each mapped to whether its **data chunks are per-chunk signed**. A **closed**
+-/// set: `Some(true)` — signed data chunks, each frame carries a chained `chunk-signature=`
+-/// the decoder verifies fail-closed; `Some(false)` — framing only (integrity rides the seed
+-/// signature + transport, as `UNSIGNED-PAYLOAD`); `None` — an unknown streaming sentinel
++/// de-frame, each mapped to `(signed, has_trailer)`. A **closed** set: `signed` — data
++/// chunks are per-chunk signed, each frame carries a chained `chunk-signature=` the decoder
++/// verifies fail-closed; `has_trailer` — a `-TRAILER` framing whose trailer section the
++/// decoder now consumes (issue #505) — checksum-validated always, and, for the signed
++/// variant, trailer-signature-verified too (per AWS's published trailing-header
++/// string-to-sign, `streaming::sign_trailer`). `None` — an unknown streaming sentinel
+ /// [`verify`] must refuse rather than half-accept (issue #364 carry-forward, iter-6 item 3).
+ ///
+-/// The `-TRAILER` variants append trailer headers (and, for the signed variant, a trailer
+-/// signature) *after* the terminating zero-length chunk. The `aws-chunked` decoder
+-/// ([`super::streaming::Decoder::next_chunk`]) requires an immediate CRLF after that zero
+-/// chunk and cannot consume those trailer bytes, so admitting a `-TRAILER` sentinel is a
+-/// half-accept: a real checksum-trailer upload would authenticate and then fail mid-body as
+-/// malformed (issue #364 carry-forward, iter-6 item 3 — "no half-accept"). So they return
+-/// `None` here and are refused up front, before any body is read. The only fully-consumable
+-/// framing is the signed, no-trailer `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`. Trailer
+-/// consumption/verification stays deferred with the rest of the streaming-checksum surface.
+-fn streaming_variant(sentinel: &str) -> Option<bool> {
++/// Issue #505 carry-forward note: the `-TRAILER` variants used to return `None` here
++/// unconditionally — the decoder could not yet consume the trailer bytes after the
++/// terminating zero-length chunk, so admitting them would have been a half-accept (a real
++/// checksum-trailer upload — what a **default-configured** modern SDK actually sends —
++/// would authenticate and then fail mid-body as malformed). Now that the decoder fully
++/// consumes and validates the trailer section (`streaming::Decoder::next_chunk`), admitting
++/// them restores SDK compatibility without reopening that half-accept.
++fn streaming_variant(sentinel: &str) -> Option<(bool, bool)> {
+     match sentinel {
+-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Some(true),
++        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Some((true, false)),
++        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => Some((true, true)),
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Some((false, true)),
+         _ => None,
+     }
+ }
+ 
++/// Parse and validate a `-TRAILER` framing's declaration headers — `x-amz-trailer`
++/// (required: the ONE checksum trailer this slice supports, brief #505 scope) and the
++/// optional `x-amz-decoded-content-length`. Runs **before any body is read**, so an
++/// unverifiable declaration (a missing `x-amz-trailer`, more than one declared trailer
++/// name, an unrecognised checksum algorithm — including the out-of-scope
++/// `x-amz-checksum-crc64nvme`) is refused up front rather than admitted and only later
++/// discovered unconsumable in the decoder (the same "no half-accept" invariant
++/// [`streaming_variant`] documents).
++fn parse_trailer_declaration(headers: &HeaderMap) -> Result<TrailerDeclaration, AuthError> {
++    let raw = header(headers, "x-amz-trailer").ok_or_else(|| {
++        AuthError::Malformed("missing x-amz-trailer for a -TRAILER streaming upload".into())
++    })?;
++    if raw.contains(',') {
++        // A stock SDK declares exactly one checksum trailer; refuse rather than
++        // half-validate a multi-trailer declaration this slice does not support.
++        return Err(AuthError::Malformed(
++            "multiple x-amz-trailer names are not supported".into(),
++        ));
++    }
++    let name = raw.trim().to_ascii_lowercase();
++    let algorithm = ChecksumAlgorithm::from_trailer_name(&name).ok_or_else(|| {
++        AuthError::Malformed(format!("unsupported x-amz-trailer checksum `{name}`"))
++    })?;
++    let decoded_content_length = match header(headers, "x-amz-decoded-content-length") {
++        Some(v) => Some(v.parse::<u64>().map_err(|_| {
++            AuthError::Malformed("x-amz-decoded-content-length is not a valid integer".into())
++        })?),
++        None => None,
++    };
++    Ok(TrailerDeclaration {
++        name,
++        algorithm,
++        decoded_content_length,
++    })
++}
++
+ /// Whether `s` is a 64-character hex string — the shape of a literal SHA-256 payload hash.
+ /// Used to tell a real signed-payload digest from a sentinel, so a bogus non-hex claim is
+ /// refused by [`verify`] rather than silently treated as a (never-matching) signed hash.
+@@ -931,6 +1006,8 @@ mod tests {
+         assert_eq!(ctx.seed_signature, signature);
+         assert_eq!(ctx.scope, "20150830/us-east-1/s3/aws4_request");
+         assert_eq!(ctx.date_time, amz_date);
++        // The plain, no-trailer sentinel carries no trailer declaration.
++        assert_eq!(ctx.trailer, None);
+         // The signing key matches the SigV4 ladder for these credentials/scope.
+         assert_eq!(
+             ctx.signing_key,
+@@ -941,6 +1018,17 @@ mod tests {
+     /// Sign a request over an arbitrary `x-amz-content-sha256` claim and run it through
+     /// [`verify`] with a fresh clock, returning the classification (or the refusal).
+     fn verify_with_claim(claim: &str) -> Result<PayloadHash, AuthError> {
++        verify_with_claim_and_headers(claim, &[])
++    }
++
++    /// As [`verify_with_claim`], but with additional (unsigned — the trailer-declaration
++    /// headers, like `x-amz-content-sha256` itself, need not be in `SignedHeaders` to be
++    /// read here) headers on the request — what a `-TRAILER` sentinel needs
++    /// (`x-amz-trailer`, optionally `x-amz-decoded-content-length`).
++    fn verify_with_claim_and_headers(
++        claim: &str,
++        extra_headers: &[(&str, &str)],
++    ) -> Result<PayloadHash, AuthError> {
+         let creds = Credentials {
+             access_key_id: "AKIDEXAMPLE".to_string(),
+             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+@@ -963,6 +1051,12 @@ mod tests {
+         headers.insert("authorization", signed.authorization.parse().unwrap());
+         headers.insert("x-amz-date", signed.amz_date.parse().unwrap());
+         headers.insert("x-amz-content-sha256", claim.parse().unwrap());
++        for (name, value) in extra_headers {
++            headers.insert(
++                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
++                value.parse().unwrap(),
++            );
++        }
+         let fresh = UNIX_EPOCH + Duration::from_secs(1_440_938_160);
+         verify(
+             "PUT",
+@@ -1010,22 +1104,89 @@ mod tests {
+                 ..
+             }))
+         ));
+-        // The `-TRAILER` variants are refused up front: the decoder cannot consume the
+-        // trailer bytes after the terminating zero chunk, so admitting them would be the
+-        // iter-6 half-accept (authenticate, then fail mid-body). Rejected cleanly here.
++        // A literal 64-char hex digest is a signed single-shot payload.
++        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
++        assert!(matches!(
++            verify_with_claim(hex),
++            Ok(PayloadHash::Signed(h)) if h == hex
++        ));
++    }
++
++    /// Issue #505: the decoder now fully consumes and validates the `-TRAILER` framings'
++    /// trailer section, so `verify` no longer half-accepts-by-refusing them — a
++    /// well-formed `-TRAILER` sentinel that ALSO declares its trailer (`x-amz-trailer`) now
++    /// classifies as `PayloadHash::Streaming` carrying the parsed [`TrailerDeclaration`],
++    /// flipping the former iter-6 blanket refusal (`sigv4.rs` pre-#505) into acceptance for
++    /// a request the decoder can now fully de-frame and verify.
++    #[test]
++    fn verify_admits_the_trailer_sentinels_with_a_declared_trailer() {
++        let payload = verify_with_claim_and_headers(
++            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
++            &[("x-amz-trailer", "x-amz-checksum-crc32")],
++        )
++        .expect("a signed -TRAILER sentinel with a declared, supported trailer authenticates");
++        let PayloadHash::Streaming(ctx) = payload else {
++            panic!("a -TRAILER sentinel must still classify as PayloadHash::Streaming");
++        };
++        assert!(ctx.signed, "…-PAYLOAD-TRAILER chunks are signed");
++        assert_eq!(
++            ctx.trailer,
++            Some(TrailerDeclaration {
++                name: "x-amz-checksum-crc32".to_string(),
++                algorithm: ChecksumAlgorithm::Crc32,
++                decoded_content_length: None,
++            })
++        );
++
++        let payload = verify_with_claim_and_headers(
++            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++            &[
++                ("x-amz-trailer", "x-amz-checksum-crc32c"),
++                ("x-amz-decoded-content-length", "42"),
++            ],
++        )
++        .expect("an unsigned -TRAILER sentinel with a declared, supported trailer authenticates");
++        let PayloadHash::Streaming(ctx) = payload else {
++            panic!("a -TRAILER sentinel must still classify as PayloadHash::Streaming");
++        };
++        assert!(!ctx.signed, "…-UNSIGNED-… chunks are not per-chunk signed");
++        assert_eq!(
++            ctx.trailer,
++            Some(TrailerDeclaration {
++                name: "x-amz-checksum-crc32c".to_string(),
++                algorithm: ChecksumAlgorithm::Crc32c,
++                decoded_content_length: Some(42),
++            })
++        );
++    }
++
++    /// The `-TRAILER` admission stays fail-closed on its OWN declaration (issue #505: "the
++    /// trailer-mode DECLARATION headers are part of the contract, not decoration") — a
++    /// `-TRAILER` sentinel with no `x-amz-trailer` at all, or one naming a checksum this
++    /// gateway cannot verify (`x-amz-checksum-crc64nvme`, out of scope), is refused
++    /// **before any body is read**, never half-accepted.
++    #[test]
++    fn verify_rejects_an_unverifiable_trailer_declaration() {
+         assert!(matches!(
+             verify_with_claim("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
+             Err(AuthError::Malformed(_))
+         ));
+         assert!(matches!(
+-            verify_with_claim("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
++            verify_with_claim_and_headers(
++                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++                &[("x-amz-trailer", "x-amz-checksum-crc64nvme")],
++            ),
+             Err(AuthError::Malformed(_))
+         ));
+-        // A literal 64-char hex digest is a signed single-shot payload.
+-        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+         assert!(matches!(
+-            verify_with_claim(hex),
+-            Ok(PayloadHash::Signed(h)) if h == hex
++            verify_with_claim_and_headers(
++                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++                &[(
++                    "x-amz-trailer",
++                    "x-amz-checksum-crc32,x-amz-checksum-sha256"
++                )],
++            ),
++            Err(AuthError::Malformed(_))
+         ));
+     }
+ }
+diff --git a/crates/gateway-s3/src/streaming.rs b/crates/gateway-s3/src/streaming.rs
+index a1f06c1..6c2cc0e 100644
+--- a/crates/gateway-s3/src/streaming.rs
++++ b/crates/gateway-s3/src/streaming.rs
+@@ -42,8 +42,9 @@ use futures_util::{Stream, StreamExt};
+ use tokio_stream::wrappers::ReceiverStream;
+ use wyrd_traits::{BoxError, Result};
+ 
++use crate::checksum::{self, RunningChecksum};
+ use crate::crypto;
+-use crate::sigv4::StreamingContext;
++use crate::sigv4::{StreamingContext, TrailerDeclaration};
+ 
+ /// SHA-256 of the empty string — the fixed `Hash("")` line in every chunk string-to-sign.
+ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+@@ -56,15 +57,35 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
+ /// chunk + trailing CRLF) well clear of `usize` overflow.
+ pub(crate) const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+ 
++/// The maximum a `-TRAILER` framing's trailer SECTION (the lines after the terminating
++/// zero-length chunk, up to the closing blank line) may occupy before it is refused — the
++/// same bounded-buffering discipline as [`MAX_CHUNK_SIZE`] (issue #364 carry-forward,
++/// iter-6 item 2), applied to the new trailer-consuming code path (issue #505): a checksum
++/// trailer is at most a couple of short header lines, so 8 KiB is far above any real one
++/// yet caps a client that never sends the closing CRLF.
++const MAX_TRAILER_SIZE: usize = 8 * 1024;
++
+ /// A refused / malformed `aws-chunked` streaming upload.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum StreamingError {
+-    /// The chunk framing was malformed (bad size line, missing CRLF, truncated body).
+-    /// Maps to HTTP 400.
++    /// The chunk framing was malformed (bad size line, missing CRLF, truncated body) — or,
++    /// for a `-TRAILER` framing (issue #505), a malformed trailer section: bad base64, a
++    /// trailer name not declared in `x-amz-trailer`, a declared trailer never sent, a
++    /// `x-amz-decoded-content-length` mismatch, or bytes after the trailer block. Maps to
++    /// HTTP 400.
+     Framing(String),
+     /// A chunk's signature did not verify — the body was not signed by the credential
+-    /// holder. Maps to HTTP 403 (fail-closed); the object is never committed.
++    /// holder — or, for a signed `-TRAILER` framing, the trailer signature did not verify
++    /// (the declared trailer headers were not signed by the credential holder). Maps to
++    /// HTTP 403 (fail-closed); the object is never committed.
+     ChunkSignature,
++    /// The declared `x-amz-checksum-*` trailer value does not match the checksum of the
++    /// bytes actually streamed (issue #505: a tampered — or simply wrong — declared
++    /// checksum). Maps to HTTP 400; the object is never committed. Deliberately distinct
++    /// from [`StreamingError::ChunkSignature`]: this is a content-integrity mismatch, not
++    /// (necessarily) an authentication failure — the unsigned `-TRAILER` variant has no
++    /// signature to fail, only a checksum to mismatch.
++    ChecksumMismatch,
+ }
+ 
+ impl fmt::Display for StreamingError {
+@@ -74,6 +95,12 @@ impl fmt::Display for StreamingError {
+             StreamingError::ChunkSignature => {
+                 write!(f, "aws-chunked chunk signature does not verify")
+             }
++            StreamingError::ChecksumMismatch => {
++                write!(
++                    f,
++                    "declared x-amz-checksum-* trailer does not match the streamed body"
++                )
++            }
+         }
+     }
+ }
+@@ -107,6 +134,41 @@ pub fn sign_chunk(ctx: &StreamingContext, previous_signature: &str, chunk_data:
+     ))
+ }
+ 
++/// The SigV4 **trailer signature** for a signed `-TRAILER` framing's declared trailer
++/// headers, chained from `previous_signature` — the terminating zero-length chunk's OWN
++/// signature (AWS "Signing the trailing header"):
++///
++/// ```text
++/// StringToSign = "AWS4-HMAC-SHA256-TRAILER" \n <date-time> \n <scope> \n
++///                <previous-signature> \n Hash(canonical-trailer-headers)
++/// trailer-signature = HexEncode(HMAC(signing-key, StringToSign))
++/// ```
++///
++/// `canonical_trailer_headers` is the exact `name:value\n` block that was signed — one
++/// line per declared trailer header, lower-cased name, in the order sent (mirrors the
++/// canonical-header-block shape the header-based signature already builds, `sigv4.rs`'s
++/// `canonical_request`). Shared by the decoder (to verify) and test harnesses (to
++/// produce), so the two can never drift — the same discipline [`sign_chunk`] keeps.
++/// Pinned to a **published** worked example (AWS's own `aws-c-auth` chunked-signing test
++/// suite, `sigv4_trailing_headers_signing_test`, which chains off this module's own
++/// `aws_published_streaming_example` seed/final-chunk signatures) by
++/// `tests::aws_published_trailing_headers_example`.
++pub fn sign_trailer(
++    ctx: &StreamingContext,
++    previous_signature: &str,
++    canonical_trailer_headers: &str,
++) -> String {
++    let block_hash = crypto::hex(&crypto::sha256(canonical_trailer_headers.as_bytes()));
++    let string_to_sign = format!(
++        "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
++        ctx.date_time, ctx.scope, previous_signature, block_hash
++    );
++    crypto::hex(&crypto::hmac_sha256(
++        &ctx.signing_key,
++        string_to_sign.as_bytes(),
++    ))
++}
++
+ /// Decode an `aws-chunked` body: strip the chunk framing, verify each chunk (for a signed
+ /// stream), and yield the raw object bytes as a stream — the same `Stream<Item = Result<Bytes>>`
+ /// shape [`crate::Gateway::put_object_streaming`] consumes. Runs on a spawned task feeding a
+@@ -146,9 +208,18 @@ struct Decoder<S> {
+     buf: Vec<u8>,
+     eof: bool,
+     ctx: StreamingContext,
+-    /// The previous chunk's signature (seed for the first chunk) — the chunk chain.
++    /// The previous chunk's signature (seed for the first chunk) — the chunk chain. Also
++    /// the seed the trailer signature (a `-TRAILER` framing, signed variant) chains from,
++    /// once the terminating zero-length chunk has updated it.
+     previous_signature: String,
+     done: bool,
++    /// A running checksum over the DECODED object bytes, for a `-TRAILER` framing (`None`
++    /// for the plain no-trailer sentinel) — checked against the declared trailer value once
++    /// the trailer section is consumed (issue #505: validated, not consumed-and-trusted).
++    checksum: Option<RunningChecksum>,
++    /// De-framed object bytes seen so far, checked against a declared
++    /// `x-amz-decoded-content-length` once the trailer is consumed.
++    decoded_len: u64,
+ }
+ 
+ impl<S> Decoder<S>
+@@ -157,6 +228,10 @@ where
+ {
+     fn new(source: S, ctx: StreamingContext) -> Self {
+         let previous_signature = ctx.seed_signature.clone();
++        let checksum = ctx
++            .trailer
++            .as_ref()
++            .map(|t| RunningChecksum::new(t.algorithm));
+         Self {
+             source,
+             buf: Vec::new(),
+@@ -164,6 +239,8 @@ where
+             ctx,
+             previous_signature,
+             done: false,
++            checksum,
++            decoded_len: 0,
+         }
+     }
+ 
+@@ -218,19 +295,32 @@ where
+             )));
+         }
+ 
+-        // 2. The chunk data plus its trailing CRLF.
+-        while self.buf.len() < size + 2 {
+-            if !self.fill().await? {
+-                return Err(framing("body ended mid-chunk"));
++        // 2. The chunk data plus its trailing CRLF — EXCEPT for the terminating chunk of a
++        // `-TRAILER` framing (issue #505), which has no data/CRLF of its own: the trailer
++        // section follows directly after the chunk header's own CRLF, exactly as HTTP/1.1
++        // chunked-transfer trailers follow the closing `0\r\n` line. The plain, no-trailer
++        // sentinel's terminator is unchanged: `0[;chunk-signature=…]\r\n\r\n` (the second
++        // `\r\n` consumed here as the "empty data + its own CRLF").
++        let is_trailer_terminator = size == 0 && self.ctx.trailer.is_some();
++        let data = if is_trailer_terminator {
++            Vec::new()
++        } else {
++            while self.buf.len() < size + 2 {
++                if !self.fill().await? {
++                    return Err(framing("body ended mid-chunk"));
++                }
+             }
+-        }
+-        let data = self.buf[..size].to_vec();
+-        if &self.buf[size..size + 2] != b"\r\n" {
+-            return Err(framing("chunk not CRLF-terminated"));
+-        }
+-        self.buf.drain(..size + 2);
++            let data = self.buf[..size].to_vec();
++            if &self.buf[size..size + 2] != b"\r\n" {
++                return Err(framing("chunk not CRLF-terminated"));
++            }
++            self.buf.drain(..size + 2);
++            data
++        };
+ 
+-        // 3. Fail-closed verification of the chunk signature (signed variants).
++        // 3. Fail-closed verification of the chunk signature (signed variants) — applies to
++        // the terminating chunk too (over empty data), chaining `previous_signature` for a
++        // signed `-TRAILER` framing's trailer signature below.
+         if self.ctx.signed {
+             let presented =
+                 chunk_sig.ok_or_else(|| framing("signed chunk missing chunk-signature"))?;
+@@ -241,16 +331,155 @@ where
+             self.previous_signature = expected;
+         }
+ 
++        // 4. Track the running checksum / decoded length over what is ACTUALLY streamed
++        // (issue #505) — a no-op for the plain no-trailer sentinel (`checksum` is `None`)
++        // and for the terminating chunk (`data` is always empty there).
++        if let Some(checksum) = self.checksum.as_mut() {
++            checksum.update(&data);
++        }
++        self.decoded_len += data.len() as u64;
++
+         if size == 0 {
+-            // The terminating chunk: nothing more is object data. Only the signed,
+-            // no-trailer `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` framing reaches this decoder —
+-            // `sigv4::streaming_variant` refuses the `-TRAILER` sentinels up front — so the
+-            // zero chunk is followed by the closing CRLF (checked above), not trailer bytes.
++            if let Some(trailer) = self.ctx.trailer.clone() {
++                self.consume_trailer(&trailer).await?;
++            }
+             self.done = true;
+             return Ok(None);
+         }
+         Ok(Some(Bytes::from(data)))
+     }
++
++    /// Read the next CRLF-terminated line of the trailer section. `Ok(None)` marks the
++    /// blank line that closes the block (already consumed). Bounded by [`MAX_TRAILER_SIZE`]
++    /// so a client that never sends the closing CRLF cannot force unbounded buffering — the
++    /// same discipline [`MAX_CHUNK_SIZE`] applies to a chunk's declared size (issue #364
++    /// carry-forward, iter-6 item 2).
++    async fn next_trailer_line(&mut self) -> Result<Option<Vec<u8>>> {
++        loop {
++            if let Some(pos) = find_crlf(&self.buf) {
++                if pos == 0 {
++                    self.buf.drain(..2);
++                    return Ok(None);
++                }
++                let line = self.buf[..pos].to_vec();
++                self.buf.drain(..pos + 2);
++                return Ok(Some(line));
++            }
++            if self.buf.len() > MAX_TRAILER_SIZE {
++                return Err(framing(&format!(
++                    "aws-chunked trailer section exceeds the {MAX_TRAILER_SIZE}-byte bound"
++                )));
++            }
++            if !self.fill().await? {
++                return Err(framing("body ended inside the aws-chunked trailer section"));
++            }
++        }
++    }
++
++    /// Consume, validate, and (for the signed variant) authenticate the `-TRAILER`
++    /// framing's trailer section — the lines after the terminating zero-length chunk, up to
++    /// the closing blank line. Fail-closed on every axis (issue #505): a trailer name not
++    /// declared in `x-amz-trailer` is refused (400), a declared trailer never sent is
++    /// refused (400), a malformed base64 checksum value is refused (400), a signed
++    /// framing's trailer signature that does not verify is refused (403, the object is
++    /// never committed), a mismatched checksum against what was ACTUALLY streamed is
++    /// refused (400, the object is never committed — never consumed-and-trusted), a
++    /// mismatched `x-amz-decoded-content-length` is refused (400), and any bytes left over
++    /// after the closing blank line — garbage the client appended past the logical end of
++    /// the body — are refused (400) rather than silently dropped.
++    async fn consume_trailer(&mut self, trailer: &TrailerDeclaration) -> Result<()> {
++        let mut declared_value: Option<(String, Vec<u8>)> = None; // (name, decoded checksum)
++        let mut canonical_line: Option<String> = None; // the exact `name:value\n` that was signed
++        let mut trailer_signature: Option<String> = None;
++
++        while let Some(line) = self.next_trailer_line().await? {
++            let line = std::str::from_utf8(&line)
++                .map_err(|_| framing("non-UTF-8 aws-chunked trailer line"))?;
++            let (name, value) = line
++                .split_once(':')
++                .ok_or_else(|| framing("malformed aws-chunked trailer line (missing `:`)"))?;
++            let lower_name = name.trim().to_ascii_lowercase();
++            let value = value.trim();
++
++            if lower_name == "x-amz-trailer-signature" {
++                if !self.ctx.signed {
++                    return Err(framing(
++                        "x-amz-trailer-signature on an unsigned streaming upload",
++                    ));
++                }
++                if trailer_signature.is_some() {
++                    return Err(framing("duplicate x-amz-trailer-signature"));
++                }
++                trailer_signature = Some(value.to_string());
++                continue;
++            }
++
++            if lower_name != trailer.name {
++                return Err(framing(&format!(
++                    "trailer `{lower_name}` was not declared in x-amz-trailer"
++                )));
++            }
++            if declared_value.is_some() {
++                return Err(framing("duplicate declared trailer header"));
++            }
++            let decoded = checksum::base64_decode(value)
++                .ok_or_else(|| framing("declared trailer checksum is not valid base64"))?;
++            canonical_line = Some(format!("{lower_name}:{value}\n"));
++            declared_value = Some((lower_name, decoded));
++        }
++
++        let (_, declared_bytes) = declared_value
++            .ok_or_else(|| framing("declared x-amz-trailer checksum was never sent"))?;
++
++        // Fail-closed authentication of the trailer headers themselves (signed variant
++        // only): a tampered/forged trailer — including a tampered checksum value, since it
++        // is part of what was signed — is refused BEFORE the checksum comparison below,
++        // same "signature first" discipline as the header-based request.
++        if self.ctx.signed {
++            let presented = trailer_signature.ok_or_else(|| {
++                framing("signed streaming upload missing x-amz-trailer-signature")
++            })?;
++            let canonical = canonical_line.expect("declared_value implies canonical_line");
++            let expected = sign_trailer(&self.ctx, &self.previous_signature, &canonical);
++            if !crypto::constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
++                return Err(Box::new(StreamingError::ChunkSignature));
++            }
++        }
++
++        // Content-integrity check: the declared checksum against what was ACTUALLY streamed
++        // — never consumed-and-trusted (issue #505's invariant: a validated trailer, not a
++        // half-accept in new clothes).
++        let computed = self
++            .checksum
++            .take()
++            .expect("trailer-mode Decoder always carries a running checksum")
++            .finalize();
++        if !crypto::constant_time_eq(&computed, &declared_bytes) {
++            return Err(Box::new(StreamingError::ChecksumMismatch));
++        }
++
++        if let Some(expected_len) = trailer.decoded_content_length {
++            if expected_len != self.decoded_len {
++                return Err(framing(
++                    "x-amz-decoded-content-length does not match the streamed body",
++                ));
++            }
++        }
++
++        // No half-accept on trailing garbage either: pull once more (or until EOF) and
++        // refuse if the client sent anything past the logical end of the aws-chunked body,
++        // rather than silently dropping it.
++        while self.buf.is_empty() {
++            if !self.fill().await? {
++                break;
++            }
++        }
++        if !self.buf.is_empty() {
++            return Err(framing("bytes present after the aws-chunked trailer block"));
++        }
++
++        Ok(())
++    }
+ }
+ 
+ /// Find the first `\r\n` in `buf`, returning the index of the `\r`.
+@@ -294,6 +523,7 @@ mod tests {
+             date_time: "20130524T000000Z".to_string(),
+             scope: "20130524/us-east-1/s3/aws4_request".to_string(),
+             signed: true,
++            trailer: None,
+         }
+     }
+ 
+@@ -458,4 +688,326 @@ mod tests {
+             "a malformed chunk header is a framing error (400), not a panic or a silent accept"
+         );
+     }
++
++    // ---- issue #505: `-TRAILER` framing (checksum-trailer) tests ----
++
++    /// AWS's published trailing-header (checksum-trailer) chunked-signing worked example —
++    /// from AWS's OWN open-source SigV4 streaming conformance suite (`aws-c-auth`,
++    /// `tests/test_chunked_signing.c`, `sigv4_trailing_headers_signing_test`), which chains
++    /// off exactly the SAME credentials/date/scope AND the SAME seed + chunk signatures
++    /// [`aws_published_streaming_example`] pins above: three trailer headers `first:1st`,
++    /// `second:2nd`, `third:3rd`, the trailer signature chained off the terminating
++    /// zero-length chunk's own signature (`b6c6ea8a…`, `sig3` above). The independent oracle
++    /// proving [`sign_trailer`] is AWS-correct, not merely self-consistent with the decoder
++    /// that also calls it.
++    #[test]
++    fn aws_published_trailing_headers_example() {
++        let ctx = aws_example_ctx();
++        let final_chunk_signature =
++            "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9";
++        let canonical_trailer_headers = "first:1st\nsecond:2nd\nthird:3rd\n";
++        let trailer_signature =
++            sign_trailer(&ctx, final_chunk_signature, canonical_trailer_headers);
++        assert_eq!(
++            trailer_signature,
++            "df5735bd9f3295cd9386572292562fefc93ba94e80a0a1ddcbd652c4e0a75e6c"
++        );
++    }
++
++    /// [`aws_example_ctx`], but declaring a `-TRAILER` framing's trailer — `signed` picks
++    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` (`true`) vs
++    /// `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (`false`).
++    fn aws_example_ctx_with_trailer(
++        signed: bool,
++        name: &str,
++        algorithm: checksum::ChecksumAlgorithm,
++    ) -> StreamingContext {
++        StreamingContext {
++            signed,
++            trailer: Some(TrailerDeclaration {
++                name: name.to_string(),
++                algorithm,
++                decoded_content_length: None,
++            }),
++            ..aws_example_ctx()
++        }
++    }
++
++    /// Standard base64 (RFC 4648, `+`/`/`, `=`-padded) — independent of
++    /// [`checksum::base64_decode`] (this is an ENCODER, the production module has no
++    /// encoder), used only to build test wire bytes.
++    fn test_base64_encode(bytes: &[u8]) -> String {
++        const ALPHABET: &[u8; 64] =
++            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++        let mut out = String::new();
++        for chunk in bytes.chunks(3) {
++            let b0 = chunk[0];
++            let b1 = *chunk.get(1).unwrap_or(&0);
++            let b2 = *chunk.get(2).unwrap_or(&0);
++            let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
++            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
++            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
++            out.push(if chunk.len() > 1 {
++                ALPHABET[((n >> 6) & 0x3f) as usize] as char
++            } else {
++                '='
++            });
++            out.push(if chunk.len() > 2 {
++                ALPHABET[(n & 0x3f) as usize] as char
++            } else {
++                '='
++            });
++        }
++        out
++    }
++
++    /// Frame `chunks` + a ONE-header checksum trailer as a real SDK checksum-trailer PUT
++    /// would: data chunks (signed per `ctx.signed`), the terminating zero-length chunk
++    /// (`0[;chunk-signature=…]\r\n`) directly followed by `<trailer_name>:<trailer_value>\r\n`
++    /// and, for a signed `ctx`, a computed `x-amz-trailer-signature:…\r\n`, closed by the
++    /// blank-line terminator.
++    fn frame_trailer_body(
++        ctx: &StreamingContext,
++        chunks: &[&[u8]],
++        trailer_name: &str,
++        trailer_value: &str,
++    ) -> Vec<u8> {
++        let mut out = Vec::new();
++        let mut prev = ctx.seed_signature.clone();
++        for data in chunks {
++            if ctx.signed {
++                let sig = sign_chunk(ctx, &prev, data);
++                out.extend_from_slice(
++                    format!("{:x};chunk-signature={sig}\r\n", data.len()).as_bytes(),
++                );
++                prev = sig;
++            } else {
++                out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
++            }
++            out.extend_from_slice(data);
++            out.extend_from_slice(b"\r\n");
++        }
++        if ctx.signed {
++            prev = sign_chunk(ctx, &prev, b"");
++            out.extend_from_slice(format!("0;chunk-signature={prev}\r\n").as_bytes());
++        } else {
++            out.extend_from_slice(b"0\r\n");
++        }
++        out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
++        if ctx.signed {
++            let canonical = format!("{trailer_name}:{trailer_value}\n");
++            let trailer_sig = sign_trailer(ctx, &prev, &canonical);
++            out.extend_from_slice(format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes());
++        }
++        out.extend_from_slice(b"\r\n");
++        out
++    }
++
++    #[tokio::test]
++    async fn decodes_an_unsigned_trailer_body_and_validates_the_checksum() {
++        let ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
++        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
++        running.update(&object);
++        let checksum_b64 = test_base64_encode(&running.finalize());
++        let framed = frame_trailer_body(
++            &ctx,
++            &[&object[..1500], &object[1500..]],
++            "x-amz-checksum-crc32",
++            &checksum_b64,
++        );
++        for piece in [1usize, 97, 512, framed.len()] {
++            let decoded = decode_to_vec(framed.clone(), piece, ctx.clone())
++                .await
++                .expect("a well-formed unsigned trailer body decodes");
++            assert_eq!(decoded, object, "piece size {piece}");
++        }
++    }
++
++    #[tokio::test]
++    async fn decodes_a_signed_trailer_body_with_a_valid_trailer_signature() {
++        let ctx = aws_example_ctx_with_trailer(
++            true,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'q'; 2000];
++        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
++        running.update(&object);
++        let checksum_b64 = test_base64_encode(&running.finalize());
++        let framed = frame_trailer_body(
++            &ctx,
++            &[&object[..1000], &object[1000..]],
++            "x-amz-checksum-crc32",
++            &checksum_b64,
++        );
++        let decoded = decode_to_vec(framed, 333, ctx)
++            .await
++            .expect("a well-signed trailer body with a valid trailer signature decodes");
++        assert_eq!(decoded, object);
++    }
++
++    /// The signed trailer signature itself is fail-closed: tampering the checksum VALUE
++    /// (part of what the trailer signature covers) without re-signing must be refused as an
++    /// auth failure, not a checksum mismatch.
++    #[tokio::test]
++    async fn a_signed_trailer_whose_signature_does_not_verify_is_refused_fail_closed() {
++        let ctx = aws_example_ctx_with_trailer(
++            true,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'q'; 500];
++        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
++        running.update(&object);
++        let checksum_b64 = test_base64_encode(&running.finalize());
++        let mut framed =
++            frame_trailer_body(&ctx, &[&object], "x-amz-checksum-crc32", &checksum_b64);
++        // Flip a byte of the trailer signature's own hex digits: it no longer verifies.
++        let needle = b"x-amz-trailer-signature:";
++        let sig_at = framed
++            .windows(needle.len())
++            .position(|w| w == needle)
++            .expect("trailer signature line")
++            + needle.len();
++        framed[sig_at] = if framed[sig_at] == b'0' { b'1' } else { b'0' };
++
++        let err = decode_to_vec(framed, 128, ctx)
++            .await
++            .expect_err("a forged trailer signature must be refused");
++        assert_eq!(
++            err.downcast_ref::<StreamingError>(),
++            Some(&StreamingError::ChunkSignature),
++            "a trailer that was not signed by the credential holder is refused fail-closed"
++        );
++    }
++
++    /// Issue #505's invariant: a declared checksum trailer that does not match what was
++    /// ACTUALLY streamed is refused (never consumed-and-trusted). The unsigned variant has
++    /// no trailer signature to catch this first, so it isolates the checksum-comparison
++    /// path specifically.
++    #[tokio::test]
++    async fn a_tampered_trailer_checksum_is_refused_fail_closed() {
++        let ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'z'; 500];
++        // A checksum for bytes OTHER than what is actually streamed.
++        let wrong_checksum_b64 = test_base64_encode(&[0u8; 4]);
++        let framed = frame_trailer_body(
++            &ctx,
++            &[&object],
++            "x-amz-checksum-crc32",
++            &wrong_checksum_b64,
++        );
++        let err = decode_to_vec(framed, 128, ctx).await.expect_err(
++            "a declared checksum that does not match the streamed body must be refused",
++        );
++        assert_eq!(
++            err.downcast_ref::<StreamingError>(),
++            Some(&StreamingError::ChecksumMismatch)
++        );
++    }
++
++    /// A trailer name on the wire other than the one declared in `x-amz-trailer` is refused
++    /// (400) — never silently consumed under the declared name, never silently ignored.
++    #[tokio::test]
++    async fn an_undeclared_trailer_name_is_refused() {
++        let ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'z'; 100];
++        let mut framed = format!("{:x}\r\n", object.len()).into_bytes();
++        framed.extend_from_slice(&object);
++        framed.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32c:AAAAAA==\r\n\r\n");
++        let err = decode_to_vec(framed, 64, ctx)
++            .await
++            .expect_err("an undeclared trailer name must be refused");
++        assert!(matches!(
++            err.downcast_ref::<StreamingError>(),
++            Some(StreamingError::Framing(_))
++        ));
++    }
++
++    /// A declared checksum value that is not valid base64 is refused (400), never
++    /// half-parsed.
++    #[tokio::test]
++    async fn a_non_base64_trailer_checksum_is_refused() {
++        let ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'z'; 100];
++        let framed = frame_trailer_body(
++            &ctx,
++            &[&object],
++            "x-amz-checksum-crc32",
++            "not valid base64!!",
++        );
++        let err = decode_to_vec(framed, 64, ctx)
++            .await
++            .expect_err("a malformed base64 checksum must be refused");
++        assert!(matches!(
++            err.downcast_ref::<StreamingError>(),
++            Some(StreamingError::Framing(_))
++        ));
++    }
++
++    /// Bytes left over after the trailer block's closing blank line are refused (400), not
++    /// silently dropped — the "garbage after the trailer block" edge (brief #505).
++    #[tokio::test]
++    async fn garbage_after_the_trailer_block_is_refused() {
++        let ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        let object = vec![b'z'; 100];
++        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
++        running.update(&object);
++        let checksum_b64 = test_base64_encode(&running.finalize());
++        let mut framed =
++            frame_trailer_body(&ctx, &[&object], "x-amz-checksum-crc32", &checksum_b64);
++        framed.extend_from_slice(b"GARBAGE-AFTER-THE-TRAILER-BLOCK");
++        let err = decode_to_vec(framed, 64, ctx)
++            .await
++            .expect_err("bytes after the trailer block must be refused");
++        assert!(matches!(
++            err.downcast_ref::<StreamingError>(),
++            Some(StreamingError::Framing(_))
++        ));
++    }
++
++    /// A declared `x-amz-decoded-content-length` that does not match the actually-decoded
++    /// byte count is refused (400).
++    #[tokio::test]
++    async fn a_decoded_content_length_mismatch_is_refused() {
++        let mut ctx = aws_example_ctx_with_trailer(
++            false,
++            "x-amz-checksum-crc32",
++            checksum::ChecksumAlgorithm::Crc32,
++        );
++        ctx.trailer.as_mut().unwrap().decoded_content_length = Some(9999);
++        let object = vec![b'z'; 100];
++        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
++        running.update(&object);
++        let checksum_b64 = test_base64_encode(&running.finalize());
++        let framed = frame_trailer_body(&ctx, &[&object], "x-amz-checksum-crc32", &checksum_b64);
++        let err = decode_to_vec(framed, 64, ctx)
++            .await
++            .expect_err("a decoded-content-length mismatch must be refused");
++        assert!(matches!(
++            err.downcast_ref::<StreamingError>(),
++            Some(StreamingError::Framing(_))
++        ));
++    }
+ }
+diff --git a/crates/server/Cargo.toml b/crates/server/Cargo.toml
+index c386af1..f9ed9e6 100644
+--- a/crates/server/Cargo.toml
++++ b/crates/server/Cargo.toml
+@@ -124,6 +124,12 @@ aws-smithy-http-client = { version = "1.1.13", default-features = false, feature
+ aws-smithy-runtime-api = { version = "1.12.3", features = ["client", "http-1x"] }
+ aws-smithy-types = "1.5.0"
+ aws-credential-types = "1.2.14"
++# An INDEPENDENT crc32c oracle for the `s3_streaming_trailer` test (issue #505): the wire
++# test needs a real CRC-32C to build a `x-amz-checksum-crc32c` trailer value, computed by
++# the (already vetted/allowlisted, root Cargo.toml) `crc32c` crate itself rather than the
++# gateway's own `checksum` module, so a shared bug there could not hide behind a
++# self-referential test. Dev-only.
++crc32c.workspace = true
+ 
+ # Inherit the workspace lint policy (single source of truth in the root
+ # Cargo.toml [workspace.lints.*]).
+diff --git a/crates/server/tests/s3_http_wire.rs b/crates/server/tests/s3_http_wire.rs
+index 254ddb9..ceb4baa 100644
+--- a/crates/server/tests/s3_http_wire.rs
++++ b/crates/server/tests/s3_http_wire.rs
+@@ -1015,6 +1015,8 @@ mod streaming_interop {
+             date_time: amz_date.clone(),
+             scope: format!("{}/{REGION}/s3/aws4_request", &amz_date[..8]),
+             signed: true,
++            // The plain, no-trailer sentinel this module drives — no trailer declaration.
++            trailer: None,
+         };
+         let headers = vec![
+             ("authorization".to_string(), signed.authorization),
+diff --git a/crates/server/tests/s3_streaming_trailer.rs b/crates/server/tests/s3_streaming_trailer.rs
+new file mode 100644
+index 0000000..8346c3c
+--- /dev/null
++++ b/crates/server/tests/s3_streaming_trailer.rs
+@@ -0,0 +1,714 @@
++//! `aws-chunked` checksum-**trailer** streaming PUT (issue #505). A **default-configured**
++//! stock SDK (boto3 / aws-cli / modern aws-sdk) does not send the plain
++//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` sentinel `s3_http_wire.rs`'s `streaming_interop`
++//! module already covers — it defaults to the checksum-**trailer** framing
++//! (`STREAMING-UNSIGNED-PAYLOAD-TRAILER` / `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, a
++//! declared `x-amz-checksum-*` trailer sent after the terminating zero-length chunk), which
++//! `sigv4::verify`'s closed set refused outright before this fix — 403, before any body was
++//! read (the iter-6 "no half-accept" set, `sigv4.rs:510-515` on `origin/main`). A
++//! default-configured `aws s3 cp` upload therefore 403-ed.
++//!
++//! This drives the **production** wire path — the real loopback HTTP listener,
++//! `sigv4::verify` + `streaming::decode` — with exactly the byte format a stock SDK sends,
++//! over BOTH trailer sentinels, and asserts:
++//!
++//! * each round-trips **byte-identical** through GET, for each of the minimum accepted
++//!   checksum algorithms (`crc32`, `crc32c`, `sha256`) — `unsigned_trailer_put_...`;
++//! * the signed variant's per-chunk AND trailer signatures are genuinely verified —
++//!   `signed_trailer_put_...` (valid) / `a_forged_trailer_signature_is_refused...` (invalid);
++//! * a tampered declared checksum is refused and the object is never published —
++//!   `a_tampered_trailer_checksum_...`;
++//! * an unrecognised checksum algorithm (`x-amz-checksum-crc64nvme`, out of scope) is
++//!   refused before admission — `an_unrecognised_checksum_algorithm_...`;
++//! * a malformed trailer section — bad base64, an undeclared trailer name, garbage after
++//!   the trailer block — is refused as a 400, never a silent accept; and
++//! * a declared `x-amz-decoded-content-length` mismatch is refused.
++//!
++//! RED on `origin/main`: every PUT here gets **403** (`AuthorizationHeaderMalformed`,
++//! "unsupported x-amz-content-sha256") before any body is read — including the ones that
++//! assert a DIFFERENT refusal (400, or a message naming the specific fault), which the
++//! pre-fix blanket 403 cannot produce, so those assertions are genuinely red too, not
++//! trivially satisfied by "any refusal". GREEN once the trailer sentinels are admitted and
++//! the decoder consumes/validates the trailer section (`sigv4.rs` / `streaming.rs`).
++//!
++//! The wire-level test harness (`send`/`parse_response`/`dechunk`/gateway bring-up,
++//! `signed_headers`) is adapted/duplicated from `s3_http_wire.rs` per the brief's citation
++//! — those helpers are PRIVATE to that test crate, not importable from here.
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::checksum::ChecksumAlgorithm;
++use wyrd_gateway_s3::sigv4::{
++    format_amz_date, sign, sign_with_payload_hash, signing_key_for, Credentials, StreamingContext,
++    TrailerDeclaration,
++};
++use wyrd_gateway_s3::streaming::{sign_chunk, sign_trailer};
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++/// A gateway with a deliberately small chunk size, so a modest object still spans several
++/// store chunks over the streaming wire path (mirrors `s3_http_wire.rs::build_gateway`).
++fn build_gateway(dir: &std::path::Path) -> Arc<Backend> {
++    Arc::new(
++        Gateway::new(
++            RedbMetadataStore::in_memory().expect("redb"),
++            FsChunkStore::open(dir).expect("fs store"),
++            MemCoordination::new(),
++        )
++        .with_chunk_size(8),
++    )
++}
++
++/// Start the S3 gateway on an ephemeral loopback port and return its address.
++async fn start_gateway() -> (SocketAddr, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let gateway = build_gateway(dir.path());
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(Arc::clone(&gateway), config);
++    tokio::spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    (addr, dir)
++}
++
++fn signed_headers(method: &str, path: &str, host: &str, body: &[u8]) -> Vec<(String, String)> {
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let amz_date = format_amz_date(SystemTime::now());
++    let signed = sign(
++        method, path, "", host, &amz_date, body, &creds, REGION, "s3",
++    );
++    vec![
++        ("authorization".to_string(), signed.authorization),
++        ("x-amz-date".to_string(), signed.amz_date),
++        ("x-amz-content-sha256".to_string(), signed.content_sha256),
++    ]
++}
++
++/// Send one HTTP/1.1 request over a fresh connection and return `(status, body)`.
++async fn send(
++    addr: SocketAddr,
++    method: &str,
++    path: &str,
++    headers: &[(String, String)],
++    body: &[u8],
++) -> (u16, Vec<u8>) {
++    let host = addr.to_string();
++    let mut request = format!("{method} {path} HTTP/1.1\r\n");
++    request.push_str(&format!("host: {host}\r\n"));
++    for (name, value) in headers {
++        request.push_str(&format!("{name}: {value}\r\n"));
++    }
++    request.push_str(&format!("content-length: {}\r\n", body.len()));
++    request.push_str("connection: close\r\n\r\n");
++
++    let mut stream = TcpStream::connect(addr).await.expect("connect");
++    stream
++        .write_all(request.as_bytes())
++        .await
++        .expect("write head");
++    stream.write_all(body).await.expect("write body");
++    stream.flush().await.expect("flush");
++
++    let mut raw = Vec::new();
++    stream.read_to_end(&mut raw).await.expect("read response");
++    parse_response(&raw)
++}
++
++fn parse_response(raw: &[u8]) -> (u16, Vec<u8>) {
++    let split = raw
++        .windows(4)
++        .position(|w| w == b"\r\n\r\n")
++        .expect("response has a header terminator");
++    let head = String::from_utf8_lossy(&raw[..split]);
++    let status_line = head.lines().next().expect("status line");
++    let status: u16 = status_line
++        .split_whitespace()
++        .nth(1)
++        .expect("status code")
++        .parse()
++        .expect("numeric status");
++    let raw_body = &raw[split + 4..];
++    let is_chunked = head.lines().any(|l| {
++        l.to_ascii_lowercase().starts_with("transfer-encoding:")
++            && l.to_ascii_lowercase().contains("chunked")
++    });
++    let body = if is_chunked {
++        dechunk(raw_body)
++    } else {
++        raw_body.to_vec()
++    };
++    (status, body)
++}
++
++/// Decode an HTTP/1.1 chunked-transfer-encoded body (`<hex-size>\r\n<bytes>\r\n…0\r\n\r\n`).
++fn dechunk(mut raw: &[u8]) -> Vec<u8> {
++    let mut out = Vec::new();
++    loop {
++        let line_end = raw
++            .windows(2)
++            .position(|w| w == b"\r\n")
++            .expect("chunk size line");
++        let size_str = String::from_utf8_lossy(&raw[..line_end]);
++        let size = usize::from_str_radix(size_str.trim(), 16).expect("hex chunk size");
++        raw = &raw[line_end + 2..];
++        if size == 0 {
++            break;
++        }
++        out.extend_from_slice(&raw[..size]);
++        raw = &raw[size + 2..];
++    }
++    out
++}
++
++/// The `x-amz-checksum-<algo>` trailer header name for `algorithm`.
++fn trailer_name(algorithm: ChecksumAlgorithm) -> &'static str {
++    match algorithm {
++        ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
++        ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
++        ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
++    }
++}
++
++/// CRC-32 (IEEE 802.3), bit-by-bit — a DELIBERATELY different implementation shape than
++/// the gateway's own table-driven one (`wyrd_gateway_s3::checksum`), so a shared bug there
++/// could not hide behind a self-referential test. Independently cross-checked against the
++/// standard `"123456789"` → `0xCBF43926` check value.
++fn crc32_ieee(data: &[u8]) -> u32 {
++    let mut crc = 0xFFFF_FFFFu32;
++    for &byte in data {
++        crc ^= u32::from(byte);
++        for _ in 0..8 {
++            let mask = (crc & 1).wrapping_neg();
++            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
++        }
++    }
++    !crc
++}
++
++/// The base64-encoded `x-amz-checksum-<algo>` trailer value for `data` under `algorithm`.
++/// `crc32c` comes from the (independent, dev-only) `crc32c` crate; `sha256` reuses
++/// `wyrd_gateway_s3::crypto::sha256` (already pinned elsewhere by NIST known answers, not
++/// specific to this feature).
++fn checksum_trailer_value(algorithm: ChecksumAlgorithm, data: &[u8]) -> String {
++    let raw: Vec<u8> = match algorithm {
++        ChecksumAlgorithm::Crc32 => crc32_ieee(data).to_be_bytes().to_vec(),
++        ChecksumAlgorithm::Crc32c => crc32c::crc32c(data).to_be_bytes().to_vec(),
++        ChecksumAlgorithm::Sha256 => wyrd_gateway_s3::crypto::sha256(data).to_vec(),
++    };
++    base64_encode(&raw)
++}
++
++/// Standard base64 (RFC 4648, `+`/`/`, `=`-padded) — used only to build test wire bytes.
++fn base64_encode(bytes: &[u8]) -> String {
++    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    let mut out = String::new();
++    for chunk in bytes.chunks(3) {
++        let b0 = chunk[0];
++        let b1 = *chunk.get(1).unwrap_or(&0);
++        let b2 = *chunk.get(2).unwrap_or(&0);
++        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
++        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
++        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
++        out.push(if chunk.len() > 1 {
++            ALPHABET[((n >> 6) & 0x3f) as usize] as char
++        } else {
++            '='
++        });
++        out.push(if chunk.len() > 2 {
++            ALPHABET[(n & 0x3f) as usize] as char
++        } else {
++            '='
++        });
++    }
++    out
++}
++
++/// Sign the SEED request for a `-TRAILER` streaming PUT, exactly as a real SDK does: the
++/// seed `Authorization` covers the sentinel (the body streams, not available whole at
++/// signing time) and the request carries the trailer-declaration headers
++/// (`x-amz-trailer`, optionally `x-amz-decoded-content-length`) — mirrors
++/// `s3_http_wire.rs`'s `streaming_interop::streaming_seed`, extended with the trailer
++/// declaration this brief (#505) adds.
++#[allow(clippy::too_many_arguments)]
++fn streaming_seed(
++    sentinel: &str,
++    signed: bool,
++    path: &str,
++    host: &str,
++    algorithm: ChecksumAlgorithm,
++    decoded_content_length: Option<u64>,
++) -> (Vec<(String, String)>, StreamingContext) {
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let amz_date = format_amz_date(SystemTime::now());
++    let seed = sign_with_payload_hash(
++        "PUT", path, "", host, &amz_date, sentinel, &creds, REGION, "s3",
++    );
++    let seed_signature = seed
++        .authorization
++        .rsplit("Signature=")
++        .next()
++        .expect("authorization carries a Signature=")
++        .to_string();
++    let name = trailer_name(algorithm).to_string();
++    let ctx = StreamingContext {
++        seed_signature,
++        signing_key: signing_key_for(SECRET_KEY, &amz_date[..8], REGION, "s3"),
++        date_time: amz_date.clone(),
++        scope: format!("{}/{REGION}/s3/aws4_request", &amz_date[..8]),
++        signed,
++        trailer: Some(TrailerDeclaration {
++            name: name.clone(),
++            algorithm,
++            decoded_content_length,
++        }),
++    };
++    let mut headers = vec![
++        ("authorization".to_string(), seed.authorization),
++        ("x-amz-date".to_string(), seed.amz_date),
++        ("x-amz-content-sha256".to_string(), seed.content_sha256),
++        ("content-encoding".to_string(), "aws-chunked".to_string()),
++        ("x-amz-trailer".to_string(), name),
++    ];
++    if let Some(len) = decoded_content_length {
++        headers.push(("x-amz-decoded-content-length".to_string(), len.to_string()));
++    }
++    (headers, ctx)
++}
++
++/// Frame `chunks` + a ONE-header checksum trailer as a real SDK checksum-trailer PUT does:
++/// data chunks (signed per `ctx.signed`), the terminating zero-length chunk
++/// (`0[;chunk-signature=…]\r\n`) directly followed by `<name>:<value>\r\n` and, for a
++/// signed `ctx`, a computed `x-amz-trailer-signature:…\r\n`, closed by the blank-line
++/// terminator — exactly the shape `streaming.rs`'s `Decoder::consume_trailer` expects.
++fn frame_trailer_body(
++    ctx: &StreamingContext,
++    chunks: &[&[u8]],
++    trailer_name: &str,
++    trailer_value: &str,
++) -> Vec<u8> {
++    let mut out = Vec::new();
++    let mut prev = ctx.seed_signature.clone();
++    for data in chunks {
++        if ctx.signed {
++            let sig = sign_chunk(ctx, &prev, data);
++            out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", data.len()).as_bytes());
++            prev = sig;
++        } else {
++            out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
++        }
++        out.extend_from_slice(data);
++        out.extend_from_slice(b"\r\n");
++    }
++    if ctx.signed {
++        prev = sign_chunk(ctx, &prev, b"");
++        out.extend_from_slice(format!("0;chunk-signature={prev}\r\n").as_bytes());
++    } else {
++        out.extend_from_slice(b"0\r\n");
++    }
++    out.extend_from_slice(format!("{trailer_name}:{trailer_value}\r\n").as_bytes());
++    if ctx.signed {
++        let canonical = format!("{trailer_name}:{trailer_value}\n");
++        let trailer_sig = sign_trailer(ctx, &prev, &canonical);
++        out.extend_from_slice(format!("x-amz-trailer-signature:{trailer_sig}\r\n").as_bytes());
++    }
++    out.extend_from_slice(b"\r\n");
++    out
++}
++
++/// A default-configured stock SDK's actual default: `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
++/// checksum-only integrity (no per-chunk signing), for EACH of the minimum accepted
++/// algorithms (brief #505: "at minimum crc32, crc32c, and sha256"). Each round-trips
++/// byte-identical through GET.
++#[tokio::test]
++async fn unsigned_trailer_put_accepts_the_minimum_checksum_algorithm_set() {
++    for algorithm in [
++        ChecksumAlgorithm::Crc32,
++        ChecksumAlgorithm::Crc32c,
++        ChecksumAlgorithm::Sha256,
++    ] {
++        let (addr, _dir) = start_gateway().await;
++        let host = addr.to_string();
++        let path = "/wyrd-bucket/unsigned-trailer-object";
++        let object: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
++
++        let (headers, ctx) = streaming_seed(
++            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++            false,
++            path,
++            &host,
++            algorithm,
++            None,
++        );
++        let value = checksum_trailer_value(algorithm, &object);
++        let framed = frame_trailer_body(
++            &ctx,
++            &[&object[..1000], &object[1000..2500], &object[2500..]],
++            trailer_name(algorithm),
++            &value,
++        );
++
++        let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++        assert_eq!(
++            status, 200,
++            "a default-configured STREAMING-UNSIGNED-PAYLOAD-TRAILER PUT ({algorithm:?}) \
++             must be accepted (was 403 pre-#505)"
++        );
++
++        let (status, body) = send(
++            addr,
++            "GET",
++            path,
++            &signed_headers("GET", path, &host, b""),
++            b"",
++        )
++        .await;
++        assert_eq!(
++            status, 200,
++            "GET of the trailer-streamed object must succeed"
++        );
++        assert_eq!(
++            body, object,
++            "the trailer-streamed object ({algorithm:?}) must round-trip byte-identical"
++        );
++    }
++}
++
++/// The SIGNED trailer sentinel (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`): valid
++/// chained per-chunk signatures AND a valid trailer signature, plus the declared checksum —
++/// round-trips byte-identical.
++#[tokio::test]
++async fn signed_trailer_put_with_valid_chunk_and_trailer_signatures_round_trips() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/signed-trailer-object";
++    let object: Vec<u8> = (0..3000u32).map(|i| (i % 197) as u8).collect();
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
++        true,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        Some(object.len() as u64),
++    );
++    let value = checksum_trailer_value(ChecksumAlgorithm::Crc32, &object);
++    let framed = frame_trailer_body(
++        &ctx,
++        &[&object[..1500], &object[1500..]],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        &value,
++    );
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 200,
++        "a signed STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER PUT with valid chunk + \
++         trailer signatures must be accepted (was 403 pre-#505)"
++    );
++
++    let (status, body) = send(
++        addr,
++        "GET",
++        path,
++        &signed_headers("GET", path, &host, b""),
++        b"",
++    )
++    .await;
++    assert_eq!(status, 200);
++    assert_eq!(body, object, "must round-trip byte-identical");
++}
++
++/// Fail-closed edge: a forged trailer signature (the declared trailer was tampered without
++/// re-signing) is refused — auth, not a checksum mismatch — and stores nothing.
++#[tokio::test]
++async fn a_forged_trailer_signature_is_refused_and_stores_nothing() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/forged-trailer-signature";
++    let object = vec![b'q'; 500];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
++        true,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        None,
++    );
++    let value = checksum_trailer_value(ChecksumAlgorithm::Crc32, &object);
++    let mut framed = frame_trailer_body(
++        &ctx,
++        &[&object],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        &value,
++    );
++    let needle = b"x-amz-trailer-signature:";
++    let sig_at = framed
++        .windows(needle.len())
++        .position(|w| w == needle)
++        .expect("trailer signature line")
++        + needle.len();
++    framed[sig_at] = if framed[sig_at] == b'0' { b'1' } else { b'0' };
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 403,
++        "a forged trailer signature must be refused (403 SignatureDoesNotMatch)"
++    );
++
++    let (status, _) = send(
++        addr,
++        "GET",
++        path,
++        &signed_headers("GET", path, &host, b""),
++        b"",
++    )
++    .await;
++    assert_eq!(status, 404, "a refused PUT must store nothing");
++}
++
++/// Fail-closed edge (brief #505): a declared trailer checksum that does not match what was
++/// ACTUALLY streamed is refused — never consumed-and-trusted — and stores nothing. The
++/// unsigned variant isolates the checksum comparison specifically (no trailer signature to
++/// catch it first). Distinguishes genuinely from the pre-fix blanket 403: this is a 400.
++#[tokio::test]
++async fn a_tampered_trailer_checksum_is_refused_and_stores_nothing() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/tampered-checksum";
++    let object = vec![b'z'; 800];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        false,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        None,
++    );
++    // A checksum for bytes OTHER than what is actually streamed.
++    let wrong_value = checksum_trailer_value(ChecksumAlgorithm::Crc32, b"not the real object");
++    let framed = frame_trailer_body(
++        &ctx,
++        &[&object],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        &wrong_value,
++    );
++
++    let (status, body) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 400,
++        "a tampered/wrong declared checksum must be refused as 400 (was blanket 403 pre-#505)"
++    );
++    assert!(
++        String::from_utf8_lossy(&body).contains("BadDigest"),
++        "the S3 error code must name the checksum mismatch: {}",
++        String::from_utf8_lossy(&body)
++    );
++
++    let (status, _) = send(
++        addr,
++        "GET",
++        path,
++        &signed_headers("GET", path, &host, b""),
++        b"",
++    )
++    .await;
++    assert_eq!(status, 404, "a refused PUT must store nothing");
++}
++
++/// Fail-closed edge (brief #505 scope: `x-amz-checksum-crc64nvme` is out of scope): an
++/// unrecognised checksum algorithm is refused BEFORE ADMISSION (before any body is read),
++/// never half-accepted. Distinguishes genuinely from the pre-fix blanket refusal by the
++/// error MESSAGE, since both are 403 `AuthorizationHeaderMalformed` — pre-fix the message
++/// names the sentinel, never `crc64nvme` (the trailer header is never even parsed).
++#[tokio::test]
++async fn an_unrecognised_checksum_algorithm_is_refused_before_admission() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/unknown-checksum-algo";
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let amz_date = format_amz_date(SystemTime::now());
++    let seed = sign_with_payload_hash(
++        "PUT",
++        path,
++        "",
++        &host,
++        &amz_date,
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        &creds,
++        REGION,
++        "s3",
++    );
++    let headers = vec![
++        ("authorization".to_string(), seed.authorization),
++        ("x-amz-date".to_string(), seed.amz_date),
++        ("x-amz-content-sha256".to_string(), seed.content_sha256),
++        ("content-encoding".to_string(), "aws-chunked".to_string()),
++        (
++            "x-amz-trailer".to_string(),
++            "x-amz-checksum-crc64nvme".to_string(),
++        ),
++    ];
++    // Refused before any body is read — an arbitrary (never-consumed) body still refuses.
++    let (status, body) = send(addr, "PUT", path, &headers, b"0\r\n\r\n").await;
++    assert_eq!(status, 403);
++    assert!(
++        String::from_utf8_lossy(&body).contains("crc64nvme"),
++        "the refusal must name the unrecognised algorithm (proves the NEW trailer-parsing \
++         path ran, not the pre-#505 blanket sentinel refusal): {}",
++        String::from_utf8_lossy(&body)
++    );
++}
++
++/// Fail-closed edge (brief #505): a declared checksum value that is not valid base64 is
++/// refused as 400, never half-parsed.
++#[tokio::test]
++async fn a_non_base64_trailer_checksum_is_refused_as_bad_request() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/bad-base64-checksum";
++    let object = vec![b'z'; 200];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        false,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        None,
++    );
++    let framed = frame_trailer_body(
++        &ctx,
++        &[&object],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        "not valid base64!!",
++    );
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 400,
++        "a malformed base64 checksum value must be a 400 (was blanket 403 pre-#505)"
++    );
++}
++
++/// Fail-closed edge (brief #505): a trailer name on the wire other than the one declared in
++/// `x-amz-trailer` is refused as 400 — never silently consumed under the declared name.
++#[tokio::test]
++async fn an_undeclared_trailer_name_is_refused_as_bad_request() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/undeclared-trailer-name";
++    let object = vec![b'z'; 200];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        false,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        None,
++    );
++    // Declares crc32 but the wire sends crc32c instead.
++    let value = checksum_trailer_value(ChecksumAlgorithm::Crc32c, &object);
++    let framed = frame_trailer_body(&ctx, &[&object], "x-amz-checksum-crc32c", &value);
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 400,
++        "a trailer name not declared in x-amz-trailer must be a 400 (was blanket 403 pre-#505)"
++    );
++}
++
++/// Fail-closed edge (brief #505): bytes left over after the trailer block's closing blank
++/// line are refused as 400, never silently dropped.
++#[tokio::test]
++async fn garbage_after_the_trailer_block_is_refused_as_bad_request() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/trailer-garbage";
++    let object = vec![b'z'; 200];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        false,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        None,
++    );
++    let value = checksum_trailer_value(ChecksumAlgorithm::Crc32, &object);
++    let mut framed = frame_trailer_body(
++        &ctx,
++        &[&object],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        &value,
++    );
++    framed.extend_from_slice(b"GARBAGE-AFTER-THE-TRAILER-BLOCK");
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 400,
++        "bytes after the trailer block must be a 400, never a silent accept (was blanket \
++         403 pre-#505)"
++    );
++}
++
++/// Fail-closed edge (brief #505 scope item (b)): a declared `x-amz-decoded-content-length`
++/// that does not match the actually-decoded byte count is refused.
++#[tokio::test]
++async fn a_decoded_content_length_mismatch_is_refused() {
++    let (addr, _dir) = start_gateway().await;
++    let host = addr.to_string();
++    let path = "/wyrd-bucket/decoded-length-mismatch";
++    let object = vec![b'z'; 200];
++
++    let (headers, ctx) = streaming_seed(
++        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
++        false,
++        path,
++        &host,
++        ChecksumAlgorithm::Crc32,
++        Some(9999), // deliberately wrong
++    );
++    let value = checksum_trailer_value(ChecksumAlgorithm::Crc32, &object);
++    let framed = frame_trailer_body(
++        &ctx,
++        &[&object],
++        trailer_name(ChecksumAlgorithm::Crc32),
++        &value,
++    );
++
++    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
++    assert_eq!(
++        status, 400,
++        "a x-amz-decoded-content-length mismatch must be a 400 (was blanket 403 pre-#505)"
++    );
++}
