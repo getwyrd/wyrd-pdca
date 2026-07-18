@@ -1,0 +1,15 @@
+Review of issue #503: persist object ETag, Content-Type, and Last-Modified metadata and surface it consistently through S3 PUT/GET, including overwrite freshness and repair preservation.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is falsifiable at the signed loopback wire and persisted-record seams, including backward compatibility and repair/overwrite semantics (`brief.md`; `crates/core/src/metadata.rs:262`). |
+| C2 Reproduction (red pre-fix) | PASS | In an attributable scratch clone, the shipped wire test failed on the base because both PUT cases lacked ETag, then passed 2/2 with the patch (`crates/server/tests/s3_object_metadata.rs:205`). |
+| C3 Change | PASS | The review decision is whether metadata is committed atomically and survives the correct lifecycle transitions; create/overwrite stamp it and repair preserves it (`crates/core/src/metadata.rs:529`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether to accept the otherwise green red→green, workspace tests, fmt/clippy/build, and wire coverage despite `cargo deny check` being unreproducible because its advisory DB lock is read-only; this matters because the complete asserted CI gate was not independently discharged (`crates/server/tests/s3_object_metadata.rs:205`). |
+| C5 Causal adequacy | PASS | The change removes the missing persisted-model/wire cause rather than adding a capability probe; distinct-time overwrite tests kill stale-publication regressions on both commit paths (`crates/core/tests/mutation_regressions.rs:397`). |
+| T1 Structure | PASS | The architectural decision is kept at the neutral gateway seam and persisted core record, with HTTP rendering confined to the S3 layer (`crates/gateway-core/src/lib.rs:118`). |
+| T2 Shape | PASS | Public implementers and test doubles type-check under the widened streaming seam, while old JSON records remain decodable through optional serde-default fields (`crates/core/src/metadata.rs:262`). |
+| T3 Runtime | PASS | Real loopback redb/fs PUT→GET and overwrite flows passed, and malformed stored Content-Type was directly exercised to return 200 with the octet-stream fallback instead of panicking (`crates/gateway-s3/src/lib.rs:2007`). |
+| T4 Contribution | PASS | Affected-path `git log --all` checks across the core/gateway/server/ADR files found no earlier object-metadata implementation or deleted/rejected equivalent; the human-cleared prior-art conclusion remains supported. |
+| T5 Judgment | NEEDS-HUMAN | Maintainer must accept the new ADR's flat optional record model and opaque SHA-256 ETag because Accepted ADRs are project-defined human-only decisions with downstream compatibility impact (`docs/design/adr/0047-object-metadata-model.md:29`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether opaque SHA-256 ETags and second-granularity Last-Modified behavior meet real client expectations; this product-compatibility judgment is not settled by the passing in-process wire oracle (`docs/design/adr/0047-object-metadata-model.md:67`). |

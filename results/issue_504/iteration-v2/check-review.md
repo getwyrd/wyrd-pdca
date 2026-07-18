@@ -1,0 +1,15 @@
+Review of issue #504: refuse unsupported S3 CopyObject PUTs before they can overwrite destination data with an empty request body.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is falsifiable and limited to refusing CopyObject while preserving the destination and ordinary PUT behavior, which the wire assertions directly encode (`crates/server/tests/s3_copy_object_guard.rs:167`). |
+| C2 Reproduction (red pre-fix) | PASS | Independently running the added wire test on the base produced the expected red: the copy-form PUT returned 200 rather than the asserted 501, while the ordinary PUT test passed (`crates/server/tests/s3_copy_object_guard.rs:192`). |
+| C3 Change | PASS | The unsupported operation is rejected before body streaming begins, so the data-loss path is closed without changing ordinary PUT processing (`crates/gateway-s3/src/lib.rs:577`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether independently confirmed targeted red→green plus passing diff-check, fmt, and affected-package clippy is sufficient — the asserted aggregate `./engine/xtask.sh ci` runner is absent from the supplied target and could not be independently rerun (`crates/server/tests/s3_copy_object_guard.rs:167`). |
+| C5 Causal adequacy | PASS | Dispatching the unsupported CopyObject request away from the body-storage path removes the destructive fall-through itself; this is not an optional-capability probe or an eager-load workaround (`crates/gateway-s3/src/lib.rs:577`). |
+| T1 Structure | PASS | The policy guard resides at the gateway method-dispatch boundary and the regression coverage is a server integration test that exercises the production wire path (`crates/gateway-s3/src/lib.rs:563`). |
+| T2 Shape | PASS | Header-presence dispatch matches CopyObject's distinguishing request shape regardless of value and leaves the existing no-header PUT path reachable (`crates/gateway-s3/src/lib.rs:577`). |
+| T3 Runtime | PASS | In the independently run patched wire test, CopyObject refusal preserved the original bytes and the ordinary PUT round-trip also passed (`crates/server/tests/s3_copy_object_guard.rs:202`). |
+| T4 Contribution | NEEDS-HUMAN | Confirm no closed or rejected forge work supersedes this contribution — affected-path history across available refs and `-S x-amz-copy-source` showed no prior implementation, but closed/rejected forge state was not mechanically available (`crates/gateway-s3/src/lib.rs:577`). |
+| T5 Judgment | PASS | Refusal rather than partial copy implementation respects the stated slice and avoids coupling this data-loss fix to the deferred metadata-dependent copy feature (`crates/gateway-s3/src/lib.rs:574`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether returning 501 for every `x-amz-copy-source` PUT is the acceptable product behavior until full CopyObject support lands — clients are protected from overwrite but copy workflows remain unavailable (`crates/gateway-s3/src/lib.rs:577`). |

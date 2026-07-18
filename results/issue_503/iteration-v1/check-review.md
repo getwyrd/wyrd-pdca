@@ -1,0 +1,15 @@
+Task under review: issue #503 adds persisted object metadata and exposes ETag, Content-Type, and Last-Modified across the real S3 PUT/GET wire path.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance decision is concrete and falsifiable: the same persisted digest and declared type must cross PUT, the metadata commit, and GET, with a valid HTTP date (`crates/server/tests/s3_object_metadata.rs:202`). |
+| C2 Reproduction (red pre-fix) | PASS | A clean-base scratch run with only the new test failed at the intended missing-PUT-ETag assertion, establishing the stated pre-fix symptom (`crates/server/tests/s3_object_metadata.rs:224`). |
+| C3 Change | PASS | The change stays within the declared model, neutral gateway seam, wire surface, compatibility call sites, test, and ADR; publication metadata is atomic while repair preserves it (`crates/core/src/metadata.rs:520`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether the independently confirmed focused red→green plus successful fmt/clippy/build/workspace tests is sufficient — the full `cargo xtask ci` rerun could not complete because `cargo deny` could not lock the host's read-only Cargo advisory DB, so the asserted deny leg remains provisional (`crates/server/tests/s3_object_metadata.rs:205`). |
+| C5 Causal adequacy | PASS | The remedy changes the persisted publication model rather than probing or guarding an optional runtime capability, and repair explicitly retains the recorded values (`crates/core/src/metadata.rs:527`). |
+| T1 Structure | PASS | The architectural ownership is coherent: protocol-neutral values live in the gateway/core seams and HTTP quoting/date rendering remains in the S3 adapter (`crates/gateway-s3/src/lib.rs:703`). |
+| T2 Shape | PASS | Backward compatibility turns on absent JSON fields decoding to `None`; all three persisted fields are optional and serde-defaulted (`crates/core/src/metadata.rs:265`). |
+| T3 Runtime | PASS | The patched real loopback/redb/fs test passed and observed byte-identical GET plus matching ETag, declared Content-Type, and formatted Last-Modified (`crates/server/tests/s3_object_metadata.rs:231`). |
+| T4 Contribution | NEEDS-HUMAN | Decide whether closed/rejected work contains overlapping prior art — `git log --all` by every affected production path found no object-metadata commit, but the available refs do not mechanically cover closed/rejected work (`crates/gateway-s3/src/lib.rs:558`). |
+| T5 Judgment | NEEDS-HUMAN | The accepting authority must approve ADR-0047's SHA-256 opaque-token and flat persisted-record decisions because the brief declares the new ADR a project-defined human-only item (`docs/design/adr/0047-object-metadata-model.md:29`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether SHA-256-as-opaque-ETag provides the intended SDK compatibility despite clients that assume single-part ETag equals MD5 — this determines whether the feature solves the motivating interoperability problem (`docs/design/adr/0047-object-metadata-model.md:67`). |

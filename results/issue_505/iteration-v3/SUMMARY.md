@@ -1,0 +1,72 @@
+# Result — issue 505 / sigv4-aws-chunked-trailer-framing
+
+## 1. Spec (from brief.md)              ← Check verifies against THIS
+- Defect / goal: the SigV4 layer accepts only the classic streaming sentinel
+- Success criterion: a `STREAMING-UNSIGNED-PAYLOAD-TRAILER` PUT and a
+- Repo + branch target: getwyrd/wyrd @ main
+- Scope (one logical fix) / out of scope: one logical change in `crates/gateway-s3`: (a) `streaming.rs` — extend the
+
+## 2. Disposition claimed               ← sign-off confirms or overrides
+- Outcome: new-feature
+- Confidence: medium
+- Recommendation: (set by Do)
+
+## 3. Correctness (Check — chain)
+- C1 Spec: none — brief.md
+- C2 Reproduction (red pre-fix): none — (no gate configured)
+- C3 Change: none — patch.diff
+- C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance): pass — xtask ci: all checks passed
+- C4 per-fix red->green: this patch's test red pre-fix, green post-fix: pass — run-verify.sh: PASS — red without the fix, green with it.
+- C5 Causal adequacy: none — reviewer + human sign-off
+
+## 4. Conformance (Check — stack)
+- T1 Structure: none — (no gate configured)
+- T2 Shape: none — (no gate configured)
+- T3 Runtime: none — (no gate configured)
+- T4 Contribution: none — (no gate configured)
+- T5 Judgment: none — reviewer + human sign-off
+- T5 judgment: → see §5.
+
+## 5. Advisory review (artifact-only, decorrelated)
+Reviewer ran without build-notes.md. Summary:
+
+Review of issue #505: fully consume and authenticate SigV4 `aws-chunked` checksum-trailer PUT framing so current SDK uploads round-trip without weakening fail-closed behavior.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is testable and complete: both trailer sentinels, three checksum algorithms, byte-identical GET, and malformed/authentication failures are exercised at `crates/server/tests/s3_streaming_trailer.rs:343`. |
+| C2 Reproduction (red pre-fix) | NEEDS-HUMAN | Decide whether direct base-source rejection is sufficient red evidence — a scratch checkout passed the base test proving both trailer sentinels are refused, but the requested exact wire-test stash/re-run oracle was not supplied (`crates/gateway-s3/src/sigv4.rs:1104`). |
+| C3 Change | PASS | The change stays on the specified data surface and preserves the object-write seam while adding admission, bounded trailer consumption, checksum validation, and error classification (`crates/gateway-s3/src/streaming.rs:390`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether to accept the unreproduced exact red and deny legs — patched wire tests passed 10/10 and fmt/clippy/build/workspace/doc tests passed, but `run-verify.sh` is absent and `cargo deny check` could not lock the read-only advisory database (`crates/server/tests/s3_streaming_trailer.rs:346`). |
+| C5 Causal adequacy | PASS | The former refusal is removed only after the decoder gains bounded full consumption plus signature/checksum enforcement; no capability probe or runtime symptom guard is introduced (`crates/gateway-s3/src/streaming.rs:295`). |
+| T1 Structure | PASS | The binding regression is a new integration-test file under the required server `tests/` surface, with unit coverage retained near checksum and framing logic (`crates/server/tests/s3_streaming_trailer.rs:1`). |
+| T2 Shape | PASS | Public context models the trailer declaration explicitly and the decoder receives it through the existing streaming path, avoiding a parallel write API (`crates/gateway-s3/src/sigv4.rs:86`). |
+| T3 Runtime | PASS | The in-process runtime suite observed valid signed/unsigned round-trips and fail-closed checksum, signature, declaration, length, base64, and trailing-garbage outcomes (`crates/server/tests/s3_streaming_trailer.rs:404`). |
+| T4 Contribution | NEEDS-HUMAN | Decide whether closed/rejected work duplicates this contribution — affected-path all-ref history contains only the original S3 gateway commit and no trailer consumer, but closed/rejected PR state is not mechanically available (`crates/gateway-s3/src/streaming.rs:137`). |
+| T5 Judgment | PASS | No new dependency audit, scope re-entry, capability probe, visual outcome, or undischarged external service remains; the only reused checksum dependency was already in the workspace (`crates/gateway-s3/Cargo.toml:26`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the demonstrated in-process compatibility and fail-closed coverage are sufficient for release confidence — this determines whether the implementation meets the real stock-client interoperability purpose beyond automated evidence (`crates/server/tests/s3_streaming_trailer.rs:343`). |
+
+
+## 6. NEEDS-HUMAN — items the human must clear before sign-off
+- [ ] C2 Reproduction (red pre-fix) — Decide whether direct base-source rejection is sufficient red evidence — a scratch checkout passed the base test proving both trailer sentinels are refused, but the requested exact wire-test stash/re-run oracle was not supplied (`crates/gateway-s3/src/sigv4.rs:1104`).
+- [ ] C4 Verification (red→green) — Decide whether to accept the unreproduced exact red and deny legs — patched wire tests passed 10/10 and fmt/clippy/build/workspace/doc tests passed, but `run-verify.sh` is absent and `cargo deny check` could not lock the read-only advisory database (`crates/server/tests/s3_streaming_trailer.rs:346`).
+- [ ] T4 Contribution — Decide whether closed/rejected work duplicates this contribution — affected-path all-ref history contains only the original S3 gateway commit and no trailer consumer, but closed/rejected PR state is not mechanically available (`crates/gateway-s3/src/streaming.rs:137`).
+- [ ] Validation — fitness-to-purpose — Decide whether the demonstrated in-process compatibility and fail-closed coverage are sufficient for release confidence — this determines whether the implementation meets the real stock-client interoperability purpose beyond automated evidence (`crates/server/tests/s3_streaming_trailer.rs:343`).
+
+## 7. Proven / not proven
+- Proven by which oracle: gates overall = pass (stub oracles).
+- Unproven / needs manual run: anything flagged in §6.
+
+## 8. Ready-to-ship attachments
+- patch.diff
+- tracker-comment.md     (ALWAYS, every tracker item)
+- build-notes.md         (builder rationale — for the human, not the reviewer)
+
+## 9. Check sign-off                     ← human completes Check here
+- Disposition confirmed / overridden:
+- Outcome: iterated-to-Do
+- Iteration delta (if iterating): Auto-iterate (round 3): Check found implementation-level items only, no architectural judgment required — C2 Reproduction (red pre-fix) — Decide whether direct base-source rejection is sufficient red evidence — a scratch checkout passed the base test proving both trailer sentinels are refused, but the requested exact wire-test stash/re-run oracle was not supplied (`crates/gateway-s3/src/sigv4.rs:1104`).; C4 Verification (red→green) — Decide whether to accept the unreproduced exact red and deny legs — patched wire tests passed 10/10 and fmt/clippy/build/workspace/doc tests passed, but `run-verify.sh` is absent and `cargo deny check` could not lock the read-only advisory database (`crates/server/tests/s3_streaming_trailer.rs:346`).; T4 Contribution — Decide whether closed/rejected work duplicates this contribution — affected-path all-ref history contains only the original S3 gateway commit and no trailer consumer, but closed/rejected PR state is not mechanically available (`crates/gateway-s3/src/streaming.rs:137`).
+- By / date: auto-iterate / 2026-07-18
+
+## 10. Act candidates (hints for the next Act review)
+- (empty is the common case)

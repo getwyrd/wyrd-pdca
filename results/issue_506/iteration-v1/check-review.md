@@ -1,0 +1,15 @@
+Task under review: implement S3 HeadObject so signed HEAD requests return GET-equivalent metadata without reading object data, with headers-only 200/404 wire responses.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is falsifiable at the signed HTTP seam: stored and absent keys have explicit status, header, body, and non-regression outcomes exercised at `crates/server/tests/s3_head_object.rs:195`. |
+| C2 Reproduction (red pre-fix) | PASS | On the folded target base with only the new test added, all three wire tests failed with HEAD returning 405 rather than the required 200/404 at `crates/server/tests/s3_head_object.rs:231`. |
+| C3 Change | PASS | The review decision is whether the new protocol behavior stays metadata-only; the production lookup reads the committed inode without opening its chunk map or stream at `crates/server/src/lib.rs:380`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Install and run `cargo machete`, then decide whether its unused-dependency result clears the full CI claim — focused red→green, fmt, Clippy, build, workspace tests, three cargo-deny audits, conformance, statics, and DST passed, but this host lacks that asserted scanner; wire assertions are at `crates/server/tests/s3_head_object.rs:231`. |
+| C5 Causal adequacy | PASS | The missing dispatch capability is added directly, with no capability probe or runtime fallback masking an eager side effect; HEAD selects the metadata seam at `crates/gateway-s3/src/lib.rs:705`. |
+| T1 Structure | PASS | The architectural decision is whether HEAD belongs on the protocol-neutral object seam; a distinct metadata result avoids coupling the wire handler to a body stream at `crates/gateway-core/src/lib.rs:62`. |
+| T2 Shape | PASS | The test is a discoverable integration target under `crates/server/tests/` and drives the public signed loopback path, with the success oracle beginning at `crates/server/tests/s3_head_object.rs:195`. |
+| T3 Runtime | PASS | Independently isolated execution observed base 405 failures and patched 200/404 success; the green run passed all three runtime cases, including unchanged GET/PUT/DELETE behavior at `crates/server/tests/s3_head_object.rs:296`. |
+| T4 Contribution | NEEDS-HUMAN | Confirm closed/rejected PR history has no competing HeadObject work before contribution sign-off — affected-path and all-local-ref searches found no `head_object` implementation, but the supplied artifacts contain no closed/rejected PR metadata; the contribution seam is at `crates/gateway-core/src/lib.rs:167`. |
+| T5 Judgment | PASS | The scope decision is proportionate to the behavioral gap: one metadata seam, one dispatch arm, its implementer, and wire tests restore HEAD without conditional/range/HeadBucket expansion at `crates/gateway-s3/src/lib.rs:697`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the in-process signed HTTP/1.1 loopback is sufficient evidence for real AWS CLI/SDK interoperability — it proves status, body suppression, metadata parity, and operation non-regression at `crates/server/tests/s3_head_object.rs:195`, but no real client was exercised. |
