@@ -110,9 +110,11 @@ from the builder's narrative.
 
 ## 9. Check sign-off                     ← human completes Check here
 - Disposition confirmed / overridden: **confirmed** — disposition hint was likely-fix.
-- Outcome: **ACCEPTED**. Both §6 NEEDS-HUMAN items cleared (T5 settled against the testkit
-  source the reviewer lacked; V accepted as fitness-to-purpose). Re-verified green on the
-  target working tree.
+- Outcome: accepted
+  - Rationale: **ACCEPTED**. Both §6 NEEDS-HUMAN items cleared (T5 settled against the
+    testkit source the reviewer lacked; V accepted as fitness-to-purpose). Re-verified
+    green on the target working tree. (Token normalized 2026-07-18 so the harness state
+    machine reads this human sign-off; the decision, author, and date below are unchanged.)
 - Iteration delta (if iterating): none — iteration 2 is final. v2 reworked the tests only
   (the fix was accepted in v1); the named DST oracle `dst_read_fanout.rs` now closes the
   iteration-1 rejection.
