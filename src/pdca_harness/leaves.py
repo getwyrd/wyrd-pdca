@@ -158,6 +158,39 @@ def _mapped_argv(leaf: LeafConfig, profile: families.FamilyProfile,
     return extra
 
 
+# A single argv string is bounded by the OS (Linux ``MAX_ARG_STRLEN`` ≈ 128 KiB); an
+# oversized interactive *seed* — e.g. the Act cross-cycle index once enough cycles have
+# frozen — overflows it with "OSError: [Errno 7] Argument list too long" before the
+# child even execs. Keep a margin under the limit for the rest of argv + the environment.
+_SEED_ARG_BUDGET = 96 * 1024
+
+
+def _seed_positional(prompt: str, workdir: Path) -> tuple[str, Path | None]:
+    """The interactive REPL seed positional, spilling an oversized prompt to a file.
+
+    Interactive leaves inherit the TTY (they open a REPL), so the prompt can't ride
+    **stdin** the way a headless leaf's does — it goes as ``claude "<seed>"``. When that
+    seed would exceed the OS single-arg limit (issue: a large frozen-cycle Act index),
+    write it to a scratch file *inside* ``workdir`` — the REPL's cwd, so it reads it with
+    no out-of-tree permission prompt — and seed with a short pointer instead. Returns
+    ``(seed, spill|None)``; the caller unlinks ``spill`` once the session ends.
+    """
+    if len(prompt.encode("utf-8")) <= _SEED_ARG_BUDGET:
+        return prompt, None
+    fh = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=workdir,
+        prefix=".pdca-prompt-", suffix=".md", delete=False)
+    with fh:
+        fh.write(prompt)
+    spill = Path(fh.name)
+    seed = (
+        "Your full instructions were too large to pass on the command line, so they "
+        f"were written to `{spill.name}` in your current directory. Read that file in "
+        "full now — it IS your prompt (task and context) — then carry it out."
+    )
+    return seed, spill
+
+
 def _invoke(
     leaf: LeafConfig,
     workdir: Path,
@@ -174,7 +207,9 @@ def _invoke(
 
     Interactive leaves get the prompt as a *seed positional* (``claude "<prompt>"``)
     and inherit the parent terminal (a REPL); a non-zero exit (the human leaving
-    the session) is not fatal. Headless leaves get the prompt on **stdin**, not as
+    the session) is not fatal. A seed over the OS single-arg limit is spilled to a
+    scratch file and replaced with a pointer (see :func:`_seed_positional`). Headless
+    leaves get the prompt on **stdin**, not as
     a trailing positional — a variadic option such as ``--allowedTools`` would
     otherwise swallow the prompt arg (claude then errors "Input must be provided…").
 
@@ -194,7 +229,12 @@ def _invoke(
     prompt = prompt_prefix + prompt
     run_env = {**os.environ, **env} if env else None
     if leaf.interactive:
-        subprocess.run(argv + [prompt], cwd=workdir, env=run_env)
+        seed, spill = _seed_positional(prompt, workdir)
+        try:
+            subprocess.run(argv + [seed], cwd=workdir, env=run_env)
+        finally:
+            if spill is not None:
+                spill.unlink(missing_ok=True)
         return
     # Headless: feed the prompt on stdin (a trailing positional would be swallowed
     # by a variadic --allowedTools) and tick a heartbeat, since `claude -p` prints

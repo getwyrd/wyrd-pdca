@@ -252,6 +252,52 @@ class FakeVendorCliEndToEnd(unittest.TestCase):
             self.assertNotIn(flag, argv)            # stream_json ignored: no stream flags
 
 
+class InteractiveSeedSpill(unittest.TestCase):
+    """An interactive leaf's seed rides as ``claude "<seed>"`` — a single argv string
+    bounded by the OS (Linux ``MAX_ARG_STRLEN`` ≈ 128 KiB). A large frozen-cycle Act
+    index overflowed it → "OSError: [Errno 7] Argument list too long". Oversized seeds
+    must spill to a scratch file the REPL reads, not the command line."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg = _cfg(self.tmp)
+        self.wd = self.tmp / "wd"
+        self.wd.mkdir()
+        # A fake interactive CLI: record its arg count, the seed it got, and — copying
+        # any spill file named in that seed — the bytes the REPL would actually read.
+        self.cli = self.tmp / "fake-claude.sh"
+        self.cli.write_text(
+            "#!/bin/sh\n"
+            'printf "%s" "$#" > argc.txt\n'
+            'printf "%s" "$1" > seed.txt\n'
+            "for f in .pdca-prompt-*.md; do [ -e \"$f\" ] && cp \"$f\" spill.txt; done\n",
+            encoding="utf-8")
+        self.cli.chmod(0o755)
+        self.leaf = LeafConfig(mode="command", family="claude", interactive=True,
+                               argv=[str(self.cli)])
+
+    def test_small_seed_is_passed_inline(self) -> None:
+        leaves._invoke(self.leaf, self.wd, "SHORT-PROMPT", cfg=self.cfg)
+        self.assertEqual((self.wd / "argc.txt").read_text(), "1")
+        self.assertEqual((self.wd / "seed.txt").read_text(), "SHORT-PROMPT")
+        self.assertFalse(list(self.wd.glob(".pdca-prompt-*.md")))
+
+    def test_oversized_seed_spills_to_a_file_the_repl_can_read(self) -> None:
+        big = "ACT-INDEX-LINE\n" * 12000            # ~180 KiB, over MAX_ARG_STRLEN
+        self.assertGreater(len(big.encode()), leaves._SEED_ARG_BUDGET)
+        leaves._invoke(self.leaf, self.wd, big, cfg=self.cfg)   # must NOT raise E2BIG
+        # Still one positional, but now a short pointer — not the 180 KiB blob.
+        self.assertEqual((self.wd / "argc.txt").read_text(), "1")
+        seed = (self.wd / "seed.txt").read_text()
+        self.assertLess(len(seed.encode()), leaves._SEED_ARG_BUDGET)
+        self.assertIn(".pdca-prompt-", seed)
+        # The REPL reads the full prompt verbatim from the spill (checked during exec)…
+        self.assertEqual((self.wd / "spill.txt").read_text(encoding="utf-8"), big)
+        # …and the spill is cleaned up once the session ends.
+        self.assertFalse(list(self.wd.glob(".pdca-prompt-*.md")))
+
+
 class SandboxGrantShapes(unittest.TestCase):
     """Issue #291. The two vendors' sandboxes grant along DIFFERENT axes, and neither is
     strictly tighter — so each family carries only the flag its own sandbox understands."""
