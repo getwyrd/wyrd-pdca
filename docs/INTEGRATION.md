@@ -101,9 +101,14 @@
   `../wyrd/docs/design/specs/conformance/vectors/v1/` (valid) and `.../invalid/v1/`
   (malformed), each a `.fragment` + its `.expected.json` / `.reason.txt` oracle (ADR-0002).
 - **Verification runner (the whole gate):** **`cargo xtask ci`**, delegated via
-  `./engine/xtask.sh` (§9). It runs identically on a laptop and in CI (ADR-0016): fmt
-  (`--check`), clippy (`-D warnings`), build, test (incl. DST property tests), `cargo deny
-  check`, and the conformance run. Exit 0 = pass. This is Wyrd's single source of gate truth.
+  `./engine/xtask.sh` (§9). It runs the same checks on a laptop and in CI (ADR-0016): the
+  prose gates (`typos`, docs lint/render — wyrd#599) first, then fmt (`--check`), clippy
+  (`-D warnings`), build, test (incl. DST property tests), `cargo deny check`, and the
+  conformance run. Exit 0 = pass. This is Wyrd's single source of gate truth. **One
+  laptop/CI asymmetry to know:** the prose gates need external tools (`typos-cli`, the
+  pinned doc renderer); when those are absent locally the gate **warns and skips** them,
+  whereas CI has them and runs them — so a local green is not full CI parity unless
+  those tools are installed.
 - **Reproduction runner(s):** Wyrd's DST is the repro substrate (ADR-0009) — a failing
   **seed** under madsim is the deterministic reproduction; `cargo xtask dst` sweeps seeds,
   and a bug-finding seed becomes a permanent regression test. `cargo xtask conformance`

@@ -62,10 +62,14 @@
   structurally invisible to the pipeline (no "declared host-only CI commands"
   pre-publish gate against the patched tree; no composition audit) — filed
   upstream eduralph/pdca-harness#311.
-- Host repo change: wyrd#598 (PR wyrd#599), awaiting merge by the maintainer.
+- Host repo change: wyrd#598 (PR wyrd#599) — **merged 2026-07-18**. The prose gates
+  are now live as the first steps of `cargo xtask ci`, so the delta above is applied
+  as of that merge; the effectiveness window below is anchored to it (a PR opened
+  before the merge could not have inherited the gates and must not count).
 
 ## How effectiveness will be judged
-- The next 5 published PRs (one act cadence, `act_cadence = 5`) must open with
+- The next 5 published PRs opened AFTER the wyrd#599 merge (2026-07-18) — one act
+  cadence, `act_cadence = 5` — must open with
   the `typos` and `docs-check` statuses green on the first push — zero
   post-open remediation commits of this class; judge at the next scheduled Act
   review. A recurrence means the host runner and its CI jobs drifted
