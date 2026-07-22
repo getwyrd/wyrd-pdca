@@ -43,6 +43,13 @@ physically cannot patch what you judge.
   `cc`, a missing CLI, a sandbox without the toolchain) is a *host caveat*, not the patch's
   fault: flag it for the human, don't propagate it as a defect (issue #236).
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + one-line rationale + path:line.
+- **Apply the target's standing rubric.** If the target repo's root `AGENTS.md` (at
+  `$PDCA_TARGET`) carries a `## Review rubric & protocol` section, judge against it: its
+  hard conventions and recurring defect classes are checklist items when the diff touches
+  their surface, and its reviewer-protocol rules bind you — in particular, never emit a
+  finding in a class that section explicitly rejects (e.g. `Signed-off-by` findings from
+  commit inspection), and treat a finding answered with a tracked-issue deferral as
+  settled rather than re-raising it.
 
 ## Always emit the complete 5/5/1 verdict table
 
