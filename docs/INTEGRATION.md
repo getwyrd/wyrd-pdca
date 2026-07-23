@@ -128,7 +128,7 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 
 | Tier | Written ruleset (normative source) | Home | Single-sourced command | Status |
 |---|---|---|---|---|
-| C4 correctness | the change + Wyrd's whole gate (wyrd#598 adds the **prose gates** — `typos` + docs lint/render, previously host-CI-only and the one gate class published PRs kept failing; **pending merge of wyrd PR#599**, until which the blind spot remains open) | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
+| C4 correctness | the change + Wyrd's whole gate (wyrd#598 moved the **prose gates** — `typos` + docs lint/render, previously host-CI-only and the one gate class published PRs kept failing — into `cargo xtask ci`; **merged in wyrd PR#599 on 2026-07-18**, so `C4-ci` now inherits them and the blind spot is closed) | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
 | T1 format-conformance | chunk-format spec v1, RFC-2119 (`../wyrd/docs/design/specs/chunk-format/v1.md`); conformance spec `specs/conformance/v1.md` (ADR-0002) | `cargo xtask conformance` (vectors in `specs/conformance/`) | `./engine/xtask.sh conformance` | [built — runs inside `ci`; advisory row optional] |
 | T2 shape | `rustfmt` + `clippy -D warnings` (no project style doc; the linters are the rule) | inside `cargo xtask ci` | (subsumed by `ci`) | [built — part of `ci`] |
 | T3 runtime / DST | testing strategy, ADR-0009 (madsim DST is the spine; from M0) | `cargo xtask dst` + `test` | `./engine/xtask.sh dst` | [built — runs inside `ci`; advisory row optional] |
@@ -233,7 +233,7 @@ PDCA **supplements** Wyrd's existing governance; it does not replace it:
 | `require-issue` on PRs | `[tracker].issue_trailer` (`Fixes #{id}`) | The trailer satisfies the linked-issue rule; init-from-brief maps onto a qualifying issue. |
 | `dco` / `adr-immutability` | builder/publisher STOP hook (`builder_guard.py`) | The hook backstops `gh pr ready`/`merge` for the leaves; Wyrd's gates are the authority. |
 | `cargo xtask ci` | `pdca gates --working-tree` re-gate | Both invoke the **same** `cargo xtask ci` via `engine/xtask.sh` — one definition, no drift. |
-| `typos` / `docs-check` (always-on prose jobs) | covered by the same `cargo xtask ci` delegation once wyrd#598 lands (**pending merge of wyrd PR#599**) | Until wyrd#598 these two host jobs were OUTSIDE `cargo xtask ci` and unmapped here — the blind spot behind wyrd PRs #595/#564/#569 opening red on `typos` (act-log 2026-07-18); it stays open until PR#599 merges. `docs-immutability` remains host-only by decision (needs git-diff context; has never failed a pipeline PR). |
+| `typos` / `docs-check` (always-on prose jobs) | covered by the same `cargo xtask ci` delegation as of wyrd#598 (**merged in wyrd PR#599, 2026-07-18**) | Before wyrd#598 these two host jobs were OUTSIDE `cargo xtask ci` and unmapped here — the blind spot behind wyrd PRs #595/#564/#569 opening red on `typos` (act-log 2026-07-18); **closed by the PR#599 merge**, so `C4-ci` now re-gates them against the patched tree. `docs-immutability` remains host-only by decision (needs git-diff context; has never failed a pipeline PR). |
 
 `ship_ci_workflow = false` at render (Wyrd runs its own CI); `ship_merge_guard = true`
 keeps the builder STOP backstop.
