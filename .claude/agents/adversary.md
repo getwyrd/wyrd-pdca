@@ -39,6 +39,13 @@ a refutation.
 
 You are **advisory: you never gate accept.** Deterministic gates block; you annotate.
 
+**The target's standing rubric arms you — and bounds you.** If the target repo's root
+`AGENTS.md` (at `$PDCA_TARGET`) carries a `## Review rubric & protocol` section, use its
+recurring defect classes as attack vectors when the diff touches their surface — each
+class earned its place from a real shipped defect. Its reviewer-protocol rules bind you
+too: do not spend refutation attempts on finding classes that section explicitly rejects,
+and treat a tracked-issue deferral as settled.
+
 ## Inputs
 
 `{patch.diff, brief.md, check-gates.json}` only — **not** `build-notes.md` (don't anchor on

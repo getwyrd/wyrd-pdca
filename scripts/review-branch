@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Batched multi-pass rubric review — the pre-PR review that matches the PR review.
+
+Why: analysis of 158 external (GitHub Codex) review findings across ~79 wyrd PRs
+showed the reviewer surfaces roughly ONE new, real, pre-existing finding per
+re-review round (extreme: 13 rounds / 15 findings on one PR). Serial "retrigger
+until clean" therefore converges slowly by design. This script batches that
+depth up front: N parallel `codex exec` review passes over the SAME artifact the
+PR review will see (the full diff against the base), each armed with the target
+repo's standing rubric (AGENTS.md § Review rubric & protocol), unioned and
+deduplicated, with rubric-rejected noise classes dropped automatically.
+
+Definition of done (matches the rubric's Reviewer protocol): deterministic gates
+green + ONE batched pass whose findings are EACH fixed or recorded-rejected.
+The gate therefore exits nonzero while ANY finding survives untriaged — not
+only BUG-class — so a CONVENTION or TEST-GAP finding cannot slip to publish
+unaddressed. To triage a finding as rejected, record it in the bundle's
+`review-rejected.md` (or `--rejected PATH`) as
+`<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a substring of the
+finding's rationale. The class and match pin the decision to the finding's
+identity — two findings can share a line, and a new defect that lands at a
+rejected line after a patch iteration is not auto-suppressed unless its
+rationale also contains the recorded phrase. The gate also fails closed on a degraded
+review: it requires all N passes to produce a format-conforming result (one
+retry each), and treats a pass whose output is neither a parseable finding nor
+the explicit `NO FINDINGS` sentinel as a failed pass, so a garbled or partial
+review is never read as clean.
+
+Wired two ways:
+  * bundle gate row (pdca.toml [[gates.checks]] tier="T4" scope="bundle"
+    cmd="scripts/review-branch --bundle"): reviews $PDCA_BUNDLE/patch.diff
+    before `pdca publish` runs its git steps (publish runs every T4 row first).
+  * manual pre-commit review for hand-made changes:
+        scripts/review-branch --repo ../wyrd --range origin/main...HEAD
+    (also `--staged` for the index). This replaces ad-hoc `codex review`
+    invocations, so the local review and the PR review share one prompt.
+
+Engine-native home proposed upstream at eduralph/pdca-harness#315 (pre-publish
+review stage with the bounded fix loop); the rubric-key half is #314. This
+instance-owned wrapper is the stopgap until those land (scripts/flow precedent).
+"""
+
+import argparse
+import concurrent.futures
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+
+# Findings whose text matches a rubric-rejected class are dropped from the union
+# (AGENTS.md § Reviewer protocol). These patterns are deliberately NARROW: they
+# match only the specific false-positive SHAPE, not any rationale that happens to
+# mention the words — a genuine BUG about sign-off/DCO LOGIC ("this guard blocks
+# sign-off for valid input", "allows a DCO failure") must NOT be silently dropped.
+# The DCO false positive: a finding that a COMMIT / message lacks its
+# Signed-off-by trailer, from inspecting a synthesized merge-preview SHA — the
+# SIGN-OFF ITSELF is the missing object. A verb of absence/addition immediately
+# precedes the sign-off term (within a few words), and the term is NOT followed
+# by an enforcement noun — so a genuine code bug about the DCO MECHANISM
+# ("Missing DCO validation", "No branch invokes the DCO check", "the DCO guard
+# accepts unsigned commits", "blocks sign-off for valid input") is NOT matched.
+DCO_FALSE_POSITIVE = re.compile(
+    r"\b(missing|add|require[sd]?|no|lacks?|without|needs?)\b"
+    r"(?:\s+\w+){0,3}\s+(?:dco[- ])?sign(?:ed)?[- ]?off(?:[- ]by)?\b"
+    r"(?!\s*(?:check|valid|guard|gate|logic|workflow|enforc|rule|branch|coverage|"
+    r"mechanism|hook|test))",
+    re.IGNORECASE)
+
+NOISE_PATTERNS = [
+    DCO_FALSE_POSITIVE,
+    # A re-raise of a finding already deferred to a tracked issue.
+    re.compile(r"deferred\s*[—-]\s*tracked in #\d+", re.IGNORECASE),
+]
+
+FINDING_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?P<loc>\S+?:\d+(?:-\d+)?|\S+\.\w+)\s*\|\s*"
+    r"(?P<cls>BUG|CONVENTION|NOISE|TEST-GAP)\s*\|\s*(?P<why>.+)$"
+)
+
+# The explicit clean signal a pass must emit when it finds nothing. A pass that
+# parses zero findings AND lacks this sentinel is treated as malformed, not
+# clean — model output is not guaranteed to obey the format, and a silent
+# zero-parse from prose/JSON must never certify a diff.
+NO_FINDINGS_RE = re.compile(r"^\s*NO FINDINGS\.?\s*$", re.IGNORECASE | re.MULTILINE)
+
+PROMPT_TEMPLATE = """\
+You are one of {n} independent review passes over the same diff; be thorough —
+assume the other passes will miss what you skip. Review the unified diff below
+as if it were a GitHub pull-request review against the target repository.
+
+Apply the target repository's standing rubric, reproduced here (AGENTS.md
+section "Review rubric & protocol"); its hard conventions and recurring defect
+classes are checklist items wherever the diff touches their surface, and its
+Reviewer protocol binds you — do NOT emit findings in classes it rejects.
+
+--- BEGIN RUBRIC ---
+{rubric}
+--- END RUBRIC ---
+
+Report ONLY genuine findings in the changed code (no praise, no summary of the
+diff, no pre-existing debt the diff does not touch). Output format — one line
+per finding, nothing else:
+
+<file>:<line> | <BUG|CONVENTION|NOISE|TEST-GAP> | <one-sentence rationale>
+
+BUG = would misbehave at runtime; CONVENTION = violates a stated repo
+convention; TEST-GAP = evidence/tests inadequate; NOISE = only if you must
+retract something. If you find nothing, output exactly: NO FINDINGS
+
+--- BEGIN DIFF ---
+{diff}
+--- END DIFF ---
+"""
+
+
+def resolve_target(explicit: str | None) -> Path:
+    """Match engine/xtask.sh: $PDCA_WORKTREE -> $WYRD_REPO -> sibling ../wyrd."""
+    for candidate in (
+        explicit,
+        os.environ.get("PDCA_WORKTREE"),
+        os.environ.get("WYRD_REPO"),
+        str(HERE.parent / "wyrd"),
+    ):
+        if candidate and (Path(candidate) / "AGENTS.md").is_file():
+            return Path(candidate).resolve()
+    sys.exit("review-branch: no target repo with an AGENTS.md found "
+             "(tried --repo, $PDCA_WORKTREE, $WYRD_REPO, ../wyrd)")
+
+
+def load_rubric(target: Path) -> str:
+    text = (target / "AGENTS.md").read_text(encoding="utf-8")
+    marker = "## Review rubric & protocol"
+    if marker not in text:
+        # Degrade by shrinking, not by silence: without the rubric the passes
+        # still run, they just review on general judgment.
+        print(f"review-branch: warning: no '{marker}' section in "
+              f"{target / 'AGENTS.md'}; passes run without a rubric", file=sys.stderr)
+        return "(target repo declares no standing rubric)"
+    return text[text.index(marker):]
+
+
+def collect_diff(args: argparse.Namespace, target: Path) -> str:
+    if args.bundle:
+        bundle = os.environ.get("PDCA_BUNDLE")
+        if not bundle:
+            sys.exit("review-branch: --bundle requires $PDCA_BUNDLE (set by the gate runner)")
+        patch = Path(bundle) / "patch.diff"
+        if not patch.is_file():
+            sys.exit(f"review-branch: {patch} not found")
+        return patch.read_text(encoding="utf-8")
+    cmd = ["git", "-C", str(target), "diff"]
+    cmd += ["--staged"] if args.staged else [args.range]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def run_pass(idx: int, prompt: str, timeout: int, target) -> tuple[int, bool, list, str]:
+    """One codex review pass -> (idx, usable, findings, note). Prompt goes over
+    stdin (`codex exec -`) so a large diff never hits the argv size limit
+    (pdca-harness#313).
+
+    Runs with `cwd=target` so a pass grounds on the code under review — the
+    diff is in the prompt, but a reviewer that inspects unchanged callsites,
+    tests, or repo state must read the TARGET checkout, not this harness root.
+
+    USABLE means the pass produced a format-conforming result: at least one
+    parseable finding, OR the explicit `NO FINDINGS` sentinel. A subprocess
+    error, a timeout, or nonempty output with neither (prose, JSON, a mangled
+    location) is NOT usable — it is never counted toward the promised N and
+    never read as clean."""
+    try:
+        proc = subprocess.run(
+            ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
+            input=prompt, capture_output=True, text=True, timeout=timeout,
+            cwd=str(target),
+        )
+    except subprocess.TimeoutExpired:
+        return idx, False, [], f"pass {idx}: timed out after {timeout}s"
+    if proc.returncode != 0:
+        return idx, False, [], f"pass {idx}: exit {proc.returncode} — {proc.stderr.strip()[-300:]}"
+    findings = parse_findings(proc.stdout)
+    if findings:
+        return idx, True, findings, f"pass {idx}: {len(findings)} finding(s)"
+    if NO_FINDINGS_RE.search(proc.stdout):
+        return idx, True, [], f"pass {idx}: clean (NO FINDINGS)"
+    return idx, False, [], (f"pass {idx}: unusable — nonempty output with no parseable "
+                            f"finding and no NO-FINDINGS sentinel")
+
+
+def parse_findings(output: str) -> list[dict]:
+    findings = []
+    for line in output.splitlines():
+        m = FINDING_RE.match(line)
+        if m:
+            findings.append({
+                "loc": m.group("loc"), "cls": m.group("cls"),
+                "why": m.group("why").strip(),
+            })
+    return findings
+
+
+def is_noise(f: dict) -> bool:
+    if f["cls"] == "NOISE":
+        return True
+    return any(p.search(f["why"]) for p in NOISE_PATTERNS)
+
+
+def load_rejected(args, target) -> list:
+    """The rejections the human has recorded, from a decisions file
+    (`$PDCA_BUNDLE/review-rejected.md` by default, or `--rejected PATH`). Each
+    non-blank, non-`#` line is `<file:line> | <CLASS> | <MATCH> | <reason>`,
+    returned as `(loc, class, match)` tuples (the reason is for the human).
+
+    A rejection binds to the finding's IDENTITY, not just its (loc, class):
+    findings dedup by (loc, class), so after a patch iteration a genuinely-new
+    BUG can land at the same line as a previously-rejected one. `MATCH` — a
+    case-insensitive substring that must occur in the finding's rationale —
+    pins the decision to the actual defect: a new defect whose rationale does
+    not contain the recorded phrase is NOT suppressed and still blocks. The
+    reason and a non-empty MATCH are both required; a bare loc does not count
+    ("rejected WITH a recorded reason")."""
+    path = None
+    if args.rejected:
+        path = Path(args.rejected)
+    elif args.bundle and os.environ.get("PDCA_BUNDLE"):
+        path = Path(os.environ["PDCA_BUNDLE"]) / "review-rejected.md"
+    if not path or not path.is_file():
+        return []
+    rejected = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip().lstrip("-*").strip()
+        if not s or s.startswith("#"):
+            continue
+        loc, s1, rest = s.partition("|")
+        cls, s2, rest2 = rest.partition("|")
+        match, s3, reason = rest2.partition("|")
+        cls = cls.strip().strip("`").upper()
+        match = match.strip().strip("`")
+        if (s1 and s2 and s3 and reason.strip() and match
+                and cls in {"BUG", "CONVENTION", "TEST-GAP", "NOISE"}):
+            rejected.append((loc.strip().strip("`"), cls, match))
+    return rejected
+
+
+def is_rejected(f: dict, rejected: list) -> bool:
+    """A finding is triaged-rejected iff a recorded decision names its
+    (loc, class) AND its `match` substring occurs in the finding's rationale."""
+    why = f["why"].lower()
+    return any(loc == f["loc"] and cls == f["cls"] and match.lower() in why
+               for loc, cls, match in rejected)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--bundle", action="store_true",
+                      help="review $PDCA_BUNDLE/patch.diff (gate-row mode)")
+    mode.add_argument("--range", metavar="RANGE",
+                      help="review `git diff RANGE` in the target repo "
+                           "(e.g. origin/main...HEAD)")
+    mode.add_argument("--staged", action="store_true",
+                      help="review the target repo's staged diff")
+    ap.add_argument("--repo", help="target repo path (default: engine resolution chain)")
+    ap.add_argument("--passes", type=int, default=3, metavar="N",
+                    help="parallel review passes (default 3)")
+    ap.add_argument("--timeout", type=int, default=1800,
+                    help="per-pass timeout in seconds (default 1800)")
+    ap.add_argument("--out", help="findings report path "
+                    "(default: $PDCA_BUNDLE/review-batch.md or ./review-batch.md)")
+    ap.add_argument("--rejected", help="decisions file of "
+                    "`<file:line> | <CLASS> | <MATCH> | <reason>` lines the human has "
+                    "triaged as rejected (default: $PDCA_BUNDLE/review-rejected.md)")
+    args = ap.parse_args()
+
+    target = resolve_target(args.repo)
+    rubric = load_rubric(target)
+    diff = collect_diff(args, target)
+    if not diff.strip():
+        print("review-branch: empty diff — nothing to review")
+        return 0
+
+    prompt = PROMPT_TEMPLATE.format(n=args.passes, rubric=rubric, diff=diff)
+
+    def run(indices):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(indices))) as pool:
+            return list(pool.map(lambda i: run_pass(i, prompt, args.timeout, target), indices))
+
+    # N passes, then ONE retry for any that did not produce a usable result — a
+    # gating review must not silently certify a thinner union than requested
+    # when the reviewer is transiently failing.
+    usable: dict[int, list] = {}
+    for idx, ok, findings, note in run(list(range(1, args.passes + 1))):
+        (usable.__setitem__(idx, findings) if ok
+         else print(f"review-branch: {note}", file=sys.stderr))
+    missing = [i for i in range(1, args.passes + 1) if i not in usable]
+    if missing:
+        print(f"review-branch: retrying {len(missing)} pass(es) once", file=sys.stderr)
+        for idx, ok, findings, note in run(missing):
+            if ok:
+                usable[idx] = findings
+            else:
+                print(f"review-branch: retry {note}", file=sys.stderr)
+    if len(usable) < args.passes:
+        sys.exit(f"review-branch: only {len(usable)}/{args.passes} passes produced a "
+                 f"usable result after one retry — refusing to certify a thinner union. "
+                 f"Re-run when the reviewer clears; do NOT treat this as a clean review.")
+
+    # Union + dedup keyed by (loc, class, normalized rationale). Two passes
+    # reporting the SAME defect (verbatim) collapse to one with a vote count;
+    # two DIFFERENT defects on the same line+class stay SEPARATE, each
+    # independently triageable — keying on (loc, class) alone would discard the
+    # second's rationale as a mere corroborating vote and let a rejection of the
+    # first certify the batch while the other defect went unseen. Paraphrases of
+    # one defect may survive as two entries; that over-reports (both block, both
+    # get triaged), which is the safe direction.
+    def _norm(why):
+        return " ".join(why.lower().split())
+
+    merged: dict[tuple, dict] = {}
+    for findings in usable.values():
+        for f in findings:
+            key = (f["loc"], f["cls"], _norm(f["why"]))
+            if key in merged:
+                merged[key]["votes"] += 1
+            else:
+                merged[key] = {**f, "votes": 1}
+
+    rejected = load_rejected(args, target)
+    noise = [f for f in merged.values() if is_noise(f)]
+    surviving = [f for f in merged.values() if not is_noise(f)]
+    # A surviving finding is triaged only if a recorded decision matches its full
+    # identity (loc, class, and a phrase from its rationale); otherwise it BLOCKS,
+    # regardless of class. Binding to the rationale keeps an old rejection from
+    # auto-clearing a genuinely-new defect that later lands at the same line.
+    blocking = [f for f in surviving if not is_rejected(f, rejected)]
+    accepted = [f for f in surviving if is_rejected(f, rejected)]
+    order = {"BUG": 0, "TEST-GAP": 1, "CONVENTION": 2}
+    blocking.sort(key=lambda f: (order.get(f["cls"], 3), -f["votes"]))
+
+    out_path = Path(args.out) if args.out else (
+        Path(os.environ["PDCA_BUNDLE"]) / "review-batch.md"
+        if args.bundle and os.environ.get("PDCA_BUNDLE") else Path("review-batch.md"))
+    lines = [f"# Batched review — {len(usable)} passes, union of findings", ""]
+    if not blocking:
+        lines.append("No untriaged findings survive (all either absent, noise-dropped, "
+                     "or recorded-rejected).")
+    for f in blocking:
+        lines.append(f"- [ ] `{f['loc']}` **{f['cls']}** (seen by {f['votes']} pass"
+                     f"{'es' if f['votes'] > 1 else ''}): {f['why']}")
+    if accepted:
+        lines += ["", "## Recorded rejections (triaged — not blocking)", ""]
+        lines += [f"- `{f['loc']}` {f['cls']}: {f['why']}" for f in accepted]
+    if noise:
+        lines += ["", "## Auto-dropped (rubric-rejected noise classes)", ""]
+        lines += [f"- `{f['loc']}` {f['cls']}: {f['why']}" for f in noise]
+    lines += ["", "Triage rule: every finding above must be fixed (it then leaves the "
+              "next run) or recorded-rejected in the decisions file "
+              f"({args.rejected or '$PDCA_BUNDLE/review-rejected.md'}) as "
+              "`<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from "
+              "the finding's rationale — not re-reviewed to silence. The gate blocks "
+              "while any finding here is unchecked."]
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Gate evidence must carry EVERY blocker, in ONE final line: the harness
+    # (gates._classify) retains only the last output line as `path_line`, so a
+    # line-per-finding would forward only the last blocker to the auto_iterate
+    # carry-forward brief — and the builder, brief-restricted, cannot read
+    # review-batch.md. All blockers therefore go on a single closing line.
+    summary = (f"review-branch: {len(blocking)} blocking, {len(accepted)} recorded-rejected, "
+               f"{len(noise)} noise-dropped -> {out_path}")
+    if blocking:
+        detail = " ;; ".join(f"{f['loc']} [{f['cls']}] {f['why']}" for f in blocking)
+        print(f"{summary} || BLOCKING: {detail}")
+    else:
+        print(summary)
+
+    return 1 if blocking else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

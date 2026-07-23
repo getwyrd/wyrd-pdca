@@ -29,6 +29,177 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-07-21 — external-review churn analysis (out-of-band; all 158 GitHub Codex findings across ~79 published PRs, not a frozen-bundle sweep)
+
+> Out-of-band Act pass over the *published-PR* half of the loop the harness never
+> sees: every `chatgpt-codex-connector[bot]` finding on getwyrd/wyrd PRs was
+> mined, classified (BUG/CONVENTION/TEST-GAP/NOISE), and resolution-tracked. No
+> contribution disposition re-decided.
+
+## Outcome (all three PRs merged 2026-07-22)
+
+The initiative's three artifacts all landed on `getwyrd/wyrd` main: #617 (the
+standing review rubric in AGENTS.md), #621 (the clippy wall-clock ban, incl. the
+DST + feature-gated legs), #618 (the two `cargo xtask ci` hygiene guards). The
+review loop that produced them is itself the strongest data point of this entry:
+#618 took **~13 external review rounds and 23 findings** on what began as two
+small guards. Retrospective, recorded so the next gate-building cycle is cheaper:
+
+- **Two finding-classes behaved oppositely, and the difference is predictive.**
+  *false-red* (guard rejects valid code: comments, strings, shebangs, lint-lists,
+  BOM) converged — each was a latent edge case, and after ~4 they stopped. *"accepts
+  what rustc wouldn't"* (effective-level override, then the `cfg_attr` conditional
+  on the FFI root) kept surfacing REAL holes on the security-relevant path, the last
+  one on the single crate allowed to contain unsafe. Lesson: a text-matcher
+  standing in for a compiler's semantics is a recurring-finding generator; reach for
+  the authoritative source early (this is the same arc as target-discovery, which
+  only settled when it stopped guessing layouts and asked `cargo metadata`).
+- **The bottleneck was my verification discipline, not the reviewer.** Two
+  self-inflicted failures: a commit pushed with a real hole after a `git checkout --`
+  revert restored the pre-change file (caught only by the guard failing on its own
+  branch during rebase), and a false "CI green" reported from a wait-loop that read
+  the PREVIOUS commit's completed runs. Both now have standing fixes: re-run the full
+  gate after any probe that ends in `git checkout --`; pin CI waits to the pushed SHA
+  (`gh run list --commit <sha>`), never PR-level check state.
+- **The candidate rubric line the whole loop argues for** (owner: human, next Act):
+  *a new gate must state its coverage boundary and be demonstrated red on a planted
+  violation before review has to find the holes* — and, folded in from the
+  test-roots finding, *an exclusion must name what enforces the excluded region, and
+  that claim must be verified, not asserted*. The repo already has the "demonstrated
+  red, not resting red on non-existence" pattern in `deploy_guard`; it is simply not
+  generalized into the rubric.
+
+Ledger state at close: 15 codex-pr classes `applied` (rubric- or gate-addressed;
+`clock-lifecycle` and `worktree-gitlink` flipped to applied when #621/#618 merged),
+3 still `open` and delta-owed — `enforcement-reach`, `false-red` (both discovered
+this loop, no rubric line yet), and `unclassified` (the keyword classifier's
+residue, itself flagged for the model-pass upgrade).
+
+## What the review data exposed
+
+- **The reviewer is high-signal (~94%)** — 5 of 158 findings hard-rejected as wrong.
+  The multi-round churn is NOT reviewer taste: the dominant mechanism is *serialized
+  depth* — ~1 new, real, pre-existing finding per `@codex review` retrigger (extreme:
+  PR 587, 13 rounds / 13 retriggers / 15 real findings on one feature; only 1 of 15
+  caused by a fix). "Iterate to reviewer silence" therefore converges slowly by
+  construction.
+- **Noise is one class**: DCO trailer false positives from GitHub's synthesized
+  merge-preview / stale SHAs (PRs 542, 549, 568, 594, 600, 608, 611) — every hard
+  rejection in the recent era but one.
+- **Recurring mechanically-checkable classes**: committed `.claude/worktrees` gitlinks
+  (PRs 594/595/597/600); docs/living-architecture drift (552, 587, 594, 608, 612);
+  vacuous/count-tolerant test assertions (8 findings ≤550); missing
+  `#![forbid(unsafe_code)]` in the two newest crates.
+- **Deferred hazards get re-raised every round** until a real gate lands (PR 559),
+  while a reply citing the tracking issue settles them (PR 612) — the deferral
+  protocol was undocumented.
+- **Stacked-PR stale content** re-surfaces already-fixed findings in dependent PRs
+  (609→610).
+
+## Process deltas
+
+- Ruleset: **standing review rubric written into the target repo** — hard conventions,
+  13 recurring defect classes, reviewer noise rules (DCO authority, deferral
+  protocol), and done = gates green + ONE triaged batched pass
+  (wyrd `AGENTS.md` § "Review rubric & protocol", PR getwyrd/wyrd#617, issue #615).
+- Gates: **`T4-batch-review` row added** — 3 parallel rubric-armed codex passes over
+  the bundle diff, unioned, noise-dropped, publish-blocking while BUG findings remain
+  (`pdca.toml` [[gates.checks]]; `scripts/review-branch`, also the canonical manual
+  pre-commit review). **Target-side gates**: worktree-gitlink guard +
+  `forbid(unsafe_code)` crate-root guard in `cargo xtask ci`
+  (getwyrd/wyrd#616 → PR in flight).
+- Agent role prompts: **builder reads the target rubric** (second narrow exception,
+  `agents/builder.md`); **reviewer/adversary apply it and honor its rejected classes**
+  (`agents/reviewer.md`, `agents/adversary.md`).
+- Ruleset: INTEGRATION.md §8 — PR definition of done rewritten (no retrigger-chasing;
+  triage external findings via `scripts/triage-pr-findings`); removed a stale
+  model-attribution trailer instruction that contradicted the maintainer's standing
+  no-attribution rule.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- Engine-native homes proposed upstream: rubric key (eduralph/pdca-harness#314),
+  pre-publish batched review stage with bounded fix loop (#315), `pdca triage`
+  ingestion (#316). Instance stopgaps live until they land (scripts/flow precedent).
+- Target-side slow lane: clippy correctness ratchet crate-by-crate
+  (chunk-format → traits → core), wall-clock `disallowed-methods` ban,
+  mutants-pr gating promotion after a baseline check → owner: Eduard, tracked in
+  the wyrd tracker as the Wave-2/3 items land.
+
+## How effectiveness will be judged
+
+- Rounds/PR on the next ~5 published PRs should trend to 1 (baseline: up to 13);
+  DCO-FP findings → 0; deferred-hazard re-raises → 0. Measure with
+  `scripts/triage-pr-findings --stats` once built; recurrence of any of the 13
+  rubric classes AFTER the rubric ships is the signal a class needs a mechanical
+  gate, not a rubric line.
+- **New class discovered post-rubric — `enforcement-reach` (2026-07-22, delta owed).**
+  The reviews of the gate-building PRs themselves (#618 ×2, #621 ×2) kept landing on
+  one shape the 13 seeded classes do not name: **a gate/lint/scan whose actual
+  coverage is narrower than its claimed scope**, so a violation passes it silently —
+  the workspace clippy step excluding `wyrd-dst` (the clock ban never evaluated
+  there); `git ls-files` reading the index while `git config -f` read the working
+  tree; a scan returning "clean" for an unreadable tree; `benches/<name>/main.rs`
+  never inspected. Each was a real hole in a brand-new guard, none was caught by any
+  rubric line. Candidate delta (for the human at the next Act pass): a rubric line
+  requiring that **a new gate be demonstrated red on a planted violation and state
+  its coverage boundary** — the repo already has the pattern (`deploy_guard`'s
+  "demonstrated red, not resting red on non-existence"), it is simply not
+  generalized. Registered `open` in the ledger; occurrences accumulate until a
+  delta lands.
+- **Second new class — `false-red` (2026-07-22, delta owed).** Distinct from
+  `enforcement-reach` and arguably more costly: a guard that **rejects valid code**.
+  Three in one day, all in the new hygiene guard — a `//` inside
+  `#![doc(html_root_url = "https://…")]` read as a comment; an unmatched `[` inside a
+  doc string unbalancing the attribute walk; a first-line shebang read as the first
+  item. Under-strict gates cost a later bug report; over-strict gates block a
+  compliant contributor at the gate, so they deserve their own signal. Registered
+  `open`.
+- **Rationales, not code, were the recurring defect.** Two findings this day landed on
+  *stated reasons* rather than logic: "test roots stay covered by the workspace lint
+  wall" (false — `warnings`/`clippy.all`/`rustdoc` deny nothing about `unsafe`, so
+  nothing was covering them) and "returns the read error for the ROOT only" (a
+  silently-shrinking scan documented as if it were a design choice). Both had been
+  written down confidently and neither had been checked. Candidate delta, to fold into
+  the `enforcement-reach` rubric line: **a scope boundary must name what enforces the
+  excluded region, and that claim must be verified, not asserted** — an exclusion whose
+  justification is wrong is worse than no exclusion, because it looks considered.
+- **The keyword classifier is the weak link — three patch rounds in one day.**
+  `scripts/triage-pr-findings` mis-filed a finding on every round until patched:
+  `\bdst\b` swallowed a lint-coverage finding into the *test*-coverage class; bare
+  `\blimit\b` pulled "limit exemptions to individual reads" into `encoded-caps`; bare
+  `workflow` claimed anything mentioning a CI job; and `silent-skip` out-competed
+  `enforcement-reach` on "silently omits". Each fix was correct, but the pattern is
+  now clear: keyword matching cannot separate classes that share vocabulary, and every
+  misfile lands as a FALSE recurrence — the one signal this beat is supposed to trust.
+  Candidate delta: make the optional model pass the DEFAULT classifier (the script
+  already supports one) and keep keywords only as a cheap pre-filter, so a class
+  boundary is decided by meaning rather than by which regex is listed first.
+- **Ledger-hygiene correction the same day.** The first recurrence signals the triage
+  script emitted were FALSE, in two ways worth recording because both would have
+  misdirected this beat: (a) a keyword collision — `\bdst\b` classified "run the
+  clock lint over the DST crate" as the *seeded* `dst-coverage` TEST-GAP class
+  (missing Tier-0 tests), which is a different thing; (b) a modeling error — every
+  class was seeded `applied` at the rubric date, but several classes' real delta is
+  a mechanical gate **still in flight** (`worktree-gitlink` → #618,
+  `clock-lifecycle` → #619/#621), so findings *about building those gates* were
+  scored as the delta having failed. Fixed: classifier tightened, and
+  `NO_APPLIED_DELTA` now seeds such classes `open` until their gate MERGES. Lesson
+  for the outer loop: a recurrence detector is only as honest as its claim about
+  when a delta actually took effect — "written in the rubric" and "enforced by a
+  merged gate" are different dates.
+- **Recall baseline measured (2026-07-22)**: `scripts/review-branch` (N=3) replayed
+  against PR 587's round-1 diff recovered ~8 of the 15 defect classes that took 13
+  serial retriggers (join-blocks-shutdown, detached-task leak, bind-failure phantom
+  registration, zero-interval panic, unbounded health() await, missing probe
+  concurrency cap, SERVING-during-drain, docs-currency) plus one TEST-GAP the
+  GitHub rounds never raised; several unrecovered ones only became visible after
+  earlier fixes (R13 was caused by R1's fix). One batched pass ≈ 8 serial rounds.
+  Known refinement: dedup keys on (loc, class), so same-defect findings at
+  adjacent lines survive as near-duplicates — cluster by proximity if triage
+  noise grows.
+
+
 # Act addendum — 2026-07-18 — cycles considered: issue_505, issue_430, issue_407 (out-of-band, recurring publish-time signal; no disposition re-decided)
 
 ## What the cycles' records exposed
@@ -75,6 +246,7 @@
   review. A recurrence means the host runner and its CI jobs drifted
   again; re-check the §10 composition table against
   `../wyrd/.github/workflows/` before the next review.
+
 
 # Act addendum — 2026-07-17 — cycles considered: issue_366 (out-of-band, post-freeze record correction; no disposition re-decided)
 

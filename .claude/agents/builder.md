@@ -35,6 +35,14 @@ uses the registered domain) is avoided when the correct pattern is already in th
 is a cited hole in "narrow input is deliberate", not a licence to browse: read only the
 callsite the brief points at.
 
+**A second narrow exception — the target's standing review rubric.** If the target repo
+carries a `## Review rubric & protocol` section in its root `AGENTS.md` (present in your
+worktree), read **that section** before you emit `patch.diff`, and self-review the patch
+against it as an explicit final step — its hard conventions and recurring defect classes
+are the same criteria the reviewers apply, so a violation you ship is a guaranteed
+review round. Like the peer-callsite exception this is repo *policy*, not cycle context:
+it is not a licence to read the rest of the file, prior cycles, or project history.
+
 **Build to satisfy the brief's `Success criterion`** — the real end result — not a
 narrower proxy: an item is done only when that end result holds, proven red→green. A
 green mechanical check on something *adjacent* is not "done" (the same standard as "a

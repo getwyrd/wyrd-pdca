@@ -190,13 +190,26 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 ## 8. Committing and PR conventions
 - **DCO sign-off:** `git commit -s` (Developer Certificate of Origin, ADR-0003 §1 — Wyrd
   uses DCO, not a CLA). Already aligned with the harness's `DCO` file.
-- **Commit-message format:** concise subject; body explains the *why*; trailer
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+- **Commit-message format:** concise subject; body explains the *why*. No model/tool
+  attribution trailers of any kind — commits, PRs, comments, and reviews carry the
+  human contributor's identity only (maintainer's standing rule).
 - **PR description format:** Root cause / Fix / Verified against / Test
   (`templates/pr-description.md.tpl`); reference the issue with `Fixes #nnnn`.
 - **Enforcement mechanism:** host-side — `dco`, `require-issue`, and `adr-immutability`
   xtask/CI gates + maintainer review (GOVERNANCE). The builder/publisher STOP hook
   (`builder_guard.py`) is a backstop, not the authority.
+- **Definition of done for a PR (review protocol):** host gates green **plus one
+  batched, fully triaged review pass** — the `T4-batch-review` gate row
+  (`scripts/review-branch`, 3 parallel rubric-armed codex passes, unioned) with every
+  finding either fixed or rejected with a recorded reason. Do **not** retrigger
+  `@codex review` chasing reviewer silence: the external reviewer surfaces ~1 new
+  pre-existing finding per re-poke (measured across 158 findings / ~79 PRs), so serial
+  retriggering converges slowly by construction — batch the depth up front instead.
+  A finding deferred with "Deferred — tracked in #N" is settled (per the target
+  AGENTS.md § Review rubric & protocol). When external findings do arrive on a
+  published PR, process them with `scripts/triage-pr-findings` so every one lands in
+  the Act ledger (bug → tracker/carry-forward; convention → gate or rubric delta;
+  noise → rubric-exclusion candidate).
 
 ## 9. Repo-specific scripts and tooling
 | Role | Path | Invocation | Status |
