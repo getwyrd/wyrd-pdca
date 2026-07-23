@@ -81,8 +81,12 @@ class NoiseFilter(unittest.TestCase):
             self.assertTrue(self._noise(why), why)
 
     def test_real_signoff_logic_bugs_survive(self):
+        # incl. the DCO-*mechanism* bugs that the too-broad filter dropped
         for why in ("this guard blocks sign-off for valid input",
-                    "the change allows a DCO failure to pass unnoticed"):
+                    "the change allows a DCO failure to pass unnoticed",
+                    "Missing DCO validation allows unsigned commits",
+                    "No branch invokes the DCO check",
+                    "the DCO guard accepts unsigned commits"):
             self.assertFalse(self._noise(why), why)
 
     def test_tracked_deferral_is_noise(self):
@@ -231,6 +235,22 @@ class GateIntegration(unittest.TestCase):
     def test_a_convention_only_finding_also_blocks(self):
         rc, _, _ = self._run(lambda i: (True, [_f("x.rs:1", "CONVENTION", "nit")], "1"))
         self.assertEqual(rc, 1)
+
+    def test_two_distinct_defects_on_one_line_stay_separate(self):
+        # Different rationales at the same (loc, class) must NOT collapse into a
+        # single corroborating vote — both must remain independently blocking.
+        pair = [_f("x.rs:1", "BUG", "off-by-one in the range check"),
+                _f("x.rs:1", "BUG", "null deref when the map is empty")]
+        rc, out, report = self._run(lambda i: (True, pair, "2"))
+        self.assertEqual(rc, 1)
+        self.assertIn("off-by-one in the range check", report)
+        self.assertIn("null deref when the map is empty", report)
+        # rejecting only ONE of them must still leave the other blocking
+        (Path(self.bundle) / "review-rejected.md").write_text(
+            "x.rs:1 | BUG | off-by-one in the range check | tracked #9\n", encoding="utf-8")
+        rc2, _, report2 = self._run(lambda i: (True, pair, "2"))
+        self.assertEqual(rc2, 1)
+        self.assertIn("null deref when the map is empty", report2)
 
     def test_every_blocker_is_on_the_single_final_line(self):
         findings = [_f("a.rs:1", "BUG", "one"), _f("b.rs:2", "TEST-GAP", "two")]

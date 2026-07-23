@@ -53,8 +53,17 @@ class Classify(unittest.TestCase):
         return tp.classify(text)
 
     def test_dco_false_positive(self):
-        self.assertEqual(self._cat("Add the required DCO sign-off"),
-                         ("dco-false-positive", "NOISE"))
+        for why in ("Add the required DCO sign-off",
+                    "commit dc275e is missing a Signed-off-by trailer",
+                    "The reviewed commit message has no Signed-off-by"):
+            self.assertEqual(self._cat(why)[0], "dco-false-positive", why)
+
+    def test_dco_mechanism_bug_is_not_dco_noise(self):
+        # A real bug about the DCO enforcement mechanism must be classified on
+        # its own merits (so it can be filed), not dropped as a trailer FP.
+        for why in ("the DCO guard accepts unsigned commits",
+                    "No branch invokes the DCO check"):
+            self.assertNotEqual(self._cat(why)[0], "dco-false-positive", why)
 
     def test_encoded_caps_on_a_real_sizing_finding(self):
         key, _ = self._cat("Size the body cap for XML-escaped maximum keys")
@@ -161,11 +170,12 @@ class FilingFailure(unittest.TestCase):
                  "created_at": "2026-07-01T00:00:00Z",
                  "body": "**Reject unsupported version-specific deletes**\n\nA BUG."}]
 
-    def _dispatch(self, create_rc):
+    def _dispatch(self, create_rc, view_rc=0):
         def run(cmd, *a, **k):
-            if "view" in cmd:            # gh pr view ... mergedAt -> merged
-                return subprocess.CompletedProcess(cmd, 0, stdout="2026-07-02T00:00:00Z", stderr="")
-            if "create" in cmd:          # gh issue create -> fails
+            if "view" in cmd:            # gh pr view ... mergedAt
+                out = "" if view_rc else "2026-07-02T00:00:00Z"
+                return subprocess.CompletedProcess(cmd, view_rc, stdout=out, stderr="api down")
+            if "create" in cmd:          # gh issue create
                 return subprocess.CompletedProcess(cmd, create_rc, stdout="", stderr="auth expired")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return run
@@ -183,6 +193,15 @@ class FilingFailure(unittest.TestCase):
                 mock.patch("subprocess.run", self._dispatch(create_rc=0)), _quiet():
             failed = tp.triage_pr(1, file_issues=True, today="2026-07-23")
         self.assertFalse(failed)
+
+    def test_failed_merge_lookup_fails_closed(self):
+        # gh pr view errors -> merge state unknown must not read as "open" and
+        # silently skip a merged PR's BUGs; the run fails and says so.
+        with mock.patch.object(tp, "gh_json", lambda p: self._merged_bug_comment()), \
+                mock.patch("subprocess.run", self._dispatch(create_rc=0, view_rc=1)), _quiet():
+            failed = tp.triage_pr(1, file_issues=True, today="2026-07-23")
+        self.assertTrue(failed)
+        self.assertIn("merge state", (self.tmp / "triage" / "PR-1.md").read_text())
 
 
 if __name__ == "__main__":
