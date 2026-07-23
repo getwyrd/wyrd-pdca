@@ -101,9 +101,14 @@
   `../wyrd/docs/design/specs/conformance/vectors/v1/` (valid) and `.../invalid/v1/`
   (malformed), each a `.fragment` + its `.expected.json` / `.reason.txt` oracle (ADR-0002).
 - **Verification runner (the whole gate):** **`cargo xtask ci`**, delegated via
-  `./engine/xtask.sh` (§9). It runs identically on a laptop and in CI (ADR-0016): fmt
-  (`--check`), clippy (`-D warnings`), build, test (incl. DST property tests), `cargo deny
-  check`, and the conformance run. Exit 0 = pass. This is Wyrd's single source of gate truth.
+  `./engine/xtask.sh` (§9). It runs the same checks on a laptop and in CI (ADR-0016): the
+  prose gates (`typos`, docs lint/render — wyrd#599) first, then fmt (`--check`), clippy
+  (`-D warnings`), build, test (incl. DST property tests), `cargo deny check`, and the
+  conformance run. Exit 0 = pass. This is Wyrd's single source of gate truth. **One
+  laptop/CI asymmetry to know:** the prose gates need external tools (`typos-cli`, the
+  pinned doc renderer); when those are absent locally the gate **warns and skips** them,
+  whereas CI has them and runs them — so a local green is not full CI parity unless
+  those tools are installed.
 - **Reproduction runner(s):** Wyrd's DST is the repro substrate (ADR-0009) — a failing
   **seed** under madsim is the deterministic reproduction; `cargo xtask dst` sweeps seeds,
   and a bug-finding seed becomes a permanent regression test. `cargo xtask conformance`
@@ -123,7 +128,7 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 
 | Tier | Written ruleset (normative source) | Home | Single-sourced command | Status |
 |---|---|---|---|---|
-| C4 correctness | the change + Wyrd's whole gate | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
+| C4 correctness | the change + Wyrd's whole gate (wyrd#598 moved the **prose gates** — `typos` + docs lint/render, previously host-CI-only and the one gate class published PRs kept failing — into `cargo xtask ci`; **merged in wyrd PR#599 on 2026-07-18**, so `C4-ci` now inherits them — **conditionally closed**: the prose gates warn-and-skip when their tools (`typos-cli`, the pinned doc renderer) are absent on the PDCA host, so `C4-ci` closes the blind spot only where those tools are installed; otherwise it goes locally green and the host CI can still open the PR red on these (see §3)) | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
 | T1 format-conformance | chunk-format spec v1, RFC-2119 (`../wyrd/docs/design/specs/chunk-format/v1.md`); conformance spec `specs/conformance/v1.md` (ADR-0002) | `cargo xtask conformance` (vectors in `specs/conformance/`) | `./engine/xtask.sh conformance` | [built — runs inside `ci`; advisory row optional] |
 | T2 shape | `rustfmt` + `clippy -D warnings` (no project style doc; the linters are the rule) | inside `cargo xtask ci` | (subsumed by `ci`) | [built — part of `ci`] |
 | T3 runtime / DST | testing strategy, ADR-0009 (madsim DST is the spine; from M0) | `cargo xtask dst` + `test` | `./engine/xtask.sh dst` | [built — runs inside `ci`; advisory row optional] |
@@ -228,6 +233,7 @@ PDCA **supplements** Wyrd's existing governance; it does not replace it:
 | `require-issue` on PRs | `[tracker].issue_trailer` (`Fixes #{id}`) | The trailer satisfies the linked-issue rule; init-from-brief maps onto a qualifying issue. |
 | `dco` / `adr-immutability` | builder/publisher STOP hook (`builder_guard.py`) | The hook backstops `gh pr ready`/`merge` for the leaves; Wyrd's gates are the authority. |
 | `cargo xtask ci` | `pdca gates --working-tree` re-gate | Both invoke the **same** `cargo xtask ci` via `engine/xtask.sh` — one definition, no drift. |
+| `typos` / `docs-check` (always-on prose jobs) | covered by the same `cargo xtask ci` delegation as of wyrd#598 (**merged in wyrd PR#599, 2026-07-18**) | Before wyrd#598 these two host jobs were OUTSIDE `cargo xtask ci` and unmapped here — the blind spot behind wyrd PRs #595/#564/#569 opening red on `typos` (act-log 2026-07-18); **conditionally closed by the PR#599 merge** — `C4-ci` now re-gates them against the patched tree, but only where `typos-cli` / the doc renderer are installed on the PDCA host; absent those it warn-skips and the pipeline can still open a PR red on these (§3). `docs-immutability` remains host-only by decision (needs git-diff context; has never failed a pipeline PR). |
 
 `ship_ci_workflow = false` at render (Wyrd runs its own CI); `ship_merge_guard = true`
 keeps the builder STOP backstop.
