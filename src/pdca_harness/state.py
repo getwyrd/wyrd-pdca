@@ -35,6 +35,32 @@ HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
 # symmetric stand-in for patch.diff — so the state machine reads it as "past Do".
 CLOSE_MARKER = "close-disposition"
 
+# Everything Do and Check write — i.e. everything downstream of brief.md. The single
+# source of truth (the driver archives exactly this set on iterate; re-exported as
+# ``driver.DOWNSTREAM_OF_BRIEF``). It lives HERE because "which files mean a cycle ran"
+# is a state question: `is_resolved` uses it to tell a real cycle from a notes-only
+# tracker. Includes the close marker (issue #60) so an iterate archives it too.
+DOWNSTREAM_OF_BRIEF = [
+    "patch.diff",
+    "build-notes.md",
+    CLOSE_MARKER,
+    "MANUAL-VERIFICATION.md",
+    "check-gates.json",
+    "check-gates.md",
+    "check-review.md",
+    "SUMMARY.md",
+]
+
+# The rest of a cycle's output, by pattern: the advisory artifacts (#64) and each leaf's
+# captured error tail (#280). The iterate archive moves these alongside DOWNSTREAM_OF_BRIEF
+# (``driver._archive_iteration``), so they are cycle evidence by exactly the same argument —
+# and they live here for the same reason: enumerating the set twice is how the two lists drift
+# apart, which is the defect this guard exists to close.
+DOWNSTREAM_GLOBS = (
+    "check-advisory-*.md",
+    "*.error.log",
+)
+
 # §9 outcome token → bundle state. state owns the state names, so the mapping
 # lives here; signoff knows only the tokens (no import cycle).
 _OUTCOME_TO_STATE = {
@@ -48,18 +74,30 @@ _OUTCOME_TO_STATE = {
 
 def is_resolved(d: Path) -> bool:
     """True iff this is a **notes-only tracker** (an open-question / research issue
-    logged as ``notes.json`` but never carried through a PDCA cycle — no ``brief.md``)
-    whose tracking issue was **resolved outside the cycle**, recorded by a top-level
-    ``resolved`` object in ``notes.json`` (github state + close date + a note that the
-    question was decided in-issue).
+    logged as ``notes.json`` but never carried through a PDCA cycle) whose tracking issue
+    was **resolved outside the cycle**, recorded by a top-level ``resolved`` object in
+    ``notes.json`` (github state + close date + a note that the question was decided
+    in-issue).
 
     Such a tracker has no result to sign off, so it can never reach COMPLETE/DISCONTINUED
     through the normal transitions and would otherwise sit in the pending UNPLANNED list
-    forever. The ``resolved`` record makes it terminal ([`RESOLVED`]). Scoped to
-    briefless bundles so a real cycle bundle is never reclassified by a stray key. A
-    malformed / unreadable ``notes.json`` is "not resolved", never a crash (every bundle
-    file is possibly-absent/garbled, same defensive contract as the rest of this module).
+    forever. The ``resolved`` record makes it terminal ([`RESOLVED`]).
+
+    A bundle carrying **any** evidence a cycle ran — ``brief.md``, any artifact in
+    [`DOWNSTREAM_OF_BRIEF`] or matching [`DOWNSTREAM_GLOBS`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
+    ``resolved`` key can never reclassify it (including a rejected cycle left briefless by
+    ``iterate-to-Plan``, which archives ``brief.md`` + everything downstream and must stay
+    UNPLANNED for its re-plan). A malformed / unreadable ``notes.json`` is "not resolved",
+    never a crash (every bundle file is possibly-absent/garbled, the defensive contract of
+    this module).
     """
+    if (
+        (d / "brief.md").exists()
+        or any((d / f).exists() for f in DOWNSTREAM_OF_BRIEF)
+        or any(q.is_file() for g in DOWNSTREAM_GLOBS for q in d.glob(g))
+        or any(d.glob("iteration-v*"))
+    ):
+        return False
     p = d / "notes.json"
     if not p.exists():
         return False

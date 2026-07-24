@@ -28,19 +28,13 @@ def _say(msg: str) -> None:
 def _headless_note(leaf) -> str:
     return " (headless Claude — no live output, may take minutes)" if leaf.mode == "command" else ""
 
-# Everything Do and Check write, i.e. everything downstream of brief.md. Includes the
-# close marker (issue #60) so an iterate archives it too — reopening a close bundle to a
-# fix path then clears the marker and runs the real Do+Check band.
-DOWNSTREAM_OF_BRIEF = [
-    "patch.diff",
-    "build-notes.md",
-    state.CLOSE_MARKER,
-    "MANUAL-VERIFICATION.md",
-    "check-gates.json",
-    "check-gates.md",
-    "check-review.md",
-    "SUMMARY.md",
-]
+# Everything Do and Check write, i.e. everything downstream of brief.md — the set the
+# driver archives on iterate. Defined in `state` (the single source of truth: "which files
+# mean a cycle ran" is a state question, also used by `state.is_resolved`); re-exported
+# here under the name the archive logic and tests already use. Includes the close marker
+# (issue #60) so an iterate archives it too — reopening a close bundle to a fix path then
+# clears the marker and runs the real Do+Check band.
+DOWNSTREAM_OF_BRIEF = state.DOWNSTREAM_OF_BRIEF
 
 
 def advance(d: Path, cfg: Config) -> None:
@@ -240,13 +234,14 @@ def _archive_iteration(d: Path, n: int, *, include_brief: bool) -> None:
     """
     arch = d / f"iteration-v{n}"
     names = list(DOWNSTREAM_OF_BRIEF)
-    names += [p.name for p in d.glob("check-advisory-*.md")]  # advisory artifacts (#64)
-    # Every leaf's captured error tail belongs to the attempt that produced it (#280 review):
+    # The advisory artifacts (#64) and every leaf's captured error tail (#280 review):
     # `build.error.log` (Do), `check-review.error.log` / `check-advisory-*.error.log` (Check).
-    # Each is cleared at the start of the NEXT run of its leaf, so a log left at the top level
-    # here is deleted rather than kept — destroying the only on-disk record of why the attempt
-    # failed, which is the whole point of capturing it. Archive them with their attempt.
-    names += [p.name for p in d.glob("*.error.log")]
+    # Each error log is cleared at the start of the NEXT run of its leaf, so a log left at the
+    # top level here is deleted rather than kept — destroying the only on-disk record of why the
+    # attempt failed, which is the whole point of capturing it. Archive them with their attempt.
+    # The patterns come from `state.DOWNSTREAM_GLOBS`, the same single source `is_resolved`
+    # reads, so the archive set and the cycle-evidence set cannot drift apart.
+    names += [p.name for g in state.DOWNSTREAM_GLOBS for p in d.glob(g)]
     if include_brief:
         names.append("brief.md")
     if (d / "brief.md").exists():

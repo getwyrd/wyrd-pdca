@@ -501,6 +501,14 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
             print(f"{state.COMPLETE}\t{d}", file=sys.stderr)
             print(f"  already complete — nothing to run. To redo it: rm -rf {d}", file=sys.stderr)
             return 0
+        if d.exists() and state.state(d) == state.RESOLVED:
+            # A notes-only tracker whose issue was resolved outside a cycle is terminal —
+            # there is nothing to run, and it is a SUCCESS, not a failure (the multi-id
+            # sweep already skips it; #150).
+            print(f"{state.RESOLVED}\t{d}", file=sys.stderr)
+            print("  resolved tracker (issue settled outside a cycle) — nothing to run.",
+                  file=sys.stderr)
+            return 0
         if not d.exists():
             d.mkdir(parents=True)
         final = flow.flow(cfg, iid, csv=args.from_csv,
@@ -509,7 +517,7 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
         if final == state.AWAITING_SIGNOFF:
             for it in signoff.open_needs_human(d / "SUMMARY.md"):
                 print(f"    {it}")
-        return 0 if final in (state.COMPLETE, state.AWAITING_SIGNOFF) else 1
+        return 0 if final in (state.COMPLETE, state.AWAITING_SIGNOFF, state.RESOLVED) else 1
 
     # Several ids: batch — auto-plan unbriefed, drive concurrently, cheap-first sign-off.
     try:
