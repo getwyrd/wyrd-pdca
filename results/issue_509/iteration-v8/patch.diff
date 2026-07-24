@@ -1,0 +1,1505 @@
+diff --git a/crates/gateway-s3/src/lib.rs b/crates/gateway-s3/src/lib.rs
+index 934a297..c454753 100644
+--- a/crates/gateway-s3/src/lib.rs
++++ b/crates/gateway-s3/src/lib.rs
+@@ -365,6 +365,33 @@ fn unsupported_subresource(query: &str) -> Option<&str> {
+         .find(|k| SUBRESOURCES.contains(k))
+ }
+ 
++/// Whether `query` carries a bare `name` parameter — e.g. the `delete` subresource on
++/// `POST /bucket?delete` (with or without a `=`, and alongside benign params like
++/// `x-id=DeleteObjects`). The key is percent-DECODED before matching, so a percent-encoded
++/// spelling cannot dodge the match — the same discipline [`unsupported_subresource`] uses,
++/// which this check must agree with because the bulk route runs just before that fence (#509).
++fn has_query_key(query: &str, name: &str) -> bool {
++    query
++        .split('&')
++        .filter(|p| !p.is_empty())
++        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
++        .any(|k| percent_decode_utf8(k) == name)
++}
++
++/// The bucket name of a **bucket-scoped** path `/{bucket}` (no object key), tolerating a lone
++/// trailing slash (`/{bucket}/`). Returns `None` for an object path `/{bucket}/{key}` — those
++/// stay on the object dispatch — and for an empty path. Used to route the bucket-scoped bulk
++/// `POST /{bucket}?delete` (issue #509) BEFORE [`split_bucket_key`] rejects the keyless path as
++/// `400 InvalidRequest`.
++fn bucket_only_path(path: &str) -> Option<&str> {
++    let trimmed = path.trim_start_matches('/');
++    let bucket = trimmed.strip_suffix('/').unwrap_or(trimmed);
++    if bucket.is_empty() || bucket.contains('/') {
++        return None;
++    }
++    Some(bucket)
++}
++
+ /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
+ /// `/` (a nested key on the flat namespace). Returns `None` for a bucket-only or empty
+ /// path — bucket-level operations are out of scope.
+@@ -785,6 +812,26 @@ where
+         }
+     };
+ 
++    // Bulk DeleteObjects — `POST /{bucket}?delete` (issue #509). Intercepted here, on the
++    // bucket-scoped keyless path, BEFORE `split_bucket_key` below rejects it as
++    // `400 InvalidRequest` and before the object-path subresource denylist (where `delete` is
++    // listed and stays refused). Only this POST bulk form is implemented; every OTHER
++    // bucket-scoped method still falls through to the keyless-path `400`. Auth already ran
++    // (SigV4 above), so the signed body is verified against its digest and buffered under an
++    // explicit byte cap inside the handler.
++    if method == Method::POST && has_query_key(&query, "delete") {
++        if let Some(bucket) = bucket_only_path(&path) {
++            return bulk_delete(
++                &state,
++                request_id,
++                &percent_decode_utf8(bucket),
++                payload,
++                body,
++            )
++            .await;
++        }
++    }
++
+     let Some((bucket, key)) = split_bucket_key(&path) else {
+         return error_response(
+             request_id,
+@@ -1018,6 +1065,754 @@ where
+     }
+ }
+ 
++/// The most keys a single `DeleteObjects` request may name. S3 caps a bulk delete at 1000
++/// objects; a body naming more is refused with `MalformedXML`, never silently truncated to
++/// the first 1000 (which would leave the caller believing keys were deleted that were not).
++const MAX_DELETE_KEYS: usize = 1000;
++
++/// The byte cap on a **buffered** `DeleteObjects` request body. Unlike an object PUT — whose
++/// body streams and is never resident whole (the "stream, don't buffer" invariant) — the
++/// bulk-delete body is small and bounded by construction (≤1000 keys, each an S3 key ≤1024
++/// bytes, plus `<Object><Key>…` framing), so buffering it whole is acceptable here. The cap
++/// makes that bound hold **by construction rather than by trusting the client's declared
++/// `Content-Length`**: a body larger than this is refused as it is read, before it is fully
++/// resident (issue #509 design). 2 MiB leaves generous headroom over the ~1 MiB a full
++/// 1000×1024-byte-key request occupies.
++const MAX_DELETE_BODY_BYTES: usize = 2 * 1024 * 1024;
++
++/// One key's fate in a bulk delete, rendered into the `<DeleteResult>`.
++enum DeleteOutcome {
++    /// The key was removed OR was already absent — S3 delete is idempotent, so both are a
++    /// `<Deleted>` (suppressed under `Quiet`).
++    Deleted(String),
++    /// The per-key delete failed at the gateway; reported as a per-key `<Error>` (code +
++    /// message from the shared [`classify`] mapping) rather than failing the whole request —
++    /// the per-key result contract `aws s3 sync --delete` relies on.
++    Error {
++        key: String,
++        code: &'static str,
++        message: String,
++    },
++}
++
++/// Handle a bulk `DeleteObjects` — `POST /bucket?delete` (issue #509). The single-object
++/// delete path already provides the correct per-key semantics (CAS unlink, orphan grace,
++/// idempotency); this is a wire-level fan-out over it plus XML in/out.
++///
++/// The body is SigV4-signed and small (≤1000 keys), so it is buffered whole under an explicit
++/// byte cap ([`MAX_DELETE_BODY_BYTES`]) and — for a `Signed` payload — verified against the
++/// signed digest exactly as the object PUT path checks its content hash, so a tampered body is
++/// rejected before any key is touched. Keys execute sequentially (correctness first at Alpha;
++/// concurrency is an optimisation the acceptance does not require), and a per-key gateway error
++/// becomes a per-key `<Error>` instead of failing the batch.
++///
++/// `bucket` arrives already percent-decoded (the URL path form the object path decodes); each
++/// key is XML-entity-unescaped out of the body ([`parse_delete`]; the body is not a URL so it is
++/// not percent-decoded), and the two compose onto the M0 flat namespace as `"{bucket}/{key}"` —
++/// byte-identical to the single-object DELETE path's `object_key`.
++async fn bulk_delete<G>(
++    state: &AppState<G>,
++    request_id: RequestId,
++    bucket: &str,
++    payload: sigv4::PayloadHash,
++    body: Body,
++) -> Response
++where
++    G: ObjectGateway,
++{
++    // Buffer the body under the byte cap (de-framing an `aws-chunked` stream if the client
++    // sent one, though a stock SDK sends the small delete body single-shot).
++    let body_bytes = match buffer_capped(&payload, body, MAX_DELETE_BODY_BYTES).await {
++        Ok(bytes) => bytes,
++        Err(BufferError::TooLarge) => {
++            return error_response(
++                request_id,
++                StatusCode::BAD_REQUEST,
++                "MalformedXML",
++                "the DeleteObjects request body exceeds the maximum size",
++            )
++        }
++        Err(BufferError::Read(err)) => return gateway_error_response(request_id, &err),
++    };
++
++    // Verify the buffered body against the signed digest, mirroring the object PUT: a `Signed`
++    // request's `x-amz-content-sha256` is the hex SHA-256 of the whole body. (`Unsigned` /
++    // `Streaming` have nothing to check here — the latter is authenticated per chunk as it is
++    // de-framed above.)
++    if let sigv4::PayloadHash::Signed(expected_hex) = &payload {
++        let actual_hex = crypto::hex(&crypto::sha256(&body_bytes));
++        if !crypto::constant_time_eq(actual_hex.as_bytes(), expected_hex.as_bytes()) {
++            return error_response(
++                request_id,
++                StatusCode::BAD_REQUEST,
++                "XAmzContentSHA256Mismatch",
++                "the delivered body does not match the signed x-amz-content-sha256",
++            );
++        }
++    }
++
++    let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
++        return error_response(
++            request_id,
++            StatusCode::BAD_REQUEST,
++            "MalformedXML",
++            "the DeleteObjects request body is not valid UTF-8",
++        );
++    };
++    let request = match parse_delete(body_str) {
++        Ok(request) => request,
++        Err(_) => {
++            return error_response(
++                request_id,
++                StatusCode::BAD_REQUEST,
++                "MalformedXML",
++                "the XML you provided was not well-formed or did not validate",
++            )
++        }
++    };
++    // S3 bounds a bulk delete at 1..=1000 keys; outside that range is `MalformedXML` (refused,
++    // not truncated). The body byte cap already bounds the parse, so this is a semantic bound.
++    if request.keys.is_empty() || request.keys.len() > MAX_DELETE_KEYS {
++        return error_response(
++            request_id,
++            StatusCode::BAD_REQUEST,
++            "MalformedXML",
++            "a DeleteObjects request must name between 1 and 1000 keys",
++        );
++    }
++
++    let mut outcomes = Vec::with_capacity(request.keys.len());
++    for key in &request.keys {
++        let object_key = format!("{bucket}/{key}");
++        match state.gateway.delete_object(&object_key).await {
++            // Idempotent: `Ok(true)` (removed) and `Ok(false)` (already absent) are both a
++            // `<Deleted>` — S3 delete of a missing key is a success. Mirrors the single-object
++            // DELETE arm (`Method::DELETE => … Ok(_) => …`).
++            Ok(_) => outcomes.push(DeleteOutcome::Deleted(key.clone())),
++            Err(err) => {
++                let (_, code, message) = classify(&err);
++                outcomes.push(DeleteOutcome::Error {
++                    key: key.clone(),
++                    code,
++                    message,
++                });
++            }
++        }
++    }
++    xml_ok_response(render_delete_result(&outcomes, request.quiet))
++}
++
++/// The `200` a successful bulk `DeleteObjects` answers with: the `<DeleteResult>` document,
++/// declared `application/xml` — the same content-type the error bodies use ([`error_response`]).
++/// The `x-amz-request-id` header is stamped by [`handle`] on the way out, as it is for every
++/// response, so it is not set here.
++fn xml_ok_response(body: String) -> Response {
++    Response::builder()
++        .status(StatusCode::OK)
++        .header("content-type", "application/xml")
++        .body(Body::from(body))
++        .expect("static response is always valid")
++}
++
++/// Why buffering a bulk-delete body stopped short of a complete read.
++enum BufferError {
++    /// The body exceeded [`MAX_DELETE_BODY_BYTES`] — refused (400 `MalformedXML`) before it is
++    /// fully resident.
++    TooLarge,
++    /// The transport (or the `aws-chunked` de-framer) yielded an error mid-read.
++    Read(BoxError),
++}
++
++/// Buffer a request body to a `Vec`, refusing once `cap` bytes are exceeded. An `aws-chunked`
++/// streaming body is de-framed ([`streaming::decode`], which authenticates each chunk) so the
++/// buffered bytes are the object payload, not the wire framing; every other payload form is the
++/// raw body. Used only for the small, bounded bulk-delete body — object PUT/GET stay streaming.
++async fn buffer_capped(
++    payload: &sigv4::PayloadHash,
++    body: Body,
++    cap: usize,
++) -> Result<Vec<u8>, BufferError> {
++    let raw = body
++        .into_data_stream()
++        .map(|item| item.map_err(|e| Box::new(e) as BoxError));
++    let mut stream: std::pin::Pin<
++        Box<dyn futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>> + Send>,
++    > = match payload {
++        sigv4::PayloadHash::Streaming(ctx) => {
++            Box::pin(streaming::decode(Box::pin(raw), ctx.clone()))
++        }
++        _ => Box::pin(raw),
++    };
++    let mut buf = Vec::new();
++    while let Some(chunk) = stream.next().await {
++        let chunk = chunk.map_err(BufferError::Read)?;
++        if buf.len() + chunk.len() > cap {
++            return Err(BufferError::TooLarge);
++        }
++        buf.extend_from_slice(&chunk);
++    }
++    Ok(buf)
++}
++
++/// Render the `<DeleteResult>` for a bulk delete. Under `quiet` the successful `<Deleted>`
++/// entries are omitted (S3's `Quiet` mode reports only errors); a per-key `<Error>` is always
++/// reported. Every key/code/message is XML-escaped so a key carrying markup cannot break the
++/// document — the same discipline the error body and the listing renderers use.
++fn render_delete_result(outcomes: &[DeleteOutcome], quiet: bool) -> String {
++    let mut xml = String::from(
++        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
++         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
++    );
++    for outcome in outcomes {
++        match outcome {
++            DeleteOutcome::Deleted(key) => {
++                if !quiet {
++                    xml.push_str("<Deleted><Key>");
++                    xml.push_str(&xml_escape(key));
++                    xml.push_str("</Key></Deleted>");
++                }
++            }
++            DeleteOutcome::Error { key, code, message } => {
++                xml.push_str("<Error><Key>");
++                xml.push_str(&xml_escape(key));
++                xml.push_str("</Key><Code>");
++                xml.push_str(&xml_escape(code));
++                xml.push_str("</Code><Message>");
++                xml.push_str(&xml_escape(message));
++                xml.push_str("</Message></Error>");
++            }
++        }
++    }
++    xml.push_str("</DeleteResult>");
++    xml
++}
++
++/// A parsed `<Delete>` request body: the object keys to remove and the `Quiet` flag.
++#[derive(Debug, PartialEq, Eq)]
++struct DeleteRequest {
++    keys: Vec<String>,
++    quiet: bool,
++}
++
++/// The `<Delete>` body is not a well-formed XML document of the fixed S3 `DeleteObjects`
++/// schema — mapped by the caller to `400 MalformedXML`. Carries a short static reason for a
++/// server-side diagnosis; the client only ever sees the generic S3 code.
++#[derive(Debug, PartialEq, Eq)]
++struct MalformedXml(&'static str);
++
++/// The deepest element nesting the scanner accepts. The S3 `DeleteObjects` schema is three
++/// deep (`<Delete><Object><Key>`); this generous bound rejects a pathologically nested body
++/// (which the byte cap alone would let build a huge element stack) so a malformed request
++/// cannot amplify into unbounded work. Well past anything a real client sends.
++const MAX_XML_DEPTH: usize = 100;
++
++/// True for an ASCII character that may **start** an XML `Name` in the subset this schema uses:
++/// a letter, `_`, or `:` (a namespace separator). Deliberately narrower than the full XML
++/// `NameStartChar` production — the S3 `DeleteObjects` schema uses only ASCII element names and
++/// the `xmlns` prefix, so anything outside this set at the head of a name is a malformed body,
++/// not a name to salvage.
++fn is_name_start(c: char) -> bool {
++    c.is_ascii_alphabetic() || c == '_' || c == ':'
++}
++
++/// True for a character that may **continue** an XML `Name`: a name-start char, an ASCII digit,
++/// `-`, or `.`.
++fn is_name_char(c: char) -> bool {
++    is_name_start(c) || c.is_ascii_digit() || c == '-' || c == '.'
++}
++
++/// XML `S` (white space): the ONLY four characters that separate tokens (`#x20 #x9 #xD #xA`).
++fn is_xml_ws(c: char) -> bool {
++    matches!(c, ' ' | '\t' | '\r' | '\n')
++}
++
++/// The **local** part of an element/attribute `Name` — any `ns:` namespace prefix stripped, so
++/// `Delete` reads as `Delete` and `s3:Object` as `Object`. A name whose local part is empty
++/// (`foo:`) is [`MalformedXml`].
++fn local_name(name: &str) -> Result<&str, MalformedXml> {
++    let local = name.rsplit_once(':').map_or(name, |(_, local)| local);
++    if local.is_empty() {
++        return Err(MalformedXml("empty local element name"));
++    }
++    Ok(local)
++}
++
++/// One open element on the [`DeleteScanner`] stack: its **raw** `Name` as written (so the end
++/// tag can be required to match it EXACTLY, prefix included — XML forbids `<s3:Object></Object>`),
++/// its namespace-stripped local name (for the `<Key>` / `<Quiet>` semantics), and the character
++/// data accumulated directly inside it.
++struct OpenElement {
++    name: String,
++    local: String,
++    text: String,
++}
++
++/// A strict, single-pass XML **well-formedness** scanner for the fixed S3 `DeleteObjects`
++/// body. The workspace has no XML crate, and adding one is a human-gated dependency decision
++/// (ADR-0003 three-test audit + `deny.toml`), so this is a small in-crate scanner scoped to
++/// exactly this body — but written as a *validating* grammar, not a lenient tokenizer.
++///
++/// **The invariant this type exists to hold:** a body that is not a well-formed XML document of
++/// the schema is [`MalformedXml`] and authorises no deletion. It is validated character by
++/// character against the XML productions and fails **closed** on the first deviation — there is
++/// no "reduce a mangled tag to a plausible one" path (the recurring destructive defect of the
++/// earlier hand tokenizer: `</Key garbage>` reduced to `</Key>`, a duplicate/`<`-bearing
++/// attribute accepted, a second root or trailing junk silently discarded). Every one of those
++/// is a distinct rule below (`ETag` allows only `S? '>'` after the name; `STag` requires each
++/// attribute be `S`-separated with a unique name and a `[^<&]`/valid-`Reference` value; the
++/// document has exactly one root and only `Misc` around it).
++///
++/// It skips the XML declaration, comments (`--` forbidden inside) and processing instructions,
++/// reads a `<![CDATA[…]]>` section as literal text, and rejects a DOCTYPE (DTDs are unsupported —
++/// fail closed) and any structurally broken construct (an unterminated tag/comment/CDATA/
++/// entity, a mismatched or stray end tag, an over-deep nest).
++struct DeleteScanner<'a> {
++    input: &'a str,
++    pos: usize,
++    stack: Vec<OpenElement>,
++    keys: Vec<String>,
++    quiet: bool,
++    /// Whether the single root element has been opened yet. Once the root has opened and
++    /// closed (stack empty again), another element is a **second root** — rejected, not run.
++    root_seen: bool,
++}
++
++impl<'a> DeleteScanner<'a> {
++    fn new(input: &'a str) -> Self {
++        Self {
++            input,
++            pos: 0,
++            stack: Vec::new(),
++            keys: Vec::new(),
++            quiet: false,
++            root_seen: false,
++        }
++    }
++
++    /// The unconsumed tail. Borrows the `'a` input, not `self`, so callers may mutate `self.pos`
++    /// while a slice of it is still in hand.
++    fn rest(&self) -> &'a str {
++        &self.input[self.pos..]
++    }
++
++    fn peek(&self) -> Option<char> {
++        self.rest().chars().next()
++    }
++
++    /// Consume `s` if the tail starts with it; report whether it did.
++    fn eat(&mut self, s: &str) -> bool {
++        if self.rest().starts_with(s) {
++            self.pos += s.len();
++            true
++        } else {
++            false
++        }
++    }
++
++    /// Consume a run of XML white space; return how many bytes were skipped (0 = none). The
++    /// count is load-bearing in a start tag: an attribute MUST be `S`-separated, so a
++    /// zero-length skip before a non-`>` char means something is butted onto a name.
++    fn skip_ws(&mut self) -> usize {
++        let start = self.pos;
++        while let Some(c) = self.peek() {
++            if is_xml_ws(c) {
++                self.pos += c.len_utf8();
++            } else {
++                break;
++            }
++        }
++        self.pos - start
++    }
++
++    /// Consume a leading XML `Name` (ASCII subset) and return it, advancing past it. `Err` when
++    /// the tail does not begin with a `NameStartChar` — an ill-formed name the caller rejects
++    /// rather than reducing arbitrary bytes to a plausible-looking name.
++    fn parse_name(&mut self) -> Result<&'a str, MalformedXml> {
++        let input = self.input;
++        let start = self.pos;
++        let mut first = true;
++        while let Some(c) = input[self.pos..].chars().next() {
++            if first {
++                if !is_name_start(c) {
++                    break;
++                }
++                first = false;
++            } else if !is_name_char(c) {
++                break;
++            }
++            self.pos += c.len_utf8();
++        }
++        if self.pos == start {
++            return Err(MalformedXml("expected an XML name"));
++        }
++        Ok(&input[start..self.pos])
++    }
++
++    /// Parse the whole document, returning the collected keys + `Quiet`. Grammar:
++    /// `document ::= Misc* element Misc*` (an optional XML declaration counts as the first
++    /// `Misc`). Exactly one root; only insignificant white space / comments / PIs may surround
++    /// it — any other content before or after is [`MalformedXml`].
++    fn parse(mut self) -> Result<DeleteRequest, MalformedXml> {
++        while self.pos < self.input.len() {
++            if self.stack.is_empty() {
++                self.step_outside_root()?;
++            } else {
++                self.step_inside_element()?;
++            }
++        }
++        if !self.stack.is_empty() {
++            return Err(MalformedXml("unclosed element"));
++        }
++        if !self.root_seen {
++            return Err(MalformedXml("missing <Delete> root element"));
++        }
++        Ok(DeleteRequest {
++            keys: self.keys,
++            quiet: self.quiet,
++        })
++    }
++
++    /// One step in the prolog/epilog (stack empty): insignificant white space, a comment, a PI /
++    /// the XML declaration, or the ONE root element. Everything else — character data, a second
++    /// root, a DOCTYPE, a stray end tag, a CDATA — is [`MalformedXml`].
++    fn step_outside_root(&mut self) -> Result<(), MalformedXml> {
++        self.skip_ws();
++        if self.pos >= self.input.len() {
++            return Ok(());
++        }
++        if self.peek() != Some('<') {
++            return Err(MalformedXml("character data outside the root element"));
++        }
++        if self.eat("<?") {
++            self.skip_pi()
++        } else if self.eat("<!--") {
++            self.skip_comment()
++        } else if self.rest().starts_with("</") {
++            Err(MalformedXml("end tag with no open element"))
++        } else if self.rest().starts_with("<!") {
++            // A DOCTYPE or a CDATA outside the root: DTDs are unsupported (fail closed) and
++            // CDATA is character data, not permitted outside the root.
++            Err(MalformedXml(
++                "unsupported declaration outside the root element",
++            ))
++        } else {
++            if self.root_seen {
++                return Err(MalformedXml("more than one root element"));
++            }
++            self.root_seen = true;
++            let (name, local, empty) = self.parse_start_tag()?;
++            if local != "Delete" {
++                return Err(MalformedXml("root element is not <Delete>"));
++            }
++            if empty {
++                // A `<Delete/>` root: no children, no keys. Left for the caller's 1..=1000-key
++                // check to refuse.
++                self.close_element(&local, String::new());
++            } else {
++                self.push(name, local)?;
++            }
++            Ok(())
++        }
++    }
++
++    /// One step inside an open element (stack non-empty): character data / a reference, or a
++    /// markup construct (child element, end tag, comment, PI, CDATA).
++    fn step_inside_element(&mut self) -> Result<(), MalformedXml> {
++        match self.peek() {
++            Some('<') => self.step_markup(),
++            Some('&') => {
++                let decoded = self.parse_reference()?;
++                self.stack
++                    .last_mut()
++                    .expect("inside an element")
++                    .text
++                    .push(decoded);
++                Ok(())
++            }
++            Some(_) => {
++                // A run of plain character data up to the next `<` or `&`.
++                let input = self.input;
++                let start = self.pos;
++                while let Some(c) = input[self.pos..].chars().next() {
++                    if c == '<' || c == '&' {
++                        break;
++                    }
++                    self.pos += c.len_utf8();
++                }
++                let run = &input[start..self.pos];
++                // `]]>` may not appear literally in character data (XML §2.4).
++                if run.contains("]]>") {
++                    return Err(MalformedXml("']]>' not allowed in character data"));
++                }
++                self.stack
++                    .last_mut()
++                    .expect("inside an element")
++                    .text
++                    .push_str(run);
++                Ok(())
++            }
++            None => Err(MalformedXml("unclosed element")),
++        }
++    }
++
++    /// Dispatch a `<…` markup construct encountered inside an element.
++    fn step_markup(&mut self) -> Result<(), MalformedXml> {
++        if self.eat("<?") {
++            self.skip_pi()
++        } else if self.eat("<!--") {
++            self.skip_comment()
++        } else if self.eat("<![CDATA[") {
++            self.parse_cdata()
++        } else if self.rest().starts_with("<!") {
++            Err(MalformedXml(
++                "unsupported '<!' declaration inside an element",
++            ))
++        } else if self.rest().starts_with("</") {
++            self.parse_end_tag()
++        } else {
++            let (name, local, empty) = self.parse_start_tag()?;
++            if empty {
++                self.close_element(&local, String::new());
++                Ok(())
++            } else {
++                self.push(name, local)
++            }
++        }
++    }
++
++    /// Push a newly opened element, enforcing the depth bound.
++    fn push(&mut self, name: String, local: String) -> Result<(), MalformedXml> {
++        if self.stack.len() >= MAX_XML_DEPTH {
++            return Err(MalformedXml("element nesting too deep"));
++        }
++        self.stack.push(OpenElement {
++            name,
++            local,
++            text: String::new(),
++        });
++        Ok(())
++    }
++
++    /// Parse a start tag `'<' Name (S Attribute)* S? '>'` or an empty-element tag
++    /// `'<' Name (S Attribute)* S? '/>'`, the cursor at the opening `<`. Returns
++    /// `(raw_name, local_name, is_empty_element)` — the RAW name so the caller can require the
++    /// end tag to match it exactly (prefix included). Enforces: no white space between `<` and
++    /// the name; each attribute is `S`-separated, has a unique name (Unique Att Spec), an `=`,
++    /// and a quoted `AttValue` free of a raw `<` and with `&` only starting a valid `Reference`.
++    /// Junk after the name (`<Delete garbage>`) is rejected, never reduced away.
++    fn parse_start_tag(&mut self) -> Result<(String, String, bool), MalformedXml> {
++        // Consume the '<' (the caller has already ruled out `</`, `<?`, `<!` forms).
++        self.pos += 1;
++        let name = self.parse_name()?;
++        // Reject an empty local part (`foo:`) now; keep the RAW name for exact end-tag matching.
++        let local = local_name(name)?.to_string();
++        let mut seen: Vec<&'a str> = Vec::new();
++        loop {
++            let ws = self.skip_ws();
++            match self.peek() {
++                Some('>') => {
++                    self.pos += 1;
++                    return Ok((name.to_string(), local, false));
++                }
++                Some('/') => {
++                    self.pos += 1;
++                    if self.peek() == Some('>') {
++                        self.pos += 1;
++                        return Ok((name.to_string(), local, true));
++                    }
++                    return Err(MalformedXml("expected '/>' to close an empty-element tag"));
++                }
++                None => return Err(MalformedXml("unterminated start tag")),
++                Some(_) => {
++                    // An attribute must be white-space-separated from the name / prior value; a
++                    // zero-length skip means junk is butted on (`<Delete=…>`, `<Object x>`'s
++                    // missing `=` is caught below).
++                    if ws == 0 {
++                        return Err(MalformedXml("attribute not separated by white space"));
++                    }
++                    let attr = self.parse_name()?;
++                    if seen.contains(&attr) {
++                        return Err(MalformedXml("duplicate attribute name (Unique Att Spec)"));
++                    }
++                    seen.push(attr);
++                    self.skip_ws();
++                    if !self.eat("=") {
++                        return Err(MalformedXml("attribute missing '='"));
++                    }
++                    self.skip_ws();
++                    self.parse_att_value()?;
++                }
++            }
++        }
++    }
++
++    /// Parse and DISCARD an `AttValue` (the schema carries no meaningful attributes), validating
++    /// its syntax: a `"`/`'` delimiter, then `([^<&delim] | Reference)*`, then the matching
++    /// delimiter. A raw `<`, a bare/`unknown` `&` (a `&` not starting a valid `Reference`), or an
++    /// unterminated value is [`MalformedXml`].
++    fn parse_att_value(&mut self) -> Result<(), MalformedXml> {
++        let quote = match self.peek() {
++            Some(c @ ('"' | '\'')) => c,
++            _ => return Err(MalformedXml("attribute value must be quoted")),
++        };
++        self.pos += quote.len_utf8();
++        loop {
++            match self.peek() {
++                None => return Err(MalformedXml("unterminated attribute value")),
++                Some(c) if c == quote => {
++                    self.pos += c.len_utf8();
++                    return Ok(());
++                }
++                Some('<') => return Err(MalformedXml("'<' not allowed in an attribute value")),
++                Some('&') => {
++                    self.parse_reference()?;
++                }
++                Some(c) => self.pos += c.len_utf8(),
++            }
++        }
++    }
++
++    /// Parse an end tag `'</' Name S? '>'`, the cursor at `</`. Per the XML `ETag` production
++    /// ONLY white space may follow the name — `</Key garbage>` is [`MalformedXml`], never a
++    /// lenient `</Key>`. The name must match the innermost open element's RAW name **exactly**
++    /// (prefix included): `<s3:Object></Object>` is a well-formedness violation, not a match on
++    /// the shared local part.
++    fn parse_end_tag(&mut self) -> Result<(), MalformedXml> {
++        self.pos += 2; // consume '</'
++        let name = self.parse_name()?;
++        self.skip_ws();
++        if !self.eat(">") {
++            return Err(MalformedXml("junk after end-tag name"));
++        }
++        let frame = self
++            .stack
++            .pop()
++            .ok_or(MalformedXml("end tag with no open element"))?;
++        if frame.name != name {
++            return Err(MalformedXml("end tag does not match the open element"));
++        }
++        self.close_element(&frame.local, frame.text);
++        Ok(())
++    }
++
++    /// Apply an element's close: a `<Key>` directly inside `<Object>` contributes its text as an
++    /// object key; a `<Quiet>` directly inside `<Delete>` sets the flag; every other element is
++    /// an ignored unknown (its text discarded). Called AFTER the element is off the stack, so
++    /// `self.stack.last()` is the parent context.
++    fn close_element(&mut self, local: &str, text: String) {
++        match self.stack.last().map(|f| f.local.as_str()) {
++            Some("Object") if local == "Key" => self.keys.push(text),
++            Some("Delete") if local == "Quiet" => {
++                self.quiet = matches!(text.trim(), "true" | "1");
++            }
++            _ => {}
++        }
++    }
++
++    /// Skip a processing instruction / XML declaration, the cursor just past `<?`.
++    fn skip_pi(&mut self) -> Result<(), MalformedXml> {
++        match self.rest().find("?>") {
++            Some(i) => {
++                self.pos += i + 2;
++                Ok(())
++            }
++            None => Err(MalformedXml("unterminated processing instruction")),
++        }
++    }
++
++    /// Skip a comment, the cursor just past `<!--`. A comment body may not contain `--`; the
++    /// first `--` must be the `-->` terminator (XML §2.5).
++    fn skip_comment(&mut self) -> Result<(), MalformedXml> {
++        let rest = self.rest();
++        match rest.find("--") {
++            Some(i) => {
++                if rest[i + 2..].starts_with('>') {
++                    self.pos += i + 3;
++                    Ok(())
++                } else {
++                    Err(MalformedXml("'--' not allowed inside a comment"))
++                }
++            }
++            None => Err(MalformedXml("unterminated comment")),
++        }
++    }
++
++    /// Read a `<![CDATA[ … ]]>` section as literal text into the current element, the cursor
++    /// just past `<![CDATA[`.
++    fn parse_cdata(&mut self) -> Result<(), MalformedXml> {
++        let rest = self.rest();
++        match rest.find("]]>") {
++            Some(i) => {
++                let literal = &rest[..i];
++                self.stack
++                    .last_mut()
++                    .expect("CDATA only appears inside an element")
++                    .text
++                    .push_str(literal);
++                self.pos += i + 3;
++                Ok(())
++            }
++            None => Err(MalformedXml("unterminated CDATA section")),
++        }
++    }
++
++    /// Parse a `Reference` at the cursor's `&`, returning the decoded character. Handles the five
++    /// predefined entities (`&amp; &lt; &gt; &quot; &apos;`) and numeric character references
++    /// (`&#38;`, `&#x26;`). A bare `&`, an unterminated reference, an unknown entity, or an
++    /// out-of-range code point is [`MalformedXml`] — the parser rejects a malformed body, it does
++    /// not pass a stray `&` through.
++    fn parse_reference(&mut self) -> Result<char, MalformedXml> {
++        self.pos += 1; // consume '&'
++        if self.eat("#") {
++            let hex = self.eat("x") || self.eat("X");
++            let radix = if hex { 16 } else { 10 };
++            let input = self.input;
++            let start = self.pos;
++            while let Some(c) = input[self.pos..].chars().next() {
++                if c == ';' {
++                    break;
++                }
++                if c.to_digit(radix).is_none() {
++                    return Err(MalformedXml("bad character reference"));
++                }
++                self.pos += c.len_utf8();
++            }
++            let digits = &input[start..self.pos];
++            if !self.eat(";") {
++                return Err(MalformedXml("unterminated character reference"));
++            }
++            if digits.is_empty() {
++                return Err(MalformedXml("empty character reference"));
++            }
++            let code = u32::from_str_radix(digits, radix)
++                .map_err(|_| MalformedXml("bad character reference"))?;
++            char::from_u32(code).ok_or(MalformedXml("character reference out of range"))
++        } else {
++            let name = self.parse_name()?;
++            if !self.eat(";") {
++                return Err(MalformedXml("unterminated entity reference"));
++            }
++            match name {
++                "amp" => Ok('&'),
++                "lt" => Ok('<'),
++                "gt" => Ok('>'),
++                "quot" => Ok('"'),
++                "apos" => Ok('\''),
++                _ => Err(MalformedXml("unknown entity reference")),
++            }
++        }
++    }
++}
++
++/// Parse a `<Delete>` DeleteObjects body into its keys + `Quiet` flag via the strict
++/// [`DeleteScanner`]. Unknown elements (`<VersionId>`, a stray `<Prefix>`, …) are ignored per
++/// the fixed schema, but the document MUST be well-formed XML with exactly one `<Delete>` root
++/// — anything else is [`MalformedXml`], and a rejected body deletes nothing. Keys are captured
++/// entity-unescaped.
++fn parse_delete(body: &str) -> Result<DeleteRequest, MalformedXml> {
++    DeleteScanner::new(body).parse()
++}
++
+ fn empty_response(status: StatusCode) -> Response {
+     let mut builder = Response::builder().status(status);
+     // **A body-less 2xx must still DECLARE its zero length.** A successful PUT answers `200` with
+@@ -2711,4 +3506,201 @@ mod tests {
+             "\"0badc0de0badc0de\"",
+         );
+     }
++
++    #[test]
++    fn has_query_key_matches_the_delete_subresource() {
++        // The bulk-delete route fires on `POST /bucket?delete` — with or without a value, and
++        // alongside benign params — but not on an unrelated query (issue #509).
++        assert!(has_query_key("delete", "delete"));
++        assert!(has_query_key("delete=", "delete"));
++        assert!(has_query_key("x-id=DeleteObjects&delete=", "delete"));
++        // A percent-encoded spelling still matches (decoded), so it cannot dodge the route the
++        // way a raw match would — the same posture as the bucket subresource fence.
++        assert!(has_query_key("dele%74e", "delete"));
++        assert!(!has_query_key("list-type=2", "delete"));
++        assert!(!has_query_key("", "delete"));
++    }
++
++    #[test]
++    fn bucket_only_path_distinguishes_bucket_from_object_paths() {
++        // A bucket-scoped keyless path routes the bulk delete; an object path does not.
++        assert_eq!(bucket_only_path("/bucket"), Some("bucket"));
++        assert_eq!(bucket_only_path("/bucket/"), Some("bucket"));
++        assert_eq!(bucket_only_path("/bucket/key"), None);
++        assert_eq!(bucket_only_path("/bucket/nested/key"), None);
++        assert_eq!(bucket_only_path("/"), None);
++        assert_eq!(bucket_only_path(""), None);
++    }
++
++    #[test]
++    fn parse_delete_reads_keys_and_quiet_ignoring_unknowns() {
++        // The exact body a stock SDK sends (XML declaration, namespace on the root, a `<Quiet>`
++        // flag, and an extra `<VersionId>` this floor ignores). Keys are captured in order.
++        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
++             <Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
++             <Object><Key>a</Key></Object>\
++             <Object><Key>b/c</Key><VersionId>ignored</VersionId></Object>\
++             <Quiet>true</Quiet></Delete>";
++        let parsed = parse_delete(body).expect("well-formed <Delete> parses");
++        assert_eq!(parsed.keys, vec!["a".to_string(), "b/c".to_string()]);
++        assert!(parsed.quiet);
++    }
++
++    #[test]
++    fn parse_delete_unescapes_entity_and_char_references_in_keys() {
++        // A key with XML-special bytes rides the body entity-escaped; the parser restores the
++        // stored key so the right object is deleted (issue #509 success criterion). Numeric
++        // character references (decimal and hex) decode too.
++        let body = "<Delete><Object><Key>a&amp;b</Key></Object>\
++             <Object><Key>x&lt;y&gt;z</Key></Object>\
++             <Object><Key>q&#38;r</Key></Object>\
++             <Object><Key>u&#x26;v</Key></Object></Delete>";
++        let parsed = parse_delete(body).expect("entity-escaped keys parse");
++        assert_eq!(
++            parsed.keys,
++            vec![
++                "a&b".to_string(),
++                "x<y>z".to_string(),
++                "q&r".to_string(),
++                "u&v".to_string(),
++            ]
++        );
++        assert!(!parsed.quiet);
++    }
++
++    #[test]
++    fn parse_delete_reads_cdata_key_and_ignores_comments() {
++        // A `<![CDATA[…]]>` key is literal text (no reference processing), and a comment inside
++        // the document is skipped — both well-formed shapes the strict scanner must still accept.
++        let body =
++            "<Delete><!-- a comment --><Object><Key><![CDATA[a<b&c]]></Key></Object></Delete>";
++        let parsed = parse_delete(body).expect("CDATA key + comment parse");
++        assert_eq!(parsed.keys, vec!["a<b&c".to_string()]);
++    }
++
++    #[test]
++    fn parse_delete_accepts_valid_namespaced_and_attributed_tags() {
++        // Strictness must NOT reject the legitimate shapes a stock SDK sends: an `xmlns`
++        // attribute (double- or single-quoted, carrying a valid `Reference`), a
++        // namespace-prefixed element, trailing white space before `>`, DISTINCT namespaced
++        // attribute names, a self-closing element the schema ignores, and insignificant white
++        // space around the document.
++        let body = "  \n<Delete xmlns='http://s3.amazonaws.com/doc/2006-03-01/' \
++             xmlns:x=\"a&amp;b\" >\
++             <s3:Object><Key>a</Key></s3:Object>\
++             <Object ><Key>b</Key><VersionId/></Object>\
++             <Quiet>true</Quiet></Delete>\n  ";
++        let parsed = parse_delete(body).expect("valid namespaced/attributed tags parse");
++        assert_eq!(parsed.keys, vec!["a".to_string(), "b".to_string()]);
++        assert!(parsed.quiet);
++        // A `<Delete/>` empty root is well-formed but names no keys.
++        assert_eq!(
++            parse_delete("<Delete/>").expect("empty root parses").keys,
++            Vec::<String>::new()
++        );
++    }
++
++    #[test]
++    fn parse_delete_rejects_every_ill_formed_body() {
++        // ONE audit of the whole grammar, not a per-defect patch: every body below is not a
++        // well-formed XML document of the schema and MUST be `MalformedXml` — so a rejected body
++        // can never authorise a deletion. Grouped by the class each closes; the destructive
++        // regressions the iteration-4..7 reviews caught (multi-root, junk-after-tag, duplicate
++        // attribute, `<`/bare-`&` in an attribute value) are named inline.
++        for body in [
++            // Not XML / structurally broken.
++            "this is not xml",
++            "",
++            "<Delete><Object><Key>oops", // unterminated tag
++            "<Delete><Object></Delete>", // mismatched end tag
++            "<Delete><Object><Key>a</Object></Key></Delete>", // improper nesting
++            "</Delete>",                 // end tag, nothing open
++            "<Delete><Object></Object></Object></Delete>", // stray extra close
++            // Wrong / multiple roots and content outside the root (iteration-4 class).
++            "<NotDelete><Object><Key>a</Key></Object></NotDelete>",
++            "<Delete></Delete><Delete><Object><Key>victim</Key></Object></Delete>",
++            "<Delete></Delete><Other/>",
++            "<Delete></Delete>trailing garbage",
++            "leading garbage<Delete></Delete>",
++            // Junk after a tag name (iteration-5 class) — NOT reduced to a plausible tag.
++            "<Delete><Object><Key>victim</Key garbage></Object></Delete>",
++            "<Delete garbage><Object><Key>a</Key></Object></Delete>",
++            "<Delete><Object x><Key>a</Key></Object></Delete>",
++            "<Delete><Object><Key>a</Key x=\"y\"></Object></Delete>",
++            "< Delete><Object><Key>a</Key></Object></Delete>", // white space after '<'
++            "<Delete><foo:>a</foo:></Delete>",                 // empty local name
++            // End tag must match the start tag's RAW name exactly (prefix included), not just
++            // the shared local part: `<s3:Object>…</Object>` is malformed and deletes nothing.
++            "<Delete><s3:Object><Key>victim</Key></s3:Object garbage></Delete>",
++            "<Delete><s3:Object><Key>victim</Key></Object></Delete>",
++            "<s3:Delete><Object><Key>victim</Key></Object></Delete>",
++            // Malformed attributes.
++            "<Delete xmlns><Object><Key>a</Key></Object></Delete>", // missing '='
++            "<Delete xmlns=bare><Object><Key>a</Key></Object></Delete>", // unquoted value
++            "<Delete xmlns=\"unterminated><Object><Key>a</Key></Object></Delete>",
++            // Duplicate attribute name (iteration-6 class, Unique Att Spec).
++            "<Delete x='1' x='2'><Object><Key>victim</Key></Object></Delete>",
++            "<Delete><Object a=\"1\" a=\"2\"><Key>victim</Key></Object></Delete>",
++            "<Delete><VersionId v='1' v='2'/><Object><Key>victim</Key></Object></Delete>",
++            "<Delete xmlns='a' xmlns=\"b\"><Object><Key>victim</Key></Object></Delete>",
++            // '<' or a bare/unknown '&' inside an attribute value (iteration-7 class).
++            "<Delete x='<'><Object><Key>victim</Key></Object></Delete>",
++            "<Delete x=\"a<b\"><Object><Key>victim</Key></Object></Delete>",
++            "<Delete x='&'><Object><Key>victim</Key></Object></Delete>",
++            "<Delete x='a&b'><Object><Key>victim</Key></Object></Delete>",
++            "<Delete x='&bogus;'><Object><Key>victim</Key></Object></Delete>",
++            // Malformed references / literal ']]>' in character data.
++            "<Delete><Object><Key>a&amp</Key></Object></Delete>", // unterminated entity
++            "<Delete><Object><Key>a&bogus;b</Key></Object></Delete>", // unknown entity
++            "<Delete><Object><Key>a&#xZZ;</Key></Object></Delete>", // bad char ref
++            "<Delete><Object><Key>a&#;b</Key></Object></Delete>", // empty char ref
++            "<Delete><Object><Key>a]]>b</Key></Object></Delete>", // literal ']]>'
++            // Comments / CDATA / DOCTYPE.
++            "<Delete><!-- a -- b --><Object><Key>a</Key></Object></Delete>", // '--' in comment
++            "<Delete><!-- oops <Object><Key>a</Key></Object></Delete>",      // unterminated comment
++            "<Delete><Object><Key><![CDATA[oops</Key></Object></Delete>",    // unterminated CDATA
++            "<!DOCTYPE Delete><Delete><Object><Key>a</Key></Object></Delete>", // DTD unsupported
++        ] {
++            assert!(
++                parse_delete(body).is_err(),
++                "expected MalformedXml (a rejected body deletes nothing): {body:?}",
++            );
++        }
++    }
++
++    #[test]
++    fn parse_delete_rejects_pathologically_deep_nesting() {
++        // A malformed body must not amplify into unbounded work: nesting past MAX_XML_DEPTH is
++        // MalformedXml. (The S3 schema is three deep, so this rejects only abuse.)
++        let mut body = String::new();
++        for _ in 0..(MAX_XML_DEPTH + 5) {
++            body.push_str("<a>");
++        }
++        assert!(
++            parse_delete(&format!("<Delete>{body}")).is_err(),
++            "an over-deep nest must be rejected, not built into a huge stack",
++        );
++    }
++
++    #[test]
++    fn render_delete_result_honours_quiet_and_escapes() {
++        let outcomes = vec![
++            DeleteOutcome::Deleted("a&b".to_string()),
++            DeleteOutcome::Error {
++                key: "c".to_string(),
++                code: "InternalError",
++                message: "boom".to_string(),
++            },
++        ];
++        // Verbose: a `<Deleted>` per removed/absent key (escaped) plus per-key `<Error>`.
++        let verbose = render_delete_result(&outcomes, false);
++        assert!(verbose.contains("<Deleted><Key>a&amp;b</Key></Deleted>"));
++        assert!(verbose.contains(
++            "<Error><Key>c</Key><Code>InternalError</Code><Message>boom</Message></Error>"
++        ));
++        // Quiet: the `<Deleted>` entries are omitted; the `<Error>` still reported.
++        let quiet = render_delete_result(&outcomes, true);
++        assert!(!quiet.contains("<Deleted>"));
++        assert!(quiet.contains("<Error><Key>c</Key>"));
++    }
+ }
+diff --git a/crates/server/tests/s3_delete_objects.rs b/crates/server/tests/s3_delete_objects.rs
+new file mode 100644
+index 0000000..263a2cd
+--- /dev/null
++++ b/crates/server/tests/s3_delete_objects.rs
+@@ -0,0 +1,477 @@
++//! Bulk **DeleteObjects** on the S3 wire surface (issue #509, ADR-0046 routing) — exercised
++//! over a real loopback listener, the same in-process redb + fs-tempdir stack
++//! `s3_object_metadata.rs` drives, and with a **stock `aws-sdk-s3` client** (mirroring the
++//! `s3_gateway_cluster.rs::sdk_client` harness) so the SDK builds the signed
++//! `POST /bucket?delete` + XML body for real.
++//!
++//! The load-bearing assertions (the brief's success criterion):
++//!
++//! * a `delete_objects()` naming N keys — some present, at least one absent — returns 200 with a
++//!   `<DeleteResult>` naming each requested key exactly once as `<Deleted>` (removed AND absent
++//!   keys, because S3 delete is idempotent), and subsequent GETs of the deleted keys answer
++//!   `404 NoSuchKey`;
++//! * with `Quiet=true` the result omits the `<Deleted>` entries (the objects are still gone);
++//! * a malformed XML body answers `400 MalformedXML`;
++//! * a document that is not well-formed XML — a SECOND `<Delete>` root, non-whitespace content
++//!   trailing the closed root, junk after a tag name (`</Key garbage>`, `<Delete garbage>`), a
++//!   DUPLICATE attribute name (`<Delete x='1' x='2'>`), or a `<` / bare `&` inside an attribute
++//!   value (`<Delete x='<'>`, `<Delete x='&'>`) — is `400 MalformedXML` AND deletes nothing (a
++//!   rejected body must never authorise a deletion: the scanner validates the whole XML grammar
++//!   and fails closed, it does not reduce a mangled tag to a plausible one);
++//! * a request naming more than 1000 keys is refused;
++//! * a body past the buffered-byte cap is refused before it is fully resident;
++//! * an entity-escaped key (`a&amp;b`) deletes the right object (`bucket/a&b`).
++//!
++//! RED on the wave base: `POST /bucket?delete` is the bucket-only `400 InvalidRequest` (or, with
++//! 507's routing split folded in, the `delete` subresource's `501 NotImplemented`); either way
++//! it is not a `<DeleteResult>`, so every assertion below fails. GREEN once the bulk handler
++//! routes and answers. The test drives the wire only (SDK + signed HTTP), importing no new
++//! production symbol, so the C4-verify red leg fails by assertion, not compile error.
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use aws_sdk_s3::config::{Credentials as SdkCredentials, Region};
++use aws_sdk_s3::primitives::ByteStream;
++use aws_sdk_s3::types::{Delete, ObjectIdentifier};
++use aws_sdk_s3::Client;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++const BUCKET: &str = "bucket";
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++/// A gateway with a small chunk size so a modest object still spans several chunks over the
++/// streaming wire path (matching the `s3_object_metadata.rs` harness).
++fn build_gateway(dir: &std::path::Path) -> Arc<Backend> {
++    Arc::new(
++        Gateway::new(
++            RedbMetadataStore::in_memory().expect("redb"),
++            FsChunkStore::open(dir).expect("fs store"),
++            MemCoordination::new(),
++        )
++        .with_chunk_size(8),
++    )
++}
++
++/// Start the S3 gateway on an ephemeral loopback port. The `TempDir` is returned so the caller
++/// keeps the chunk store alive for the test.
++async fn start_gateway() -> (SocketAddr, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let gateway = build_gateway(dir.path());
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(gateway, config);
++    tokio::spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    (addr, dir)
++}
++
++/// An `aws-sdk-s3` client pointed at the loopback gateway — a real SDK configured the way any
++/// S3-compatible endpoint is reached (custom endpoint, path-style, static creds, plaintext).
++/// Mirrors `s3_gateway_cluster.rs::sdk_client`; retries and stalled-stream protection are off so
++/// the test is deterministic.
++fn sdk_client(addr: SocketAddr) -> Client {
++    let http_client = aws_smithy_http_client::Builder::new().build_http();
++    let config = aws_sdk_s3::Config::builder()
++        .behavior_version_latest()
++        .region(Region::new(REGION))
++        .endpoint_url(format!("http://{addr}"))
++        .credentials_provider(SdkCredentials::new(
++            ACCESS_KEY, SECRET_KEY, None, None, "static",
++        ))
++        .http_client(http_client)
++        .force_path_style(true)
++        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
++        .stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
++        .build();
++    Client::from_conf(config)
++}
++
++/// PUT one object of a few bytes under `key` via the SDK.
++async fn put_object(client: &Client, key: &str) {
++    client
++        .put_object()
++        .bucket(BUCKET)
++        .key(key)
++        .body(ByteStream::from(format!("body-of-{key}").into_bytes()))
++        .send()
++        .await
++        .unwrap_or_else(|e| panic!("PUT {key} failed: {e:?}"));
++}
++
++/// Assert that GET of `key` answers `404 NoSuchKey` — the object is gone.
++async fn assert_absent(client: &Client, key: &str) {
++    let err = client
++        .get_object()
++        .bucket(BUCKET)
++        .key(key)
++        .send()
++        .await
++        .expect_err("a deleted key must GET as an error");
++    let service = err.into_service_error();
++    assert!(
++        service.is_no_such_key(),
++        "expected 404 NoSuchKey for {key}, got {service:?}",
++    );
++}
++
++/// Assert that GET of `key` still succeeds — the object survived. Used to prove a REJECTED
++/// bulk delete touched no keys (a malformed body must not delete anything).
++async fn assert_present(client: &Client, key: &str) {
++    client
++        .get_object()
++        .bucket(BUCKET)
++        .key(key)
++        .send()
++        .await
++        .unwrap_or_else(|e| panic!("expected {key} to still exist, GET failed: {e:?}"));
++}
++
++/// Build a `Delete` payload from keys, optionally quiet.
++fn delete_payload(keys: &[&str], quiet: bool) -> Delete {
++    let mut builder = Delete::builder();
++    for key in keys {
++        builder = builder.objects(
++            ObjectIdentifier::builder()
++                .key(*key)
++                .build()
++                .expect("object identifier"),
++        );
++    }
++    builder.quiet(quiet).build().expect("delete payload")
++}
++
++/// Send one HTTP/1.1 request over a fresh connection and return `(status, head, body)` — the raw
++/// head so the caller can read the status line. Mirrors `s3_object_metadata.rs::send`.
++async fn send(
++    addr: SocketAddr,
++    method: &str,
++    path: &str,
++    headers: &[(String, String)],
++    body: &[u8],
++) -> (u16, String, Vec<u8>) {
++    let host = addr.to_string();
++    let mut request = format!("{method} {path} HTTP/1.1\r\n");
++    request.push_str(&format!("host: {host}\r\n"));
++    for (name, value) in headers {
++        request.push_str(&format!("{name}: {value}\r\n"));
++    }
++    request.push_str(&format!("content-length: {}\r\n", body.len()));
++    request.push_str("connection: close\r\n\r\n");
++
++    let mut stream = TcpStream::connect(addr).await.expect("connect");
++    stream
++        .write_all(request.as_bytes())
++        .await
++        .expect("write head");
++    stream.write_all(body).await.expect("write body");
++    stream.flush().await.expect("flush");
++
++    let mut raw = Vec::new();
++    stream.read_to_end(&mut raw).await.expect("read response");
++    let split = raw
++        .windows(4)
++        .position(|w| w == b"\r\n\r\n")
++        .expect("response has a header terminator");
++    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
++    let status: u16 = head
++        .lines()
++        .next()
++        .and_then(|line| line.split_whitespace().nth(1))
++        .and_then(|code| code.parse().ok())
++        .expect("numeric status");
++    (status, head, raw[split + 4..].to_vec())
++}
++
++/// Sign and send a raw `POST /{bucket}?{query}` with `body`, driving the wire directly — used
++/// for inputs the typed SDK will not produce (a malformed XML body, an over-limit key count).
++/// Signs exactly as `s3_object_metadata.rs` does; the query is signed and sent verbatim so the
++/// gateway's SigV4 verify recomputes the same canonical form.
++async fn post_delete_raw(addr: SocketAddr, query: &str, body: &[u8]) -> (u16, String, Vec<u8>) {
++    let host = addr.to_string();
++    let uri = format!("/{BUCKET}");
++    let amz_date = format_amz_date(SystemTime::now());
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let signed = sign(
++        "POST", &uri, query, &host, &amz_date, body, &creds, REGION, "s3",
++    );
++    let headers = vec![
++        ("authorization".to_string(), signed.authorization),
++        ("x-amz-date".to_string(), signed.amz_date),
++        ("x-amz-content-sha256".to_string(), signed.content_sha256),
++    ];
++    let target = format!("{uri}?{query}");
++    send(addr, "POST", &target, &headers, body).await
++}
++
++/// Drive a raw malformed-body attack: PUT `victim`, POST the (rejected) `body`, and assert
++/// `400 MalformedXML` AND that `victim` survived. The load-bearing invariant across every
++/// not-well-formed body: a rejected request authorises no deletion.
++async fn assert_rejected_and_keeps_victim(body: &[u8]) {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++    put_object(&client, "victim").await;
++
++    let (status, head, resp) = post_delete_raw(addr, "delete", body).await;
++    let resp = String::from_utf8_lossy(&resp);
++    assert_eq!(
++        status,
++        400,
++        "a not-well-formed DeleteObjects body must be 400: {head}\nbody sent: {}",
++        String::from_utf8_lossy(body),
++    );
++    assert!(
++        resp.contains("MalformedXML"),
++        "expected S3 MalformedXML code, got body: {resp}",
++    );
++    // The load-bearing assertion: the rejected request removed nothing.
++    assert_present(&client, "victim").await;
++}
++
++#[tokio::test]
++async fn delete_objects_removes_present_and_absent_keys_idempotently() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++
++    // Three present objects; the delete also names one that was never stored.
++    for key in ["k1", "k2", "nested/k3"] {
++        put_object(&client, key).await;
++    }
++    let requested = ["k1", "k2", "nested/k3", "never-existed"];
++
++    let out = client
++        .delete_objects()
++        .bucket(BUCKET)
++        .delete(delete_payload(&requested, false))
++        .send()
++        .await
++        .expect("delete_objects returns a well-formed DeleteResult (200)");
++
++    assert!(
++        out.errors().is_empty(),
++        "no per-key errors expected, got {:?}",
++        out.errors()
++    );
++    let mut deleted: Vec<String> = out
++        .deleted()
++        .iter()
++        .map(|d| d.key().expect("a <Deleted> names its key").to_string())
++        .collect();
++    deleted.sort();
++    let mut expected: Vec<String> = requested.iter().map(|k| k.to_string()).collect();
++    expected.sort();
++    // Each requested key named exactly once — removed AND absent keys are <Deleted> (idempotent).
++    assert_eq!(
++        deleted, expected,
++        "every requested key must appear once as <Deleted>, present or absent",
++    );
++
++    // The present keys are actually gone now.
++    for key in ["k1", "k2", "nested/k3"] {
++        assert_absent(&client, key).await;
++    }
++}
++
++#[tokio::test]
++async fn delete_objects_quiet_omits_deleted_entries_but_still_deletes() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++
++    for key in ["q1", "q2"] {
++        put_object(&client, key).await;
++    }
++
++    let out = client
++        .delete_objects()
++        .bucket(BUCKET)
++        .delete(delete_payload(&["q1", "q2"], true))
++        .send()
++        .await
++        .expect("quiet delete_objects still returns 200");
++
++    assert!(
++        out.deleted().is_empty(),
++        "Quiet=true omits <Deleted> entries, got {:?}",
++        out.deleted()
++    );
++    assert!(out.errors().is_empty(), "no errors expected");
++
++    // Omitting the <Deleted> entries does not mean the objects survived.
++    for key in ["q1", "q2"] {
++        assert_absent(&client, key).await;
++    }
++}
++
++#[tokio::test]
++async fn delete_objects_entity_escaped_key_deletes_the_right_object() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++
++    // A key whose bytes are XML-special: the SDK entity-escapes it in the body (`a&amp;b`), and
++    // the gateway must unescape it to delete the stored `bucket/a&b`.
++    let key = "a&b/weird<key>";
++    put_object(&client, key).await;
++
++    let out = client
++        .delete_objects()
++        .bucket(BUCKET)
++        .delete(delete_payload(&[key], false))
++        .send()
++        .await
++        .expect("delete of an entity-escaped key returns 200");
++
++    let deleted: Vec<&str> = out.deleted().iter().filter_map(|d| d.key()).collect();
++    assert_eq!(
++        deleted,
++        vec![key],
++        "the entity-escaped key round-trips through the body and is reported deleted",
++    );
++    assert_absent(&client, key).await;
++}
++
++#[tokio::test]
++async fn delete_objects_malformed_xml_is_rejected() {
++    let (addr, _dir) = start_gateway().await;
++    let (status, head, body) = post_delete_raw(addr, "delete", b"this is not valid XML").await;
++    let body = String::from_utf8_lossy(&body);
++    assert_eq!(status, 400, "a malformed <Delete> body is a 400: {head}");
++    assert!(
++        body.contains("MalformedXML"),
++        "expected S3 MalformedXML code, got body: {body}",
++    );
++}
++
++#[tokio::test]
++async fn delete_objects_multiple_roots_are_rejected_and_delete_nothing() {
++    // A well-formed DeleteObjects body has EXACTLY ONE `<Delete>` root. A body with a SECOND
++    // root must be MalformedXML — and, critically, must delete NOTHING (the iteration-4 class).
++    assert_rejected_and_keeps_victim(
++        b"<Delete></Delete><Delete><Object><Key>victim</Key></Object></Delete>",
++    )
++    .await;
++}
++
++#[tokio::test]
++async fn delete_objects_trailing_content_after_root_is_rejected_and_deletes_nothing() {
++    // Non-whitespace character data after the closed `<Delete>` root is MalformedXML — the
++    // parser must reject it, not silently discard it (iteration-4 class).
++    assert_rejected_and_keeps_victim(
++        b"<Delete><Object><Key>victim</Key></Object></Delete>trailing garbage",
++    )
++    .await;
++}
++
++#[tokio::test]
++async fn delete_objects_junk_after_a_tag_name_is_rejected_and_deletes_nothing() {
++    // The iteration-5 destructive defect: a hand tokenizer reduced a tag to its first
++    // whitespace-delimited token, so `</Key garbage>` was accepted as `</Key>` — a body that
++    // must be rejected still authorised the key's deletion. Both a mangled END tag (the exact
++    // reviewer case) and the start-tag half of the same class must be 400 AND delete NOTHING.
++    for attack in [
++        b"<Delete><Object><Key>victim</Key garbage></Object></Delete>".to_vec(),
++        b"<Delete garbage><Object><Key>victim</Key></Object></Delete>".to_vec(),
++    ] {
++        assert_rejected_and_keeps_victim(&attack).await;
++    }
++}
++
++#[tokio::test]
++async fn delete_objects_duplicate_attribute_is_rejected_and_deletes_nothing() {
++    // The iteration-6 destructive defect: attribute syntax was validated but names were not
++    // tracked, so a duplicate attribute — `<Delete x='1' x='2'>` — was accepted (although XML's
++    // Unique Att Spec makes the document malformed) and its `<Key>victim</Key>` deleted.
++    for attack in [
++        b"<Delete x='1' x='2'><Object><Key>victim</Key></Object></Delete>".to_vec(),
++        b"<Delete><Object a=\"1\" a=\"2\"><Key>victim</Key></Object></Delete>".to_vec(),
++    ] {
++        assert_rejected_and_keeps_victim(&attack).await;
++    }
++}
++
++#[tokio::test]
++async fn delete_objects_malformed_attribute_value_is_rejected_and_deletes_nothing() {
++    // The iteration-7 destructive defect: an attribute value's interior was located by finding
++    // the closing quote but never validated, so a `<` or a bare `&` inside it (both forbidden by
++    // the XML `AttValue` production) was accepted — `<Delete x='<'>` deleted `victim`. The
++    // strict scanner now validates the value character by character.
++    for attack in [
++        b"<Delete x='<'><Object><Key>victim</Key></Object></Delete>".to_vec(),
++        b"<Delete x=\"a<b\"><Object><Key>victim</Key></Object></Delete>".to_vec(),
++        b"<Delete x='&'><Object><Key>victim</Key></Object></Delete>".to_vec(),
++        b"<Delete x='a&b'><Object><Key>victim</Key></Object></Delete>".to_vec(),
++    ] {
++        assert_rejected_and_keeps_victim(&attack).await;
++    }
++}
++
++#[tokio::test]
++async fn delete_objects_more_than_1000_keys_is_refused() {
++    let (addr, _dir) = start_gateway().await;
++    let mut xml = String::from("<Delete>");
++    for i in 0..1001 {
++        xml.push_str(&format!("<Object><Key>k{i}</Key></Object>"));
++    }
++    xml.push_str("</Delete>");
++
++    let (status, head, body) = post_delete_raw(addr, "delete", xml.as_bytes()).await;
++    let body = String::from_utf8_lossy(&body);
++    assert_eq!(
++        status, 400,
++        "a DeleteObjects naming more than 1000 keys is refused: {head}",
++    );
++    // Assert the S3 code, not merely the 400 status: the base's keyless-path `400
++    // InvalidRequest` is also a 400, so a status-only check would not discriminate red→green.
++    // Over-limit is specifically `MalformedXML` (S3 refuses, never truncates to the first 1000).
++    assert!(
++        body.contains("MalformedXML"),
++        "expected S3 MalformedXML code for an over-limit key count, got body: {body}",
++    );
++}
++
++#[tokio::test]
++async fn delete_objects_oversized_body_is_refused_before_it_is_resident() {
++    // The bulk-delete body is buffered whole (unlike a streamed object PUT), so the handler
++    // caps the buffered bytes BY CONSTRUCTION rather than trusting the declared Content-Length
++    // (brief §Scope: "bound the buffered body bytes"). A body past the cap is refused as it is
++    // read — before it is fully resident and before any key is touched. This drives the
++    // production `buffer_capped` -> `BufferError::TooLarge` -> 400 branch over the wire; the
++    // 1000-key semantic bound above cannot reach it (1001 small keys are well under the cap).
++    let (addr, _dir) = start_gateway().await;
++    // A single element whose text pads the body past the 2 MiB cap: well-formed XML, so a
++    // *green* handler that ignored the cap would parse it and answer 200 — only the byte cap
++    // makes this a 400.
++    let mut xml = String::from("<Delete><Object><Key>");
++    xml.push_str(&"a".repeat(3 * 1024 * 1024));
++    xml.push_str("</Key></Object></Delete>");
++
++    let (status, head, body) = post_delete_raw(addr, "delete", xml.as_bytes()).await;
++    let body = String::from_utf8_lossy(&body);
++    assert_eq!(
++        status, 400,
++        "a DeleteObjects body past the buffered-byte cap is refused: {head}",
++    );
++    assert!(
++        body.contains("MalformedXML"),
++        "expected S3 MalformedXML code for the oversized body, got body: {body}",
++    );
++}

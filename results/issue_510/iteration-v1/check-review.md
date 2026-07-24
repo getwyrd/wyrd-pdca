@@ -1,0 +1,15 @@
+Review of issue 510: add byte-range GETs and GET/HEAD conditional-request handling to the S3 gateway while reading only covering chunks.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance contract fixes the supported range forms, conditional precedence, S3 comparison semantics, and no-whole-object-read requirement in `brief.md:10`. |
+| C2 Reproduction (red pre-fix) | PASS | Independently retaining the wire test while restoring the three production files produced 0/7 passing tests, with the expected 200 responses and absent `Accept-Ranges` at `crates/server/tests/s3_range_conditional.rs:291`. |
+| C3 Change | FAIL | Wildcard preconditions must turn on existence, not availability of stored ETag metadata; `If-Match: *` wrongly returns 412 and `If-None-Match: *` wrongly returns 200 for an existing pre-ADR-0047 object because `etag_matches` returns `stored.is_some()` at `crates/gateway-s3/src/lib.rs:2101`. |
+| C4 Verification (red→green) | FAIL | The focused loopback test independently transitions from 0/7 to 7/7, but the required `typos` gate reproducibly rejects four patch-added spellings, including `unparseable` at `crates/gateway-s3/src/lib.rs:2056`. |
+| C5 Causal adequacy | PASS | The fix removes the ignored-header cause at the wire path and performs bounded reads at the storage seam; the covering-chunk selection at `crates/server/src/lib.rs:408` is exercised by the one-of-eight chunk oracle at `crates/server/tests/s3_range_conditional.rs:499`. |
+| T1 Structure | PASS | Protocol parsing remains in the S3 layer while the core/server seam accepts only offsets and lengths, preserving layer ownership at `crates/server/src/lib.rs:399`. |
+| T2 Shape | PASS | The separate ranged-read seam has a bounded stream result and leaves the existing full-read path intact, matching the requested cost shape at `crates/server/src/lib.rs:399`. |
+| T3 Runtime | PASS | The applied target completed `cargo test -p wyrd-server --test s3_range_conditional` with 7/7 passing, including cross-chunk slicing and the covering-chunk count at `crates/server/tests/s3_range_conditional.rs:274`. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether affected-path prior art is clear of closed/rejected competing work — merged/all-ref history was checked by affected path, but this checkout contains no mechanically authoritative closed/rejected review history, so collision risk remains. |
+| T5 Judgment | FAIL | Decide and test the promised `*` semantics for metadata-less existing objects before acceptance — the current tests cover only concrete ETags at `crates/server/tests/s3_range_conditional.rs:390`, so the legacy-object regression is unguarded. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the behavior meets real-client needs — after the two defects are fixed, run `aws s3api get-object --endpoint-url <gateway> --bucket wyrd-bucket --key <multi-chunk-key> --range bytes=8-15 <output>` and confirm 206 headers plus exact slice bytes, because the in-process oracle does not exercise the registered AWS CLI acceptance path. |

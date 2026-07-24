@@ -1,0 +1,15 @@
+Review of issue 509: implement S3 bulk `DeleteObjects` so signed `POST /bucket?delete` deletes requested keys and returns contract-compliant XML responses.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is testable at the wire: success, idempotent absence, quiet mode, malformed XML, the 1000-key limit, and entity decoding are concretely defined in `brief.md:9`. |
+| C2 Reproduction (red pre-fix) | PASS | A scratch checkout of target HEAD plus only the new wire test produced the required assertion-level red: 0/5 tests passed because the base returned 501 at `crates/server/tests/s3_delete_objects.rs:208`. |
+| C3 Change | FAIL | Malformed XML must be rejected, but a second top-level `<Delete>` is accepted whenever the stack becomes empty again, and text outside the root is silently discarded; this can delete keys from a document that is not well-formed XML at `crates/gateway-s3/src/lib.rs:2127`. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether independently confirmed focused 0/5→5/5 plus clean fmt/clippy is sufficient — the asserted aggregate `./engine/xtask.sh ci` and red→green wrapper are absent from the target, so their broader coverage could not be reproduced; the focused green begins at `crates/server/tests/s3_delete_objects.rs:208`. |
+| C5 Causal adequacy | PASS | The change removes the unsupported bucket-POST route and delegates to the existing delete primitive, with no capability probe or runtime symptom guard at `crates/gateway-s3/src/lib.rs:1477`. |
+| T1 Structure | PASS | The feature remains inside the S3 adapter and its wire integration test, preserving the gateway-core and storage seams at `crates/gateway-s3/src/lib.rs:1803`. |
+| T2 Shape | FAIL | The fixed-schema parser does not enforce one document element despite promising balanced, well-formed input, so its accepted-input shape is broader than the S3 XML contract at `crates/gateway-s3/src/lib.rs:2116`. |
+| T3 Runtime | PASS | The applied target passed all five loopback/SDK tests, including actual deletion, quiet output, malformed input, over-limit input, and entity-escaped keys at `crates/server/tests/s3_delete_objects.rs:208`. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether merged-history-only prior-art coverage is sufficient — affected-path `git log --all` found history for `crates/gateway-s3/src/lib.rs:1` and none for the new test, but local refs cannot establish closed/rejected work, which matters for avoiding duplicate contribution. |
+| T5 Judgment | PASS | No scope re-entry or unresolved architectural choice is required to judge the patch; the parser defect is mechanically decidable against the explicit malformed-XML criterion at `crates/gateway-s3/src/lib.rs:2120`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether this Alpha implementation is fit for real recursive-delete workflows — focused SDK wire behavior passed, but operator acceptance with `aws s3 rm --recursive` and `aws s3 sync --delete` remains outside the automated evidence at `crates/server/tests/s3_delete_objects.rs:208`. |
