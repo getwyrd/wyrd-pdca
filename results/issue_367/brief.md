@@ -114,7 +114,7 @@
   next", blueprint `:691`): labels precede spread-verification precedes zero-assertion
   precedes the kill-and-reconstruct loop.
 
-- **Do model:** opus-xhigh
+- **Do model:** opus-max
 - **Difficulty:** high — an umbrella/integration gate, not a confined code change.
   Its blast radius is the composition of five prior deliverables plus a
   multi-step, timing-sensitive verification loop (the reconstruction step waits on
