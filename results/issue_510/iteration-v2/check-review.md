@@ -1,0 +1,15 @@
+Review of issue 510: add byte-range GETs and GET/HEAD conditional-request handling to the S3 gateway while reading only covering chunks.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief gives executable wire outcomes, precedence rules, range edge cases, and a covering-chunk oracle; the required behavior is decision-complete. |
+| C2 Reproduction (red pre-fix) | PASS | In an isolated base clone with only the new test applied, 8/9 cases failed on ignored Range/conditional headers (for example expected 206 but got 200 at `crates/server/tests/s3_range_conditional.rs:291`). |
+| C3 Change | FAIL | Wildcard preconditions must turn on representation existence, but the object is already known to exist and `*` instead returns `stored.is_some()`, so legacy objects without ETags incorrectly yield 412 for `If-Match: *` and 200 for `If-None-Match: *` (`crates/gateway-s3/src/lib.rs:2114`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether the independently confirmed targeted red→green is sufficient despite the host-blocked final policy scan — all 9 targeted tests pass at `crates/server/tests/s3_range_conditional.rs:285`, and fmt/clippy/build/workspace tests passed, but `cargo deny check` could not acquire the read-only advisory DB lock. |
+| C5 Causal adequacy | FAIL | The implementation removes the ignored-header cause and bounds chunk reads, but the required `*` conditional semantics remain incomplete for pre-ADR-0047 objects because matching is coupled to ETag availability (`crates/gateway-s3/src/lib.rs:2114`). |
+| T1 Structure | PASS | The protocol-neutral range seam and wire-layer resolution preserve the gateway boundary, while the server maps spans to overlapping chunks (`crates/gateway-core/src/lib.rs:211`; `crates/server/src/lib.rs:399`). |
+| T2 Shape | PASS | The new range method, extracted GET/HEAD handlers, and focused wire test fit existing trait/dispatch/test shapes without a new dependency (`crates/gateway-core/src/lib.rs:211`; `crates/gateway-s3/src/lib.rs:1620`). |
+| T3 Runtime | PASS | The in-process wire suite observed correct 206/304/412/416 responses and the narrow-range oracle observed exactly one covering chunk fetched (`crates/server/tests/s3_range_conditional.rs:576`). |
+| T4 Contribution | NEEDS-HUMAN | Decide whether collision risk is acceptable — merged/all-ref history was checked by each affected path, but this checkout has no mechanically authoritative record of closed/rejected work for those paths. |
+| T5 Judgment | FAIL | Shipping wildcard support that changes behavior based on whether an existing legacy record happens to carry an ETag violates the stated compatibility behavior and needs correction or an explicit scope decision (`crates/gateway-s3/src/lib.rs:2109`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the feature is fit for real S3 clients after fixing wildcard semantics — the in-process signed-wire evidence is strong, but the reserved AWS CLI round-trip acceptance remains manual. |

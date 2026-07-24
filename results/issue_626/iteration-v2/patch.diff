@@ -1,0 +1,1318 @@
+diff --git a/docs/design/proposals/README.md b/docs/design/proposals/README.md
+index b521e1b..c15e068 100644
+--- a/docs/design/proposals/README.md
++++ b/docs/design/proposals/README.md
+@@ -29,5 +29,6 @@ This index is the authoritative record of each proposal's current status and any
+ | [0013](accepted/0013-implementation-arc-rescoped.md) | The implementation arc (rescoped) | accepted (supersedes 0002; tracker [#298](https://github.com/getwyrd/wyrd/issues/298)) |
+ | [0014](draft/0014-milestone-7-failover-and-dr-single-dc.md) | Milestone 7 — failover and disaster recovery, single-DC | draft (authoring: [#368](https://github.com/getwyrd/wyrd/issues/368)) |
+ | [0015](accepted/0015-milestone-4-production-metadata-backend-revised.md) | Milestone 4 — production metadata backend (TiKV), revised | accepted (supersedes 0007; tracker [#201](https://github.com/getwyrd/wyrd/issues/201)) |
++| [0016](draft/0016-multipart-commit-protocol.md) | The multipart commit protocol (assembled writes) | draft (settlement: [#626](https://github.com/getwyrd/wyrd/issues/626)) |
+ 
+ ¹ Frozen pre-rescope: uses proposal 0002's original milestone numbering (old M5/M6/M7 = cross-zone replication / global control plane / cross-zone DR → **M9/M10/M11** today), and where these files call M4 the release point or the first deployable/usable product, that is superseded too — the **Step-2 ★ release point moved to M8** (M4 is a soft stopping point that completes the data plane). Reconcile through [0013's old→new mapping table](accepted/0013-implementation-arc-rescoped.md).
+diff --git a/docs/design/proposals/draft/0016-multipart-commit-protocol.md b/docs/design/proposals/draft/0016-multipart-commit-protocol.md
+new file mode 100644
+index 0000000..70484fa
+--- /dev/null
++++ b/docs/design/proposals/draft/0016-multipart-commit-protocol.md
+@@ -0,0 +1,1301 @@
++---
++created: 23.07.2026 21:35
++type: proposal
++status: draft
++author: Eduard Ralph
++tracking-issue: "#626"
++tags:
++  - proposal
++  - s3
++  - multipart
++  - metadata
++  - custodian
++  - commit-protocol
++---
++# Proposal: The multipart commit protocol — publication, protection, and reclamation for assembled writes
++
++> **What this settles.** Everything *underneath* `CompleteMultipartUpload`: what proves an
++> assembled chunk map is safe to publish, what protects durable-but-unpublished bytes and
++> which maintenance consumer sees them, the upload lifecycle and its failure semantics, the
++> bounded-work pattern for objects whose fan-out is proportional to their size, the
++> reclamation evidence a failed in-flight write must leave, the abandoned-upload **reaper**
++> (both its protocol-facing half and its detection/sweep algorithm), and **chunk-map
++> segmentation** — the record shape and staged publication that let a published object exceed
++> what one metadata value can hold.
++>
++> **What this does not settle.** The S3 wire surface — routing, denylist removal, the
++> percent-encoding fence, exact status and error codes — stays with the implementing slice
++> [#508][i508]; it was stable across every round of adversarial review and is not in
++> question. This proposal *decides*; it implements nothing. The reaper's **implementation**
++> stays [#625][i625] (this document is its design), and the ETag basis is closed by
++> [ADR-0047][a47]. Choosing knob *values* inside the valid ranges settled here, and wiring
++> the metrics/alerts/CLI, stays with the implementing slices.
++>
++> **The class, not the feature.** Multipart is the first **assembled write** — a write whose
++> durable staging outlives any single request or lease window. Server-side copy ([#504][i504]
++> step 2) and any future resumable write have the same shape, which is why three of these
++> decisions are recommended for graduation to ADRs (see *Graduation criteria*).
++>
++> **Reading the citations.** Every `path:line` citation is pinned to `origin/main` at commit
++> `cd82a29`; lines move, so treat the path plus the quoted contract as authoritative and the
++> line as a pin. This proposal is a **draft** under [ADR-0037][a37] and is editable until it
++> is ratified; ratification (draft → accepted, architecture-board / founding-maintainer
++> authority) is a separate governance act that is **not** part of this cycle.
++
++## Motivation
++
++`CompleteMultipartUpload` is not a new verb over the existing write path. It is the first
++consumer of the metadata layer's safety contracts that violates the shape those contracts
++were written for — a single streaming upload, publishing inside one 30-second lease window —
++and it violates all four of them at once:
++
++- **Publication is lease-conditional and TTL-timed.** "These bytes are still safe to publish
++  over" is proved today by *lease liveness*: every chunk must hold an unexpired `pending:`
++  lease, checked by compare-and-set preconditions riding in the publishing batch
++  (`live_lease_guards`, `crates/core/src/metadata.rs:763-796`, issue #490 — an absent **or**
++  lapsed entry fails closed with `Conflict`). The TTL is 30 s
++  (`crates/server/src/lib.rs:53`) and is renewed only while a single `stream_write_data`
++  call is in flight (`crates/core/src/write.rs:474-500`; a renewal that finds a lapsed lease
++  aborts the upload rather than resurrect dead authority). A multipart Complete assembles a
++  chunk map from parts committed minutes, hours, or days apart. **Lease liveness cannot be
++  the proof**, and no *correctness* timer may be put on an inherently long-lived operation.
++- **The maintenance planes gate on committed state only.** The reference set that protects
++  bytes from reclamation is built from *committed* inode chunk maps and nothing else — a
++  pending inode's provisional map is excluded **by design**
++  (`crates/custodian/src/gc.rs:217-228`, built at `:249-260`). GC's safety gate
++  (`gc.rs:162`, via `ReferenceSet::protects`, `:244-246`), the restore pass's identical gate
++  (`crates/custodian/src/restore.rs:218-224`), scrub's walk of `referenced.placed`
++  (`crates/custodian/src/scrub.rs:95-110`) and drain's `genuinely_holds`
++  (`crates/custodian/src/desired_state.rs:157-164`) share that one set; reconstruction
++  (`crates/custodian/src/reconstruction.rs:313-325`, scan at `:607`), rebalance evacuation
++  planning (`crates/custodian/src/rebalance.rs:147-151`) and backfill
++  (`crates/custodian/src/backfill.rs:79`) scan committed `inode:` records independently.
++  Multipart introduces a **third class** of durable byte — committed to disk, referenced by
++  something that is not an inode, not yet published — and today's two-class world has no
++  place for it.
++- **The metadata model assumes small records.** The store trait inherits its backend's
++  limits — "FoundationDB's are the tightest in play and are therefore the de-facto ceiling:
++  10 KB key, 100 KB value, 10 MB and 5 s per transaction" — and states that the model in
++  `core` "writes small records and stays far inside them"
++  (`crates/traits/src/lib.rs:744-758`). Multipart is the feature that makes a *large* object
++  routine, and then permits overwriting it, at which point publication owes one `put` per
++  prior fragment **in a single batch** (`commit_chunk_map_superseding`,
++  `crates/core/src/metadata.rs:582-619`). It also makes the *value* ceiling bite: a chunk map
++  large enough to describe a multi-gigabyte object does not fit in one 100 KB value at all
++  (the arithmetic is in decision 4 and decision 7).
++- **Batches are explicitly non-idempotent.** "A batch is not guaranteed idempotent … A
++  caller that wants replay safety must build that safety into the batch itself"
++  (`crates/traits/src/lib.rs:833-843`), and a commit whose outcome is unknown has exactly
++  one remedy: re-read and establish what happened (`:738-745`). A Complete that a client
++  retries after a timeout must be distinguishable from a first Complete by **durable
++  evidence** — and once publication is *staged* (decision 7), that evidence must survive a
++  crash in the middle of it.
++
++The sharpest consequence needs no crash. Fence a Complete `Open → Completing`; let a
++concurrent `PutObject` to the same key win the publication compare-and-set — `create`'s
++`require_absent` on inode and dirent (`crates/core/src/metadata.rs:366-382`) or the
++superseding CAS on the prior inode's bytes (`:582-619`). Complete's publish returns
++`Conflict`. With no defined exit from the fenced state, the session is stuck forever and
++every staged byte it references is protected forever. That is not a bug in an
++implementation; it is a protocol that was never written down.
++
++Rounds of adversarial plan review on #508 each closed the previous round's findings and
++surfaced a defect one layer deeper, because a slice is only briefable when **the negations
++of its success criterion are enumerable** — for every way to implement it wrong, an
++observable that fails. This proposal exists to make that enumeration possible: seven
++decisions, each with its invariant and its failure-mode table, plus a register of concrete
++executions (crash points, lost races, operator actions, clock mismatches, segment-write
++crashes) and what disposes of each.
++
++### The honest object ceiling — why segmentation is in scope
++
++The launch requirement is objects **over 10 GiB**. A published chunk map is one JSON value,
++and one value cannot hold an unbounded map. Working the arithmetic through (decision 4): a
++`ChunkRef` encodes to ~131 B (small D-server ids) to ~302 B (worst-case `u64` ids), and the
++100 KB value ceiling with 2× headroom holds only **165–381 chunks** — about **165–381 MiB**
++of object at the 1 MiB default chunk size (`crates/server/src/lib.rs:51`). That is *below*
++the 5 GB single-PUT ceiling, not above it; even 13–32 MiB chunks reach only ~5–12 GiB,
++traded against gateway memory (`chunk_size × max_concurrent_encodes`, a chunk is buffered to
++erasure-code it). A design that stops there cannot deliver the feature's own promise.
++Therefore **chunk-map segmentation is settled here** (decision 7), designed *with* the
++staged-obligation machinery of decision 4 as one pattern family, not beside it — a segmented
++map cannot be published in one batch, so it needs its own staged publication (write segments,
++then flip the root). The computed ceilings, flat and segmented, are stated as real numbers in
++the accepted-costs register.
++
++### Implementation order — normative
++
++**[#625][i625] (the reaper) MUST land with or before [#508][i508] (multipart).** This is a
++requirement, not a preference, and it follows from the design rather than from taste:
++
++1. The protocol has states whose **only** exit is the reaper — a session whose client walked
++   away (no verb will ever arrive), a session fenced into `Completing` by a gateway that then
++   crashed, a teardown obligation whose draining gateway died mid-drain, a session that has
++   outlived its `W_session` residency ceiling (decision 6). Sweeper-only exits are permitted
++   *because* the sweeper is designed here (decision 6) and its absence would make those states
++   absorbing, violating invariant (3).
++2. Without the reaper, staged records only accumulate. The admission counter (decision 6)
++   bounds the live-session namespace even with the reaper down, but a bound with no drain is a
++   permanent `503 SlowDown` — the service stops accepting uploads rather than losing data, but
++   it stops. `MetadataStore::scan` fails loud above `SCAN_CAP = 1 << 20` with no partial
++   result (`crates/traits/src/lib.rs:275-292`; backends clamp to it,
++   `crates/metadata-redb/src/lib.rs:73-78`), and a reference-set build that crossed the cap
++   would abort the whole reconcile step before GC, scrub, reconstruction and rebalance run
++   (each leg `?`-propagates, `crates/custodian/src/reconciliation.rs:75-112`). The admission
++   counter is what keeps every namespace under the cap; the reaper is what keeps the service
++   accepting work.
++
++Both are required, and they are required in the same release as the S3 verbs that create
++sessions. A deployment that exposes `CreateMultipartUpload` without a running reaper is
++misconfigured, and the implementing slices MUST make that state visible (a startup refusal or
++an operator-visible alarm — the mechanism is #508's and #625's, the requirement is this
++proposal's).
++
++## Design
++
++### Settled directions this design applies (sign-off, 2026-07-23)
++
++Eight directions were settled by the maintainer at sign-off and are **applied** below as
++decisions taken, not re-opened. They are referenced by label (`D-A`…`D-H`) at each point of
++use; none is flagged NEEDS-HUMAN, because the design honours all eight.
++
++- **D-A — Session lifetime.** No *correctness* timer; one *administrative* residency ceiling
++  `W_session` (from initiation, deployment default, per-bucket tighten-only) bounds residency
++  (decisions 1, 2, 6). The reaper stays record-only.
++- **D-B — Restore.** No resumption across a metadata restore; a restore fences/aborts every
++  session open in the restored image (decisions 1.4, 2, 3; F13).
++- **D-C — Admission is guaranteed.** A serialized slot reservation — a counter CAS'd in the
++  create batch, released in the terminal delete; contention is the `503 SlowDown` (decision 6;
++  F12). Create only — part commits stay counter-free.
++- **D-D — Namespace cardinality.** Per-session indexed access to owned `pending:` (`sidx:`),
++  cursor-keyed bounded `retire:` walks, an in-flight-part cap, all-records admission
++  accounting, bounded tombstone retention, and drain-health alarms (decisions 4, 5, 6; F11).
++- **D-E — Mechanical repairs.** `W_completing` from the fence instant; best-effort `UploadPart`
++  refusal with the authoritative check at Complete; the clock table owns the reaper's owned-lease
++  read; the reaper stale-snapshot rule (decisions 3, 4, 6; F15, F16, F17, F10).
++- **D-F — Honest arithmetic.** Computed ceilings as real numbers in the accepted-costs register
++  (decisions 4, 7).
++- **D-G — Segmentation in scope.** Staged publication (write segments, then root flip) designed
++  with decision 4's machinery as one pattern family (decision 7).
++- **D-H — Structure.** One document — 0016 expanded in place.
++
++### 0. Vocabulary
++
++- **Assembled write** — a write whose durable staging outlives any single request or lease
++  window. Multipart today; server-side copy (#504 step 2) and resumable writes tomorrow.
++- **Staged bytes** — fragments durably written to D servers, referenced by a staging record,
++  not referenced by any committed inode.
++- **Session** — one multipart upload, from `CreateMultipartUpload` to its terminal state.
++- **Fence** — a compare-and-set on the session record that both changes its state and bumps
++  its **epoch**, so every operation that preconditions on the old epoch bytes fails closed.
++- **Retirement** — the bounded, durable, idempotent draining of an obligation installed at
++  publication or teardown.
++- **Segmented map** — a published chunk map too large for one value, split into a bounded set
++  of segment records named by a root (decision 7). A **flat map** is the inline chunk list an
++  object small enough for one value carries today.
++
++### 1. The records (ADR-0046: real records, not synthesized encodings)
++
++[ADR-0046][a46] settled that a new namespace concept gets first-class records under a
++disjoint prefix, not encodings smuggled into an existing namespace, and that such a record
++states its key shape, who writes it, who deletes it, and which scans see it. It also flagged
++that a **scan-then-commit** emptiness/population check is race-prone (`0046` §Consequences on
++`DeleteBucket`) — the reason admission here is a serialized reservation, not a scan
++(decision 6). The existing namespaces are `inode:` / `dirent:` / `pending:` / `bucket:` /
++`orphan:` (`crates/core/src/metadata.rs:30-70`) and `desired:dserver:`
++(`crates/custodian/src/desired_state.rs:33-38`). This protocol adds the following, all
++disjoint from each other and from the above (no prefix is a prefix of another, so no `scan`
++returns a neighbour's records):
++
++| Key | Value (JSON, as every record today) | Written by | Deleted by | Scanned / read by |
++|---|---|---|---|---|
++| `mpuctl:count` | one integer: the number of `mpu:` records that exist in any state (the admission counter, decision 6) | CAS'd `+1` in the Create batch; CAS'd `-1` in the batch that deletes the last session record | never deleted (a fixed singleton) | Create (read-then-CAS reservation) |
++| `mpu:<upload-id>` | session: target bucket/key, `content_type`, `created_at_millis`, `clock_source`, `state`, `epoch`; on `Completing` also `fenced_at_millis` and `publish_target`; on `Completed` the published `{inode, version, etag, completed_at_millis}` | `CreateMultipartUpload` (`require_absent` + counter CAS); every later state change is a fenced CAS | the retirement drain, last of all its records (with the counter `-1`) | the staged reference build; the reaper (one bounded `scan("mpu:")`, ≤ `MAX_SESSIONS`); `ListMultipartUploads` |
++| `part:<upload-id>:<part-number>` | part: `chunks: Vec<ChunkRef>`, `len`, `digest`, `committed_at_millis`, `session_epoch` | the fenced part commit (`UploadPart`), and only it — **no maintenance pass ever writes a part record except under the session fence** (decision 2, reconstruction row) | the retirement drain | the staged reference build; the reaper and every resolver via the **bounded per-session range** `scan("part:<upload-id>:")` (≤ `MAX_PARTS_PER_SESSION`); `ListParts`; Complete |
++| `sidx:<upload-id>:<chunk-id>` | empty (an index record): "this owned `pending:` entry belongs to this session" | `write::intent` for a staging write, atomically with the owned `pending:` entry | the part commit or compensation that deletes the `pending:` entry; else the reaper | the reaper, via the **bounded per-session range** `scan("sidx:<upload-id>:")` (≤ `MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`) — this is what replaces any global `pending:` scan |
++| `seg:<upload-id>:<index>` | one segment of a published map: `chunks: Vec<ChunkRef>`, `byte_offset`, `byte_len` (decision 7) | the Completing session's segment-write phase (bounded batches, before the root flip) | the retirement drain — on abort/rollback, or when the object that owns them is superseded/deleted | every maintenance consumer resolving a **segmented** committed inode, via the bounded per-object range `scan("seg:<upload-id>:")` (≤ `MAX_ROOT_SEGMENTS`) |
++| `retire:bytes:<token>` | one of `{session, parts}` / `{chunks}` / `{generation: {inode, version, chunks, segments?}}` — bytes to orphan-mark, then the naming records to delete | the batch that removed the last reference to those bytes, atomically with it | the retirement drain, when the obligation is fully drained | the reaper, via cursor-keyed **bounded key ranges** (never one unbounded scan) |
++| `retire:records:<token>` | `{session, parts}` and/or `{seg: <upload-id>}` — staging records (part records and/or dangling segment records) to delete whose bytes are protected by something else | the publication batch (part records), or a Completing rollback/abort (dangling segments) | the retirement drain | the reaper, via cursor-keyed **bounded key ranges** |
++
++`parts` is a **range-encoded part-number set** (`[[1, 400]]` for a contiguous run), so the
++common "every staged part was published" case is a few bytes and the worst case — 10,000
++alternating numbers — stays inside one value. It is what distinguishes the two obligations a
++Complete can install: S3 publishes **only the parts the client names**, so the named parts'
++records are deleted (`retire:records:`) and any staged part the client did *not* name has its
++bytes orphaned and then its record deleted (`retire:bytes:`). Deriving that set later from
++the published map instead would mean reading an inode that may already have been superseded.
++
++**Why the mode lives in the key, not in a field.** `retire:bytes:` orphan-marks fragments;
++`retire:records:` must never orphan anything, because its bytes are live object content or
++still protected by a part record. A boolean field misread once is silent data loss; a
++malformed key prefix is an error at decode, which is the boundary [ADR-0045][a45] puts
++structural invariants at (the rubric's *Metadata validation boundaries* rule). The drain
++dispatches on the prefix and treats a `retire:` key it cannot parse as an error, never as a
++default.
++
++**One additive field on an existing record.** `PendingEntry`
++(`crates/core/src/metadata.rs:344-350`) gains
++
++```rust
++#[serde(default, skip_serializing_if = "Option::is_none")]
++pub owner: Option<String>,   // the upload id, for session-owned staging writes
++```
++
++`skip_serializing_if` is **load-bearing**, exactly as it is for [ADR-0047][a47]'s optional
++inode fields: `renew_pending` and `live_lease_guards` compare the *re-encoded* prior entry
++byte-for-byte against stored bytes (`crates/core/src/metadata.rs:748-758`, `:786-793`), so
++`decode → encode` must be the identity on a legacy entry. Emitting `"owner":null` would turn
++every renewal and every lease guard on a pre-upgrade entry into a permanent `Conflict`. This
++is the *Serialization identity* class the review rubric calls out (`AGENTS.md:170-174`), and
++the round-trip test is named in *Graduation criteria*. The `owner` tag lets the expiry sweep
++recognise (and skip) an owned entry in O(1); the `sidx:` index is the forward direction — how
++the reaper *enumerates* one session's owned entries without a global scan.
++
++**Upload ids** are 128-bit random tokens rendered as lowercase hex, minted by the gateway —
++coordination-free in the same spirit as the chunk-id epoch (`crates/server/src/lib.rs:237-251`,
++[ADR-0019][a19]). `require_absent` on the session key turns the (astronomically unlikely)
++collision into a `Conflict`, never a shared session — the same 2^-128 basis as the chunk-id
++epoch (execution X31).
++
++### 2. The state machine
++
++```text
++                       CreateMultipartUpload
++                                │  reserve: read mpuctl:count < MAX_SESSIONS,
++                                │  CAS count+1 && require_absent(mpu:<id>)  (one batch)
++                                ▼
++   ┌──────────────────────── Open@E ────────────────────────┐
++   │  UploadPart: require(mpu == Open@E)  (no write to it)  │
++   │                                                        │
++   ├─ Complete fence ─────────► Completing@E+1              │  (stamps fenced_at_millis,
++   │       (validate, then segment-write phase, then flip)  │   publish_target)
++   │                             │                          │
++   │                             ├─ root flip wins ──────► Completed@E+2 ──► (drain) ──► ∅ (count-1)
++   │                             ├─ publish CAS lost ─────► Open@E+2   (fence released, seg cleanup)
++   │                             ├─ request invalid ──────► Open@E+2   (fence released, 4xx, seg cleanup)
++   │                             └─ completer crashed ────► Open@E+2   (reaper rollback, seg cleanup)
++   │                                                        │
++   ├─ Abort fence ────────────► Aborting@E+1 ──► (drain) ──► ∅ (count-1)
++   ├─ reaper fence (abandoned) ► Aborting@E+1 ──► (drain) ──► ∅ (count-1)
++   └─ reaper fence (W_session) ► Aborting@E+1 ──► (drain) ──► ∅ (count-1)
++```
++
++Every transition is a compare-and-set on the **exact current bytes** of the session record,
++so it both authorizes the transition and invalidates every operation that read the previous
++state. The epoch is a monotone counter inside the record; "exact bytes" is what
++`WriteBatch::require` compares (`crates/traits/src/lib.rs:825-843`), and the epoch makes two
++successive states textually distinct even when nothing else changes. Two stamps are added to
++the record the moment it fences into `Completing`: `fenced_at_millis` (so `W_completing` is
++measured from the fence, decision 6) and `publish_target` (the inode key and the version the
++Complete will write, so a resumed completer is deterministic, decision 7).
++
++**No state is absorbing** (invariant 3):
++
++| State | Exits | Driver |
++|---|---|---|
++| `Open` | `Completing` (Complete), `Aborting` (Abort, idle abandonment, or `W_session` ceiling) | client; reaper after `W_open` idle **or** `W_session` from initiation |
++| `Completing` | `Completed` (root flip won), `Open` (publish lost, request rejected as invalid, or reaper rollback after `W_completing` from `fenced_at`) | client; reaper |
++| `Completed` | record deleted after its `retire:records:` obligation drains and the tombstone window elapses | retirement drain (reaper, or the completing gateway inline) |
++| `Aborting` | record deleted after its `retire:bytes:` obligation drains | retirement drain (reaper, or the aborting gateway inline) |
++| a `retire:` obligation | deleted when drained | retirement drain; re-entrant after any crash |
++| a session-owned `pending:` entry | orphan-marked and deleted when its session leaves `Open` or vanishes | retirement drain via `sidx:` (decision 5) |
++| a dangling `seg:` record | deleted by `retire:records:{seg}` on rollback/abort; adopted by the inode on a winning flip | retirement drain (decision 7) |
++
++The session record is deleted **last**, together with the `mpuctl:count` decrement, so the
++counter can never under-count a live session, and a partially drained teardown is always
++discoverable.
++
++### 3. Batch inventory — every batch this protocol commits, and its bound
++
++This table is the proof obligation for invariant (4) and for refutation outcome (d): no batch
++is proportional to object size. `V` is the backend value ceiling (100 KB by the inherited
++envelope, `crates/traits/src/lib.rs:744-758`); `C_part`, `C_seg` and `C_object` are the
++per-part, per-segment and per-object chunk bounds of decisions 4 and 7; `B` is the drain
++batch size (`MARK_BATCH = 1_000` precedent, `crates/custodian/src/restore.rs:93-100`).
++
++| Batch | Preconditions | Mutations | Size bound |
++|---|---|---|---|
++| Create session | `require(mpuctl:count == c && c < MAX_SESSIONS)`, `require_absent(mpu:<id>)`, bucket-existence per [ADR-0046][a46] §4 | 1 put session, 1 CAS `mpuctl:count` `c→c+1` | O(1), < 1 KB |
++| Part intent | none (unchanged `write::intent`, `crates/core/src/write.rs:198-214`) | one small owned `pending:` put per chunk **and** its `sidx:` index put, each its own commit, as today | O(1) per commit |
++| Part commit | `require(mpu == Open@E)`, `require_absent(part:…)` or `require(part:… == prior)` | 1 put (part record ≤ `V`), ≤ `C_part` `pending:`+`sidx:` deletes, ≤ 1 put (`retire:bytes:` on re-upload, ≤ `V`) | ≤ 2·V + O(chunks in part)·(key) |
++| Complete fence | `require(mpu == Open@E)` | 1 put (state, `fenced_at_millis`, `publish_target`) | O(1) |
++| Segment write (one, decision 7) | `require(mpu == Completing@E)` | ≤ `B` `seg:<id>:` puts (each ≤ `V`), 1 cursor put | ≤ B·V, B inside the envelope |
++| Root flip (publish) | `require(mpu == Completing@E)`; the bucket-existence pair of [ADR-0046][a46] §4; `require_absent(inode)`+`require_absent(dirent)` **or** `require(inode == prior)` | 1 put session→`Completed`, 1 put inode root (≤ `V`), ≤ 1 put dirent, 1 put `retire:records:`, ≤ 1 put `retire:bytes:` for unnamed staged parts, ≤ 1 put `retire:bytes:{generation}` for the superseded generation | ≤ 4·V + O(1) |
++| Fence release (publish lost / invalid) | `require(mpu == Completing@E)` | 1 put session→`Open`, ≤ 1 put `retire:records:{seg}` for the phase's segments | O(1) |
++| Abort / reap fence | `require(mpu == Open@E)` (or `Completing@E` for the rollback) | 1 put, 1 put `retire:bytes:{session}`, ≤ 1 put `retire:records:{seg}` | O(1) |
++| Retirement drain step | `require(retire:… == prior)` | ≤ `B` orphan puts **or** ≤ `B` record deletes, plus 1 cursor put | ≤ B·(key+value), B inside the envelope |
++| Owned-pending drain step | none (reference-based, decision 5) | ≤ `B` orphan puts + `pending:`+`sidx:` deletes, 1 cursor put | ≤ B·(key+value) |
++| Losing-writer compensation | none (its chunks are referenced by nothing else) | 1 put `retire:bytes:{chunks}` (≤ `V`), ≤ `C_part` `pending:`+`sidx:` deletes | ≤ V + O(chunks in part)·(key) |
++
++No row is proportional to total object size except through `V`, which is capped by admission
++(decision 4), and the *number* of segment-write and drain batches, which is what makes the
++work bounded-per-batch rather than bounded-per-object. The root flip in particular is **O(1)
++in the number of parts and segments** — the fence, not per-part or per-segment preconditions,
++is what proves the set did not move (decision 1); the segments are already durable when the
++flip commits (decision 7).
++
++---
++
++### Decision 1 — What replaces lease liveness as the publication-time proof
++
++**Decision.** Publication of an assembled write is conditional on **durable protection
++evidence plus a fence**, never on a timer:
++
++1. Staged bytes are protected by their `part:` record, not by a `pending:` lease. The part
++   commit atomically writes the part record and deletes the chunks' `pending:` (and `sidx:`)
++   entries, so protection is continuous — the entry that protects the bytes is replaced by a
++   record that protects them in the same batch, never with a gap.
++2. `CompleteMultipartUpload` **fences first** (`Open@E → Completing@E+1`, stamping
++   `fenced_at_millis` and `publish_target`), **then** reads the part records, **then**
++   validates the client's named-part list against them (every named part exists and its
++   recorded digest matches; part numbers ascending), **then** writes any segments (decision 7),
++   **then** flips the root with `require(mpu == Completing@E+1)` in the same batch as the inode
++   create/CAS. A validation failure releases the fence back to `Open` and answers
++   `400 InvalidPart` — a rejected request never wedges a session.
++3. Because every part commit carries `require(mpu == Open@E)` and every teardown begins with a
++   fence, no `part:` record can be created, replaced, or deleted after the Complete fence
++   lands. The single session precondition therefore proves *the entire part set is exactly
++   what Complete read* — the same guarantee per-part preconditions would give, at O(1) size
++   and with no serialization of concurrent part uploads (preconditions do not write, so N
++   concurrent part commits sharing one session precondition do not conflict with each other).
++4. **The records-only proof is scoped to records that have not been rewound.** The proof is a
++   statement about which records exist *now* in the live store. A metadata restore can rewind
++   the store to an image in which a torn-down session and its parts are resurrected while their
++   fragments are physically gone; a records-only proof cannot see that the restore falsified
++   its premises. Decision 3 and **D-B** close this: a restore **fences/aborts every session
++   open in the restored image**, so no resurrected session can be Completed — the proof holds
++   only over records the restore left standing.
++5. Publication stamps [ADR-0047][a47] metadata (`etag`, `content_type`, `modified`) as any
++   content publication does; `modified` is the Complete instant, matching the existing rule
++   that publication time is the instant the object became atomically visible
++   (`crates/server/src/lib.rs:169-181`).
++
++**Invariant preserved.** (1) A chunk map is never published over bytes a maintenance pass is
++free to reclaim — the #490 obligation, restated for a class of write whose staging window is
++unbounded. The proof changes from *the lease has not lapsed* to *the protecting record is
++still exactly as read, its session has not been torn down, and the store has not been rewound
++under it*, which is a statement about references rather than about clocks — so it holds for a
++session that was open for a week, and it does **not** hold across a restore that falsifies the
++records (decision 3).
++
++**Residency, not correctness, is what `W_session` bounds.** There is no *correctness* timer:
++publication is proved by records. There is one **administrative** ceiling, `W_session`
++(**D-A**), measured from `created_at_millis`, that bounds how long a session may hold staged
++bytes before the reaper fences it — an operator policy modelled on Amazon's
++`AbortIncompleteMultipartUpload` lifecycle rule (days-after-initiation, deployment-side, not
++client-opt-in). It never falsifies a publication proof: a session at the ceiling is *reaped*
++(fenced to `Aborting`), and a fenced session's Complete fails the fence — it does not publish
++a stale map.
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Reuse `create_leased` / `commit_chunk_map_superseding_leased` and keep multipart parts on renewed `pending:` leases | A test that stages a part, advances the clock past `2 × lease TTL` with no renewal, and Completes: publication MUST succeed. Under a lease-conditional publish it returns `Conflict` (`metadata.rs:763-796`). |
++| Publish without the session precondition (read parts, then commit) | DST: interleave a reaper fence between Complete's part read and its flip. The flip MUST fail with `Conflict`. Without the precondition it publishes a map over bytes the teardown will orphan — refutation outcome (c). |
++| Fence *after* reading the part set instead of before | DST: a part re-upload commits between the read and the fence. Complete MUST NOT publish the superseded chunk list; assert the published map equals the part set as of the fence. |
++| Delete `pending:`/`sidx:` entries in a batch separate from the part-record write | Kill the process between the two commits; assert no fragment is ever left with neither a `pending:` entry nor a `part:` record naming it (the classification sweep in *Graduation criteria*). |
++| Precondition on the part records instead of the session (O(N) exact-value preconditions) | A 10,000-part Complete against the FoundationDB backend: the flip batch MUST commit. With per-part preconditions the batch carries N part values and exceeds the envelope (`traits/src/lib.rs:744-758`). |
++| Put a **correctness** timer on the session (make publication conditional on completing within `T`) | A session that stages a part, idles, then resumes within `W_open` of its last progress (or holding a live owned lease) and within its remaining `W_session` budget, and Completes: publication MUST succeed. Publication is proved by records, never by a clock; the only timer is the administrative `W_session` ceiling, which reaps an over-age session but never falsifies a publication proof. |
++| Keep a records-only proof valid across a restore | The F13 trace (execution register): snapshot an `Open` session with staged parts, abort/reap it, let GC reclaim the fragments, then restore to the snapshot and retry Complete. The retried Complete MUST NOT publish (the restore fenced the session to `Aborting`, **D-B**); a design without the restore fence publishes over reclaimed bytes — outcome (c). |
++
++---
++
++### Decision 2 — A protection class for durable-but-unpublished bytes, per consumer
++
++**Decision.** Staged bytes are a **first-class protection class**, distinct from committed
++references and from leased garbage. `ReferenceSet` (`crates/custodian/src/gc.rs:228-247`)
++gains a second, *disjoint* member — the staged set, built from the `part:` records of sessions
++that still exist — and `protects()` returns true for either. Keeping the sets disjoint (rather
++than merging staged fragments into `placed`) is what lets each consumer make its own decision
++below rather than inherit one. Building the staged set is bounded: the build iterates the
++`mpu:` scan (≤ `MAX_SESSIONS`) and, per session, the bounded `part:<id>:` range (≤
++`MAX_PARTS_PER_SESSION`) — it never issues a global `part:` scan, so it cannot cross
++`SCAN_CAP` (decision 6, and the arithmetic there).
++
++| Consumer | Sees staged? | Why, and what it costs |
++|---|---|---|
++| **GC** — `gc.rs:162` via `protects`, `:244-246` | **Yes — protect** | Staged fragments carry no `orphan:` record and (after the part commit) no `pending:` entry, so GC's conservative arm would keep them today; relying on that is relying on an absence. Explicit protection is what makes the guarantee auditable. Cost: none. |
++| **Restore** — the identical gate, `restore.rs:218-224`, and the pending skip at `:257-264` | **Yes — protect, then fence sessions** | The pass marks every unreferenced, non-pending on-disk fragment `orphan:` (`restore.rs:266-269`); without staged awareness it marks a live upload's fragments and GC reclaims them. And by **D-B**, the pass MUST additionally **fence every restored `Open`/`Completing` session to `Aborting`** — a restore rewinds records to an image whose bytes may be gone, so no resurrected session may Complete (decision 1.4, F13). The `pending_skipped` counter (`restore.rs:111-113`) gains `staged_skipped` and `sessions_fenced` siblings. Cost: an upload open at restore time is aborted (KISS: no resumption across a restore, **D-B**). |
++| **Scrub** — walks `referenced.placed`, `scrub.rs:95-110` | **Yes — verify** | A staged fragment can rot during a staging window measured in hours. Scrub verifies it exactly as it verifies committed fragments, using the scheme recorded in the part record, and enqueues the ordinary `repair:` obligation. Cost: scrub's per-pass work grows by the staged population, which admission bounds. |
++| **Reconstruction** — `assess` / `find_chunk`, `reconstruction.rs:313-325`, `:601-620` | **Yes — resolve and repair, under the session fence** | Without it, a repair obligation for a staged chunk resolves to no committed map and is silently drained (`Assessment::Drain`, `reconstruction.rs:188-191`), so staged redundancy would decay untended. Resolution reads the `part:` record; the re-place commit CASes that part record **with `require(mpu == Open@E)`**, so it is fenced exactly like a part upload and can never race a Complete that has already fenced. A repair blocked by an in-progress Complete stays queued and is retried after publication. For a **segmented committed** object it resolves via the bounded `seg:<upload-id>:` range (decision 7e). |
++| **Rebalance evacuation** — `plan_evacuations` scans `inode:`, `rebalance.rs:147-151` | **No — do not evacuate** | Evacuation exists to empty a draining server; staged fragments empty themselves within `W_session` (published, aborted, or reaped). Evacuating them would mean mutating part records outside the fence for no durability gain. Cost: a drain waits (next row). |
++| **Drain / desired-state** — `genuinely_holds` from `referenced.placed`, `desired_state.rs:157-164` | **Yes — count staged as held** | Otherwise the F6 trace runs: a drain reports `Satisfied` while staged fragments sit on the server, nothing evacuates them, the operator wipes the disk, and Complete publishes a map naming wiped bytes. Cost: the drain stays `Pending` while staged bytes live there — **bounded by `W_session`**, see below. |
++| **Backfill** — `backfill.rs:79-99`, `:161-172` | **No — nothing to do** | Backfill fills *empty* placement vectors on pre-M3 records. Part and segment records are born with an explicit full-length placement written by the current write path (`crates/core/src/write.rs:108-114`), so the population it drains cannot contain one. |
++| **Allocator recovery** — `high_water_marks`, `metadata.rs:847-881` | **No — unaffected** | It recovers the `< 2^64` in-process chunk-id space; gateway-minted ids carry a random epoch and are `>= 2^127` (`crates/server/src/lib.rs:237-251`), so a staged chunk id is never re-minted. Inode ids are unaffected: a session holds no inode until publication. |
++
++**Bounding the drain stall (the cost of the "yes" in the drain row).** Staged placement MUST
++select against `Topology::excluding(draining)` (`crates/core/src/placement.rs:141-152`) rather
++than the plain selector the write path uses today (`write.rs:108-114`), so **no new staged
++fragment lands on a draining server**. The staged population on a draining server is therefore
++fixed at the instant the drain is requested, and every member of it exits within **`W_session`**
++(published, aborted, or reaped at the ceiling) — because even a *live, progressing* session is
++capped at `W_session` (**D-A**; the earlier `W_open` claim was wrong, a live session is
++bounded by `W_open` by nothing). The stall is an availability cost with a stated bound; the
++urgent-drain remedy for when `W_session` is too long to wait is **FU-2**, not the bound.
++
++**Invariant preserved.** (2) Every durable byte is, at every instant, classifiable as
++committed-referenced, staged-with-an-exit, or garbage-with-a-sound-reclamation-path. Staged is
++now a named class with a named exit (bounded by `W_session`), and the fourth category —
++"protected forever by residue" — is closed by decisions 5, 6 and 7.
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Leave the reference set committed-only (implement staging records but not the protection) | Stage a part, run one `reconcile_step` with an `orphan:` record present for one of its fragments, assert the fragment survives; and run `reconcile_after_restore` with the part staged and assert `stranded_marked == 0`, `staged_skipped > 0`. |
++| Restore without fencing resurrected sessions (**D-B**) | The F13 trace: assert `sessions_fenced > 0` and that a Complete retried against a restored session returns `4xx`, never a publication. |
++| Merge staged fragments into `placed` instead of a disjoint set | Assert `ReferenceSet` exposes staged separately: rebalance's evacuation plan for a draining server holding **only** staged fragments MUST be empty, while `reconciliation_status` for that server MUST be `Pending`. A merged set makes those two answers inconsistent. |
++| Make the drain ignore staged bytes (the "availability first" temptation) | The F6 wipe trace as a test: drain a server holding a staged fragment; `reconciliation_status` MUST be `Pending`, never `Satisfied`. |
++| Let staged placement land on a draining server | Request a drain, then stage a part; assert no fragment of the new part is placed on the draining server (`Topology::excluding`). Without it, the drain stall is unbounded even under `W_session`. |
++| Repair a staged chunk by rewriting its part record without the session precondition | DST: interleave a reconstruction re-place commit after a Complete fence; the re-place MUST return `Conflict` and the obligation MUST stay queued. |
++| Scrub staged fragments but leave reconstruction committed-only | Assert a repair obligation enqueued for a staged chunk is *resolved*, not drained: after one reconstruction pass the fragment is rebuilt and the part record's placement updated (never `Assessment::Drain`). |
++| Build the staged reference set with a global `part:` scan | Create sessions past `SCAN_CAP / MAX_PARTS_PER_SESSION` (≈ 104) and assert `reconcile_step` still succeeds — the build MUST iterate sessions and use bounded `part:<id>:` ranges, so it never issues a scan that can cross `SCAN_CAP`. |
++
++---
++
++### Decision 3 — Lifecycle states and failure semantics
++
++**Decision.** The state machine of §2, with these normative answers:
++
++- **Publication loses the CAS race.** Complete re-reads the target key and retries the flip
++  against the new prior at most `R_publish` times (retrying a `Conflict` is what `Conflict` is
++  for, `crates/traits/src/lib.rs:738-745`). Because segment records are keyed by upload-id and
++  their content is fixed by the frozen part set, a retry **reuses the same `seg:` records** —
++  there is no per-retry segment churn. On exhaustion Complete **releases the fence**
++  (`Completing@E → Open@E+1`) and answers `409 OperationAborted`; the session stays usable and
++  the client may retry Complete without re-uploading a part.
++- **Retry after an unknown outcome (F5).** The root flip changes the session record to
++  `Completed{inode, version, etag, completed_at_millis}` **in the same batch** as the inode
++  commit. There is therefore no state in which the object is published and the session is not
++  `Completed`, or the reverse. A Complete that receives `CommitUnknownResult`
++  (`traits/src/lib.rs:730-745`) re-reads the session record: `Completed` → answer success with
++  the recorded ETag; `Completing@E` → resume (re-run any missing segment writes, which are
++  idempotent by deterministic key, then retry the flip); `Open@E+1` → someone rolled the fence
++  back, re-fence and retry. A *retried* Complete from the client is answered from the same
++  evidence, which is what makes Complete idempotent over a non-idempotent batch primitive —
++  and the evidence now spans the whole segment-write phase, not just the flip (decision 7d).
++- **The completed session is a tombstone before it is nothing.** After its `retire:records:`
++  obligation drains, the session record survives in `Completed` for `W_tombstone`, so a client
++  retry inside that window gets `200` with the same ETag rather than `404`. Tombstones are
++  **counted by the admission counter** (they still hold an `mpu:` record) and their retention is
++  bounded by `W_tombstone` (**D-D**), so they cannot silently inflate any namespace.
++- **Client-visible answers by state** (normative for #508; the exact XML/status encoding is
++  #508's):
++
++| Verb | `Open` | `Completing` | `Aborting` | `Completed` (tombstone) | record absent |
++|---|---|---|---|---|---|
++| `UploadPart` | accepted | `404 NoSuchUpload` | `404 NoSuchUpload` | `404 NoSuchUpload` | `404 NoSuchUpload` |
++| `CompleteMultipartUpload` | fences, publishes | `409 OperationAborted` | `404 NoSuchUpload` | `200` + recorded ETag | `404 NoSuchUpload` |
++| `AbortMultipartUpload` | fences, `204` at once | `409 OperationAborted` | `204` (idempotent) | `404 NoSuchUpload` | `404 NoSuchUpload` |
++| `ListParts` | the part set | the frozen part set | `404 NoSuchUpload` | `404 NoSuchUpload` | `404 NoSuchUpload` |
++| `ListMultipartUploads` | listed | listed | not listed | not listed | not listed |
++
++  A session the reaper fences at `W_session` becomes `Aborting`, so a subsequent client verb
++  sees the `Aborting` column (`404 NoSuchUpload`) — the S3-visible signal that the upload
++  expired (FU-4 surfaces the reason in the error text). A restore that fences a session
++  (**D-B**) has the identical client-visible effect.
++
++- **A rejected Complete releases the fence.** An invalid named-part list (an absent part, a
++  digest mismatch, part numbers out of order), a bucket that was deleted mid-session (the
++  [ADR-0046][a46] §4 existence precondition), or an assembled map past the segmented ceiling
++  (decision 7) all answer `4xx` **and** CAS the session back to `Open` (cleaning up any segment
++  records the phase wrote). The session remains abortable and retriable; the one thing a
++  rejected request may never do is leave the session fenced, which would make a client error
++  indistinguishable from F1.
++- **Abort is bounded-latency by construction (F9).** Abort's HTTP response is the *fence
++  commit* — one O(1) batch that installs the `retire:bytes:{session}` obligation. Byte
++  reclamation is the drain's, asynchronously and in bounded batches; teardown of a
++  10,000-part session never rides inside one request.
++- **`W_completing` is measured from the fence instant.** The reaper rolls a `Completing`
++  session back to `Open` when `now - fenced_at_millis > W_completing` (**D-E**) — **not** from
++  last part progress, which would make a healthy Complete begun long after its last part
++  immediately rollback-eligible (F16). `fenced_at_millis` is stamped into the record by the
++  fence batch itself.
++- **Who drives resumption after a crash.** The retirement drain is re-entrant: obligations are
++  durable, orphan marking is idempotent (a plain put, `gc.rs:106-122`) and already-marked
++  fragments are skipped so the original grace clock is preserved (the restore precedent,
++  `restore.rs:93-100`). Whichever party runs next — the gateway inline, or the reaper —
++  re-derives the remaining work from the durable records. The session record is deleted last.
++
++**Invariant preserved.** (3) No lifecycle state is absorbing, and (1) again: because the root
++flip and the session transition are one batch, "published" and "about to publish" are never
++both true.
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Treat a lost publication CAS as terminal (dead session) | The F1 trace: fence a Complete, land a concurrent `PutObject` on the key, retry Complete — the second Complete MUST succeed (publishing over the interloper) or, on exhaustion, leave the session `Open`. Assert the session is never left in `Completing`. |
++| Commit the inode and the session transition in two batches | Kill between them (DST, both orderings). Assert: never an object published with the session still `Completing`, and never a `Completed` session with no object. |
++| Measure `W_completing` from part progress instead of the fence instant (F16) | Fence a Complete; advance the clock past `W_completing` measured from the *last part* but not from `fenced_at`; the reaper MUST NOT roll it back. A progress-relative measure rolls back a healthy late Complete. |
++| Distinguish a retried Complete by anything but the session record (client token, part digests) | Retry Complete after a `CommitUnknownResult`; assert exactly one publication (inode `version` advanced once) and one set of `retire:` obligations, including when the crash landed mid segment-write phase. |
++| Delete the session record in the flip batch | Retry Complete immediately: it MUST answer `200` with the recorded ETag, not `404`, inside `W_tombstone`. |
++| Answer Abort synchronously by tearing down inline | Abort a 10,000-part session against the FoundationDB backend and assert the response is returned in one batch and that no single commit exceeds the envelope. |
++| Let `UploadPart` succeed while `Completing` | Fence a Complete, then issue `UploadPart`; it MUST fail. A part accepted after the fence is invisible to the publication that already read the set — a silently lost part. |
++| Allow two Completes to both fence | Two concurrent Completes: exactly one fences; assert the other returns `409` and that only one publication occurs. |
++| Leave the session fenced when the request is rejected | Complete with a bad named-part list, then Abort: the Abort MUST succeed (session back in `Open`), not `409`. Otherwise a client typo wedges an upload until the reaper's `W_completing`. |
++| Publish every staged part instead of the ones the client named | Stage parts 1–3, Complete naming 1 and 3: the object MUST be parts 1+3, and part 2's **bytes** MUST end up orphan-marked while parts 1 and 3's bytes must not. |
++| Publish without the bucket-existence precondition | Delete the target bucket while a session is open, then Complete: it MUST answer `NoSuchBucket` and MUST NOT strand an object in a deleted bucket ([ADR-0046][a46] §4). |
++
++---
++
++### Decision 4 — Bounded work for unbounded objects
++
++**The arithmetic first (real numbers, not "well under S3's 5 TiB").** At
++`DEFAULT_CHUNK_SIZE = 1 MiB` (`crates/server/src/lib.rs:51`) and RS(6,3) (`:49`, 9 fragments
++per chunk), a 5 GiB part is 5,120 chunks and 46,080 fragments. Two ceilings bite:
++
++- **Transaction ceiling.** Superseding that part's generation with one `put` per prior
++  fragment in a single batch (`commit_chunk_map_superseding`, `metadata.rs:582-619`) owes
++  46,080 puts — a *permanent* failure to publish, not a slow one.
++- **Value ceiling.** `InodeRecord.chunk_map` is one JSON value (`metadata.rs:262-275`, encoded
++  at `:352-356`). A `ChunkRef` (`metadata.rs:124-136`) encodes to ~131 B (small D-server ids)
++  to ~302 B (worst-case `u64` ids), so a 100 KB value at V/2 headroom holds
++  `MAX_MAP_CHUNKS = ⌊50000 / b_ref⌋` = **165–381 chunks** — about **165–381 MiB** of object at
++  1 MiB chunks. Reaching 5 GiB flat needs 13–32 MiB chunks; 5–12 GiB is the flat ceiling even
++  at large chunks (traded against gateway memory). This is *pre-existing* (a 5 GiB single PUT
++  already crosses it), routine under multipart, and it is why the flat map alone cannot meet
++  the >10 GiB launch requirement — decision 7 lifts it.
++
++**Decision.** Three rules, one pattern.
++
++1. **The retirement ledger is the general bounded-work pattern.** An obligation proportional
++   to object size is installed as **one small record**, atomically with the transition that
++   created it, and drained in **bounded batches** of at most `B` mutations, idempotently. This
++   replaces inline fan-out on *every* superseding publication — including the ordinary
++   single-PUT overwrite path, because a 5 MiB `PutObject` over a large object has exactly the
++   same fan-out. `commit_chunk_map_superseding{,_leased}` therefore stops expanding the prior
++   map inline and instead writes `retire:bytes:{generation}` carrying the superseded map (its
++   chunks, and its `seg:` range if it was segmented, decision 7f).
++2. **Evidence precedes the lifting of protection, always.** The drain writes `orphan:` records
++   for a batch of fragments *before* deleting the record that protected them. There is
++   therefore no instant at which a durable byte is both unprotected and unevidenced —
++   invariant (2) restated as an ordering rule. It also means the drain can never reclaim
++   earlier than today's inline orphaning, only later: a strictly safe direction, at the cost of
++   a longer retention window (registered as an accepted cost).
++3. **Admission bounds what cannot be drained: the map, the part, the segment, and the session
++   population.** `MAX_MAP_CHUNKS` caps a flat map, `MAX_SEG_CHUNKS` a segment record,
++   `MAX_PART_CHUNKS` a part record, `MAX_ROOT_SEGMENTS` the segments a root may name
++   (decision 7), and `MAX_SESSIONS` / `MAX_INFLIGHT_PARTS` the namespaces (decision 6). Each is
++   enforced by a **refusal**, never an over-envelope commit. `UploadPart` refuses **best-effort**
++   early (a cumulative read-only check that concurrent commits can race, **D-E**, F17) and
++   Complete refuses **authoritatively** at the fence, where the part set is frozen — the
++   authoritative check is what the bound rests on; the early one is a courtesy.
++
++**Correctness-relevant knobs — valid ranges settled here, values chosen by the implementing
++slices.** A knob a safety property depends on has its range and bounding invariant settled in
++this proposal; only a knob whose entire range is safe is the implementer's freely.
++
++| Knob | Valid range | Bounding invariant | Value chosen by |
++|---|---|---|---|
++| `MAX_MAP_CHUNKS` | `> 0`, and `max_chunkref_bytes × MAX_MAP_CHUNKS ≤ V / 2` | a flat inode value stays inside the backend value ceiling with 2× headroom | #508 |
++| `MAX_SEG_CHUNKS` | same rule against a `seg:` record | ditto for segment values | #508 |
++| `MAX_PART_CHUNKS` | same rule against a `part:` record | ditto for part values | #508 |
++| `MAX_ROOT_SEGMENTS` | `> 0`, and `max_segref_bytes × MAX_ROOT_SEGMENTS ≤ V / 2` | a segmented root inode value stays inside the ceiling (decision 7) | #508 |
++| `MAX_SESSIONS` | `[1, SCAN_CAP)` with headroom | `scan("mpu:") ≤ MAX_SESSIONS ≤ SCAN_CAP`; enforced exactly by the serialized counter (decision 6) | #508 |
++| `MAX_INFLIGHT_PARTS` | `[1, MAX_PARTS_PER_SESSION]` | owned `pending:`/`sidx:` per session `≤ MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS` | #508 |
++| `chunk_size` (assembled writes) | `[1 MiB, chunk_size_max]` | `ceil(max_object_bytes / chunk_size) ≤ MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS`, **and** `chunk_size × max_concurrent_encodes ≤ the gateway memory budget` | #508 |
++| `B` (drain / segment batch) | `[1, B_max]` with `B_max` from the envelope | one commit stays inside 10 MB / 5 s; `MARK_BATCH = 1_000` is the in-tree precedent (`restore.rs:93-100`) | #625 |
++| `R_publish` (publish retries) | `[1, small]` | bounded so Complete terminates; exceeding it releases the fence rather than looping | #508 |
++
++**Invariant preserved.** (4) Every obligation installed at publication or teardown is drained
++in bounded work, and replay safety is built into each batch (each drain step carries
++`require(retire:… == prior)`; each orphan put is idempotent) rather than assumed — the
++explicit demand of `crates/traits/src/lib.rs:833-843`. And **every namespace the protocol
++grows is bounded by an enforced admission formula or accessed only through bounded key ranges**
++(decision 6).
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Keep inline orphan expansion for supersede "because large objects are rare" | Publish an object of `MAX_MAP_CHUNKS` chunks, then overwrite it with a 1-byte `PutObject` against FoundationDB; the overwrite MUST commit. Inline expansion exceeds the envelope and fails permanently. |
++| Install the obligation in a batch *after* the publication | Kill between publication and obligation. Assert no fragment is ever unreferenced *and* unevidenced: the classification sweep (below) finds it in neither the reference set, nor `pending:`, nor `orphan:`, nor a `retire:` payload. |
++| Drain by deleting the staging record first, then marking orphans | Kill mid-drain after the deletes; the fragments are unprotected and unevidenced — same sweep, same failure. |
++| Choose `B` by feel (e.g. "the whole session") | A 10,000-part teardown against FoundationDB: every drain commit MUST be inside the envelope; assert the maximum observed batch size. |
++| Enforce `MAX_MAP_CHUNKS` / the segmented ceiling only at `UploadPart` (treat the early check as authoritative) | Concurrent `UploadPart`s that each read sub-cap and collectively overshoot (F17): they MAY all be accepted (best-effort), but Complete MUST refuse authoritatively at the fence; assert Complete rejects the over-ceiling assembled map with a defined S3 error and leaves the session abortable. |
++| Enforce it nowhere and let the backend error | Complete an object past the ceiling: the answer MUST be a defined S3 error, and the session MUST remain abortable (never a wedged session whose Complete always errors). |
++| Let `retire:records:` orphan bytes (mode confusion) | Complete a session, drain it fully, then assert **no** `orphan:` record exists for any chunk in the published map. |
++
++---
++
++### Decision 5 — Reclamation evidence for failed in-flight work
++
++**The problem, precisely.** A part upload that is fenced or refused mid-stream leaves
++`pending:` entries. The deployed GC runs `ExpiredPendingPolicy::Defer` — correctly, because
++reclaiming on a producer's stamp is unsound when producers do not share the reconciler's clock
++(`crates/custodian/src/gc.rs:77-104`, the #557 class; the deployed loop takes the policy as a
++parameter whose contract names `Defer` as the deployed default,
++`crates/server/src/custodian.rs:456-464`, and the CLI passes `Defer` unless the operator
++attests `--gc-expired-pending`, `crates/server/src/cli.rs:975-979`). So that residue is never
++reclaimed in deployment. The everyday case is Ctrl-C during `aws s3 cp` with parts in flight.
++
++**Decision — reclaim by reference, not by expiry; a fast path and a per-session backstop.**
++
++1. **Ownership tag and per-session index.** Every `pending:` entry a staging write creates
++   carries `owner = <upload-id>` (§1) and is mirrored by a `sidx:<upload-id>:<chunk-id>` index
++   record, both written by `write::intent` *before* any fragment reaches a D server
++   (`crates/server/src/lib.rs:167-168`, `write.rs:198-214`), so **no staged byte can exist
++   without a tagged entry and an index record naming it** — the property the backstop depends
++   on, and the property that lets the backstop find a session's owned entries **without a
++   global `pending:` scan**.
++2. **Fast path — the loser compensates.** A part commit that definitively fails (`Conflict`,
++   or a `CommitUnknownResult` **the re-read settles as not-committed** — an unknown result is
++   never treated as a conflict, the rubric's *Transactions* rule, `AGENTS.md:178-180`) commits
++   one `retire:bytes:{chunks}` obligation for its own chunks and deletes its own
++   `pending:`/`sidx:` entries in the same batch, then drains it. This is sound for the same
++   reason the orphan ledger is sound today: the record is written only once nothing references
++   the bytes, so it is clock-independent (`gc.rs:91-94`).
++3. **Backstop — reference-based, per-session reclamation.** When a session leaves `Open`
++   (aborted, reaped, or fenced by a restore) or vanishes, the reaper walks that session's owned
++   entries through the **bounded** range `scan("sidx:<upload-id>:")` (≤
++   `MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`) and orphan-marks + deletes them in batches of at most
++   `B`. The judgment uses **no clock at all** — it is a statement about which records exist —
++   so it is immune to the #557 trap by construction and needs no operator attestation. There is
++   **no global `pending:` scan** anywhere in this protocol (the iteration-1 hole, F11a).
++4. **Hands off everything else.** `ExpiredPendingPolicy` and the expiry-based sweep
++   (`gc.rs:296-313`, `write::sweep_expired_leases`, `write.rs:623-648`) MUST **skip
++   session-owned entries** (recognised in O(1) by the `owner` tag): their exit is by reference,
++   and expiry-based reclamation of them would resurrect exactly the mid-flight-deletion hazard
++   the `Defer` posture exists to avoid. The non-multipart `pending:` residue keeps its current
++   posture; this proposal does not change it, and multipart does not add to it.
++
++**In-flight concurrency is admission-capped (**D-D**).** A session admits at most
++`MAX_INFLIGHT_PARTS` parts in flight at once; each part holds at most `MAX_PART_CHUNKS` owned
++entries. So the owned population *per session* is `≤ MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`, and
++the fleet-wide owned population is `≤ MAX_SESSIONS × MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS` —
++bounded, and never touched by any single scan because reclamation is per-session and
++bounded-range.
++
++**Invariant preserved.** (2) — the residue of a failed in-flight part is
++garbage-with-a-sound-reclamation-path within `W_session`, not a fourth, forever-protected class.
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Reclaim owned residue with a global `scan("pending:")` (the iteration-1 hole, F11a) | Strand `> SCAN_CAP` owned entries across many sessions (each an in-flight part crash), then run the reaper: reclamation MUST still proceed, because it walks bounded `sidx:<id>:` ranges per fenced session — a global `pending:` scan would fail `ScanCapExceeded` and reclaim nothing. |
++| Rely on the expiry sweep for staged residue | Run one deployed-configuration reconcile (`Defer`) after killing a part upload; the residue MUST still be reclaimed — by the reaper's reference arm, with no `--gc-expired-pending` attestation anywhere in the test. |
++| Let the expiry sweep touch owned entries | Stage a part with a *lapsed* lease under `ExpiredPendingPolicy::Reclaim` while its session is `Open`; assert the entry and its fragments survive. Deleting them is the #557 mid-flight-deletion defect with a new name. |
++| Tag ownership after the fragments are written | Assert the **order** directly (a recording store fake: the tagged `pending:`+`sidx:` commit precedes the first fragment put), not merely that no untagged fragment was observed — the absence is what a passing test would show either way, the order is what makes it true (the rubric's *Absent or unsupported entries* rule against count-only assertions). |
++| Omit `skip_serializing_if` on the new `owner` field | Round-trip an entry written before the upgrade: `decode → encode` MUST be byte-identical, and a `renew_pending` against it MUST return `Committed`, not `Conflict` (`metadata.rs:748-758`). |
++| Compensate with per-fragment orphan puts in one batch | Kill a 5 GiB part upload; assert every compensation commit is inside the envelope (it goes through the retirement ledger, decision 4). |
++| Make the backstop judge by lease expiry rather than session state | A DST run with a logical-clock producer and a wall-clocked reaper: no owned entry of an `Open` session may be reclaimed regardless of stamp skew. |
++| Treat a `CommitUnknownResult` part commit as a failure and compensate at once | DST: inject an unknown result on a part commit whose batch *does* land. The writer MUST re-read the part record first; compensating blind would orphan-mark the chunks of a part record that exists — a live staged part pointed at reclaimable bytes, refutation outcome (c). |
++
++---
++
++### Decision 6 — The abandoned-upload reaper (designed here, implemented in #625)
++
++**(a) The protocol-facing half.**
++
++- **The liveness observable, derived only from records the protocol durably writes.** No
++  settled design carries a per-part session counter, and none is assumed here. A session's
++  *last progress instant* is
++  `max(mpu.created_at_millis, max over its part records of committed_at_millis)`, read via the
++  bounded `part:<id>:` range, and a session additionally counts as live while **any
++  session-owned `pending:` entry holds an unexpired lease** — which is exactly what a single
++  long `UploadPart` produces, because the streaming write renews its leases every half-TTL
++  while the call is in flight (`crates/core/src/write.rs:474-500`). A 5 GiB part streaming for
++  hours is therefore *observably* progressing without inventing a new record or a new heartbeat.
++- **Abandonment rule (two arms).** A session in `Open` is fenced to `Aborting` when **either**:
++  (i) it is **idle-abandoned** — its last progress instant is older than `W_open` *and* it
++  owns no unexpired `pending:` lease; **or** (ii) it has reached the **administrative residency
++  ceiling** — `now - created_at_millis > W_session` (**D-A**), regardless of liveness. Arm (i)
++  reclaims the walked-away client; arm (ii) bounds *every* session's residency (F14) and is what
++  re-derives the drain bound (F6) and models Amazon's `AbortIncompleteMultipartUpload`. Both
++  arms read only records and the deployment wall clock — the reaper stays **record-only**, with
++  no topology coupling (**D-A**). `Completing` sessions use the separate, shorter
++  `W_completing`, measured from `fenced_at_millis` (**D-E**, F16), and are **rolled back**
++  (`Completing → Open`), never reaped directly — rollback is always safe because the epoch bump
++  invalidates any publication batch the crashed completer might still land.
++- **What the reaper may exit** — every state in §2's exit table: idle-abandoned or over-age
++  `Open` (fence to `Aborting`), stale `Completing` (roll back to `Open`, cleaning up its
++  `seg:` records), any `retire:` obligation (drain), any session-owned `pending:` entry of a
++  non-`Open` session (decision 5, via `sidx:`), and finally the session record itself with the
++  counter decrement. **Once the reaper exists, no protocol state is unexitable** — this is what
++  closes F1 globally rather than case by case.
++- **The stale-snapshot rule (**D-E**, F15).** The reaper reclaims a session's owned
++  `pending:` entries **only after it has fenced that session** (CAS to `Aborting`, or confirmed
++  the record absent) **in the same pass** — the step-5 judgment must be **no staler than the
++  entry it condemns**. It never filters a global snapshot of `pending:` against an
++  older-than-the-scan session list, because that reclaims the in-flight entries of a session
++  *created mid-pass*, orphan-marking a live streaming part's fragments and killing its renewals
++  (`crates/core/src/write.rs:474-478`, "refuse rather than resurrect"). Per-session,
++  fence-then-walk reclamation makes the stale-snapshot mode unconstructible; the DST observable
++  is in the failure-mode table.
++- **The clock lifecycle and its owner (F10, **D-E**).** The abandonment judgment reads the
++  **deployment wall clock**, stamped by the gateway into `created_at_millis` /
++  `committed_at_millis` / `fenced_at_millis` and evaluated by the reaper — the same
++  cross-component lifecycle the overwrite path already uses (`orphaned_at_millis` stamped at
++  `crates/core/src/write.rs:305-313`, evaluated against the grace window at `gc.rs:171-176`). It
++  is `SystemTime::now()`, which madsim virtualises, so DST determinism holds ([ADR-0009][a9];
++  the [ADR-0047][a47] publication timestamp is the worked precedent). The reaper **does** read
++  the owned lease stamp as abandonment condition (i)'s liveness input — the clock-lifecycle
++  table owns that honestly (below), and the fail direction is safe (skew → a false-positive reap
++  → the fenced, bounded FU-4 cost). The session record records its `clock_source`, and **the
++  reaper skips (and alarms on) any session whose `clock_source` it does not own** — fail-safe,
++  no reap. No logical-clock producer may open a session; the CLI, the one such producer in tree
++  (`crates/server/src/cli.rs:629-637`, the fixed logical `NOW_MILLIS`), has no multipart verb,
++  and the tag keeps that true by evidence rather than by assumption.
++- **Admission control — the enforceable, exact bound (**D-C**, F7/F12).** `CreateMultipartUpload`
++  makes a **serialized slot reservation**: in the create batch it reads the singleton
++  `mpuctl:count`, refuses with `503 SlowDown` if it is at `MAX_SESSIONS`, and otherwise CASes
++  it `+1` together with `require_absent(mpu:<id>)`. The terminal delete CASes it `-1`. This is
++  the reserve/CAS pattern ([ADR-0007][a7]); the counter counts **all** session records in any
++  state (Open/Completing/Aborting/Completed tombstones), so it bounds the whole `mpu:` namespace
++  and every namespace derived from it. Contention at the counter under a create storm **is** the
++  `503 SlowDown` backpressure — that is by design, and it costs nothing on the hot path because
++  **only Create touches the counter; part commits never do** (the retry-storm objection that
++  ruled out a per-part counter, decision 1, does not apply to a per-*create* counter). This
++  reverses iteration 1's scan-then-create / "no hot counter" stance for **Create only**:
++  scan-then-create is race-prone (ADR-0046 flagged the same shape for `DeleteBucket`) and admits
++  unbounded overshoot; a cap overrun would halt the maintenance plane, which is data-loss-class,
++  so the bound must be **enforced, not observed**.
++
++**The bounding formula, and every namespace bounded.** With the reworked access patterns, the
++**only** global scan multipart adds is one bounded `scan("mpu:")`; everything else is a bounded
++key range or reference-based:
++
++| Namespace | Bound | How it is accessed (never an unbounded scan) |
++|---|---|---|
++| `mpu:` | `≤ MAX_SESSIONS ≤ SCAN_CAP` | exact serialized counter (**D-C**); one bounded `scan("mpu:")` in the reaper |
++| `part:` | `≤ MAX_PARTS_PER_SESSION` per session | per-session range `scan("part:<id>:")` |
++| owned `pending:` / `sidx:` | `≤ MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS` per session | per-session range `scan("sidx:<id>:")`, fence-then-walk (**D-E**) |
++| `seg:` | `≤ MAX_ROOT_SEGMENTS` per object/session | per-object range `scan("seg:<id>:")` (decision 7) |
++| `retire:` | grows with overwrites; **not** session-bounded | cursor-keyed **bounded key ranges**, `B` per drain step; growth is bounded-or-alarmed by drain-health (oldest-obligation-age alarm, **D-D**) — it is never read by one unbounded scan, so it cannot halt the plane |
++
++**Admission bounds the namespaces when the reaper is down; the reaper makes the system make
++progress.** An asynchronous collector alone establishes no cardinality bound, which is why both
++are required and why neither alone is offered as F7's disposal. The `retire:` namespace is the
++one that can *grow* under sustained overwrites even with admission (ordinary `PutObject` traffic,
++not session-bounded), so its safety rests not on a cardinality cap but on **never being read by
++a single scan**: the drain walks it in cursor-keyed bounded ranges, and a drain that falls behind
++raises the oldest-obligation-age alarm (**D-D**) rather than silently crossing a cap.
++
++**(b) The algorithm.**
++
++```text
++one reaper pass (dispatched from the fenced control point, like every custodian loop):
++  1. sessions = scan("mpu:")                      # bounded by MAX_SESSIONS (the counter)
++  2. for each session, in id order:               # deterministic order, resumable
++       progress = max(created_at, max part committed_at)   # scan("part:<id>:") — <= MAX_PARTS
++       if clock_source not ours:      alarm; skip
++       if state == Open and ((now - progress > W_open and no live owned lease)
++                             or (now - created_at > W_session)):
++             CAS Open@E -> Aborting@E+1 + put retire:bytes:{session, all}  # one O(1) batch
++             then reclaim this session's owned entries:                    # step 5, same pass
++                 for k in scan("sidx:<id>:"):  orphan-mark + delete pending:+sidx: in B-batches
++       if state == Completing and now - fenced_at > W_completing:
++             CAS Completing@E -> Open@E+1 + put retire:records:{seg:<id>}   # rollback, safe
++       if state == Aborting:
++             reclaim owned entries via scan("sidx:<id>:") as above          # fence already done
++       if state == Completed and now - completed_at > W_tombstone and no obligation left:
++             delete mpu:<id> + CAS mpuctl:count -1
++  3. for cursor-key range in retire: (bounded ranges, resumable cursor):
++       drain at most B mutations, then commit; repeat next range / next pass
++         retire:bytes:   orphan-mark this batch of fragments (idempotent; never re-stamp)
++                         -> when all marked: delete the records the payload names
++                         -> when all deleted: delete the obligation; delete the session
++                            record (+ count -1) once it has no obligation left and window elapsed
++         retire:records: delete this batch of the records the payload names (parts and/or seg:)
++                         -> when all deleted: delete the obligation (never orphan-mark)
++```
++
++Every step is one preconditioned, idempotent batch; a pass may stop anywhere and the next pass
++re-derives its work from durable records. The sweep is bounded per pass (`B` mutations per
++commit, decision 4) and **never scans an unbounded namespace**: the only whole-namespace scan is
++`scan("mpu:")`, bounded by the counter; `part:`, `sidx:`, `seg:` are per-session/per-object
++ranges; `retire:` is walked in cursor-keyed bounded ranges. Owned-`pending:` reclamation is
++**fence-then-walk** (**D-E**) — a session's entries are touched only after that session is
++fenced or confirmed absent in this pass, so a session created mid-pass is never condemned (F15).
++
++**Invariant preserved.** (3) globally — with the reaper deployed, every state in §2 has a
++driver, and no residency is unbounded (`W_session`); and (2) — every staged byte's exit is the
++reaper's when no client provides one.
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| **False positive: reap a progressing upload.** Judge liveness by session age, or by "no part committed within W" alone | A single `UploadPart` streaming longer than `W_open` (DST: a slow body with lease renewals): the session MUST survive the idle-abandonment arm, and the part MUST commit afterwards. (It is still bounded by `W_session`, arm ii.) |
++| **Unbounded residency: never bound a live session (F14).** Omit the `W_session` arm | A client that uploads one part every `W_open/2` for a week while a server drains: the session MUST be reaped at `W_session` and the drain MUST clear. Without arm (ii) the drain stalls indefinitely — an unbounded availability cost wearing a bounded label. |
++| **Stale-snapshot reclamation (F15).** Filter a global `pending:`/`sidx:` snapshot against an older session list | DST: create a session mid-pass; the reaper MUST NOT orphan-mark its in-flight part's fragments or kill its renewals. Fence-then-walk per session makes this unconstructible; a stale-snapshot implementation reaps the live part (a DST observable on the renewal refusal, `write.rs:474-478`). |
++| **`W_completing` from the wrong instant (F16).** Measure staleness from last part progress | Fence a Complete long after its last part; advance the clock past `W_completing` from that part but not from `fenced_at`; the reaper MUST NOT roll it back. |
++| **The Complete race.** Reap a session concurrently with its Complete | DST both interleavings: (i) reaper fences first → Complete's fence returns `Conflict`, client sees `404 NoSuchUpload`, **no object is published**; (ii) Complete fences first → the reaper's CAS fails and it MUST NOT touch the session, and the published object's fragments MUST carry no `orphan:` record after the drain. |
++| **Roll back a `Completing` session unsafely** | DST: reaper rolls back while the completer's flip batch is in flight; assert the flip returns `Conflict` and that a subsequent Complete publishes exactly once, and that the rolled-back session's stale `seg:` records are reclaimed. |
++| **Crash mid-teardown** | Kill the reaper at each drain step (seeded DST): re-running MUST converge to zero staged records with no fragment left unevidenced, no orphan record re-stamped (grace clock preserved), and the counter back to its true value. |
++| **False negative: never reap** | A session abandoned for `> W_open`, or over-age past `W_session`, MUST be gone (records and bytes reclaimed, counter decremented) within a bounded number of passes; assert the staged population and the counter return to baseline. |
++| **The sweep breaks the bounded-work rule** | Reap a 10,000-part session and assert every commit is inside the envelope and that the pass makes durable partial progress when interrupted. |
++| **Tombstone / retire accumulation (F11c/F11b).** Bound only the open population | Drive sustained creates+completes and overwrites; assert `scan("mpu:")` stays `≤ MAX_SESSIONS` (tombstones counted by the counter, expired at `W_tombstone`) and that `retire:` never fails a scan (walked in bounded ranges), while the oldest-obligation-age alarm fires if the drain falls behind. |
++| **Arrival outruns drain** | Drive session creation faster than the reaper reclaims: creation MUST start refusing at `MAX_SESSIONS` (`503`) via the serialized counter, and every namespace MUST stay accessible without `ScanCapExceeded`. |
++| **Reaper unavailable** | Stop the reaper entirely, then drive creation: `reconcile_step` MUST keep succeeding indefinitely (no `ScanCapExceeded`), because the counter refuses new sessions before `mpu:` can approach the cap and no other namespace is read by an unbounded scan. |
++| **Clock-epoch mismatch** | Write a session record with a foreign `clock_source`; the reaper MUST skip it and raise an operator signal, never reap it. |
++| **Reap by expiry of owned leases** | An `Open` session whose owned leases lapsed (a stalled but live client) MUST NOT have its bytes reclaimed until the session itself is abandoned (arm i) or hits `W_session` (arm ii) and is fenced. |
++
++---
++
++### Decision 7 — Chunk-map segmentation (the >10 GiB launch requirement)
++
++**Decision.** A published map larger than one value is split into **segment records** named by
++the root inode, and the object is published by **staged publication** — write the segments in
++bounded batches, then flip the root in one batch — reusing decision 4's retirement machinery as
++one pattern family, never a new unbounded or unevidenced namespace. Whether an object is flat or
++segmented is a size decision applied **uniformly** to multipart Complete *and* single-PUT
++supersede: a published map of `≤ MAX_MAP_CHUNKS` chunks stays a flat inline map (unchanged,
++today's shape); a larger map is segmented. (A 5 GiB single PUT already produces > `MAX_MAP_CHUNKS`
++chunks, so this also fixes the pre-existing single-PUT value-ceiling hazard — one publication
++path for both.)
++
++**(a) The record shape ([ADR-0046][a46]).** The segmented `InodeRecord.chunk_map` becomes a
++two-variant value: `Flat(Vec<ChunkRef>)` as today, or
++`Segmented { owner: <upload-id>, segment_count, segments: Vec<SegmentRef> }` where a `SegmentRef`
++is `{ index, byte_offset, byte_len }` and the chunks of segment *i* live in the record
++`seg:<owner>:<i>` (§1). `owner` is the minting upload-id — an opaque **segment-group id** that
++outlives the session (2^-128 reuse, the X31 basis). Key shape, writer, deleter and scan
++visibility are stated in the §1 table; a maintenance consumer resolves the map by reading the
++root, then the bounded range `scan("seg:<owner>:")` (≤ `MAX_ROOT_SEGMENTS`). Because this
++changes the shape of `InodeRecord` for **every** consumer of `.chunk_map` (the read path, GC's
++reference build, reconstruction's `find_chunk`, rebalance, backfill, and every backend's
++conformance expectations), it is the strongest ADR-graduation candidate here — the successor to
++[ADR-0047][a47]'s record shape (*Graduation criteria*).
++
++**(b) Staged publication (write segments, then flip).** Complete, after fencing and validating
++(decision 1.2), computes the full ordered chunk list from the frozen part set and splits it into
++`⌈total_chunks / MAX_SEG_CHUNKS⌉ ≤ MAX_ROOT_SEGMENTS` segments. It writes the `seg:<owner>:<i>`
++records in bounded batches of at most `B` (each `require(mpu == Completing@E)`), then flips the
++root in **one** batch: `require(mpu == Completing@E)` + the inode CAS + session→`Completed` +
++`retire:records:{parts}` + any `retire:bytes:`. **The flip is the publication instant**, carrying
++exactly decision 1's fence/epoch proof; the segments are already durable when it commits, so the
++flip is O(1) and cannot exceed the envelope. A segmented map thus needs its own staged
++publication precisely because it cannot be published in one batch (the transaction envelope,
++`crates/traits/src/lib.rs:744-758`) — the mirror image of decision 4's staged *retirement*
++(commit-then-drain vs. write-then-commit), one pattern family per **D-G**.
++
++**(c) The crash story — one pattern family with decisions 4/5.** A completer that dies between
++segment writes and the flip leaves `seg:<owner>:*` records whose bytes are **still protected by
++the `part:` records** (the flip has not installed `retire:records:{parts}` yet) and whose session
++is still `Completing@E`. Two exits, both bounded:
++- **Resumed Complete** (the client retries, or a second gateway picks it up): sees
++  `Completing@E`, re-runs the segment-write phase — **idempotent because the keys
++  (`seg:<owner>:<i>`) and their content are fixed by the frozen part set**, so a re-write is the
++  same bytes and the flip lands at most once (F5, **D-B**) — then flips.
++- **Rollback / abort** (reaper after `W_completing`, or a rejected Complete): the transition
++  installs `retire:records:{seg:<owner>}`, which the drain deletes in bounded batches (never
++  orphan-marking — the fragments remain part-protected). On the next Complete the segments are
++  recomputed fresh (the part set may have changed after a rollback to `Open`).
++
++So a dangling segment set is **evidenced** (by the session's `publish_target` while `Completing`,
++and by the `retire:records:{seg}` obligation on rollback) and **bounded** (≤ `MAX_ROOT_SEGMENTS`
++per session, one generation — segment keys are upload-id-scoped, not per-attempt, so publish
++*retries* reuse them and create no per-retry generations, decision 3). It is never a new
++unbounded or unevidenced namespace.
++
++**(d) Complete idempotency over the segment-write phase (F5).** The idempotency proof of
++decision 3 now spans the whole phase, not just the flip: segment keys are deterministic from
++`owner` and the frozen part set; segment content is deterministic; the flip is a single fenced
++batch. A resumed Complete therefore **never double-writes** (identical keys+bytes) and **never
++half-flips** (the flip is atomic and fenced). A concurrent second completer either loses the flip
++CAS (`Conflict` → re-read → sees `Completed` → returns the recorded ETag) or writes the same
++segment bytes (idempotent).
++
++**(e) Every maintenance consumer resolves the segmented shape in bounded work.** Each consumer of
++decision 2's list that resolves a committed inode's map (GC reference build, restore's identical
++gate, scrub, reconstruction, rebalance, backfill) reads the root and, if `Segmented`, the bounded
++range `scan("seg:<owner>:")` (≤ `MAX_ROOT_SEGMENTS`) — **never a global `seg:` scan**. Reference-set
++construction therefore stays under `SCAN_CAP`: it already iterates objects (bounded per object),
++and segment resolution adds a bounded per-object range, not a new whole-namespace scan. Segment
++records are **counted** in the cardinality reasoning (decision 6's formula) as ≤ `MAX_ROOT_SEGMENTS`
++per committed object, resolved per-object.
++
++**(f) Supersede/overwrite of a segmented object.** Publishing over a segmented generation
++installs `retire:bytes:{generation: {inode, version, chunks?, segments: <owner>}}` (decision 4),
++which the drain uses to orphan-mark the prior generation's fragments **and** delete its
++`seg:<owner>:*` records in bounded batches. The committed inode carried `owner`, so the supersede
++finds the segment range without reading the (possibly already superseded) prior map inline.
++
++**(g) The arithmetic (**D-F**).** With a `SegmentRef` encoding to ~96 B (compact) to ~160 B
++(worst case), the root holds `MAX_ROOT_SEGMENTS = ⌊50000 / b_segref⌋` = **312–520** segments, each
++holding `MAX_SEG_CHUNKS = MAX_MAP_CHUNKS` = **165–381** chunks. The segmented object ceiling is
++`MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS × chunk_size`:
++
++- at the **default 1 MiB chunk**: 312 × 165 × 1 MiB = **50.3 GiB** (worst-case encoding) to
++  520 × 381 × 1 MiB = **193.5 GiB** (best case) — **comfortably over the 10 GiB launch
++  requirement even in the worst case**, and at the default chunk size, so no gateway-memory
++  trade is forced to reach it.
++- reaching S3's **5 TiB** object cap needs the map to hold `5 TiB / chunk_size` chunks; with a
++  map capacity of 51,480–198,120 chunks that is a **26.5–101.8 MiB** chunk size — reachable, but
++  traded against the gateway memory budget (`chunk_size × max_concurrent_encodes`). The design
++  does **not** claim 5 TiB at default chunks; it claims >10 GiB at default chunks and up to S3's
++  ceiling with larger chunks.
++- `MAX_PARTS_PER_SESSION = 10_000` (S3's limit) is **not** the binding ceiling in this range: a
++  50 GiB object over 10,000 parts is 5.12 MiB/part (≥ S3's 5 MiB minimum) and a 5 TiB object is
++  524 MiB/part (≤ S3's 5 GiB maximum).
++
++The full computed register is in *Accepted costs*.
++
++**Invariant preserved.** (1)/(2)/(4) at object scale: the segmented map is published by the same
++fence proof (1), its dangling segments are an evidenced, bounded, reclaimable class (2), and both
++its publication and its retirement are bounded-per-batch (4).
++
++**Failure-mode table.**
++
++| Way to implement it wrong | Observable that fails |
++|---|---|
++| Publish a segmented map in one batch | Complete a `> MAX_MAP_CHUNKS` object against FoundationDB in a single publication batch: it MUST be staged (segment writes, then flip); a one-batch publish exceeds the envelope and fails permanently. |
++| Leave dangling `seg:` records after a completer crash (F18) | Kill a completer between segment writes and the flip, then roll the session back: assert every `seg:<owner>:` record is reclaimed by `retire:records:{seg}` and **no** fragment is orphaned (the parts still protect them). |
++| Non-deterministic segment keys/content across a resume (F18) | DST: crash mid segment-write phase, resume with a second gateway; assert exactly one published object, no double-written segment, no half-flip (identical keys+bytes; one fenced flip). |
++| Resolve a segmented map with a global `seg:` scan | Publish enough segmented objects that a global `seg:` scan would cross `SCAN_CAP`; assert `reconcile_step` still succeeds — resolution MUST be per-object bounded `seg:<owner>:` ranges. |
++| Orphan-mark a superseded segmented generation's fragments but leak its `seg:` records | Overwrite a segmented object; after the drain, assert no `seg:<owner>:` record of the prior generation survives and its fragments are orphan-marked. |
++| Count segment records outside the cardinality formula | Assert the reference-set build over `MAX_SESSIONS` segmented objects stays under `SCAN_CAP` and that segment resolution is bounded per object. |
++
++---
++
++### Clock lifecycles this protocol introduces (F10, one table)
++
++`AGENTS.md:132-142` makes it a MUST that a new clock read states which source owns its
++lifecycle, and that one lifecycle never mixes sources.
++
++| Lifecycle | Stamp | Written by | Evaluated by | Owner |
++|---|---|---|---|---|
++| Abandonment (idle + residency) | `mpu.created_at_millis`, `part.committed_at_millis` | gateway | reaper (arms i and ii) | deployment wall clock (`SystemTime::now`, madsim-virtualised); guarded by `clock_source` — an unrecognized source is skipped, never reaped |
++| Completing rollback | `mpu.fenced_at_millis` (stamped at the fence) | gateway (fence batch) | reaper (`W_completing`) | deployment wall clock |
++| Owned staging lease | `pending.lease_expiry_millis` (owned entries) | write path, renewed in flight (`write.rs:474-500`) | **the reaper**, as abandonment condition (i)'s liveness input (an unexpired owned lease ⇒ live), *and* the in-flight renewal | deployment wall clock; owned entries carry the session's `clock_source`; fail direction is safe (skew → false-positive reap → FU-4's fenced, bounded cost) |
++| Orphan grace | `orphan:` value written by the retirement drain | whoever drains (gateway inline or reaper) | GC (`gc.rs:171-176`) | the same deployment wall clock, exactly as the overwrite path's `orphaned_at_millis` (`write.rs:305-313`) |
++| Tombstone | `mpu.completed_at_millis` | gateway (flip batch) | reaper (`W_tombstone`) | deployment wall clock |
++
++No new clock *source* is introduced — every lifecycle is the deployment wall clock the overwrite
++path already uses. The one lifecycle that could have mixed sources — reclamation of staged
++residue — is made **clock-free** instead (decision 5, reference-based). The owned-lease row now
++states honestly that the reaper reads the lease as a liveness input (**D-E**, correcting
++iteration 1's "nothing that decides reclamation").
++
++### Execution register — the enumeration, in one place
++
++The refutation test for this proposal is a concrete execution — a crash point, a lost CAS, a
++race, an operator action, a clock mismatch, a segment-write crash — that (a) strands bytes or
++metadata with no bounded reclamation path, (b) leaves a state nothing can exit, (c) publishes or
++preserves a chunk map over bytes a maintenance pass may reclaim or has reclaimed, or (d) installs
++an obligation past the transaction envelope. This table is the enumeration those outcomes are
++tested against; every row states what actually happens and what makes it so.
++
++| # | Execution | Outcome under this protocol | Disposed by |
++|---|---|---|---|
++| X1 | Concurrent `PutObject` wins the publication CAS (no crash) | Flip returns `Conflict`; bounded retry (reusing the same segments); else fence released to `Open`, `409` | D3 |
++| X2 | Completer crashes after fencing, before flipping | Session sits in `Completing`; reaper rolls it back to `Open` after `W_completing` from `fenced_at`, cleaning its `seg:` records | D3, D6, D7 |
++| X3 | Completer crashes after the flip commit, before answering | Session is `Completed`; the client's retry answers `200` with the recorded ETag | D3 (F5) |
++| X4 | Publication returns `CommitUnknownResult` | Re-read the session record; it is the single authority on what happened | D3, `traits/src/lib.rs:730-745` |
++| X5 | Reaper fences an abandoned session while a Complete fences it | One CAS wins; loser gets `Conflict`. If the reaper won, nothing is published and the bytes are retired; if Complete won, the reaper does not touch the session | D6 |
++| X6 | Reaper rolls back a `Completing` session whose completer is merely slow | The slow flip fails its `require(mpu == Completing@E)` and publishes nothing; the client retries | D6 (F16 — measured from `fenced_at`, not progress) |
++| X7 | A part commit lands after a Complete fence | `require(mpu == Open@E)` fails; `404 NoSuchUpload`; the writer compensates its own chunks | D1, D5 |
++| X8 | Gateway crashes mid part-upload (fragments on disk, owned `pending:`/`sidx:` entries) | Entries are owned and indexed by construction (intent precedes bytes); reclaimed per-session via `sidx:` when the session leaves `Open` or vanishes | D5 |
++| X9 | Client re-uploads a part number that already has a record | The part commit replaces the record and installs `retire:bytes:{chunks}` for the superseded chunk list in the same batch | D4, D5 |
++| X10 | Two concurrent `UploadPart`s for the same part number | Exact-value precondition on the part key: one wins, the loser gets `Conflict` and compensates | D1, D5 |
++| X11 | Client aborts a 10,000-part session | One O(1) fence batch answers `204`; teardown drains asynchronously in `B`-sized batches; counter decremented last | D3, D4 (F9) |
++| X12 | Drain crashes after orphan-marking, before deleting the part records | Bytes are both protected and evidenced; re-entry skips already-marked fragments, grace clock intact | D4, `restore.rs:93-100` |
++| X13 | Drain crashes after deleting records, before deleting the obligation | Bytes carry orphan evidence; GC reclaims after grace; the obligation is re-drained as a no-op | D4 |
++| X14 | Operator drains a D server holding staged fragments | `reconciliation_status` stays `Pending`; no new staged fragment lands there; clears within `W_session` | D2 (F6) |
++| X15 | Operator wipes that server anyway | The pre-wipe status was `Pending`, so the wipe is an operator override, not a silent `Satisfied` — the F6 trace is closed at the reporting step | D2 |
++| X16 | Metadata restored to a point before the session's part records existed | Those fragments are genuinely unreferenced (the session record is rewound too), so marking them is correct; a *surviving* session's staged fragments are protected by the staged reference set | D2, *Backward compatibility* |
++| X17 (F13) | Snapshot an `Open` session with staged parts → abort/reap → GC reclaims fragments → restore to the snapshot → retry Complete | The restore **fences every resurrected session to `Aborting`** (**D-B**), so the retried Complete returns `4xx` and **cannot** publish over the reclaimed bytes; the client re-uploads from the start | D1.4, D2, D3 |
++| X18 (F14) | A live client uploads one part every `W_open/2` for a week while a server drains | Idle-abandonment (arm i) never fires (the session is live), but the residency ceiling (arm ii) reaps it at `W_session`; the drain clears within `W_session` | D6 (F14), D2 |
++| X19 (F15) | A session is created mid reaper pass | Fence-then-walk reclamation touches a session's owned entries only after fencing it, so the mid-pass session is never condemned; its live part's renewals survive | D6 (F15) |
++| X20 | 1-byte `PutObject` overwrites a max-size (flat or segmented) object | Publication installs `retire:bytes:{generation}` (with the `seg:` range if segmented); no inline fan-out; the commit fits the envelope | D4, D7 (F4) |
++| X21 | Multipart Complete overwrites an existing multipart object | Same, plus `retire:records:` for its own staging records | D4, D7 |
++| X22 | Abandoned/tombstoned sessions accumulate while the reaper is down | The serialized counter refuses new sessions at `MAX_SESSIONS`; every namespace stays accessible (bounded ranges); the custodian plane keeps reconciling | D6 (F7) |
++| X23 | Valid uploads arrive faster than the reaper drains | Same counter: `503 SlowDown` at the cap — contention at the counter is the backpressure | D6 (F7/F12) |
++| X24 | Fleet-wide concurrent creates race the cap | The serialized counter CAS admits exactly `MAX_SESSIONS`; losers retry or get `503` — no overshoot (F12) | D6 (**D-C**) |
++| X25 | `> SCAN_CAP` owned `pending:` entries stranded across many crashed in-flight parts | Reclaimed per-session via bounded `sidx:` ranges; no global `pending:` scan exists to fail `ScanCapExceeded` (F11a) | D5, D6 |
++| X26 | A session record carries a `clock_source` the reaper does not own | Skipped and alarmed — never reaped on a foreign stamp (the #557 class) | D6 (F10) |
++| X27 | Expired-pending sweep runs with `Reclaim` while a session is `Open` | Owned entries are recognised by the `owner` tag and skipped; only the reference-based arm may reclaim them | D5 |
++| X28 | A D server holding staged fragments loses a disk | Scrub detects, reconstruction rebuilds and re-places under the session fence (segmented map resolved by bounded `seg:` range) | D2, D7 |
++| X29 | Reconstruction re-places a staged chunk while a Complete is fencing | The re-place CAS fails (`require(mpu == Open@E)`); the obligation stays queued and is served after publication | D2 |
++| X30 | Complete names only a subset of the staged parts | Named parts publish; unnamed parts' bytes are orphan-marked and their records deleted | D3, §1 |
++| X31 | The target bucket is deleted mid-session | The flip's bucket-existence precondition fails; `NoSuchBucket`; fence released | D3, [ADR-0046][a46] §4 |
++| X32 | The assembled map would exceed the segmented ceiling | Refused best-effort at `UploadPart` and authoritatively at Complete (F17); never an over-envelope commit | D4, D7 |
++| X33 | Complete retried after the tombstone window | `404 NoSuchUpload`, with the object present and readable by its key | D3 (bounded, registered) |
++| X34 | An `orphan:` record exists for a chunk that is committed-referenced | GC's reference gate is evaluated **first** (`gc.rs:159-176`), so the record is inert while the reference stands | GC precedence, defence in depth |
++| X35 | Two sessions Complete on the same key concurrently | Both flip through the inode CAS; one supersedes the other; the superseded generation (its `seg:` range too) is retired | D3, D4, D7 |
++| X36 | Gateway restarts (fresh random chunk epoch) with sessions open | Chunk ids never collide across epochs and are `>= 2^127`, clear of allocator recovery; sessions are unaffected — a second gateway can complete them | `crates/server/src/lib.rs:237-251` |
++| X37 (F18) | Completer dies between segment writes and the root flip | Segments are evidenced (`publish_target` while `Completing`) and the fragments stay part-protected; a resumed Complete re-runs idempotently (deterministic keys) or a rollback installs `retire:records:{seg}` | D7 |
++| X38 | A part commit returns `CommitUnknownResult` and the batch later lands | The writer re-reads before compensating; only a settled not-committed outcome triggers compensation, so a live part's chunks are never orphan-marked | D5, `traits/src/lib.rs:730-745` |
++| X39 | Sustained `PutObject` overwrites grow `retire:` past `SCAN_CAP` | `retire:` is walked in cursor-keyed bounded ranges, never one scan, so it never fails `ScanCapExceeded`; a lagging drain raises the oldest-obligation-age alarm (**D-D**) | D4, D6 (F11b) |
++
++### What the implementing slices change (summary)
++
++- `crates/core/src/metadata.rs` — the new key helpers and parsers (`mpuctl:`, `mpu:`, `part:`,
++  `sidx:`, `seg:`, `retire:`); `PendingEntry.owner` (additive, `skip_serializing_if`); the
++  `Flat | Segmented` chunk-map variant (decision 7 — the ADR-scale change); session-fenced
++  publication committers beside the lease-guarded ones; supersede stops expanding orphans inline
++  (decision 4); the serialized admission counter (**D-C**).
++- `crates/core/src/write.rs` — staged placement selects against `Topology::excluding(draining)`
++  (`placement.rs:141-152`); `intent` tags owned entries and writes the `sidx:` index; the
++  losing-writer compensation path.
++- `crates/custodian/src/gc.rs` — `ReferenceSet` gains the disjoint staged set (built by bounded
++  per-session ranges) and resolves segmented maps by bounded `seg:` ranges; the expiry arm skips
++  owned entries.
++- `crates/custodian/{restore,scrub,reconstruction,desired_state}.rs` — per decision 2's table;
++  restore additionally fences resurrected sessions (**D-B**).
++- `crates/custodian/` — the reaper loop (#625), dispatched from `reconcile_step` like every other
++  pass (`reconciliation.rs:75-112`); admission counter, `sidx:` reclamation, cursor-keyed
++  `retire:` drain, drain-health alarms.
++- `crates/gateway-s3`, `crates/server` — the verbs, the state/verb answer table, serialized
++  admission control (#508); the subresource denylist that refuses multipart today
++  (`crates/gateway-s3/src/lib.rs:335-346`, object-route guard `:1696-1709`) loses its multipart
++  entries in that slice.
++- The **living architecture** documents ([runtime view][arch6], [crosscutting concepts][arch8])
++  gain the new record classes, the segmented map, and the reaper loop **in the slice that lands
++  them** — the docs-currency rule for a change that adds persisted fields and API operations
++  (`AGENTS.md:154-157`). This proposal, which lands no code, is not that slice.
++
++## Alternatives considered
++
++- **Keep lease liveness and renew the leases of staged parts.** Rejected: it puts a correctness
++  timer on an inherently long-lived operation, and it makes the *renewal loop* a correctness
++  dependency for data whose client may be offline for hours. It also leaves the staged bytes
++  inside `pending:`, where the deployed `Defer` posture makes their residue unreclaimable (F3).
++- **A per-session mutation counter, CAS'd by every part commit.** Would give Complete a
++  one-precondition proof exactly as the fence does, but it serializes every `UploadPart` of one
++  upload through a single hot key — S3 clients upload 4–16 parts concurrently by default, so this
++  converts parallel uploads into a retry storm. The fence buys the same proof with a CAS only on
++  *state transitions*, which are rare. **Note the asymmetry with admission:** the *per-create*
++  counter (**D-C**) is a hot key only for `CreateMultipartUpload`, which is rare relative to
++  part commits, so its contention is acceptable and is exactly the intended `503` backpressure.
++- **Scan-then-create admission (iteration 1's "no hot counter").** Rejected on rework: a
++  population read followed by a create is race-prone (ADR-0046 flagged the identical shape for
++  `DeleteBucket`), admits unbounded fleet-wide overshoot, and cannot enforce the `SCAN_CAP`
++  invariant that a cap overrun would violate — and that overrun halts the maintenance plane,
++  which is data-loss-class. The serialized counter (**D-C**) makes the bound exact. The cost
++  shown: a single hot key on the Create path only; part commits stay counter-free.
++- **A global `scan("pending:")` backstop for owned residue (iteration 1's F11a hole).** Rejected:
++  owned `pending:` cardinality is per-chunk of in-flight parts, unbounded by the *open-session*
++  count, so the scan can cross `SCAN_CAP` and reclaim nothing — the exact halt it was meant to
++  prevent. Replaced by the `sidx:` per-session index and the in-flight part cap (**D-D**):
++  bounded key-range reclamation, no global scan.
++- **Per-part exact-value preconditions at Complete.** Correct, and it is the shape a first
++  implementation reaches for; rejected on the envelope: 10,000 part values in one batch cannot
++  fit inside 10 MB / 5 s (`traits/src/lib.rs:744-758`), so the largest legal upload would be the
++  one that cannot complete.
++- **Staging inside `pending:` with a longer TTL.** Rejected: it is exactly the "synthesized
++  encoding into an existing namespace" [ADR-0046][a46] rejected for buckets, it inherits the
++  expiry-based reclamation hazard (#557), and it makes every consumer of `pending:` — GC, restore,
++  the sweep, allocator recovery — implicitly a consumer of multipart semantics.
++- **Inline orphan expansion with a "large object" special case.** Two code paths, two correctness
++  stories, and the boundary between them is exactly where the bug hides. The retirement ledger is
++  one path for both.
++- **Synchronous Abort teardown.** Rejected on the same envelope arithmetic as above, and it would
++  make Abort's latency proportional to the session's size — an unbounded HTTP response time for
++  the verb clients call *to recover*.
++- **A smaller reference-set scan bound.** Rejected: choosing a smaller cap only makes the halt
++  arrive earlier (`SCAN_CAP` is a correctness constraint, not a tuning knob,
++  `traits/src/lib.rs:275-292`). The bound has to come from admission and bounded key ranges.
++- **Bounding session life with `W_open` alone (no `W_session`).** Rejected on rework: `W_open` is
++  the *idle* window; a live, progressing session is bounded by it by nothing, so a drain behind
++  such a session stalls indefinitely (F14) — an unbounded availability cost. The administrative
++  `W_session` ceiling (**D-A**) is what bounds residency; it never falsifies a publication proof.
++- **Resumable uploads across a metadata restore.** Rejected on KISS (**D-B**): resumption would
++  require the restore to prove the staged bytes still exist, which a records-only image cannot do.
++  Fencing every resurrected session to `Aborting` is the simple, safe rule; the cost is that an
++  in-flight upload at restore time restarts from the beginning.
++- **Deferring chunk-map segmentation (iteration 1's FU-1).** Rejected on rework: the honest flat
++  ceiling is ~165–381 MiB at default chunks and ~5–12 GiB even at large chunks, below the >10 GiB
++  launch requirement — so segmentation is not a follow-up, it is decision 7. It is designed *with*
++  decision 4's staged-obligation machinery (one pattern family, **D-G**), not beside it. The
++  cost shown: it changes the `InodeRecord.chunk_map` shape for the ~19 `.chunk_map` read sites, so
++  it is recommended for ADR graduation (successor to ADR-0047's record shape) — but deferring it
++  would ship a feature that cannot meet its own requirement.
++- **Letting staged bytes go unscrubbed and unrepaired** (the smaller diff for decision 2).
++  Rejected because the cost class is durability, not availability: over a staging window measured
++  in hours, unrepaired fragment loss accumulates and Complete would publish a map over fewer than
++  `k` survivors. Only availability, latency, capacity and operational costs are acceptable
++  trade-offs here.
++
++## Graduation criteria
++
++### The F1–F18 disposition list
++
++Exactly one disposition per row: **eliminated** by the design (with the observable that would
++catch a regression), a **bounded non-safety cost** (with bound, rationale, and follow-up), or
++**flagged NEEDS-HUMAN** (never self-accepted). No refutation-standard outcome — (a) stranded with
++no bounded reclamation, (b) a state nothing can exit, (c) a map over reclaimable bytes, (d) an
++obligation past the envelope — is disposed of as an accepted cost.
++
++| # | Disposition | Mechanism | Binding observable |
++|---|---|---|---|
++| **F1** absorbing state on publication CAS loss | **Eliminated** | D3: bounded retry, then fence release to `Open`; reaper rollback for a crashed completer; §2's exit table | After a concurrent `PutObject` wins, the session is never left in `Completing`; a state-machine test asserts every state has a taken exit |
++| **F2** staging-record disposal at publication | **Eliminated** | `retire:records:` installed in the flip batch; drained in bounded batches; the mode lives in the key | After Complete + full drain: `scan("part:<id>:")` is empty, and **no** `orphan:` record exists for any published chunk |
++| **F3** abort-race residue unreclaimable under `Defer` | **Eliminated** | D5: ownership tag, loser compensation, reference-based per-session backstop; expiry sweep skips owned entries | Kill a part upload, run the deployed configuration (`Defer`, no attestation): residue reclaimed within `W_session`; owned entries survive an expiry sweep while `Open` |
++| **F4** obligation fan-out vs. the envelope | **Eliminated** | D4: retirement ledger for every superseding publication; D7 staged publication for the map itself | Overwrite a max-size object with a 1-byte PUT on FoundationDB: it commits, and every commit in the batch inventory stays inside the envelope |
++| **F5** non-idempotent Complete / retry after unknown outcome (incl. the segment-write phase) | **Eliminated** | Flip + `Completed` in one batch; deterministic segment keys/content; the session record is the durable evidence; re-read protocol `traits/src/lib.rs:730-745`; tombstone window | Retry Complete after an injected `CommitUnknownResult` mid segment-write phase: exactly one publication, one obligation set, identical ETag, no double-written segment |
++| **F6** maintenance-pass visibility split | **Eliminated** (safety half); **bounded availability cost** (drain half) | D2's per-consumer table; staged placement excludes draining servers; drain bound re-derived as `W_session` | The wipe trace: drain a server holding staged fragments → `Pending`, never `Satisfied`. **Cost:** a drain waits up to `W_session`. **Follow-up:** FU-2 (urgent operator-forced staged evacuation) |
++| **F7** unbounded staged state halts the custodian plane | **Eliminated** | Serialized admission counter (exact `MAX_SESSIONS`) + bounded key-range access for every derived namespace + the reaper (progress) | Reaper stopped + sustained creation/overwrites: `reconcile_step` keeps succeeding and creation refuses with `503`; assert no namespace ever fails `ScanCapExceeded` |
++| **F8** vacuous or unsound reaper design | **Eliminated** | D6: liveness from records the protocol writes (part stamps + owned leases), clock-sound detection, the full false-positive / false-negative / race / crash / stale-snapshot table, and the normative `#625` ordering | D6's failure-mode table in full, run as seeded DST |
++| **F9** client-visible semantics of fenced states | **Eliminated** | D3's verb × state table (incl. `W_session`-fenced and restore-fenced sessions); Abort answers from the fence commit alone | A wire-level test per cell of the table (owned by #508), plus: Abort of a 10,000-part session answers from one O(1) batch |
++| **F10** clock-lifecycle ownership | **Eliminated** | The clock-lifecycle table: one source (deployment wall clock), `clock_source` guard, the owned-lease read owned honestly as a liveness input, and staged reclamation made clock-free | A foreign `clock_source` session is skipped and alarmed, never reaped; DST with skewed producers reclaims nothing it should not |
++| **F11** namespace cardinality escapes the admission formula (3 surfaces) | **Eliminated** | (a) `sidx:` per-session index + `MAX_INFLIGHT_PARTS` cap; (b) `retire:` walked in cursor-keyed bounded ranges + drain-health alarm; (c) tombstones counted by the serialized counter, retention bounded by `W_tombstone` | Strand `> SCAN_CAP` owned entries and drive overwrites; assert no scan fails `ScanCapExceeded` and `scan("mpu:") ≤ MAX_SESSIONS` |
++| **F12** admission race: scan-then-create is not a bound | **Eliminated** | **D-C**: serialized slot reservation (counter CAS'd in the create batch, released in the terminal delete); contention is the `503` | Race fleet-wide creates against the cap: exactly `MAX_SESSIONS` admitted, no overshoot; part commits never touch the counter |
++| **F13** restore resurrection mints a publication over reclaimed bytes | **Eliminated** | **D-B**: restore fences/aborts every session open in the restored image; the records-only proof scoped to unrewound records (D1.4); execution X17 | X17 as a test: `sessions_fenced > 0`; a Complete retried against a restored session returns `4xx`, never a publication |
++| **F14** unbounded session residency | **Eliminated** | **D-A**: `W_session` administrative ceiling from initiation, deployment default, tighten-only per bucket; the reaper's arm (ii); drain bound and F6 re-derived from it | X18 as a test: a live one-part-per-window session is reaped at `W_session` and a drain behind it clears |
++| **F15** reaper stale-snapshot judgment | **Eliminated** | **D-E**: per-session fence-then-walk reclamation (no global filtered `pending:` snapshot); the no-staler rule with its DST observable | X19 as a test: a session created mid-pass is never condemned; its live part's renewals survive |
++| **F16** `W_completing` measured from the wrong instant | **Eliminated** | **D-E**: `fenced_at_millis` stamped in the session record at the fence; rollback measured from it | X6 as a test: a healthy Complete begun long after its last part is not rolled back |
++| **F17** cumulative admission at `UploadPart` overstated | **Eliminated** | **D-E**: best-effort early refusal, authoritative check at Complete (frozen part set); **D-D**'s in-flight cap for the hard namespace bound | Concurrent `UploadPart`s overshoot the early check (allowed); Complete refuses the over-ceiling assembled map authoritatively |
++| **F18** segmentation's staged publication leaves residue | **Eliminated** | D7: one pattern family with D4/D5 — evidenced, bounded, reclaimable segments; deterministic idempotent resume; per-object bounded resolution | X37 and D7's failure-mode table as seeded DST: crash between segment writes and flip, resume/rollback, supersede |
++
++### Accepted costs register (computed numbers, **D-F**)
++
++Each is a bounded availability / latency / capacity / operational trade-off. None is a
++refutation outcome. `V = 100 KB`; headroom keeps an encoded value `≤ V/2 = 50 KB`;
++`SCAN_CAP = 1 << 20 = 1,048,576`.
++
++| Cost | Bound (computed) | Rationale | Follow-up |
++|---|---|---|---|
++| **Flat object ceiling** (no segmentation) | `MAX_MAP_CHUNKS = ⌊50000/b_ref⌋` = **165–381 chunks** (`b_ref` = 131–302 B); **165–381 MiB** at 1 MiB chunks, ~5–12 GiB at 13–32 MiB chunks | the value ceiling is inherited and pre-existing (a 5 GiB single PUT already crosses it); refusing past it is safe, committing is not | **subsumed** — decision 7 lifts it (segmentation is in scope, not deferred) |
++| **Segmented object ceiling** | `MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS × chunk_size` = 312–520 × 165–381 chunks = 51,480–198,120 chunks ⇒ **50.3–193.5 GiB at 1 MiB chunks**; S3's 5 TiB reachable only at **26.5–102 MiB chunks** (traded against gateway RAM); `MAX_PARTS_PER_SESSION = 10,000` is not binding in `[10 GiB, 5 TiB]` (5.1 MiB–524 MiB/part) | >10 GiB is met at default chunks with worst-case margin; the full S3 5 TiB is a chunk-size/RAM trade, stated honestly | **FU-1** — record-shape ADR (successor to ADR-0047); larger-object tuning |
++| **Concurrent-session capacity** | `MAX_SESSIONS` enforced exactly by the serialized counter; hard architectural bound `≤ SCAN_CAP ≈ 1,048,576` (the `mpu:` scan). Iteration 1's global-part-scan design forced `≤ SCAN_CAP / MAX_PARTS_PER_SESSION ≈ 104`; the per-session-indexed rework (**D-D**) lifts that coupling, leaving `MAX_SESSIONS` a policy capacity knob inside `[1, SCAN_CAP)` | a cap overrun halts the maintenance plane (data-loss-class), so it is enforced exactly; `503 SlowDown` is the backpressure | **FU-3** — admission/drain telemetry and alerting |
++| A drain waits for staged uploads on the draining server | **`W_session`** (deployment default; per-bucket tighten-only) | the alternative is the F6 wipe trace, a safety outcome; `W_open` was the wrong (unbounded) label | **FU-2** — urgent operator-forced staged evacuation |
++| Prior-generation bytes retained slightly longer than today (grace starts at drain, not at supersede) | one reaper cadence plus the grace window | evidence must precede the lifting of protection; the direction is strictly safe | **FU-3** — drain-rate telemetry and obligation-age alert |
++| A retried Complete after `W_tombstone` answers `404` although the object exists | `W_tombstone` | unbounded tombstones are an unbounded namespace (they are counted by the admission counter) | none required (S3-conforming) |
++| A reap of a *progressing but silent* upload (idle arm) or an *over-age* upload (`W_session` arm) costs the client its staged parts | `W_open` / `W_session` (operator-chosen inside the settled ranges) | reaping is safe (the fence prevents any partial publication); the cost is re-upload | **FU-4** — surface the abandonment reason in the S3 error text |
++| An upload open at metadata-restore time is aborted (no resumption across a restore) | one restore event | KISS (**D-B**): a records-only image cannot prove the staged bytes still exist | none required (documented operator behaviour) |
++
++### Follow-ups this proposal requires (filed on acceptance)
++
++FU-1 (chunk-map segmentation) is **dissolved into decision 7** — it is in scope, not a
++follow-up; what remains as FU-1 is the **record-shape ADR graduation** it triggers. Each accepted
++cost above names one of these; filing them is part of accepting this proposal.
++
++| Tag | Issue to file | Owner / milestone | Trigger |
++|---|---|---|---|
++| **FU-1** | *Segmented chunk-map record-shape ADR* — graduate decision 7's flat-or-segmented `InodeRecord.chunk_map` and the `seg:` namespace to an ADR (successor to [ADR-0047][a47]'s record shape), since it changes the object model for every `.chunk_map` consumer | metadata / object model | with #508 (the shape lands there); the ADR records the settled decision |
++| **FU-2** | *Urgent operator-forced staged evacuation* — a management verb that fences sessions holding fragments on a decommissioning server so a drain need not wait out `W_session` | management surface (proposal 0008) | an operator hits the drain wait in practice |
++| **FU-3** | *Retirement-drain and admission telemetry/alerting* — open sessions, obligation count, oldest obligation age, drain rate, admission refusals, with alert thresholds | observability floor (proposal 0010) | with #625 |
++| **FU-4** | *Surface the abandonment reason in the multipart error text* — so a client reaped after `W_open`/`W_session` learns why | S3 gateway (#508 follow-up) | after the first operator report |
++
++### Tests and telemetry the implementing slices owe
++
++- **Tier-0 DST ([ADR-0009][a9]) is the correctness authority** for every interleaving named in
++  the failure-mode tables: the Complete/reap race in both orders, publication CAS loss, crash at
++  each step of the publication, segment-write, and drain sequences, restore-fence (X17), the
++  `W_session` residency reap (X18), the stale-snapshot mid-pass creation (X19), and
++  arrival-outruns-drain. Each lands as a seeded regression.
++- **The classification sweep** — one test helper this protocol earns: given a store and a fleet,
++  assert every on-disk fragment is in exactly one class (committed-referenced,
++  staged-with-a-session, evidenced-for-reclamation). It is the mechanical form of invariant (2)
++  and the single strongest regression net for this protocol; run it after every DST scenario.
++- **Conformance across backends** (`metadata-conformance`) for the new record round-trips, the
++  segmented map, and the `PendingEntry` decode→encode identity on a legacy value.
++- **Telemetry** ([ADR-0011][a11]): open sessions (vs. `MAX_SESSIONS`), staged bytes/records,
++  oldest session age, obligation count and oldest obligation age, reaper pass outcome counts,
++  admission refusals. The three that matter operationally are *oldest obligation age* (the drain
++  is falling behind, **D-D**), *admission refusals* (backpressure engaged), and *open sessions*
++  (capacity headroom).
++
++### Definition of done
++
++- **#625 (reaper)** — decision 6 implemented as a custodian loop with its knob values inside the
++  settled ranges, decision 5's per-session reference-based reclamation, the serialized admission
++  counter, the cursor-keyed retirement drain, the `W_session` arm, and the DST rows above. Lands
++  **with or before** #508.
++- **#508 (multipart)** — the S3 verbs over decisions 1–4 and 7, serialized admission control, the
++  verb × state table, and the wire surface that was already settled.
++
++### ADR graduation recommendation
++
++Three of these decisions outlive multipart and should graduate to ADRs after this proposal is
++accepted (authoring them is follow-up work under [ADR-0037][a37], not part of this document):
++
++1. **The segmented chunk-map record shape** (decision 7) — it changes `InodeRecord` for every
++   consumer of `.chunk_map`, which is precisely the class of decision an ADR records; the
++   strongest candidate here, successor to [ADR-0047][a47]'s shape (FU-1).
++2. **The retirement ledger — durable obligations installed atomically, drained in bounded,
++   idempotent batches** (decision 4). It applies to every superseding publication, to
++   server-side copy (#504 step 2), and to any future resumable write, and it changes an existing
++   committed contract (`commit_chunk_map_superseding`).
++3. **The staging protection class and per-consumer visibility rule** (decision 2). It changes
++   what the maintenance plane's reference set *means* — a contract every custodian pass and every
++   future maintenance pass inherits.
++
++Decisions 1, 3, 5 and 6 are multipart-shaped enough to live in this proposal; if server-side copy
++adopts decision 1's fence verbatim, that is the moment to reconsider.
++
++## Backward compatibility
++
++- **On-disk / record format.** Additive prefixes (`mpuctl:`, `mpu:`, `part:`, `sidx:`, `seg:`,
++  `retire:`) and one optional field on `PendingEntry` that is `#[serde(default)]` **and**
++  `skip_serializing_if = "Option::is_none"`, so a record written before the change decodes
++  unchanged and re-encodes byte-identically — the CAS-identity rule [ADR-0047][a47] established
++  for `InodeRecord`. The one non-additive change is `InodeRecord.chunk_map` becoming a
++  `Flat | Segmented` variant (decision 7): a legacy inode is `Flat` and MUST decode and re-encode
++  byte-identically (the same serialization-identity rule; the round-trip test is owed), so
++  existing objects are unaffected and only newly published large objects are `Segmented`. This is
++  the change FU-1 graduates to an ADR.
++- **Version skew during rollout — a hard ordering requirement.** A custodian build **without**
++  decision 2's staged awareness, run against a store where a newer gateway is staging parts,
++  would mark live staged fragments `orphan:` via the restore pass (`restore.rs:257-269`) and GC
++  would reclaim them after grace. GC itself is safe (its conservative arm, `gc.rs:183-187`), as is
++  scrub. A custodian without decision 7's `Segmented` awareness cannot resolve a segmented map at
++  all. Therefore: **the custodian plane, including the restore tool, MUST be upgraded before any
++  gateway is allowed to create multipart sessions or publish a segmented object.** The implementing
++  slices should make this checkable rather than documentary (a refusal or an alarm when the
++  staging/segment namespaces are non-empty and staged/segment awareness is absent).
++- **Metadata restore.** The restore tool MUST fence every restored `Open`/`Completing` session to
++  `Aborting` (**D-B**) — an operational change: after a restore, in-flight uploads are aborted,
++  not resumed. This is the F13 remedy and is part of the custodian upgrade above.
++- **Deployments.** No new external dependency, no new service, no new port. The reaper is another
++  pass in the existing custodian loop, dispatched from the same fenced control point
++  (`reconciliation.rs:75-112`). `W_session` is a new deployment default (per-bucket tighten-only).
++- **Public API.** Additive: the multipart verbs (#508). Existing PUT/GET/DELETE semantics are
++  unchanged, with two deliberate internal changes — a superseding publication installs a
++  retirement obligation instead of expanding orphan records inline (decision 4), and a
++  large single PUT is published as a segmented object (decision 7). Both are reader-transparent;
++  reclamation of a superseded generation is asynchronous, and the reader-safe grace guarantee is
++  unchanged (reclamation is never *earlier* than today).
++- **Rollback.** Disabling the multipart verbs after sessions exist leaves records the reaper still
++  drains; the reaper must therefore keep running (and keep its rows compiled in) even when the
++  verbs are disabled. Removing the reaper while sessions exist is the one unsupported downgrade —
++  it re-creates F1, F7 and F14 by construction. A store that has published a segmented object
++  cannot be served by a build without `Segmented` support.
++
++## Open questions
++
++Each of these is explicitly **non-gating for #508** and carries its reason and its owner. None of
++the seven decisions and none of F1–F18 is parked here.
++
++- **Multipart ETag composition.** [ADR-0047][a47] closed the ETag *basis* (lowercase-hex SHA-256
++  as an opaque change-token; MD5 rejected) and deferred only the multipart *composition* to the
++  implementing slice. Non-gating for the commit protocol because the protocol needs exactly one
++  property from it — the published ETag must be a **pure function of the part records' recorded
++  digests and their order**, so a re-derived value on a retried Complete is identical, and the
++  value is in any case recorded in the `Completed` session record. Owner: **#508**.
++- **Knob values.** Every correctness-relevant knob has its range and bounding invariant settled
++  above; choosing the values inside those ranges, and wiring the metrics, alerts and CLI flags, is
++  non-gating because no value inside a settled range can break an invariant. Owners: **#625**
++  (`B`, `W_open`, `W_completing`, `W_session`, `W_tombstone`, cadence), **#508**
++  (`MAX_MAP_CHUNKS`, `MAX_SEG_CHUNKS`, `MAX_PART_CHUNKS`, `MAX_ROOT_SEGMENTS`, `MAX_SESSIONS`,
++  `MAX_INFLIGHT_PARTS`, `chunk_size`, `R_publish`).
++- **Whether the single-PUT path segments above a threshold or shares the multipart segmenter
++  verbatim.** Decision 7 settles that a `> MAX_MAP_CHUNKS` map is segmented uniformly; the code
++  factoring (one segmenter or two callers of one helper) is an implementation choice inside that
++  invariant. Owner: **#508**.
++- **Whether `ExpiredPendingPolicy::Defer` can be retired once every producer stamps live leases**
++  (#490 / #557). Untouched by this proposal — staged reclamation is clock-free precisely so it does
++  not depend on that question being answered. Owner: **#557**.
++- **Per-bucket lifecycle expiry of incomplete uploads** (S3's `AbortIncompleteMultipartUpload`).
++  Non-gating: the deployment-default `W_session` already bounds the namespace; a per-bucket policy
++  is a tighten-only refinement that belongs with lifecycle configuration. Owner: proposal 0006's
++  adoption slice.
++
++[arch6]: ../../architecture/06-runtime-view.md
++[arch8]: ../../architecture/08-crosscutting-concepts.md
++[a7]: ../../adr/0007-reserve-append-cas-watch.md
++[a9]: ../../adr/0009-deterministic-simulation-testing.md
++[a11]: ../../adr/0011-durability-telemetry-and-declarative-management.md
++[a19]: ../../adr/0019-chunk-format-layout.md
++[a37]: ../../adr/0037-proposal-and-spec-process.md
++[a45]: ../../adr/0045-metadata-validation-boundaries.md
++[a46]: ../../adr/0046-bucket-model-real-namespace.md
++[a47]: ../../adr/0047-object-metadata-model.md
++[i504]: https://github.com/getwyrd/wyrd/issues/504
++[i508]: https://github.com/getwyrd/wyrd/issues/508
++[i625]: https://github.com/getwyrd/wyrd/issues/625

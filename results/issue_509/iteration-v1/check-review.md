@@ -1,0 +1,15 @@
+Review of issue 509: implement S3 bulk `DeleteObjects` so signed `POST /bucket?delete` requests delete all named keys and return a conforming per-key XML result.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance contract distinguishes present/absent keys, quiet output, malformed and oversized input, entity decoding, and post-delete reads, giving independently observable outcomes at `crates/server/tests/s3_delete_objects.rs:160`. |
+| C2 Reproduction (red pre-fix) | PASS | On dependency #507's base with only the new test added, all 5 cases fail through the existing 501 `NotImplemented` response, confirming the missing bucket operation at `crates/server/tests/s3_delete_objects.rs:202`. |
+| C3 Change | PASS | The change remains within the agreed wire-layer and integration-test scope, with bounded request handling at `crates/gateway-s3/src/lib.rs:1063` and no dependency, storage, or core-seam change. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Decide whether focused red→green plus independent fmt/clippy is sufficient without rerunning the aggregate gate — all 5 wire tests changed from failing to passing at `crates/server/tests/s3_delete_objects.rs:163`, but the asserted `./engine/xtask.sh ci` script was absent from the supplied target/clone, so its full checks remain provisional. |
+| C5 Causal adequacy | PASS | The missing bucket-scoped operation is implemented directly before the denylist at `crates/gateway-s3/src/lib.rs:1902`; no capability probe or runtime symptom guard was introduced. |
+| T1 Structure | PASS | Production behavior is localized to the existing S3 dispatcher/module and exercised through a dedicated server integration test at `crates/server/tests/s3_delete_objects.rs:1`, preserving crate seams. |
+| T2 Shape | PASS | The implementation has explicit 1000-key/2 MiB bounds and rejects invalid input before deletion at `crates/gateway-s3/src/lib.rs:1416`, matching the required request/response shape. |
+| T3 Runtime | PASS | The independently run loopback suite passes all 5 cases, including stock-SDK signing, idempotent deletion, quiet output, malformed/over-limit rejection, entity round-trip, and 404 readback at `crates/server/tests/s3_delete_objects.rs:202`. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether the available prior-art search is complete — affected-path `git log --all` found merged history for `crates/gateway-s3/src/lib.rs:1` and none for the new test, but available refs cannot establish closed/rejected work, which matters for avoiding a duplicate contribution. |
+| T5 Judgment | PASS | The additive route reuses the established delete seam, preserves other `?delete` refusals, bounds buffering, and exercises the real SDK wire path; the tradeoff is proportionate at `crates/gateway-s3/src/lib.rs:1359`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether the in-process stock-SDK coverage is sufficient evidence for the user-facing recursive-delete workflows — it proves protocol behavior at `crates/server/tests/s3_delete_objects.rs:202`, while real `aws s3 rm --recursive` / `aws s3 sync --delete` acceptance remains off-Check. |

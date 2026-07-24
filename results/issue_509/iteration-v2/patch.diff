@@ -1,0 +1,862 @@
+diff --git a/crates/gateway-s3/src/lib.rs b/crates/gateway-s3/src/lib.rs
+index c088774..20eb9ed 100644
+--- a/crates/gateway-s3/src/lib.rs
++++ b/crates/gateway-s3/src/lib.rs
+@@ -372,6 +372,22 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
+     "metadataTable",
+ ];
+ 
++/// Whether the percent-decoded query carries the `delete` subresource key (`POST
++/// /bucket?delete`, S3's bulk DeleteObjects — issue #509), matched the same
++/// percent-decoded way [`unsupported_subresource_decoded`] matches, so an encoded
++/// `?%64elete` cannot dodge bulk-delete routing either. The dispatcher checks this BEFORE
++/// the subresource denylist below (which also lists `delete`, for every OTHER method/path
++/// form) — an object-scoped `PUT/DELETE /b/k?delete` and a non-POST bucket-scoped
++/// `?delete` both keep today's refusal unchanged (brief's Impact & compatibility); only
++/// the POST form is a real bucket-level operation.
++fn has_delete_subresource(query: &str) -> bool {
++    query
++        .split('&')
++        .filter(|p| !p.is_empty())
++        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
++        .any(|k| percent_decode_utf8(k) == "delete")
++}
++
+ /// The first [`UNSUPPORTED_SUBRESOURCES`] query key present in `query`, matching **raw**
+ /// (un-decoded) keys. Used on the OBJECT path (PUT/GET/DELETE), where a missed subresource
+ /// falls through to the plain verb rather than to a listing — so this is a raw match, not the
+@@ -1044,6 +1060,424 @@ fn list_response(xml: String) -> Response {
+         .expect("static response is always valid")
+ }
+ 
++/// AWS's own documented `DeleteObjects` limits (brief §Scope): at most this many
++/// `<Object>` entries per request, and the whole XML body bounded by this many bytes.
++/// Both bounds are enforced by construction (never by trust) before the body is parsed.
++const DELETE_OBJECTS_MAX_KEYS: usize = 1000;
++const DELETE_OBJECTS_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
++
++/// One parsed `<Delete>` request body: the ordered keys to remove, and whether `Quiet`
++/// asked the result to omit `<Deleted>` entries (issue #509).
++struct DeleteRequest {
++    keys: Vec<String>,
++    quiet: bool,
++}
++
++/// One node of a minimal parsed XML tree — either an element (name + children) or a text
++/// run (already entity-unescaped, [`xml_unescape`]). Scoped to exactly the tiny fixed
++/// `<Delete>` schema this slice needs (Design: the workspace carries no XML crate, and
++/// adding one is a human-gated ADR-0003 dependency/license decision) — not a general-
++/// purpose XML library, but general enough to skip an unknown child element (a future
++/// `<VersionId>`, say) correctly even when it nests, rather than special-casing every
++/// element name the parser walks past.
++enum XmlNode {
++    Element {
++        name: String,
++        children: Vec<XmlNode>,
++    },
++    Text(String),
++}
++
++/// A cursor over the input for [`XmlNode`] parsing. Byte-offset indexing is safe here
++/// (never splits a multi-byte UTF-8 sequence): every cut point is found by searching for
++/// an ASCII structural byte (`<`, `>`, `/`, `=`, a quote), and no continuation byte of a
++/// multi-byte UTF-8 sequence is ever equal to an ASCII byte.
++struct XmlParser<'a> {
++    input: &'a str,
++    pos: usize,
++}
++
++impl<'a> XmlParser<'a> {
++    fn new(input: &'a str) -> Self {
++        Self { input, pos: 0 }
++    }
++
++    fn rest(&self) -> &'a str {
++        &self.input[self.pos..]
++    }
++
++    fn skip_ws(&mut self) {
++        let trimmed = self.rest().trim_start();
++        self.pos = self.input.len() - trimmed.len();
++    }
++
++    /// Skip any run of whitespace, `<?...?>` processing instructions (the `<?xml
++    /// version="1.0"?>` prolog a real client sends), and `<!--...-->` comments preceding
++    /// the next element.
++    fn skip_misc(&mut self) {
++        loop {
++            self.skip_ws();
++            if self.rest().starts_with("<?") {
++                match self.rest().find("?>") {
++                    Some(end) => self.pos += end + 2,
++                    None => self.pos = self.input.len(),
++                }
++                continue;
++            }
++            if self.rest().starts_with("<!--") {
++                match self.rest().find("-->") {
++                    Some(end) => self.pos += end + 3,
++                    None => self.pos = self.input.len(),
++                }
++                continue;
++            }
++            break;
++        }
++    }
++
++    /// Parse exactly one element starting at the current position (after [`skip_misc`]).
++    /// `None` on any structural violation — mismatched/unterminated tags, a name-less tag —
++    /// which the caller answers as S3's `MalformedXML` (never a partial/best-effort read).
++    fn parse_element(&mut self) -> Option<XmlNode> {
++        if !self.rest().starts_with('<') {
++            return None;
++        }
++        self.pos += 1;
++        let name_len = self
++            .rest()
++            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')?;
++        if name_len == 0 {
++            return None;
++        }
++        let name = self.rest()[..name_len].to_string();
++        self.pos += name_len;
++        let self_closing = self.skip_attributes()?;
++        if self_closing {
++            return Some(XmlNode::Element {
++                name,
++                children: Vec::new(),
++            });
++        }
++        let mut children = Vec::new();
++        loop {
++            self.skip_misc();
++            if self.rest().starts_with("</") {
++                let close_len = self.rest()[2..].find('>')?;
++                let close_name = self.rest()[2..2 + close_len].trim();
++                if close_name != name {
++                    return None;
++                }
++                self.pos += 2 + close_len + 1;
++                break;
++            }
++            if self.rest().is_empty() {
++                return None;
++            }
++            if self.rest().starts_with('<') {
++                children.push(self.parse_element()?);
++            } else {
++                let text_len = self.rest().find('<').unwrap_or(self.rest().len());
++                let text = xml_unescape(&self.rest()[..text_len]);
++                self.pos += text_len;
++                if !text.is_empty() {
++                    children.push(XmlNode::Text(text));
++                }
++            }
++        }
++        Some(XmlNode::Element { name, children })
++    }
++
++    /// Consume an open tag's attribute list up to its terminating `>`, honouring quoted
++    /// attribute values (so a `>` or `/` inside one does not end the tag early). Returns
++    /// whether the tag was self-closing (`/>`); `None` on malformed attribute syntax.
++    fn skip_attributes(&mut self) -> Option<bool> {
++        loop {
++            self.skip_ws();
++            let c = self.rest().chars().next()?;
++            match c {
++                '/' => {
++                    self.pos += 1;
++                    if !self.rest().starts_with('>') {
++                        return None;
++                    }
++                    self.pos += 1;
++                    return Some(true);
++                }
++                '>' => {
++                    self.pos += 1;
++                    return Some(false);
++                }
++                _ => {
++                    let name_len = self
++                        .rest()
++                        .find(|c: char| c.is_whitespace() || c == '=' || c == '/' || c == '>')?;
++                    if name_len == 0 {
++                        return None;
++                    }
++                    self.pos += name_len;
++                    self.skip_ws();
++                    if self.rest().starts_with('=') {
++                        self.pos += 1;
++                        self.skip_ws();
++                        let quote = self.rest().chars().next()?;
++                        if quote != '"' && quote != '\'' {
++                            return None;
++                        }
++                        self.pos += 1;
++                        let val_len = self.rest().find(quote)?;
++                        self.pos += val_len + 1;
++                    }
++                }
++            }
++        }
++    }
++}
++
++/// Un-escape the five predefined XML entities in text content — the exact inverse of
++/// [`xml_escape`] — so a `<Key>` carrying `&amp;` (S3's XML-escaped literal `&`) decodes
++/// to the real key rather than the escaped text (brief success criterion: an
++/// entity-escaped key deletes the right object). An unrecognised `&...;` run is copied
++/// verbatim rather than rejected — a permissive read, matching a real XML parser, over one
++/// unknown entity the caller did not invent maliciously.
++fn xml_unescape(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    let bytes = s.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] == b'&' {
++            if let Some(end) = s[i..].find(';') {
++                let entity = &s[i + 1..i + end];
++                let replacement = match entity {
++                    "amp" => Some('&'),
++                    "lt" => Some('<'),
++                    "gt" => Some('>'),
++                    "quot" => Some('"'),
++                    "apos" => Some('\''),
++                    _ => None,
++                };
++                if let Some(c) = replacement {
++                    out.push(c);
++                    i += end + 1;
++                    continue;
++                }
++            }
++        }
++        let ch = s[i..]
++            .chars()
++            .next()
++            .expect("i is a char boundary within s");
++        out.push(ch);
++        i += ch.len_utf8();
++    }
++    out
++}
++
++/// Parse a `<Delete>` XML body ([`DeleteRequest`]): the root must be `<Delete>`; each
++/// `<Object>` child must carry a `<Key>` (an `<Object>` with no `<Key>`, or any structural
++/// violation, is malformed); an optional top-level `<Quiet>true</Quiet>` sets `quiet`.
++/// Unknown child elements — inside `<Delete>` or inside an `<Object>` (e.g. a future
++/// `<VersionId>`) — are ignored, not rejected. `None` on any malformed input; the caller
++/// answers S3's `MalformedXML`, never a partial/best-effort read.
++fn parse_delete_request(body: &[u8]) -> Option<DeleteRequest> {
++    let text = std::str::from_utf8(body).ok()?;
++    let mut parser = XmlParser::new(text);
++    parser.skip_misc();
++    let root = parser.parse_element()?;
++    parser.skip_ws();
++    if !parser.rest().is_empty() {
++        return None; // trailing content after the root element closed
++    }
++    let XmlNode::Element { name, children } = root else {
++        return None;
++    };
++    if name != "Delete" {
++        return None;
++    }
++    let mut keys = Vec::new();
++    let mut quiet = false;
++    for child in children {
++        let XmlNode::Element { name, children } = child else {
++            continue; // stray top-level text is ignored
++        };
++        match name.as_str() {
++            "Object" => {
++                let key = children.into_iter().find_map(|c| match c {
++                    XmlNode::Element { name, children } if name == "Key" => {
++                        children.into_iter().find_map(|c| match c {
++                            XmlNode::Text(t) => Some(t),
++                            _ => None,
++                        })
++                    }
++                    _ => None,
++                })?;
++                keys.push(key);
++            }
++            "Quiet" => {
++                let text = children.into_iter().find_map(|c| match c {
++                    XmlNode::Text(t) => Some(t),
++                    _ => None,
++                });
++                quiet = text.as_deref() == Some("true");
++            }
++            _ => {} // unknown top-level element: ignored
++        }
++    }
++    Some(DeleteRequest { keys, quiet })
++}
++
++/// Buffer a byte stream into memory, capped at `cap` bytes: `Err` (rather than a silent
++/// truncation) if the stream would exceed it, or if the stream itself errors. The ONLY
++/// request body this wire layer buffers whole rather than streams (module docs "stream,
++/// don't buffer") — justified by Design: the DeleteObjects body is SigV4-signed as a
++/// single unit (not a per-chunk streaming signature) and AWS bounds it at ≤1000 keys /
++/// ≤2 MiB, so buffering it is a bounded, deliberate exception, not an unbounded one.
++async fn buffer_bounded<S>(mut stream: S, cap: usize) -> Result<Vec<u8>, BoxError>
++where
++    S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>> + Unpin,
++{
++    let mut buf = Vec::new();
++    while let Some(chunk) = stream.next().await {
++        let chunk = chunk?;
++        if buf.len() + chunk.len() > cap {
++            return Err("the request body exceeds the DeleteObjects size limit".into());
++        }
++        buf.extend_from_slice(&chunk);
++    }
++    Ok(buf)
++}
++
++/// `POST /bucket?delete` — S3's bulk DeleteObjects (issue #509). Buffers the (bounded)
++/// body, checks it against the SigV4-signed payload hash exactly as the PUT path does
++/// post-stream (`sigv4::PayloadHash::Signed`), parses the `<Delete>` request, deletes each
++/// named key via the existing single-object seam ([`ObjectGateway::delete_object`] —
++/// already idempotent: `Ok(_)` for both a removed and an already-absent key, so S3's
++/// "delete is idempotent" contract holds here for free), and renders the per-key
++/// `<DeleteResult>` — `<Deleted>` on success (omitted under `Quiet`), `<Error>` (code +
++/// message, via the seam's own [`classify`]) on a per-key gateway fault. A malformed body,
++/// an over-count, or an over-size body all answer once, for the whole request, before any
++/// key is touched — never a partial run against an unparsed request.
++async fn delete_objects<G>(
++    state: &AppState<G>,
++    request_id: RequestId,
++    bucket: &str,
++    body: Body,
++    payload: sigv4::PayloadHash,
++) -> Response
++where
++    G: ObjectGateway,
++{
++    let raw = Box::pin(
++        body.into_data_stream()
++            .map(|item| item.map_err(|e| Box::new(e) as BoxError)),
++    );
++    let buffered = match &payload {
++        // A stock-SDK streaming-signature body (unexpected for this small, non-streamed
++        // op, but handled rather than mishandled if a client ever sends one): de-frame
++        // with the SAME decoder the PUT path uses, then buffer the decoded bytes.
++        sigv4::PayloadHash::Streaming(ctx) => {
++            buffer_bounded(
++                streaming::decode(raw, ctx.clone()),
++                DELETE_OBJECTS_MAX_BODY_BYTES,
++            )
++            .await
++        }
++        sigv4::PayloadHash::Signed(_) | sigv4::PayloadHash::Unsigned => {
++            buffer_bounded(raw, DELETE_OBJECTS_MAX_BODY_BYTES).await
++        }
++    };
++    let buffered = match buffered {
++        Ok(bytes) => bytes,
++        Err(_) => {
++            return error_response(
++                request_id,
++                StatusCode::BAD_REQUEST,
++                "MalformedXML",
++                "the request body could not be read or exceeds the DeleteObjects size limit",
++            )
++        }
++    };
++
++    // A single-shot signed body: verify the buffered bytes against the signed digest
++    // BEFORE trusting a single byte of it — the same discipline the PUT path applies
++    // post-stream (`sigv4::PayloadHash::Signed`, `lib.rs` PUT arm), just applied to a
++    // buffered body instead of a streamed one.
++    if let sigv4::PayloadHash::Signed(hex) = &payload {
++        let digest = crate::crypto::hex(&crate::crypto::sha256(&buffered));
++        if !crate::crypto::constant_time_eq(digest.as_bytes(), hex.as_bytes()) {
++            return error_response(
++                request_id,
++                StatusCode::BAD_REQUEST,
++                "XAmzContentSHA256Mismatch",
++                "the delivered body does not match the signed x-amz-content-sha256",
++            );
++        }
++    }
++
++    let Some(parsed) = parse_delete_request(&buffered) else {
++        return error_response(
++            request_id,
++            StatusCode::BAD_REQUEST,
++            "MalformedXML",
++            "the request body could not be parsed as a <Delete> request",
++        );
++    };
++    if parsed.keys.is_empty() {
++        return error_response(
++            request_id,
++            StatusCode::BAD_REQUEST,
++            "MalformedXML",
++            "a Delete request must name at least one object",
++        );
++    }
++    if parsed.keys.len() > DELETE_OBJECTS_MAX_KEYS {
++        return error_response(
++            request_id,
++            StatusCode::BAD_REQUEST,
++            "MalformedXML",
++            "a Delete request may name at most 1000 objects",
++        );
++    }
++
++    let mut out = String::with_capacity(256 + parsed.keys.len() * 96);
++    out.push_str(
++        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
++         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
++    );
++    for key in &parsed.keys {
++        let object_key = format!("{bucket}/{key}");
++        match state.gateway.delete_object(&object_key).await {
++            // Idempotent: `Ok(_)` covers both a removed key and an already-absent one — S3
++            // reports BOTH as `<Deleted>` (brief success criterion: absent keys delete
++            // as a no-op success, never a per-key error).
++            Ok(_) => {
++                if !parsed.quiet {
++                    out.push_str("<Deleted><Key>");
++                    out.push_str(&xml_escape(key));
++                    out.push_str("</Key></Deleted>");
++                }
++            }
++            Err(err) => {
++                let (_, code, message) = classify(&err);
++                out.push_str("<Error><Key>");
++                out.push_str(&xml_escape(key));
++                out.push_str("</Key><Code>");
++                out.push_str(&xml_escape(code));
++                out.push_str("</Code><Message>");
++                out.push_str(&xml_escape(&message));
++                out.push_str("</Message></Error>");
++            }
++        }
++    }
++    out.push_str("</DeleteResult>");
++
++    Response::builder()
++        .status(StatusCode::OK)
++        .header("content-type", "application/xml")
++        .header("content-length", out.len().to_string())
++        .body(Body::from(out))
++        .expect("static response is always valid")
++}
++
+ /// Mint this request's id, run the dispatcher **inside a span carrying it**, and stamp the
+ /// id onto the response — every response, success or failure (#529).
+ ///
+@@ -1461,6 +1895,21 @@ where
+     // verbs); the split routes bucket-scoped GET to the listing handler and leaves every
+     // other bucket-scoped method on today's 400 (#511 / 509 extend the split later).
+     if let Some(bucket) = bucket_scoped_path(&path) {
++        // `POST /bucket?delete` — S3's bulk DeleteObjects (issue #509) — is checked BEFORE
++        // the subresource denylist just below (which also lists `delete` and would otherwise
++        // answer 501 here exactly as it does for every other method/path form naming
++        // `delete` — see [`has_delete_subresource`]).
++        if method == Method::POST && has_delete_subresource(&query) {
++            return delete_objects(
++                &state,
++                request_id,
++                &percent_decode_utf8(bucket),
++                body,
++                payload,
++            )
++            .await;
++        }
++
+         // The bucket path MUST still consult the subresource denylist first: only a listing
+         // form (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys`
+         // forms, and benign params) routes to listing. `GET /bucket?acl` / `?policy` /
+diff --git a/crates/server/tests/s3_delete_objects.rs b/crates/server/tests/s3_delete_objects.rs
+new file mode 100644
+index 0000000..5ace601
+--- /dev/null
++++ b/crates/server/tests/s3_delete_objects.rs
+@@ -0,0 +1,382 @@
++//! Bulk `DeleteObjects` — `POST /bucket?delete` (issue #509). Drives the gateway's S3
++//! wire surface with a **stock `aws-sdk-s3`** client (`delete_objects()`, which builds the
++//! signed POST + `<Delete>` XML body for real — mirrors `s3_gateway_cluster.rs`'s
++//! `sdk_client` / `s3_http_wire.rs::real_sdk_interop::sdk_client`) over the same in-process
++//! redb + fs-tempdir loopback stack `s3_object_metadata.rs` stands up.
++//!
++//! Asserted (brief success criterion): a bulk delete naming several present keys and at
++//! least one absent one answers `200` with a `<DeleteResult>` naming each requested key
++//! exactly once — `<Deleted>` for BOTH the removed and the already-absent keys (S3 delete
++//! is idempotent) — and a follow-up `GetObject` of a deleted key is `404 NoSuchKey`;
++//! `Quiet=true` omits the `<Deleted>` entries; a malformed XML body is `400 MalformedXML`;
++//! more than 1000 keys is refused; and an entity-escaped key (`&amp;` etc.) deletes the
++//! right object.
++//!
++//! RED on the wave base: `POST /bucket?delete` falls through the bucket-scoped dispatch to
++//! `400 InvalidRequest` (non-GET bucket-scoped methods) or is denylisted straight to `501`
++//! (the `delete` subresource, `crates/gateway-s3/src/lib.rs` `UNSUPPORTED_SUBRESOURCES`) —
++//! either way never a `200 <DeleteResult>` — so every assertion below fails pre-fix. GREEN
++//! once the bulk-delete route exists.
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::SystemTime;
++
++use aws_sdk_s3::config::{Credentials as SdkCredentials, Region};
++use aws_sdk_s3::primitives::ByteStream;
++use aws_sdk_s3::types::{Delete, ObjectIdentifier};
++use aws_sdk_s3::Client;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++
++type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
++
++/// Mirrors `s3_object_metadata.rs::build_gateway` / `s3_http_wire.rs::build_gateway`.
++fn build_gateway(dir: &std::path::Path) -> Arc<Backend> {
++    Arc::new(
++        Gateway::new(
++            RedbMetadataStore::in_memory().expect("redb"),
++            FsChunkStore::open(dir).expect("fs store"),
++            MemCoordination::new(),
++        )
++        .with_chunk_size(8),
++    )
++}
++
++/// Start the S3 gateway on an ephemeral loopback port. Mirrors
++/// `s3_object_metadata.rs::start_gateway`.
++async fn start_gateway() -> (SocketAddr, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let gateway = build_gateway(dir.path());
++    let config = S3Config::new(vec![Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(gateway, config);
++    tokio::spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    (addr, dir)
++}
++
++/// Build an `aws-sdk-s3` client pointed at the loopback gateway. Mirrors
++/// `s3_gateway_cluster.rs::sdk_client` / `s3_http_wire.rs::real_sdk_interop::sdk_client`.
++fn sdk_client(addr: SocketAddr) -> Client {
++    let http_client = aws_smithy_http_client::Builder::new().build_http();
++    let config = aws_sdk_s3::Config::builder()
++        .behavior_version_latest()
++        .region(Region::new(REGION))
++        .endpoint_url(format!("http://{addr}"))
++        .credentials_provider(SdkCredentials::new(
++            ACCESS_KEY, SECRET_KEY, None, None, "static",
++        ))
++        .http_client(http_client)
++        .force_path_style(true)
++        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
++        .stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
++        .build();
++    Client::from_conf(config)
++}
++
++/// The SigV4 headers for a hand-built raw request (the malformed-XML case, which a stock
++/// SDK will never construct itself). Mirrors `s3_object_metadata.rs::signed_headers`.
++fn signed_headers(
++    method: &str,
++    path: &str,
++    query: &str,
++    host: &str,
++    body: &[u8],
++) -> Vec<(String, String)> {
++    let creds = Credentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    };
++    let amz_date = format_amz_date(SystemTime::now());
++    let signed = sign(
++        method, path, query, host, &amz_date, body, &creds, REGION, "s3",
++    );
++    vec![
++        ("authorization".to_string(), signed.authorization),
++        ("x-amz-date".to_string(), signed.amz_date),
++        ("x-amz-content-sha256".to_string(), signed.content_sha256),
++    ]
++}
++
++/// Send one HTTP/1.1 request over a fresh connection and return `(status, body)`. Mirrors
++/// `s3_http_wire.rs::send`.
++async fn send(
++    addr: SocketAddr,
++    method: &str,
++    path_and_query: &str,
++    headers: &[(String, String)],
++    body: &[u8],
++) -> (u16, Vec<u8>) {
++    let host = addr.to_string();
++    let mut request = format!("{method} {path_and_query} HTTP/1.1\r\n");
++    request.push_str(&format!("host: {host}\r\n"));
++    for (name, value) in headers {
++        request.push_str(&format!("{name}: {value}\r\n"));
++    }
++    request.push_str(&format!("content-length: {}\r\n", body.len()));
++    request.push_str("connection: close\r\n\r\n");
++
++    let mut stream = TcpStream::connect(addr).await.expect("connect");
++    stream
++        .write_all(request.as_bytes())
++        .await
++        .expect("write head");
++    stream.write_all(body).await.expect("write body");
++    stream.flush().await.expect("flush");
++
++    let mut raw = Vec::new();
++    stream.read_to_end(&mut raw).await.expect("read response");
++    let split = raw
++        .windows(4)
++        .position(|w| w == b"\r\n\r\n")
++        .expect("response has a header terminator");
++    let head = String::from_utf8_lossy(&raw[..split]);
++    let status_line = head.lines().next().expect("status line");
++    let status: u16 = status_line
++        .split_whitespace()
++        .nth(1)
++        .expect("status code")
++        .parse()
++        .expect("numeric status");
++    (status, raw[split + 4..].to_vec())
++}
++
++/// A bulk delete naming several PRESENT keys and one ABSENT key answers `200` with every
++/// requested key named exactly once, `<Deleted>` for both classes (S3 delete is
++/// idempotent) — and a follow-up GET of a deleted key is `404 NoSuchKey`.
++#[tokio::test]
++async fn bulk_delete_removes_present_and_absent_keys_reporting_each_once() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++    let bucket = "wyrd-bucket";
++
++    for key in ["a/one", "a/two"] {
++        client
++            .put_object()
++            .bucket(bucket)
++            .key(key)
++            .body(ByteStream::from(b"payload".to_vec()))
++            .send()
++            .await
++            .expect("PUT must succeed");
++    }
++
++    let delete = Delete::builder()
++        .objects(
++            ObjectIdentifier::builder()
++                .key("a/one")
++                .build()
++                .expect("key"),
++        )
++        .objects(
++            ObjectIdentifier::builder()
++                .key("a/two")
++                .build()
++                .expect("key"),
++        )
++        .objects(
++            ObjectIdentifier::builder()
++                .key("a/never-existed")
++                .build()
++                .expect("key"),
++        )
++        .build()
++        .expect("at least one object");
++
++    let output = client
++        .delete_objects()
++        .bucket(bucket)
++        .delete(delete)
++        .send()
++        .await
++        .expect("a stock aws-sdk-s3 DeleteObjects must be accepted by the gateway");
++
++    assert!(output.errors().is_empty(), "no per-key errors expected");
++    let mut deleted: Vec<&str> = output
++        .deleted()
++        .iter()
++        .map(|d| d.key().expect("Deleted must carry a Key"))
++        .collect();
++    deleted.sort_unstable();
++    assert_eq!(
++        deleted,
++        vec!["a/never-existed", "a/one", "a/two"],
++        "each requested key must be named exactly once, present or absent alike \
++         (delete is idempotent)"
++    );
++
++    for key in ["a/one", "a/two"] {
++        let got = client.get_object().bucket(bucket).key(key).send().await;
++        let err = got.expect_err("a GET of a bulk-deleted key must 404, not return stale bytes");
++        assert_eq!(
++            err.into_service_error().meta().code(),
++            Some("NoSuchKey"),
++            "key {key} must read back NoSuchKey after the bulk delete"
++        );
++    }
++}
++
++/// `Quiet=true` omits every `<Deleted>` entry from the result (no per-key errors either,
++/// since nothing here fails) — while still actually deleting the object.
++#[tokio::test]
++async fn bulk_delete_quiet_omits_deleted_entries() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++    let bucket = "wyrd-bucket";
++    let key = "quiet/object";
++
++    client
++        .put_object()
++        .bucket(bucket)
++        .key(key)
++        .body(ByteStream::from(b"payload".to_vec()))
++        .send()
++        .await
++        .expect("PUT must succeed");
++
++    let delete = Delete::builder()
++        .objects(ObjectIdentifier::builder().key(key).build().expect("key"))
++        .quiet(true)
++        .build()
++        .expect("at least one object");
++
++    let output = client
++        .delete_objects()
++        .bucket(bucket)
++        .delete(delete)
++        .send()
++        .await
++        .expect("a Quiet DeleteObjects must still be accepted");
++
++    assert!(
++        output.deleted().is_empty(),
++        "Quiet=true must omit every <Deleted> entry"
++    );
++    assert!(output.errors().is_empty());
++
++    let got = client.get_object().bucket(bucket).key(key).send().await;
++    assert!(
++        got.is_err(),
++        "the object must actually be gone even though Quiet suppressed the <Deleted> echo"
++    );
++}
++
++/// A malformed `<Delete>` body (not XML at all) answers `400 MalformedXML` — a stock SDK
++/// never sends this, so it is hand-signed and sent raw (mirrors
++/// `s3_http_wire.rs`'s hand-built-request tests).
++#[tokio::test]
++async fn bulk_delete_malformed_xml_body_is_refused() {
++    let (addr, _dir) = start_gateway().await;
++    let body = b"this is not XML at all";
++    let headers = signed_headers("POST", "/wyrd-bucket", "delete", &addr.to_string(), body);
++    let (status, response_body) = send(addr, "POST", "/wyrd-bucket?delete", &headers, body).await;
++
++    assert_eq!(
++        status, 400,
++        "a malformed Delete body must be refused, not accepted"
++    );
++    let xml = String::from_utf8_lossy(&response_body);
++    assert!(
++        xml.contains("<Code>MalformedXML</Code>"),
++        "expected the MalformedXML S3 error code, got: {xml}"
++    );
++}
++
++/// A request naming more than 1000 keys is refused (AWS's own documented DeleteObjects
++/// cap) rather than silently accepted or run partially.
++#[tokio::test]
++async fn bulk_delete_more_than_1000_keys_is_refused() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++    let bucket = "wyrd-bucket";
++
++    let mut builder = Delete::builder();
++    for i in 0..1001 {
++        builder = builder.objects(
++            ObjectIdentifier::builder()
++                .key(format!("over-limit/{i}"))
++                .build()
++                .expect("key"),
++        );
++    }
++    let delete = builder.build().expect("at least one object");
++
++    let err = client
++        .delete_objects()
++        .bucket(bucket)
++        .delete(delete)
++        .send()
++        .await
++        .expect_err("a Delete request naming more than 1000 keys must be refused");
++    assert_eq!(
++        err.into_service_error().meta().code(),
++        Some("MalformedXML"),
++        "expected a 400-class MalformedXML refusal for the over-limit request"
++    );
++}
++
++/// An entity-escaped key (an ampersand, which S3 XML-escapes as `&amp;`) deletes the RIGHT
++/// object — the SDK escapes it building the request; the gateway must un-escape it back
++/// the same way before composing the store key.
++#[tokio::test]
++async fn bulk_delete_entity_escaped_key_deletes_the_right_object() {
++    let (addr, _dir) = start_gateway().await;
++    let client = sdk_client(addr);
++    let bucket = "wyrd-bucket";
++    let key = "a&b.txt";
++
++    client
++        .put_object()
++        .bucket(bucket)
++        .key(key)
++        .body(ByteStream::from(b"ampersand payload".to_vec()))
++        .send()
++        .await
++        .expect("PUT of an ampersand key must succeed");
++
++    let delete = Delete::builder()
++        .objects(ObjectIdentifier::builder().key(key).build().expect("key"))
++        .build()
++        .expect("at least one object");
++
++    let output = client
++        .delete_objects()
++        .bucket(bucket)
++        .delete(delete)
++        .send()
++        .await
++        .expect("DeleteObjects naming an ampersand key must be accepted");
++
++    assert!(output.errors().is_empty());
++    assert_eq!(
++        output
++            .deleted()
++            .iter()
++            .filter_map(|d| d.key())
++            .collect::<Vec<_>>(),
++        vec![key],
++        "the entity-escaped key must round-trip to the exact requested key"
++    );
++
++    let got = client.get_object().bucket(bucket).key(key).send().await;
++    assert!(
++        got.is_err(),
++        "the ampersand-keyed object must actually be gone, proving the RIGHT object was hit"
++    );
++}
