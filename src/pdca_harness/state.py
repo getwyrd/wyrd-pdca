@@ -51,6 +51,16 @@ DOWNSTREAM_OF_BRIEF = [
     "SUMMARY.md",
 ]
 
+# The rest of a cycle's output, by pattern: the advisory artifacts (#64) and each leaf's
+# captured error tail (#280). The iterate archive moves these alongside DOWNSTREAM_OF_BRIEF
+# (``driver._archive_iteration``), so they are cycle evidence by exactly the same argument —
+# and they live here for the same reason: enumerating the set twice is how the two lists drift
+# apart, which is the defect this guard exists to close.
+DOWNSTREAM_GLOBS = (
+    "check-advisory-*.md",
+    "*.error.log",
+)
+
 # §9 outcome token → bundle state. state owns the state names, so the mapping
 # lives here; signoff knows only the tokens (no import cycle).
 _OUTCOME_TO_STATE = {
@@ -74,7 +84,7 @@ def is_resolved(d: Path) -> bool:
     forever. The ``resolved`` record makes it terminal ([`RESOLVED`]).
 
     A bundle carrying **any** evidence a cycle ran — ``brief.md``, any artifact in
-    [`DOWNSTREAM_OF_BRIEF`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
+    [`DOWNSTREAM_OF_BRIEF`] or matching [`DOWNSTREAM_GLOBS`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
     ``resolved`` key can never reclassify it (including a rejected cycle left briefless by
     ``iterate-to-Plan``, which archives ``brief.md`` + everything downstream and must stay
     UNPLANNED for its re-plan). A malformed / unreadable ``notes.json`` is "not resolved",
@@ -84,6 +94,7 @@ def is_resolved(d: Path) -> bool:
     if (
         (d / "brief.md").exists()
         or any((d / f).exists() for f in DOWNSTREAM_OF_BRIEF)
+        or any(q.is_file() for g in DOWNSTREAM_GLOBS for q in d.glob(g))
         or any(d.glob("iteration-v*"))
     ):
         return False

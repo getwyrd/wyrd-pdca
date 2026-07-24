@@ -14,6 +14,7 @@ briefless bundles so a real cycle bundle with a stray key is untouched; RESOLVED
 
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import unittest
@@ -106,6 +107,33 @@ class ResolvedStateTest(unittest.TestCase):
                 state.is_resolved(d), f"{artifact} present must block RESOLVED"
             )
             self.assertEqual(state.state(d), state.UNPLANNED)
+
+    def test_briefless_with_a_glob_matched_artifact_is_not_resolved(self) -> None:
+        # The iterate archive moves `check-advisory-*.md` and `*.error.log` with the attempt
+        # that produced them (driver._archive_iteration), so they are cycle evidence by the
+        # same argument as DOWNSTREAM_OF_BRIEF: a damaged bundle retaining only one of them
+        # is a cycle awaiting a re-plan, not a notes-only tracker.
+        for artifact in ("check-advisory-adversary.md", "build.error.log"):
+            d = _bundle(self.root, f"issue_glob_{artifact.replace('.', '_')}")
+            (d / artifact).write_text("x\n", encoding="utf-8")
+            (d / "notes.json").write_text(
+                json.dumps({"resolved": {"github_state": "closed"}}), encoding="utf-8"
+            )
+            self.assertFalse(
+                state.is_resolved(d), f"{artifact} present must block RESOLVED"
+            )
+            self.assertEqual(state.state(d), state.UNPLANNED)
+
+    def test_archive_globs_are_the_shared_source_of_truth(self) -> None:
+        # Same rule as the list above, for the patterns: the archive reads
+        # state.DOWNSTREAM_GLOBS rather than repeating the globs, so the set the archive
+        # moves and the set is_resolved counts as evidence cannot drift apart.
+        from pdca_harness import driver
+
+        self.assertIs(driver.state.DOWNSTREAM_GLOBS, state.DOWNSTREAM_GLOBS)
+        src = inspect.getsource(driver._archive_iteration)
+        self.assertIn("state.DOWNSTREAM_GLOBS", src)
+        self.assertNotIn('d.glob("check-advisory-*.md")', src)
 
     def test_downstream_of_brief_is_the_shared_source_of_truth(self) -> None:
         # driver re-exports state's list — one source, so is_resolved and the iterate
