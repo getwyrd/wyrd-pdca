@@ -36,6 +36,10 @@ from pdca_harness import leaves
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "handoff-check"
 
+# §9 must carry the `- Outcome:` line `signoff.record` writes into: it REPLACES that line, so
+# without it the decision is silently dropped (PR #169 review round 2).
+_SUMMARY = "## 6. NEEDS-HUMAN\n\n\n## 9. Check sign-off\n\n- Outcome:\n"
+
 
 def _load():
     loader = importlib.machinery.SourceFileLoader("handoff_check", str(_SCRIPT))
@@ -50,6 +54,7 @@ hc = _load()
 _BRIEF = """# Brief
 
 - **Slug:** fix-the-thing
+- **Scope:** the reaper fence commit path only
 - **Success criterion:** the reaper commits its fence under a concurrent abort
 - **Falsifiability:** revert the fence commit; the reaper conformance clause goes RED
 - **Repo + branch target:** `getwyrd/wyrd` @ `main`
@@ -91,7 +96,8 @@ class Planner(_Base):
     def test_a_missing_branch_target_fails(self) -> None:
         # The one field with no fallback: `publish._resolve_target` partitions on `@` and
         # an empty value yields an empty repo spec AND an empty base.
-        self._brief("# Brief\n\n- **Slug:** fix-the-thing\n- **Success criterion:** it works\n")
+        self._brief("# Brief\n\n- **Slug:** fix-the-thing\n- **Scope:** one path\n"
+                    "- **Success criterion:** it works\n")
         results = hc.check_planner(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("repo + branch target" in r.label for r in results), results)
@@ -100,7 +106,9 @@ class Planner(_Base):
         """Seven committed bundles ship `Test file` empty on purpose, and `brief.test_files`
         returns [] for it — the driver only uses it to unlink a shipped test on iterate. A
         gate that failed them would false-positive on 7% of the corpus."""
-        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:** it works\n"
                     "- **Falsifiability:** revert it\n"
                     "- **Repo + branch target:** `o/r` @ `main`\n- **Test file:**\n")
         self.assertTrue(self._ok(hc.check_planner(self.d, named=True)))
@@ -112,6 +120,8 @@ class Planner(_Base):
         contract requires it, and Do/Check otherwise proceed without the condition they exist
         to implement and verify."""
         self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    ""
                     "- **Repo + branch target:** `o/r` @ `main`\n")
         results = hc.check_planner(self.d, named=True)
         self.assertFalse(self._ok(results))
@@ -123,7 +133,9 @@ class Planner(_Base):
         briefs (`plan-pointer.md.tpl`) and any long criterion write it that way. Four
         committed bundles do (256/258/364/366). Failing them would be a parser artifact, not
         a contract breach."""
-        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n"
                     "- **Falsifiability:** revert it\n"
                     "- **Success criterion:**\n"
                     "  - **BINDING:** the under-replicated count rises and returns to zero\n")
@@ -131,18 +143,24 @@ class Planner(_Base):
 
     def test_a_label_with_nothing_under_it_still_fails(self) -> None:
         # The other direction: tolerating multi-line must not tolerate an EMPTY field.
-        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:**\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:**\n"
                     "- **Repo + branch target:** `o/r` @ `main`\n")
         self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
 
     def test_a_multiline_placeholder_still_fails(self) -> None:
-        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n"
                     "- **Success criterion:**\n  <the observable condition that means it is "
                     "fixed>\n")
         self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
 
     def test_a_placeholder_success_criterion_fails(self) -> None:
-        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** <the observable "
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:** <the observable "
                     "condition>\n- **Repo + branch target:** `o/r` @ `main`\n")
         self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
 
@@ -150,14 +168,18 @@ class Planner(_Base):
         """PR #169 review. `brief.field` is truthy for `owner/repo` with no `@ branch`, so a
         presence check passes while `_resolve_target` yields an empty base and publish aborts
         — after the interactive session is gone."""
-        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:** it works\n"
                     "- **Repo + branch target:** `getwyrd/wyrd`\n")
         results = hc.check_planner(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("@ <branch>" in r.label for r in results), results)
 
     def test_a_target_without_an_owner_fails(self) -> None:
-        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:** it works\n"
                     "- **Repo + branch target:** `wyrd` @ `main`\n")
         results = hc.check_planner(self.d, named=True)
         self.assertFalse(self._ok(results))
@@ -167,7 +189,9 @@ class Planner(_Base):
         """PR #169 review round 2. The stock placeholders WRAP, so the first line opened with
         `<` and the continuation did not — and the continuation was read as authored text, so
         an entirely untouched template field passed."""
-        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n"
                     "- **Falsifiability:** revert the commit; the clause goes RED\n"
                     "- **Success criterion:** <the observable condition that means it is "
                     "fixed — must be\n  demonstrable by C4-verify on the target harness>\n")
@@ -200,12 +224,24 @@ class Planner(_Base):
         # segment to cfg.root.parent, aiming later git operations at the wrong directory.
         for target in ("`getwyrd/` @ `main`", "`/wyrd` @ `main`"):
             with self.subTest(target=target):
-                self._brief(f"# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                self._brief(f"# Brief\n\n- **Slug:** s\n"
+                    "- **Scope:** the one path\n"
+                    "- **Success criterion:** it works\n"
                             f"- **Falsifiability:** revert it\n"
                             f"- **Repo + branch target:** {target}\n")
                 results = hc.check_planner(self.d, named=True)
                 self.assertFalse(self._ok(results), target)
                 self.assertTrue(any("owner/repo" in r.label for r in results), results)
+
+    def test_a_missing_scope_fails(self) -> None:
+        """PR #169 review round 2. agents/planner.md:24 requires scope / out of scope so Do
+        cannot sprawl; without it the gate hands implementation an unbounded slice. Authored
+        in all 85 committed briefs, so unlike falsifiability this is not a legacy gap."""
+        self._brief(_BRIEF.replace(
+            "- **Scope:** the reaper fence commit path only\n", ""))
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("`scope`" in r.label for r in results), results)
 
     def test_an_unfilled_optional_field_warns_but_does_not_fail(self) -> None:
         self._brief(_BRIEF + "- **Ordering note:** <optional free text>\n")
@@ -219,10 +255,22 @@ class Signoff(_Base):
         super().setUp()
         # A summary must exist for a decision to be recorded against — see
         # test_a_missing_summary_fails_the_signoff for why the gate now insists.
-        (self.d / "SUMMARY.md").write_text("## 6. NEEDS-HUMAN\n\n", encoding="utf-8")
+        (self.d / "SUMMARY.md").write_text(_SUMMARY, encoding="utf-8")
 
     def _decision(self, text: str) -> None:
         (self.d / leaves.SIGNOFF_DECISION).write_text(text, encoding="utf-8")
+
+    def test_a_summary_with_no_outcome_FIELD_fails(self) -> None:
+        """PR #169 review round 2. `outcome_token()` returns "" for a MISSING field and an
+        unset one alike, so an accept passed — and `signoff.record` only REPLACES an existing
+        line, so it then silently recorded nothing, deleted the decision, and left the bundle
+        awaiting sign-off with the session gone."""
+        (self.d / "SUMMARY.md").write_text("## 9. Check sign-off\n\n(nothing)\n",
+                                           encoding="utf-8")
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("no `- Outcome:` line" in r.label for r in results), results)
 
     def test_a_missing_summary_fails_the_signoff(self) -> None:
         """PR #169 review round 2. `open_needs_human` and `outcome_token` both return
@@ -274,7 +322,8 @@ class Signoff(_Base):
         the same `signoff.open_needs_human` predicate the driver runs."""
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
-            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n", encoding="utf-8")
+            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n"
+            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
         results = hc.check_signoff(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("§6 item(s) still open" in r.label for r in results), results)
@@ -283,13 +332,15 @@ class Signoff(_Base):
         # C6 guards ACCEPT only — an iterate is exactly what you record when §6 is not clear.
         self._decision("iterate-do\nthe cause was misread\n")
         (self.d / "SUMMARY.md").write_text(
-            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n", encoding="utf-8")
+            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n"
+            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
     def test_an_accept_with_every_item_cleared_passes(self) -> None:
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
-            "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — adjudicated\n", encoding="utf-8")
+            "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — adjudicated\n"
+            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
     def test_a_model_authored_section9_fails(self) -> None:
@@ -297,7 +348,8 @@ class Signoff(_Base):
         runs BEFORE the flow applies the decision, so a set §9 can only be the session's."""
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
-            "## 9. Check sign-off\n\n- Outcome: merged-wider\n", encoding="utf-8")
+            "## 6. NEEDS-HUMAN\n\n\n## 9. Check sign-off\n\n- Outcome: merged-wider\n",
+            encoding="utf-8")
         results = hc.check_signoff(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("§9" in r.label for r in results), results)
@@ -415,6 +467,33 @@ class Act(unittest.TestCase):
         results = self._check("the morning run", committed=None)
         self.assertTrue(self._ok(results))
         self.assertTrue(any(r.warn for r in results), results)
+
+
+class EmptyScan(_Base):
+    """An empty scan is not a pass (PR #169 review round 2).
+
+    These leaves are invoked for KNOWN bundles, so "no bundle carried an artifact" means the
+    session produced nothing — precisely the dropped-session failure this gate exists to
+    catch. It used to return success.
+    """
+
+    def _run(self, *argv: str) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = hc.main(list(argv))
+        return rc, buf.getvalue()
+
+    def test_an_empty_scan_fails_for_each_bundle_leaf(self) -> None:
+        empty = self.tmp / "none"
+        empty.mkdir()
+        cfg = mock.Mock(root=self.tmp, bundle_root=empty, process_dir=self.tmp / "process")
+        for leaf in ("planner", "signoff", "publisher"):
+            with self.subTest(leaf=leaf):
+                with mock.patch.object(hc.Config, "load", return_value=cfg):
+                    rc, out = self._run("--leaf", leaf)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("nothing to check", out)
+                self.assertIn("Name the bundle ids", out)
 
 
 class NoBundleWrites(_Base):
