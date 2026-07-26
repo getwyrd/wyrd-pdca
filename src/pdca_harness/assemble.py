@@ -49,6 +49,18 @@ class NeedsHumanItem(NamedTuple):
 _GATE_ELEMENTS = frozenset(e for e, _label, kind, _oracle in canonical_elements()
                            if kind == "gate")
 
+# Elements the REVIEWER may promote to builder-fixable with an `[impl]` tag (issue #332).
+# The taxonomy says where a finding sits; only the reviewer knows what it actually IS, and a
+# judgment cell routinely carries an ordinary build defect (a weak causal argument that is
+# really a missing case). So a judgment row may be promoted — but nothing else:
+#   * `input` cells (C1 spec, C3 change) are NOT promotable. A defective brief is a Plan miss,
+#     and rebuilding against the same brief cannot fix it — that is an iterate-PLAN, which
+#     this module deliberately cannot decide.
+#   * `V` is NOT promotable. It is the STANDING row, emitted every cycle whatever the reviewer
+#     found (#293); a constant carries no signal in either direction.
+_PROMOTABLE_ELEMENTS = frozenset(e for e, _label, kind, _oracle in canonical_elements()
+                                 if kind == "judgment") - {"V"}
+
 # A §6 item's leading 5/5/1 element id, when the reviewer's table row carries one.
 _ELEMENT_RE = re.compile(r"^(C[1-5]|T[1-5]|V)\b")
 
@@ -65,6 +77,28 @@ _V_LABEL = next(label for e, label, _kind, _oracle in canonical_elements() if e 
 # never enough (PR #294 review, local pass): a "## Concerns" table can carry the exact same label.
 _CANONICAL_LABELS = frozenset(label.strip().casefold()
                               for _e, label, _kind, _oracle in canonical_elements())
+
+# An Item cell's optional leading element id (issue #332). `leaves._REVIEW_PROMPT` lists the
+# matrix as `{elem} — {label}` and then asks for "the element label above" in the Item column,
+# so `V — Validation — fitness-to-purpose` is the literal reading of the instruction — and 37
+# rows of the wyrd corpus wrote exactly that, against 185 bare ones. The exact-match STANDING
+# test then failed and the constant row became a HUMAN veto: #293 returning through a
+# formatting variant. Normalize the prefix away before comparing.
+_ITEM_ELEMENT_PREFIX_RE = re.compile(r"^(?:C[1-5]|T[1-5]|V)\s*[—–-]{1,2}\s*")
+
+
+def _normalized_item_label(cell: str) -> str:
+    """An Item cell reduced to its canonical label for an EXACT comparison.
+
+    Strips a leading element id and folds an ASCII `--` to the em-dash the matrix uses (one
+    corpus row wrote `Validation -- fitness-to-purpose`). Deliberately narrow: only the
+    element prefix and the separator are normalized, never the label text. Matching the
+    label by PREFIX is what PR #294 identified as letting a real objection wear the
+    template's clothes, so the comparison stays exact — this only removes decoration the
+    prompt itself invites.
+    """
+    text = _ITEM_ELEMENT_PREFIX_RE.sub("", cell.strip(), count=1)
+    return re.sub(r"\s*--\s*", " — ", text).strip()
 
 # Leaf-status marker (issue #278). When a reviewer / advisory leaf could not produce a
 # verdict, `leaves` writes a placeholder carrying one of these as a machine-readable comment.
@@ -95,7 +129,8 @@ def leaf_status(artifact_text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _classify_finding(text: str, *, standing: bool = False) -> NeedsHumanItem:
+def _classify_finding(text: str, *, standing: bool = False,
+                      tagged_impl: bool = False) -> NeedsHumanItem:
     """Classify one reviewer / advisory §6 item, stripping any `[impl]` marker.
 
     Three kinds. IMPL — a rebuild can address it. STANDING — the reviewer's `Validation` row,
@@ -122,6 +157,13 @@ def _classify_finding(text: str, *, standing: bool = False) -> NeedsHumanItem:
     m = _ELEMENT_RE.match(text)
     if m and m.group(1) in _GATE_ELEMENTS:
         return NeedsHumanItem(text, IMPL)
+    # The reviewer tagged its own verdict cell `NEEDS-HUMAN [impl]` (#332). Honoured only on a
+    # judgment cell — see :data:`_PROMOTABLE_ELEMENTS`. Ordered AFTER the standing check on
+    # purpose: a tag on the V row must not turn the constant into a rebuild trigger. An
+    # unmappable row is not promotable either, since there is no element to check the tag
+    # against, and this function fails safe to HUMAN throughout.
+    if tagged_impl and m and m.group(1) in _PROMOTABLE_ELEMENTS:
+        return NeedsHumanItem(text, IMPL)
     return NeedsHumanItem(text, HUMAN)
 
 
@@ -136,8 +178,9 @@ def _items_from_artifact(text: str, *, allow_standing: bool = False) -> list[Nee
     and forced to HUMAN: there is no finding for a rebuild to fix, so an infra-empty must
     never be auto-iterated (#264). A real artifact is unaffected."""
     label = _LEAF_STATUS_LABEL.get(leaf_status(text), "")
-    items = [_classify_finding(t, standing=allow_standing and is_standing)
-             for t, is_standing in _needs_human(text)]
+    items = [_classify_finding(f.text, standing=allow_standing and f.standing,
+                               tagged_impl=f.tagged_impl)
+             for f in _needs_human(text)]
     if not label:
         return items
     return [NeedsHumanItem(f"{label} — {it.text}", HUMAN) for it in items]
@@ -172,7 +215,27 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
-    return items
+    return items + _deferred_items(d, items)
+
+
+def _deferred_items(d: Path, current: list[NeedsHumanItem]) -> list[NeedsHumanItem]:
+    """Findings earlier auto-iterate rounds passed over, re-entering §6 (issue #332).
+
+    An ``iterate-do`` archives SUMMARY.md and check-review.md, and the rebuild assembles a
+    fresh §6 from a fresh review — so a HUMAN finding raised in round 1 survives nowhere
+    unless the next reviewer independently raises it again. Auto-iterate may now run several
+    rounds past such a finding, so without this the driver could quietly iterate a real
+    architectural objection out of existence and hand the human a §6 that never mentions it.
+
+    Re-entering them here rather than only at render keeps :func:`collect_needs_human` the
+    single source it claims to be: the C6 accept-guard, the rendered §6 and the auto-iterate
+    classifier all see the same set. They are HUMAN, so they never make a bundle eligible on
+    their own, and they no longer block a rebuild either — they simply must not be lost.
+    """
+    from . import autoiterate  # local import: autoiterate imports this module
+    seen = {it.text.casefold() for it in current}
+    return [NeedsHumanItem(t, HUMAN) for t in autoiterate.deferred(d)
+            if t.casefold() not in seen]
 
 
 def assemble_summary(d: Path, cfg: Config) -> None:
@@ -313,8 +376,22 @@ def _missing_review_text() -> str:
     )
 
 
-def _needs_human(review_text: str) -> list[tuple[str, bool]]:
-    """Every reviewer NEEDS-HUMAN → ``(text, from_table)``, order-preserving and deduped.
+class _ReviewFinding(NamedTuple):
+    """One parsed NEEDS-HUMAN row, with the two facts the classifier needs about it."""
+
+    text: str
+    standing: bool      # IS the canonical constant Validation row (#293)
+    tagged_impl: bool   # the reviewer marked the verdict cell `[impl]` (#332)
+
+
+# The reviewer's own builder-fixability tag, in the VERDICT cell: `NEEDS-HUMAN [impl]` (#332).
+# In the verdict cell rather than a new column so the table schema is unchanged — `_needs_human`
+# already finds that cell by content, and every existing parser keeps working.
+_VERDICT_IMPL_RE = re.compile(r"\[impl\]", re.IGNORECASE)
+
+
+def _needs_human(review_text: str) -> list[_ReviewFinding]:
+    """Every reviewer NEEDS-HUMAN → ``(text, standing, tagged_impl)``, ordered and deduped.
 
     The reviewer always emits the 5/5/1 verdict table (see leaves._REVIEW_PROMPT);
     a table row whose verdict cell is NEEDS-HUMAN becomes a §6 item (Item — Basis).
@@ -332,20 +409,22 @@ def _needs_human(review_text: str) -> list[tuple[str, bool]]:
 
     Everything else keeps its signal.
     """
-    items: list[tuple[str, bool]] = []
+    items: list[_ReviewFinding] = []
     seen: set[str] = set()
     lines = review_text.splitlines()
     verdict_table = _verdict_table_lines(lines)
 
-    def add(text: str, *, standing: bool) -> None:
+    def add(text: str, *, standing: bool, tagged_impl: bool = False) -> None:
         text = text.strip()
         if text and text.lower() not in seen:
             seen.add(text.lower())
-            items.append((text, standing))
+            items.append(_ReviewFinding(text, standing, tagged_impl))
 
     for i, line in enumerate(lines):
         s = line.strip()
         if s.startswith("- NEEDS-HUMAN"):
+            # A bullet's `[impl]` rides in the TEXT and is read by `_classify_finding`'s
+            # marker strip — the advisory contract, unchanged.
             add(s[len("- NEEDS-HUMAN"):].lstrip(" —:-").strip(), standing=False)
         elif s.startswith("|") and "needs-human" in s.lower():
             cells = [c.strip() for c in s.strip("|").split("|")]
@@ -356,14 +435,15 @@ def _needs_human(review_text: str) -> list[tuple[str, bool]]:
             basis = cells[vi + 1] if vi + 1 < len(cells) else ""
             add(f"{label} — {basis}" if basis else label,
                 standing=(i in verdict_table
-                          and label.strip().casefold() == _V_LABEL.casefold()))
+                          and _normalized_item_label(label).casefold() == _V_LABEL.casefold()),
+                tagged_impl=bool(_VERDICT_IMPL_RE.search(cells[vi])))
 
     # FAIL CLOSED on ambiguity. The template row is a CONSTANT — it occurs exactly once. If two
     # survive (a second verdict-shaped table, a duplicated row), at least one of them is not the
     # constant, and we cannot tell which. Grant STANDING to neither, so the bundle halts for the
     # human rather than risk archiving a real objection.
-    if sum(1 for _t, standing in items if standing) > 1:
-        return [(t, False) for t, _s in items]
+    if sum(1 for it in items if it.standing) > 1:
+        return [it._replace(standing=False) for it in items]
     return items
 
 
@@ -392,7 +472,12 @@ def _verdict_table_lines(lines: list[str]) -> set[int]:
         while j < len(lines) and lines[j].strip().startswith("|"):
             j += 1
         block = range(i, j)
-        labels = {lines[k].strip().strip("|").split("|")[0].strip().casefold() for k in block}
+        # Normalized like the STANDING test itself (#332): the prompt invites a `C4 — ` style
+        # element prefix on every Item cell, so a table written that way carries ZERO cells
+        # that match exactly and would not be recognised as the mandated table at all — which
+        # then denies its Validation row the exemption for a second, independent reason.
+        labels = {_normalized_item_label(lines[k].strip().strip("|").split("|")[0]).casefold()
+                  for k in block}
         if len(labels & _CANONICAL_LABELS) >= 2:
             out.update(block)
         i = j

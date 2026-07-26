@@ -239,7 +239,15 @@ class Config:
     # The per-bundle cap on those automatic rounds; on exhaustion the bundle halts at
     # AWAITING_SIGNOFF for the human. Clamped below ``max_passes`` so a wave's pass budget
     # can't run out mid-auto-iteration (which #260 would then report as abandoned).
+    # This is the HARD ceiling: a round at or below it fires regardless of whether the
+    # previous one made progress.
     max_auto_iters: int = 3
+    # The SOFT floor (issue #332): rounds up to it fire unconditionally, rounds ABOVE it
+    # fire only while the implementation-finding count is not increasing. 0 ⇒ unset ⇒
+    # equals ``max_auto_iters``, which reproduces the pre-#332 behaviour exactly (every
+    # round unconditional), so a rendered instance changes nothing until it opts in.
+    # Normalized in :meth:`__post_init__`; never above ``max_auto_iters``.
+    soft_auto_iters: int = 0
     # Worktree isolation (issue #94): run a cycle's Do/Check in a dedicated git worktree
     # off the target's base, so the host's primary checkout is never mutated in place.
     # On by default; ``[driver].worktree = false`` disables (then Do/Check edit the
@@ -308,6 +316,23 @@ class Config:
     # same declare-in-config pattern as [[gates.checks]].
     doctor_checks: list[dict] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._normalize_auto_iters()
+
+    def _normalize_auto_iters(self) -> None:
+        """Resolve the soft floor against the hard ceiling (issue #332).
+
+        Unset (0 or negative) means "no soft tier" — the floor sits AT the ceiling, so every
+        allowed round fires unconditionally and the behaviour is exactly pre-#332. A floor
+        configured ABOVE the ceiling is a misconfiguration with only one safe reading: the
+        ceiling still bounds the work, so clamp to it rather than let the floor raise the
+        cap it is supposed to sit under. Idempotent — :meth:`override_max_passes` re-runs it
+        after lowering the ceiling, which must drag the floor down with it.
+        """
+        if self.soft_auto_iters <= 0:
+            self.soft_auto_iters = self.max_auto_iters
+        self.soft_auto_iters = min(self.soft_auto_iters, self.max_auto_iters)
+
     def profile(self, leaf: LeafConfig):
         """The resolved :class:`~pdca_harness.families.FamilyProfile` for ``leaf``."""
         from . import families as _families  # local import: keep config import-light
@@ -348,6 +373,10 @@ class Config:
         spent >= budget check then declines before the decision is recorded)."""
         self.max_passes = max(1, n)
         self.max_auto_iters = min(self.max_auto_iters, max(0, self.max_passes - 1))
+        # The soft floor sits under the ceiling by construction, so lowering the ceiling
+        # must drag it down too — otherwise a floor left above it would make every
+        # remaining round unconditional, which is the opposite of what the clamp is for.
+        self._normalize_auto_iters()
 
     def close_class(self, disposition: str) -> str:
         """The close class matching ``disposition``, or "" if it is not a close hint.
@@ -511,6 +540,11 @@ class Config:
         if os.environ.get("PDCA_MAX_AUTO_ITERS"):
             max_auto_iters = max(1, int(os.environ["PDCA_MAX_AUTO_ITERS"]))
         max_auto_iters = min(max_auto_iters, max(0, max_passes - 1))
+        # The soft floor (issue #332). 0 ⇒ unset ⇒ __post_init__ sets it to the ceiling,
+        # so an instance that never declares it behaves exactly as it did before.
+        soft_auto_iters = max(0, int(driver_cfg.get("soft_auto_iters", 0)))
+        if os.environ.get("PDCA_SOFT_AUTO_ITERS"):
+            soft_auto_iters = max(0, int(os.environ["PDCA_SOFT_AUTO_ITERS"]))
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
         overflow = max(0, int(driver_cfg.get("overflow", 0)))  # issue #226; 0 ⇒ heal in place
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
@@ -569,6 +603,7 @@ class Config:
             max_passes=max_passes,
             auto_iterate=auto_iterate,
             max_auto_iters=max_auto_iters,
+            soft_auto_iters=soft_auto_iters,
             worktree=worktree,
             overflow=overflow,
             lane_preflight=lane_preflight,

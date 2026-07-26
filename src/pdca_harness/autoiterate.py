@@ -44,74 +44,192 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .assemble import IMPL, STANDING, NeedsHumanItem
+from .assemble import HUMAN, IMPL, NeedsHumanItem
+from .config import Config
 from .leaves import SIGNOFF_DECISION
 
 BUDGET_FILE = "auto-iterate.json"
+
+# Findings the driver iterated PAST (issue #332). An `iterate-do` archives SUMMARY.md and
+# check-review.md and the rebuild assembles a fresh §6, so a HUMAN finding raised in an early
+# round exists nowhere afterwards unless the next reviewer happens to raise it again. Over a
+# multi-round budget that is a live way to drop a real architectural objection, so each
+# deferred item is recorded here and merged back into §6 at handover (assemble.py). Like
+# BUDGET_FILE it is deliberately NOT in driver.DOWNSTREAM_OF_BRIEF, so the archive step leaves
+# it in place and it accumulates across rebuilds.
+DEFERRED_FILE = "deferred-findings.json"
 
 # The only token this module is ever allowed to write.
 DECISION = "iterate-do"
 
 
 def eligible(items: list[NeedsHumanItem]) -> bool:
-    """True iff a rebuild is the right next step: at least one IMPL finding, and nothing
-    else the human must see *first*.
+    """True iff there is implementation work a rebuild can do: at least one IMPL finding.
 
     An **empty** §6 is deliberately not eligible — that is a clean bundle awaiting a human
-    *accept*, and auto-iterate must never accept. A situational HUMAN item still disqualifies
-    the whole bundle: the human has to look at it anyway, so there is nothing to save by
-    rebuilding first.
+    *accept*, and auto-iterate must never accept. Neither is a §6 of HUMAN items with no IMPL
+    item beside them: there is nothing for a rebuild to address, so the bundle goes straight
+    to the human.
 
-    But a **STANDING** item does not. The reviewer's prompt hard-codes `Validation —
-    fitness-to-purpose` to NEEDS-HUMAN on EVERY cycle regardless of what it found, so that row
-    is a constant, and a constant is not evidence that a human must look right now. Requiring
-    `all(IMPL)` therefore made this function unreachable in production: every real review
-    artifact carries that row, so auto-iterate never fired once (#293). The bundle still halts
-    for the human as soon as the implementation findings are gone — which is the whole point:
-    iterate Do→Check while the reviewer keeps finding defects only Do can fix, then hand over.
+    A HUMAN item no longer disqualifies a bundle that DOES carry implementation work (#332).
+    It used to, and the cost was measured: over a 230-attempt corpus only 31 attempts (13.5%)
+    were eligible, and a single situational judgment row vetoed the rest however many build
+    defects sat beside it. A finding needing a human is not a signal to stop rebuilding — it
+    is a signal that Plan overlooked something, and it is the ROUND BUDGET, not the finding,
+    that bounds the iteration. Such items are deferred: recorded in :data:`DEFERRED_FILE` and
+    merged back into §6 at handover, so nothing raised in an early round is lost.
+
+    The STANDING `Validation` row has never counted either way (#293): the reviewer's prompt
+    emits it on every cycle whatever it found, so it is a constant and a constant is not
+    evidence about anything.
     """
-    return (any(item.kind == IMPL for item in items)
-            and all(item.kind in (IMPL, STANDING) for item in items))
+    return any(item.kind == IMPL for item in items)
+
+
+def impl_count(items: list[NeedsHumanItem]) -> int:
+    """How many findings in this §6 a rebuild can address — the convergence signal."""
+    return sum(1 for item in items if item.kind == IMPL)
+
+
+def _state(d: Path) -> dict:
+    """The budget file as a dict. Tolerant of missing/garbled/legacy content, like
+    ``loop-telemetry.json`` — a bundle mid-flight when this ships must not crash."""
+    try:
+        raw = json.loads((d / BUDGET_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def count(d: Path) -> int:
-    """How many automatic iterations this bundle has already spent. Tolerant of a missing
-    or garbled file, like ``loop-telemetry.json``."""
+    """How many automatic iterations this bundle has already spent."""
     try:
-        return int(json.loads((d / BUDGET_FILE).read_text(encoding="utf-8"))["count"])
-    except (OSError, ValueError, KeyError, TypeError):
+        return int(_state(d)["count"])
+    except (KeyError, TypeError, ValueError):
         return 0
 
 
-def bump(d: Path) -> int:
-    """Spend one automatic iteration; return the new count."""
+def impl_history(d: Path) -> list[int]:
+    """The IMPL count observed at each Check that spent a round, oldest first.
+
+    Empty for a pre-#332 budget file, which is the compatibility case that matters: a bundle
+    already mid-iteration when this ships has a count but no history, and
+    :func:`should_iterate` reads an absent baseline as "cannot test convergence, fire" —
+    the pre-#332 behaviour, rather than halting a bundle on a comparison we cannot make.
+    """
+    raw = _state(d).get("impl_counts")
+    if not isinstance(raw, list):
+        return []
+    return [int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)]
+
+
+def bump(d: Path, observed_impl: int) -> int:
+    """Spend one automatic iteration, recording the IMPL count that justified it."""
     n = count(d) + 1
-    (d / BUDGET_FILE).write_text(json.dumps({"count": n}) + "\n", encoding="utf-8")
+    history = impl_history(d) + [int(observed_impl)]
+    (d / BUDGET_FILE).write_text(
+        json.dumps({"count": n, "impl_counts": history}) + "\n", encoding="utf-8")
     return n
+
+
+def should_iterate(d: Path, items: list[NeedsHumanItem], cfg: Config) -> tuple[bool, str]:
+    """Whether the round about to be spent may fire — ``(fire, why_not)`` (issue #332).
+
+    Two budgets, because "keep trying" and "keep trying only while it is working" are
+    different needs and one number cannot express both:
+
+    * ``n <= soft_auto_iters`` — fires unconditionally. Early rounds are allowed to get
+      worse: a builder that fixes one defect and uncovers three has still made progress the
+      count cannot see, and stopping there would waste the cheap rounds.
+    * ``soft_auto_iters < n <= max_auto_iters`` — fires only while the implementation
+      findings are not INCREASING. Past the floor, a round that leaves more work than it
+      found is not converging, and the escalation ladder has it on the top model tier by
+      then, so spinning is expensive.
+    * ``n > max_auto_iters`` — never. The hard ceiling is absolute.
+
+    Equal counts continue: the bound is on getting *worse*, not on failing to improve, since
+    a round can trade one finding for another of equal number and still be closing in.
+    """
+    spent = count(d)
+    upcoming = spent + 1
+    if upcoming > cfg.max_auto_iters:
+        return False, f"hard budget spent ({spent}/{cfg.max_auto_iters})"
+    if upcoming <= cfg.soft_auto_iters:
+        return True, ""
+    history = impl_history(d)
+    if not history:
+        return True, ""  # legacy ledger: no baseline to compare — keep the old behaviour
+    now, before = impl_count(items), history[-1]
+    if now > before:
+        return False, (f"soft budget spent ({spent}/{cfg.soft_auto_iters}) and the "
+                       f"implementation findings did not converge ({before} → {now})")
+    return True, ""
+
+
+def deferred(d: Path) -> list[str]:
+    """Every HUMAN finding this bundle has iterated past, oldest first, deduped."""
+    try:
+        raw = json.loads((d / DEFERRED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = raw.get("items") if isinstance(raw, dict) else raw
+    if not isinstance(rows, list):
+        return []
+    return [str(r) for r in rows if isinstance(r, str)]
+
+
+def defer(d: Path, items: list[NeedsHumanItem], *, attempt: int) -> list[str]:
+    """Record the HUMAN findings this round is iterating past; return the full ledger.
+
+    Deduped on the item text, oldest first: a reviewer that raises the same objection every
+    round must not grow the handover §6 by one copy per round. STANDING is not recorded — it
+    is emitted every cycle whatever the reviewer found, so it is not something being deferred.
+    """
+    ledger = deferred(d)
+    seen = {text.casefold() for text in ledger}
+    for item in items:
+        if item.kind != HUMAN or item.text.casefold() in seen:
+            continue
+        seen.add(item.text.casefold())
+        ledger.append(item.text)
+    (d / DEFERRED_FILE).write_text(
+        json.dumps({"items": ledger, "through_round": attempt}, indent=1) + "\n",
+        encoding="utf-8")
+    return ledger
 
 
 def rationale(items: list[NeedsHumanItem], *, attempt: int) -> str:
     """The §9 "Iteration delta" line, which the driver folds into the brief's carry-forward
     so the next Do iteration isn't blind about why it was rejected.
 
-    IMPL items ONLY. The STANDING `Validation` row rides along in ``items`` (it does not veto
-    the rebuild, #293), but it is not a finding and no builder can act on it — carrying it
-    forward would hand the next Do a human-only judgment call as though it were a defect to fix,
-    under a sentence claiming the set is "implementation-level items only" (PR #294 review).
+    The *findings* named here are IMPL items ONLY, and that filter is load-bearing: the
+    STANDING `Validation` row and any deferred HUMAN item ride along in ``items``, but no
+    builder can act on either, and handing the next Do a human-only judgment call as though
+    it were a defect to fix is exactly the failure PR #294's review caught.
+
+    Deferred items are *counted* rather than quoted, for the same reason — the §9 record has
+    to say the human's findings still exist and are waiting (they are, in
+    :data:`DEFERRED_FILE`, and they return to §6 at handover), without dressing them up as
+    build work. Before #332 this line asserted "implementation-level items only, no
+    architectural judgment required", which a deferring round makes false.
     """
     findings = "; ".join(item.text for item in items if item.kind == IMPL)
-    return (f"Auto-iterate (round {attempt}): Check found implementation-level items only, "
-            f"no architectural judgment required — {findings}")
+    held = sum(1 for item in items if item.kind == HUMAN)
+    tail = (f" {held} finding(s) needing human judgment were deferred to sign-off, not "
+            f"addressed here." if held else "")
+    return (f"Auto-iterate (round {attempt}): rebuilding for the implementation-level "
+            f"findings — {findings}.{tail}")
 
 
 def write_decision(d: Path, items: list[NeedsHumanItem]) -> None:
     """Write the ``iterate-do`` decision + rationale, and spend one round of the budget.
 
-    Guarded: refuses to write anything for an ineligible item set, so no caller can turn
-    this into an auto-accept.
+    Guarded: refuses to write anything for an item set with no implementation work in it, so
+    no caller can turn this into an auto-accept.
     """
     if not eligible(items):
         raise ValueError("auto-iterate: refusing to decide on a non-implementation finding set")
-    attempt = bump(d)
+    attempt = bump(d, impl_count(items))
+    defer(d, items, attempt=attempt)
     (d / SIGNOFF_DECISION).write_text(
         f"{DECISION}\n{rationale(items, attempt=attempt)}\n", encoding="utf-8")

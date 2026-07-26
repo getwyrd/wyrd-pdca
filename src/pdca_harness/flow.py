@@ -175,14 +175,18 @@ def _maybe_auto_iterate(
     if not autoiterate.eligible(items):
         return False
     spent = autoiterate.count(d)
-    if spent >= cfg.max_auto_iters:
-        print(f"flow: {d.name} — auto-iterate budget spent ({spent}/{cfg.max_auto_iters}); "
-              f"handing the implementation findings to the human", file=sys.stderr)
+    fire, why_not = autoiterate.should_iterate(d, items, cfg)
+    if not fire:
+        print(f"flow: {d.name} — {why_not}; handing the findings to the human",
+              file=sys.stderr)
         return False
+    n_impl = autoiterate.impl_count(items)
+    n_held = sum(1 for it in items if it.kind == assemble.HUMAN)
+    held = f", deferring {n_held} for the human" if n_held else ""
+    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters} "
+          f"(soft {cfg.soft_auto_iters}): rebuilding for {n_impl} implementation-level "
+          f"finding(s){held}", file=sys.stderr)
     autoiterate.write_decision(d, items)
-    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters}: "
-          f"{len(items)} implementation-level finding(s), no human judgment needed",
-          file=sys.stderr)
     return _apply_decision(cfg, d, by="auto-iterate", today=today,
                            apply_now=apply_now) == "iterate-do"
 

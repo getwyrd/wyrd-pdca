@@ -83,6 +83,24 @@ matters>", not a description of the code. Use `N/A` with a reason when an elemen
 does not apply — **do not drop the row.** The harness lifts every NEEDS-HUMAN row
 into `SUMMARY.md` §6, so a row you omit is a verdict the human never sees.
 
+Write each **Item cell exactly as above** — no element-id prefix (`V — Validation …`),
+no extra words. The driver identifies its own template rows by an exact match, so a
+decorated label reads as a different, substantive finding (issue #332).
+
+## Say when a judgment row is really a build defect
+
+On the two **judgment** rows — `C5 Causal adequacy` and `T5 Judgment` — and nowhere
+else, write the verdict cell as `NEEDS-HUMAN [impl]` when the concern is an
+implementation defect a rebuild can fix: a missed case behind a weak causal argument, a
+test that does not exercise what it claims. The driver then routes it straight back to
+Do instead of spending the human's attention on it.
+
+Keep the plain `NEEDS-HUMAN` for anything needing an **architectural, scope or
+fitness-to-purpose** decision; when in doubt omit `[impl]`, since an untagged row always
+reaches the human. The tag is **ignored** on the input cells (`C1 Spec`, `C3 Change` —
+those defects belong to Plan and survive any rebuild against the same brief) and on the
+validation row (emitted every cycle regardless), so do not write it there.
+
 ## Emit NEEDS-HUMAN by design on
 
 Validation fitness-to-purpose; contested symptom-vs-root-cause; semantic
