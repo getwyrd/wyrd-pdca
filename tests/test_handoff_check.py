@@ -28,7 +28,7 @@ import json
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -38,7 +38,8 @@ _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "handoff-check"
 
 # §9 must carry the `- Outcome:` line `signoff.record` writes into: it REPLACES that line, so
 # without it the decision is silently dropped (PR #169 review round 2).
-_SUMMARY = "## 6. NEEDS-HUMAN\n\n\n## 9. Check sign-off\n\n- Outcome:\n"
+_SUMMARY = ("## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n"
+            "- Outcome:\n- Iteration delta (if iterating):\n")
 
 
 def _load():
@@ -265,12 +266,67 @@ class Signoff(_Base):
         unset one alike, so an accept passed — and `signoff.record` only REPLACES an existing
         line, so it then silently recorded nothing, deleted the decision, and left the bundle
         awaiting sign-off with the session gone."""
-        (self.d / "SUMMARY.md").write_text("## 9. Check sign-off\n\n(nothing)\n",
-                                           encoding="utf-8")
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n(nothing)\n",
+            encoding="utf-8")
         self._decision("accept\n")
         results = hc.check_signoff(self.d, named=True)
         self.assertFalse(self._ok(results))
-        self.assertTrue(any("no `- Outcome:` line" in r.label for r in results), results)
+        self.assertTrue(any("writable `outcome`" in r.label for r in results), results)
+
+    def test_the_REAL_assembled_summary_shape_passes(self) -> None:
+        """THE regression test (PR #169 review round 3). `outcome_token()` on an unset
+        `- Outcome:` followed by `- Iteration delta (if iterating):` returns that NEXT LABEL,
+        which is truthy — so the "§9 already set" check failed EVERY legitimate sign-off. The
+        earlier test passed only because its fixture put nothing after the Outcome line, which
+        is a shape `assemble_summary` never emits. This fixture is the real one."""
+        real = ("## 6. NEEDS-HUMAN\n\n- (none)\n\n"
+                "## 9. Check sign-off                     \u2190 human completes Check here\n"
+                "- Disposition confirmed / overridden:\n"
+                "- Outcome:\n"
+                "- Iteration delta (if iterating):\n"
+                "- By / date:\n")
+        (self.d / "SUMMARY.md").write_text(real, encoding="utf-8")
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertTrue(self._ok(results),
+                        [r.label for r in results if not r.ok and not r.warn])
+
+    def test_a_lookalike_outcome_field_is_not_writable(self) -> None:
+        """`signoff.record` replaces only the exact `^- Outcome:` form, so a tolerant
+        predicate reported `- outcome:` or an indented variant as writable and passed an
+        accept the recorder would silently fail to write."""
+        for variant in ("- outcome:", "  - Outcome:", "-  Outcome:"):
+            with self.subTest(variant=variant):
+                (self.d / "SUMMARY.md").write_text(
+                    f"## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n{variant}\n",
+                    encoding="utf-8")
+                self._decision("accept\n")
+                self.assertFalse(self._ok(hc.check_signoff(self.d, named=True)), variant)
+
+    def test_an_iterate_needs_a_writable_delta_line(self) -> None:
+        """Without it `signoff.record` cannot insert the rationale, the flow deletes the
+        decision, and `_carry_forward_into_brief` reads an empty delta — so the next attempt
+        loses the human's rejection reason and can repeat the same approach."""
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n- Outcome:\n",
+            encoding="utf-8")
+        self._decision("iterate-do\nthe cause was misread\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("iteration delta" in r.label for r in results), results)
+
+    def test_an_accept_with_no_section6_at_all_fails(self) -> None:
+        """An over-reaching leaf deleting the §6 heading and body leaves `open_needs_human`
+        returning [], and the driver applies the same empty-list guard — so a malformed
+        summary could reach COMPLETE without the human ever seeing the mandatory section."""
+        (self.d / "SUMMARY.md").write_text(
+            "## 9. Check sign-off\n\n- Outcome:\n- Iteration delta (if iterating):\n",
+            encoding="utf-8")
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("§6 NEEDS-HUMAN is absent" in r.label for r in results), results)
 
     def test_a_missing_summary_fails_the_signoff(self) -> None:
         """PR #169 review round 2. `open_needs_human` and `outcome_token` both return
@@ -323,7 +379,8 @@ class Signoff(_Base):
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
             "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n"
-            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
+            "\n## 9. Check sign-off\n\n- Outcome:\n"
+            "- Iteration delta (if iterating):\n", encoding="utf-8")
         results = hc.check_signoff(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("§6 item(s) still open" in r.label for r in results), results)
@@ -333,14 +390,16 @@ class Signoff(_Base):
         self._decision("iterate-do\nthe cause was misread\n")
         (self.d / "SUMMARY.md").write_text(
             "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n"
-            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
+            "\n## 9. Check sign-off\n\n- Outcome:\n"
+            "- Iteration delta (if iterating):\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
     def test_an_accept_with_every_item_cleared_passes(self) -> None:
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
             "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — adjudicated\n"
-            "\n## 9. Check sign-off\n\n- Outcome:\n", encoding="utf-8")
+            "\n## 9. Check sign-off\n\n- Outcome:\n"
+            "- Iteration delta (if iterating):\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
     def test_a_model_authored_section9_fails(self) -> None:
@@ -459,6 +518,18 @@ class Act(unittest.TestCase):
         self._log("# Act review — 2026-07-25 — yesterday by the flow's clock\n\nbody\n")
         self.assertTrue(self._ok(self._check("yesterday by the flow's clock", committed="")))
 
+    def test_an_untouched_scaffold_is_not_a_review(self) -> None:
+        """PR #169 review round 3. `act.scaffold_entry` pre-fills bundles and patterns and
+        leaves the DELTAS as TODO — so the body is non-empty and a body-emptiness test passed
+        an untouched scaffold as a completed review."""
+        self._log("# Act review — 2026-07-26 — cycles considered: 505, 509\n\n"
+                  "## What the cycles' records exposed\n- [C4] a recurring signal\n\n"
+                  "## Process deltas  (TODO — the human decides these; each must be located)\n"
+                  "- Spec template: <field added/clarified/removed>            (path)\n")
+        results = self._check("cycles considered", committed="")
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("untouched scaffold" in r.label for r in results), results)
+
     def test_an_absent_log_fails(self) -> None:
         self.assertFalse(self._ok(self._check("anything", committed="")))
 
@@ -469,31 +540,40 @@ class Act(unittest.TestCase):
         self.assertTrue(any(r.warn for r in results), results)
 
 
-class EmptyScan(_Base):
-    """An empty scan is not a pass (PR #169 review round 2).
+class ScanRequiresIds(_Base):
+    """A bare scan cannot know which bundles this session touched (PR #169 review round 3).
 
-    These leaves are invoked for KNOWN bundles, so "no bundle carried an artifact" means the
-    session produced nothing — precisely the dropped-session failure this gate exists to
-    catch. It used to return success.
+    Both directions were wrong: a newly authored brief was exempted from the named-only
+    checks, while any unrelated pre-existing valid brief supplied a PASS even when the session
+    wrote nothing. Deriving the set needs a session-START baseline, which an end-of-session
+    command cannot take.
     """
 
     def _run(self, *argv: str) -> tuple[int, str]:
-        buf = io.StringIO()
-        with redirect_stdout(buf):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             rc = hc.main(list(argv))
-        return rc, buf.getvalue()
+        return rc, out.getvalue() + err.getvalue()
 
-    def test_an_empty_scan_fails_for_each_bundle_leaf(self) -> None:
-        empty = self.tmp / "none"
-        empty.mkdir()
-        cfg = mock.Mock(root=self.tmp, bundle_root=empty, process_dir=self.tmp / "process")
+    def test_each_bundle_leaf_refuses_a_bare_scan(self) -> None:
+        cfg = mock.Mock(root=self.tmp, bundle_root=self.tmp, process_dir=self.tmp / "process")
         for leaf in ("planner", "signoff", "publisher"):
             with self.subTest(leaf=leaf):
                 with mock.patch.object(hc.Config, "load", return_value=cfg):
                     rc, out = self._run("--leaf", leaf)
-                self.assertEqual(rc, 1, out)
-                self.assertIn("nothing to check", out)
-                self.assertIn("Name the bundle ids", out)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("name the bundle ids", out)
+
+    def test_act_still_needs_no_ids(self) -> None:
+        (self.tmp / "process").mkdir(exist_ok=True)
+        (self.tmp / "process" / "act-log.md").write_text(
+            "# Act review — 2026-07-26 — a real one\n\nConsidered 505. No delta.\n",
+            encoding="utf-8")
+        cfg = mock.Mock(root=self.tmp, bundle_root=self.tmp, process_dir=self.tmp / "process")
+        with mock.patch.object(hc, "_committed_act_log", return_value=""), \
+             mock.patch.object(hc.Config, "load", return_value=cfg):
+            rc, _out = self._run("--leaf", "act", "--entry", "a real one")
+        self.assertEqual(rc, 0)
 
 
 class NoBundleWrites(_Base):

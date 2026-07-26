@@ -36,7 +36,7 @@ must know into the channels your role already owns — the brief's fields for `p
 ## 3. Run the gate
 
 ```bash
-scripts/handoff-check --leaf <your leaf> $ARGUMENTS
+scripts/handoff-check --leaf <your leaf> $ARGUMENTS   # ids required
 ```
 
 For `act`, name the entry you appended so the gate can tell it from an earlier run's:
@@ -45,11 +45,14 @@ For `act`, name the entry you appended so the gate can tell it from an earlier r
 scripts/handoff-check --leaf act --entry "<the heading you wrote>"
 ```
 
-Name the bundle ids you worked. The bare form scans, and a scan that finds nothing now
-FAILS — "no bundle carried an artifact" is exactly the dropped-session case this gate exists
-to catch, so it must not read as success. For a publisher handoff in pending-id mode (as
-`pdca publish --no-issue`), add `--no-issue` so the lint does not demand a tracker reference
-the downstream path explicitly permits omitting.
+**You must name the bundle ids you worked** — the bundle leaves refuse a bare invocation. A
+scan cannot tell which bundles are this session's output, and it was wrong in both directions:
+it exempted a brief you just wrote from the checks that apply only to your own work, and it
+passed on somebody else's valid artifact even when you wrote nothing.
+
+For a publisher handoff in pending-id mode (as `pdca publish --no-issue`), add `--no-issue`
+so the lint does not demand a tracker reference the downstream path explicitly permits
+omitting.
 
 It is deterministic — file existence and set membership, reusing the driver's own predicates
 so it cannot disagree with the harness about what a valid artifact is. With an id it requires
