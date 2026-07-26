@@ -570,7 +570,8 @@ def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
     beside ``$PDCA_BUNDLE`` — the caller's mode, declared to the checker that has to act
     on it, rather than a blanket amnesty applied to its exit code afterwards. The shipped
     checker reads it as ``contribcheck --no-issue``: no tracker-id requirement, every
-    other contribution check unchanged.
+    other contribution check unchanged. Set or unset, the variable the gate sees is the
+    one this flag says it should: an inherited value is scrubbed, not honoured.
 
     Output stays captured — a failing gate's evidence is reported in one place below —
     so the gate is silent for as long as it runs, and a T4 gate is routinely a
@@ -585,7 +586,17 @@ def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
           if c.get("tier") == "T4" and c.get("at_publish", True)]
     if not t4:
         return True
+    # PDCA_PENDING_ID is DERIVED from the flag, never inherited (PR #184 review r2). An
+    # ambient value — an operator's export, a wrapper script that ran a --no-issue publish
+    # earlier — would otherwise silence the trailer check on a publish that never asked
+    # for the mode, and publish would record `id_pending: false` beside it: the missing id
+    # neither blocked nor flagged, which is the one outcome this pair of states must not
+    # produce. Publish owns the variable for the gate's lifetime; the caller's value is
+    # not an input. (`$PDCA_BUNDLE` below is overwritten unconditionally for the same
+    # reason.) A human re-gating a pending-id bundle by hand still has `contribcheck
+    # --no-issue`, and Check-time gates still honour a deliberate export.
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    env.pop("PDCA_PENDING_ID", None)
     if pending_id:
         env["PDCA_PENDING_ID"] = "1"
     for chk in t4:

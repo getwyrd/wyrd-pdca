@@ -322,7 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     p_publish.add_argument("--dry-run", action="store_true", help="print the git/gh commands without running them")
     p_publish.add_argument("--no-pr", action="store_true", help="push the branch but don't open the draft PR")
     p_publish.add_argument("--no-issue", action="store_true",
-                           help="no tracker id yet: relax T4 to a flag, record id_pending (vs a magic #0000)")
+                           help="no tracker id yet: drop the T4 tracker-id requirement AND NOTHING ELSE "
+                                "(every other T4 failure still blocks the push), record id_pending "
+                                "(vs a magic #0000)")
     p_publish.add_argument("--by", default="", help="who published (recorded in publish.json)")
 
     p_doctor = sub.add_parser("doctor",

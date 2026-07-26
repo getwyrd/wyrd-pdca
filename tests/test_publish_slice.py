@@ -460,11 +460,36 @@ class PublishSlice(unittest.TestCase):
         d = _bundle(self.cfg, "NOPEND", brief_body=_FIX_BRIEF, accepted=True)
         with mock.patch.object(publish.progress, "run_with_heartbeat",
                                return_value=(0, "", True)) as beat, \
-                redirect_stderr(io.StringIO()), \
-                mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("PDCA_PENDING_ID", None)
+                redirect_stderr(io.StringIO()):
             publish._t4_passes(self.cfg, d)
         self.assertNotIn("PDCA_PENDING_ID", beat.call_args.kwargs["env"])
+
+    def test_an_inherited_pending_id_is_scrubbed_not_honoured(self) -> None:
+        """PR #184 review r2: the mode is DERIVED from the flag, never inherited. An
+        ambient `PDCA_PENDING_ID=1` — an operator's export, a wrapper that ran a
+        --no-issue publish earlier — would otherwise silence the trailer check on a
+        publish that never asked for it, while `publish.json` records `id_pending: false`
+        beside it: the missing id neither blocked nor flagged."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "INHERIT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            publish._t4_passes(self.cfg, d)          # no pending_id: the flag says no
+        self.assertNotIn("PDCA_PENDING_ID", beat.call_args.kwargs["env"])
+
+    def test_the_bundle_env_is_likewise_publishs_to_set(self) -> None:
+        """The same rule for `$PDCA_BUNDLE`, which the runner has always overwritten:
+        an inherited value must not decide which bundle the gate lints."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "OTHERBUNDLE", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {"PDCA_BUNDLE": "/somewhere/else"}):
+            publish._t4_passes(self.cfg, d)
+        self.assertEqual(beat.call_args.kwargs["env"]["PDCA_BUNDLE"], str(d))
 
     def _stacked_dry_run(self, *, base_remote: str) -> str:
         # A `Stacks on:` dependent whose parent has a published branch — dry-run publish.

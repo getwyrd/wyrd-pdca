@@ -87,6 +87,61 @@ class PdcaLauncherTest(unittest.TestCase):
             "PDCA_CLI": f"env PYTHONPATH={self.root}/src python3 -m pdca_harness.cli"})
         self.assertEqual(got.stdout.strip(), "SOURCE contribcheck", got.stderr)
 
+    def test_pdca_cli_override_takes_an_unquoted_spaced_path_whole(self) -> None:
+        """PR #184 review r2: whitespace-splitting an override reintroduces the 127 this
+        launcher exists to remove — through the escape hatch, on exactly the platforms
+        (macOS, Windows) where a spaced install path is ordinary. A value that names an
+        executable is one word, whatever it contains."""
+        spaced = _exe(self.tmp / "My Tools" / "wyrd-pdca", 'echo "SPACED $@"')
+        got = self._run("contribcheck", env={"PDCA_CLI": str(spaced)})
+        self.assertEqual(got.stdout.strip(), "SPACED contribcheck", got.stderr)
+
+    def test_pdca_cli_override_honours_quoting(self) -> None:
+        """A spaced path WITH arguments can only be expressed by quoting it, so the split
+        has to read quotes the way the command line it claims to be would."""
+        spaced = _exe(self.tmp / "My Tools" / "wyrd-pdca", 'echo "SPACED $@"')
+        got = self._run("contribcheck", env={"PDCA_CLI": f'"{spaced}" --flag'})
+        self.assertEqual(got.stdout.strip(), "SPACED --flag contribcheck", got.stderr)
+
+    def test_pdca_cli_override_honours_backslash_escapes(self) -> None:
+        """The other way to spell it."""
+        spaced = _exe(self.tmp / "My Tools" / "wyrd-pdca", 'echo "SPACED $@"')
+        got = self._run("contribcheck", env={"PDCA_CLI": str(spaced).replace(" ", r"\ ")})
+        self.assertEqual(got.stdout.strip(), "SPACED contribcheck", got.stderr)
+
+    def test_an_unparseable_override_fails_closed(self) -> None:
+        """An override that doesn't parse must not fall through to `exec "$@"` — that
+        would run `contribcheck` as a command and, on a gating row, whatever it exits
+        with decides the gate. 127 and say which value broke."""
+        got = self._run("contribcheck", env={"PDCA_CLI": '"/opt/unbalanced'})
+        self.assertEqual(got.returncode, 127)
+        self.assertIn("PDCA_CLI", got.stderr)
+        self.assertIn("/opt/unbalanced", got.stderr)
+
+    def test_an_override_that_names_no_command_fails_closed(self) -> None:
+        """Set-but-whitespace parses cleanly to an empty argv — also 127, not a silent
+        `exec` of the arguments."""
+        got = self._run("contribcheck", env={"PDCA_CLI": "   "})
+        self.assertEqual(got.returncode, 127)
+        self.assertIn("names no command", got.stderr)
+
+    def test_a_non_executable_override_fails_closed_rather_than_falling_back(self) -> None:
+        """A directory (`-x` is true of any searchable one, which is why the whole-path
+        branch also tests `-f`) or a file without `+x`: the launcher does NOT quietly fall
+        through to the next candidate. An override that was meant to be used and cannot be
+        is an operator error, and on a gating row a silent substitution is worse than a
+        refusal — 126 is the shell's own 'found it, cannot run it', and it names the path."""
+        self._venv_cli()  # present, and deliberately NOT used as a consolation prize
+        (self.tmp / "not-a-cli").mkdir()
+        unrunnable = self.tmp / "no-plus-x"
+        unrunnable.write_text("#!/bin/sh\necho nope\n", encoding="utf-8")
+        unrunnable.chmod(0o644)
+        for target in (self.tmp / "not-a-cli", unrunnable):
+            with self.subTest(target=target.name):
+                got = self._run("contribcheck", env={"PDCA_CLI": str(target)})
+                self.assertEqual(got.returncode, 126)
+                self.assertIn(target.name, got.stderr)
+
     def test_project_venv_is_preferred_over_path(self) -> None:
         """The venv is THIS project's pinned install; PATH is whatever the machine has."""
         self._venv_cli()
