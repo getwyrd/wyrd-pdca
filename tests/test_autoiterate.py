@@ -1171,12 +1171,40 @@ class DeferredFindingsSurvive(_Base):
 
     def test_a_PRE_332_bundle_with_no_ledger_stays_innocent(self) -> None:
         # A bundle that spent rounds BEFORE the ledger existed also has a count and no file,
-        # and must not be read as data loss. `impl_counts` is the discriminator: only the
-        # post-#332 code writes that key.
+        # and must not be read as data loss.
         d = self._bundle("LEGACY", review=self._REVIEW)
         (d / autoiterate.BUDGET_FILE).write_text('{"count": 3}', encoding="utf-8")
         self.assertFalse((d / autoiterate.DEFERRED_FILE).exists())
         self.assertEqual(autoiterate.deferred(d), [])
+
+    def test_observing_a_legacy_bundle_does_not_make_it_look_lost(self) -> None:
+        """PR #168 review round 10 (P1). The round-9 discriminator was "the budget carries
+        impl_counts" — but `observe` writes that at EVERY Check, so a pre-#332 bundle that
+        merely reached sign-off acquired the key without ever having had a ledger, was then
+        reported as having LOST one, and had every accept blocked permanently. The marker is
+        now written by `defer` alone, which no other path can produce."""
+        d = self._bundle("LEGACYOBS", review=self._REVIEW)
+        (d / autoiterate.BUDGET_FILE).write_text('{"count": 3}', encoding="utf-8")
+        autoiterate.observe(d, assemble.collect_needs_human(d, self.cfg))
+        self.assertIn("impl_counts", (d / autoiterate.BUDGET_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(autoiterate.deferred(d), [], "observing must not imply a lost ledger")
+
+    def test_the_marker_survives_the_other_state_writers(self) -> None:
+        # `observe` and `bump` rewrite the budget file; if either dropped the marker, a real
+        # deletion would stop being detected. Every writer merges instead of replacing.
+        d = self._bundle("MARKKEEP", review=self._REVIEW)
+        self.assertTrue(self._try(d))
+        self.assertTrue(autoiterate._state(d).get(autoiterate.LEDGER_MARK))
+        autoiterate.observe(d, assemble.collect_needs_human(d, self.cfg))
+        autoiterate.bump(d)
+        self.assertTrue(autoiterate._state(d).get(autoiterate.LEDGER_MARK),
+                        "observe/bump must not drop the ledger marker")
+
+    def test_the_marker_is_written_after_the_ledger(self) -> None:
+        # Interruption between the two must leave a ledger and no marker (innocent), never a
+        # marker with no ledger (reads as loss).
+        src = inspect.getsource(autoiterate.defer)
+        self.assertLess(src.index("DEFERRED_FILE"), src.index("LEDGER_MARK"))
 
     def test_the_ledger_is_written_before_the_round_is_spent(self) -> None:
         # The absence guard reads "count >= 1 with no ledger" as loss, so the two writes have

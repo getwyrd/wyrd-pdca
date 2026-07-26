@@ -129,6 +129,23 @@ def _state(d: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+# Set by `defer` when it writes the ledger, and ONLY by it (PR #168 review round 10). The
+# previous discriminator was "the budget carries impl_counts", which `observe` writes at every
+# Check — so a pre-#332 bundle that merely reached sign-off acquired the key without ever
+# having a ledger, and was then reported as having LOST one, blocking every accept forever.
+# A marker the ledger's own writer sets cannot be acquired that way.
+LEDGER_MARK = "ledger"
+
+
+def _write_state(d: Path, **updates) -> None:
+    """Merge into the budget file. Every writer goes through here, so none can drop a key
+    another owns — `observe` and `bump` used to rewrite the whole object, which is exactly how
+    a marker like `LEDGER_MARK` would be lost."""
+    st = _state(d)
+    st.update(updates)
+    (d / BUDGET_FILE).write_text(json.dumps(st) + "\n", encoding="utf-8")
+
+
 def count(d: Path) -> int:
     """How many automatic iterations this bundle has already spent."""
     try:
@@ -207,16 +224,13 @@ def observe(d: Path, items: list[NeedsHumanItem]) -> None:
     # garbled or legacy value by design, and `observe` now runs at EVERY Check that reaches
     # sign-off, so raising here would abort the flow on a corrupted field that every other
     # reader in this module degrades past (PR #168 review round 4).
-    (d / BUDGET_FILE).write_text(
-        json.dumps({"count": count(d), "impl_counts": _record_observation(d, items)}) + "\n",
-        encoding="utf-8")
+    _write_state(d, impl_counts=_record_observation(d, items))
 
 
 def bump(d: Path) -> int:
     """Spend one automatic iteration. The observation is recorded separately by `observe`."""
     n = count(d) + 1
-    (d / BUDGET_FILE).write_text(
-        json.dumps({"count": n, "impl_counts": impl_history(d)}) + "\n", encoding="utf-8")
+    _write_state(d, count=n)
     return n
 
 
@@ -308,13 +322,11 @@ def deferred(d: Path) -> list[str]:
         # which is the same fail-open the unreadable-content path already closes.
         #
         # A PRE-#332 bundle also has a count and no ledger, and must stay innocent — it ran
-        # before the ledger existed. `impl_counts` is the discriminator: only this code writes
-        # that key, so its presence proves the new flow ran on this bundle.
-        st = _state(d)
-        if int(st.get("count", 0) or 0) >= 1 and "impl_counts" in st:
+        # before the ledger existed.
+        if _state(d).get(LEDGER_MARK):
             raise DeferredLedgerUnreadable(
-                f"{p} is absent though this bundle has spent {st['count']} auto-iterate "
-                f"round(s) — the ledger was deleted or its write was interrupted")
+                f"{p} is absent though this bundle has written one before — the ledger was "
+                f"deleted or its write was interrupted")
         return []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
@@ -441,6 +453,9 @@ def defer(d: Path, items: list[NeedsHumanItem], *, attempt: int) -> list[str]:
     (d / DEFERRED_FILE).write_text(
         json.dumps({"items": ledger, "through_round": attempt}, indent=1) + "\n",
         encoding="utf-8")
+    # Marker AFTER the file, so an interruption between them leaves a ledger and no marker —
+    # innocent — rather than a marker with no ledger, which reads as loss.
+    _write_state(d, **{LEDGER_MARK: True})
     return ledger
 
 
