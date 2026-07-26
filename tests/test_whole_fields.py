@@ -67,6 +67,24 @@ class WholeField(unittest.TestCase):
         self.assertIn("first condition", whole)
         self.assertIn("second condition", whole)
 
+    def test_an_issue_reference_is_not_a_heading(self) -> None:
+        """PR #175 review. `line.lstrip().startswith("#")` matched an indented issue
+        reference in prose — `  #442 rule` at results/issue_407/brief.md:24 — and stopped
+        extraction mid-criterion, truncating two committed briefs to roughly half. The
+        anti-truncation fix was still truncating, for a different reason."""
+        bp = self._brief("- **Success criterion:** the oracle refuses a fault that did not\n"
+                         "  bite (an un-materialized run FAILS as inconclusive — the\n"
+                         "  #442 rule); and the logic is exercised red-green at Check\n"
+                         "- **Scope:** x\n")
+        whole = brief.whole_field(bp, "success criterion")
+        self.assertIn("#442", whole)
+        self.assertIn("red-green at Check", whole, "extraction must not stop at the reference")
+
+    def test_a_hash_without_a_space_is_not_a_heading(self) -> None:
+        # Even at column 0: a heading is `#{1,6}` followed by whitespace.
+        bp = self._brief("- **Success criterion:** it works\n#442 is a ticket, not a heading\n")
+        self.assertIn("#442", brief.whole_field(bp, "success criterion"))
+
     def test_a_heading_ends_the_value(self) -> None:
         bp = self._brief("- **Success criterion:** it works\n\n## Notes\n\nnot the criterion\n")
         self.assertNotIn("not the criterion", brief.whole_field(bp, "success criterion"))

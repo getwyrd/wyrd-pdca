@@ -63,6 +63,13 @@ def field(brief_path: Path, *labels: str, default: str = "") -> str:
 # brief uses), and treating that as a new field truncated the value to nothing (issue #174).
 _NEXT_FIELD_RE = re.compile(r"^-[ \t]*\*{0,2}[^:*]+?\*{0,2}[ \t]*:")
 
+# A Markdown heading ends a value — but only a real one. `line.lstrip().startswith("#")` also
+# matched an indented ISSUE REFERENCE in prose (`  #442 rule`, `results/issue_407/brief.md:24`),
+# which stopped extraction mid-criterion and truncated two committed briefs to roughly half.
+# A heading is at column 0, is one-to-six hashes, and is followed by whitespace; `#442` fails
+# both the anchor and the space.
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+
 
 def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
     """First matching field among ``labels``, as its COMPLETE value (issue #174).
@@ -96,7 +103,7 @@ def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
             continue
         value = [m.group(1)]
         for line in text[m.end():].splitlines()[1:]:
-            if _NEXT_FIELD_RE.match(line) or line.lstrip().startswith("#"):
+            if _NEXT_FIELD_RE.match(line) or _HEADING_RE.match(line):
                 break
             value.append(line)
         whole = "\n".join(value).strip()
