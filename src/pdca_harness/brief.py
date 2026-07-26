@@ -10,6 +10,7 @@ deliberately lenient: a field is read from a ``- **Label:** value`` or
 from __future__ import annotations
 
 import re
+import textwrap
 from pathlib import Path
 
 # The colon may sit INSIDE the bold (`**Label:**`, as `brief.md.tpl` and every real
@@ -106,7 +107,15 @@ def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
             if _NEXT_FIELD_RE.match(line) or _HEADING_RE.match(line):
                 break
             value.append(line)
-        whole = "\n".join(value).strip()
+        # Dedent CONSISTENTLY (PR #175 review). The inline remainder sits at column 0 by
+        # construction while every continuation carries the brief's own indentation, so a
+        # plain `.strip()` dedented the first line alone. A caller re-indenting uniformly then
+        # pushed the rest one level deeper — turning a value's sibling sub-bullets into
+        # children of the first and changing the structure the human reads at sign-off
+        # (`results/issue_364/brief.md:48-62`). Removing the continuations' COMMON indent
+        # keeps their relative nesting while putting the whole value on one baseline.
+        head, rest = value[0].strip(), textwrap.dedent("\n".join(value[1:])).rstrip()
+        whole = "\n".join(x for x in (head, rest) if x)
         if whole:
             return whole
     return default

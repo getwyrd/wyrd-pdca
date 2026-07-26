@@ -148,6 +148,22 @@ class SpecRendering(unittest.TestCase):
                         len(body[1]) - len(body[1].lstrip()),
                         "a sub-bullet's continuation must stay more indented than its bullet")
 
+    def test_SIBLING_sub_bullets_stay_siblings(self) -> None:
+        """PR #175 review round 2. `whole_field`'s `.strip()` dedented the inline remainder
+        only, so a uniform re-indent pushed every continuation one level deeper — turning a
+        value's sibling sub-bullets into children of the first and changing the structure the
+        human reads at sign-off (`results/issue_364/brief.md:48-62`)."""
+        out = self._line("- **Success criterion:**\n  - **BINDING:** one\n    wrapped\n"
+                         "  - **DEFERRED:** two\n", "Success criterion", "success criterion")
+        indents = {l.split("- **")[0].count(" "): l for l in out.splitlines()
+                   if "**" in l and l.strip().startswith("- **")}
+        binding = next(l for l in out.splitlines() if "BINDING" in l)
+        deferred = next(l for l in out.splitlines() if "DEFERRED" in l)
+        wrapped = next(l for l in out.splitlines() if "wrapped" in l)
+        ind = lambda x: len(x) - len(x.lstrip())
+        self.assertEqual(ind(binding), ind(deferred), "siblings must share an indent")
+        self.assertGreater(ind(wrapped), ind(binding), "a continuation stays under its bullet")
+
     def test_an_absent_field_falls_back_to_the_default(self) -> None:
         self.assertEqual(self._line("- **Slug:** s\n", "Outcome", "disposition hint",
                                     default="Fixed"), "- Outcome: Fixed")
