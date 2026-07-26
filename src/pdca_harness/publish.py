@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import brief, leaves, state
+from . import brief, leaves, progress, state
 from .config import Config
 
 COMMIT_MSG = "commit-msg.txt"
@@ -548,16 +548,37 @@ def _fork_owner(repo: Path, remote: str = "origin") -> str:
 
 def _t4_passes(cfg: Config, d: Path) -> bool:
     """Run every configured T4-tier gate over the bundle. No T4 gate → nothing to
-    enforce (True). Keeps publish decoupled from any one project's checker."""
+    enforce (True). Keeps publish decoupled from any one project's checker.
+
+    Output stays captured — a failing gate's evidence is reported in one place below —
+    so the gate is silent for as long as it runs, and a T4 gate is routinely a
+    model-backed review measured in minutes, not seconds. Captured *and* silent reads
+    as a hang, and an operator who kills it loses the whole run (issue #181): on a
+    bundle whose contribution artifacts already exist this is the FIRST thing publish
+    does after the guards, so the terminal goes quiet immediately. Announce each gate
+    and tick a heartbeat through :mod:`pdca_harness.progress` — the single place that
+    pattern lives, already used by the Check-time gates (``gates.py``) and the leaves.
+    """
     t4 = [c for c in cfg.gates_checks if c.get("tier") == "T4"]
     if not t4:
         return True
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
     for chk in t4:
-        r = subprocess.run(chk.get("cmd", ""), shell=True, cwd=cfg.root, env=env,
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print((r.stdout or r.stderr).strip(), file=sys.stderr)
+        label = chk.get("label") or chk.get("id") or chk.get("cmd", "")
+        print(f"  · T4 gate {label} (a model-backed review gate can take minutes)…",
+              file=sys.stderr, flush=True)
+        # No `status` probe here, deliberately. `bundle_activity` reports the newest
+        # write in the bundle — the right signal for a Do leaf or a Check gate, which
+        # are producing artifacts as they run. A T4 gate is not: it reads patch.diff
+        # and writes its report (if any) once, at the end. The bundle's newest write is
+        # whatever Check left hours ago, so the probe would tick `⚠ no writes 180m` —
+        # a stall warning, on the very run whose point is to show it is NOT stalled.
+        rc, output, _ = progress.run_with_heartbeat(
+            chk.get("cmd", ""), cwd=cfg.root, shell=True, env=env, capture=True,
+            label=label,
+        )
+        if rc != 0:
+            print(output.strip(), file=sys.stderr)
             return False
     return True
 

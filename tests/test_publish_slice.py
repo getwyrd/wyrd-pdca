@@ -353,6 +353,42 @@ class PublishSlice(unittest.TestCase):
         self.assertEqual(pj["pr_url"], "")                       # recorded, but empty
         self.assertEqual(pj["branch"], "fix/PUBFAIL-my-fix")     # branch was pushed
 
+    def test_t4_gate_announces_itself_and_ticks_a_heartbeat(self) -> None:
+        """Issue #181: a T4 gate is routinely a model-backed review measured in
+        minutes, and its output is captured until it exits. Captured + silent reads as
+        a hang, so the gate must announce itself and tick through `progress` (the one
+        place that pattern lives) rather than a bare captured `subprocess.run`."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "label": "batched rubric review",
+                                  "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "TICK", brief_body=_FIX_BRIEF, accepted=True)
+        err = io.StringIO()
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, redirect_stderr(err):
+            self.assertTrue(publish._t4_passes(self.cfg, d))
+        # Announced BEFORE the wait, naming the gate and warning it is slow.
+        self.assertIn("batched rubric review", err.getvalue())
+        self.assertIn("minutes", err.getvalue())
+        # Run through the heartbeat runner, still capturing for the failure report.
+        self.assertTrue(beat.call_args.kwargs["capture"])
+        self.assertEqual(beat.call_args.kwargs["label"], "batched rubric review")
+        self.assertEqual(beat.call_args.kwargs["env"]["PDCA_BUNDLE"], str(d))
+        # No bundle-activity probe: a T4 gate writes its report once, at the end, so
+        # the probe would tick a `⚠ no writes <hours>` stall warning off Check's last
+        # write — the opposite of the reassurance this heartbeat exists to give.
+        self.assertIsNone(beat.call_args.kwargs.get("status"))
+
+    def test_t4_gate_failure_still_reports_the_captured_output(self) -> None:
+        """The heartbeat must not cost the evidence: a failing gate's captured output
+        is still what publish prints, so the operator sees WHY it refused."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "exit 1", "scope": "bundle"}]
+        d = _bundle(self.cfg, "T4OUT", brief_body=_FIX_BRIEF, accepted=True)
+        err = io.StringIO()
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(1, "review-branch: 2 blocking\n", True)), \
+                redirect_stderr(err):
+            self.assertFalse(publish._t4_passes(self.cfg, d))
+        self.assertIn("2 blocking", err.getvalue())
+
     def test_no_issue_relaxes_failing_t4_to_a_flag(self) -> None:
         """Issue #7 item3: `--no-issue` (pending_id) relaxes a failing T4 to a flag
         instead of aborting — publish proceeds and flags it; without it a failing T4
