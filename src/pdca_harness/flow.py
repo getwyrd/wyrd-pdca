@@ -113,6 +113,22 @@ def _apply_decision(
               f"{state.state(d)}); skipping record, will re-drive", file=sys.stderr)
         (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
         return None
+    # Ledger integrity is checked HERE, not in `_maybe_auto_iterate` (PR #168 review round 8).
+    # That was the wrong home for it: the function returns at its `not cfg.auto_iterate` guard,
+    # and the batch sweep never calls it at all — so a bundle whose ledger broke after assembly
+    # could be resumed with auto-iterate off, or signed off through the batch queue, and
+    # ACCEPTED against a stale SUMMARY that never mentioned the lost objections.
+    #
+    # `_apply_decision` is the choke point every path shares and where the accept guard already
+    # lives, so the condition is enforced beside C6 rather than beside the rebuild decision.
+    try:
+        autoiterate.deferred(d)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        assemble.ensure_section6_item(d / "SUMMARY.md", _LEDGER_LOST.format(exc=exc))
+        if action == "accept":
+            print(f"flow: {d.name} — cannot accept, {exc}; recorded in §6", file=sys.stderr)
+            return "blocked"
+        print(f"flow: {d.name} — {exc}; recorded in §6", file=sys.stderr)
     if action == "accept" and signoff.open_needs_human(d / "SUMMARY.md"):
         print(f"flow: {d.name} — cannot accept, §6 NEEDS-HUMAN still open (C6)", file=sys.stderr)
         return "blocked"

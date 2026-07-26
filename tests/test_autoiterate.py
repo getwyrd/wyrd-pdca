@@ -1178,6 +1178,38 @@ class DeferredFindingsSurvive(_Base):
         self.assertFalse(self._try(d), "a rebuild here would destroy the held findings")
         self.assertEqual(autoiterate.count(d), 0)      # no budget spent
 
+    def test_an_unreadable_ledger_blocks_accept_with_auto_iterate_OFF(self) -> None:
+        """PR #168 review round 8 (P1). The round-7 fix lived in `_maybe_auto_iterate`, which
+        returns at its `not cfg.auto_iterate` guard and is never called by the batch sweep —
+        so a bundle whose ledger broke after assembly could be resumed with auto-iterate off,
+        or signed off through the batch queue, and ACCEPTED against a stale SUMMARY that never
+        mentioned the lost objections. The check now sits beside C6 in `_apply_decision`,
+        which every path shares."""
+        d = self._bundle("LEDGOFF", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        (d / leaves.SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
+        self.cfg.auto_iterate = False                      # the path round 7 could not reach
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            action = flow._apply_decision(self.cfg, d, by="t", today="2026-07-26",
+                                          apply_now=False)
+        self.assertEqual(action, "blocked", "an unreadable ledger must refuse an accept")
+        self.assertTrue(any("unreadable" in t
+                            for t in signoff.open_needs_human(d / "SUMMARY.md")))
+        self.assertNotEqual(state.state(d), state.COMPLETE)
+
+    def test_an_unreadable_ledger_still_lets_an_iterate_through(self) -> None:
+        # It blocks ACCEPT, not every decision: an iterate is a legitimate response, and the
+        # §6 item rides along so the human still sees it at the next sign-off.
+        d = self._bundle("LEDGITER", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        (d / leaves.SIGNOFF_DECISION).write_text("iterate-do\nthe cause was misread\n",
+                                                 encoding="utf-8")
+        self.cfg.auto_iterate = False
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            action = flow._apply_decision(self.cfg, d, by="t", today="2026-07-26",
+                                          apply_now=False)
+        self.assertEqual(action, "iterate-do")
+
     def test_an_unreadable_ledger_reaches_section6_with_NO_impl_finding(self) -> None:
         """PR #168 review round 7 (P1). The readability check sat AFTER the eligibility test,
         so when the ledger became unreadable once the SUMMARY was already assembled and the
