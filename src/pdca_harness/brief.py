@@ -10,6 +10,7 @@ deliberately lenient: a field is read from a ``- **Label:** value`` or
 from __future__ import annotations
 
 import re
+import textwrap
 from pathlib import Path
 
 # The colon may sit INSIDE the bold (`**Label:**`, as `brief.md.tpl` and every real
@@ -54,6 +55,77 @@ def field(brief_path: Path, *labels: str, default: str = "") -> str:
         val = fields.get(label.lower())
         if val and not _is_placeholder(val):
             return val
+    return default
+
+
+# What ends a field's value: the NEXT top-level field, at column 0. Deliberately not
+# `_FIELD_RE`, which tolerates leading whitespace — a brief's value routinely continues as an
+# INDENTED sub-bullet (`  - **BINDING (demonstrable at Check):** …`, the shape every pointer
+# brief uses), and treating that as a new field truncated the value to nothing (issue #174).
+_NEXT_FIELD_RE = re.compile(r"^-[ \t]*\*{0,2}[^:*]+?\*{0,2}[ \t]*:")
+
+# A Markdown heading ends a value — but only a real one. `line.lstrip().startswith("#")` also
+# matched an indented ISSUE REFERENCE in prose (`  #442 rule`, `results/issue_407/brief.md:24`),
+# which stopped extraction mid-criterion and truncated two committed briefs to roughly half.
+# A heading is at column 0, is one-to-six hashes, and is followed by whitespace; `#442` fails
+# both the anchor and the space.
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+
+
+def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
+    """First matching field among ``labels``, as its COMPLETE value (issue #174).
+
+    :func:`parse_fields` is line-based, so :func:`field` returns only a field's first line. On a
+    real brief that is most of the value missing — `issue_508`'s success criterion is 13,357
+    characters and `field` returns 69 of them, cut mid-clause — and for a value written on the
+    lines *beneath* its label it returns nothing at all. The template invites exactly that
+    shape: `templates/brief.md.tpl` wraps the Success criterion placeholder over two lines.
+
+    This returns the inline remainder plus every continuation line, stopping at the next
+    ``- **Field:**`` or a Markdown heading, with internal newlines PRESERVED so a caller can
+    re-indent it.
+
+    Two deliberate differences from :func:`field`:
+
+    * The value is **raw** — no ``_is_placeholder`` filtering. The renderer must keep showing an
+      unfilled field exactly as it does today, and a caller that wants the filtering (the
+      `/handoff` gate does) applies it to the reassembled value itself.
+    * :func:`field` is left alone rather than widened. `publish._resolve_target` partitions its
+      value on ``@``, :func:`test_files` pulls path tokens out of one line, and
+      :func:`depends_on` parses an id list while ignoring trailing prose — all of them read a
+      first line on purpose. Widening the accessor would reach every one; widening the callers
+      that want the whole value reaches only them.
+    """
+    text = brief_path.read_text(encoding="utf-8")
+    for label in labels:
+        m = re.search(rf"^-[ \t]*\*{{0,2}}{re.escape(label)}\*{{0,2}}[ \t]*:\*{{0,2}}[ \t]*(.*)$",
+                      text, re.MULTILINE | re.IGNORECASE)
+        if not m:
+            continue
+        value = [m.group(1)]
+        for line in text[m.end():].splitlines()[1:]:
+            # A continuation is blank or INDENTED. Anything else at column 0 ends the value
+            # (PR #175 review round 3). Two special cases had accumulated — the next field,
+            # then ATX headings — and each was a guess at what else might appear there. The
+            # general rule subsumes both and catches what they missed: `results/issue_256`
+            # ends with a `</content>` wrapper line, which my special cases let through, so
+            # §2 rendered `likely-fix </content>` where it had been a clean `likely-fix`.
+            # Indentation is what distinguishes "part of this value" from "something else",
+            # and every real continuation in the corpus is indented.
+            if line.strip() and not line[:1].isspace():
+                break
+            value.append(line)
+        # Dedent CONSISTENTLY (PR #175 review). The inline remainder sits at column 0 by
+        # construction while every continuation carries the brief's own indentation, so a
+        # plain `.strip()` dedented the first line alone. A caller re-indenting uniformly then
+        # pushed the rest one level deeper — turning a value's sibling sub-bullets into
+        # children of the first and changing the structure the human reads at sign-off
+        # (`results/issue_364/brief.md:48-62`). Removing the continuations' COMMON indent
+        # keeps their relative nesting while putting the whole value on one baseline.
+        head, rest = value[0].strip(), textwrap.dedent("\n".join(value[1:])).rstrip()
+        whole = "\n".join(x for x in (head, rest) if x)
+        if whole:
+            return whole
     return default
 
 

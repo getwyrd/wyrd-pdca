@@ -335,8 +335,34 @@ def ensure_section6_item(summary_path: Path, text: str) -> bool:
     return True
 
 
+def _spec_line(label: str, brief_path: Path, *fields: str, default: str = "") -> str:
+    """One §1 spec bullet, carrying the field's WHOLE value (issue #174).
+
+    §1 is what the sign-off leaf and the HUMAN read to decide accept or iterate, and what the
+    C6 accept-guard gates on — so it has to show the spec, not its first line. It was built
+    from `brief.parse_fields`, which is line-based: 88 of 94 committed criteria reached
+    sign-off truncated, four rendered as nothing at all, and the worst showed 69 characters of
+    13,357, cut mid-clause. `brief.whole_field` reassembles the value; this re-indents its
+    continuation lines so a multi-line value stays one valid Markdown list item instead of
+    breaking the list.
+    """
+    value = brief.whole_field(brief_path, *fields, default=default)
+    lines = value.splitlines()
+    if len(lines) <= 1:
+        return f"- {label}: {value}"
+    # Multi-line: start the value on its own line and keep the brief's OWN relative
+    # indentation, so a criterion written as nested sub-bullets renders as nested sub-bullets
+    # rather than being flattened into one run-on paragraph. Two spaces minimum keeps every
+    # line inside this list item.
+    head, *rest = lines
+    body = [f"  {head.strip()}"] if head.strip() else []
+    body += [("  " + ln.rstrip()) if ln.strip() else "" for ln in rest]
+    return "\n".join([f"- {label}:", *body])
+
+
 def assemble_summary(d: Path, cfg: Config) -> None:
-    fields = brief.parse_fields(d / "brief.md")
+    bp = d / "brief.md"
+    fields = brief.parse_fields(bp)   # still used for the title's deliberate [:40] truncation
     gates = json.loads((d / "check-gates.json").read_text(encoding="utf-8"))
     review_path = d / "check-review.md"
     # The review is advisory; a missing one (e.g. the reviewer's model connection
@@ -372,13 +398,13 @@ def assemble_summary(d: Path, cfg: Config) -> None:
             f"# Result — issue {issue} / {fields.get('slug', fields.get('defect', '')[:40])}",
             "",
             "## 1. Spec (from brief.md)              ← Check verifies against THIS",
-            f"- Defect / goal: {fields.get('defect', fields.get('goal', ''))}",
-            f"- Success criterion: {fields.get('success criterion', '')}",
-            f"- Repo + branch target: {fields.get('repo + branch target', fields.get('branch target', ''))}",
-            f"- Scope (one logical fix) / out of scope: {fields.get('scope', '')}",
+            _spec_line("Defect / goal", bp, "defect", "goal"),
+            _spec_line("Success criterion", bp, "success criterion"),
+            _spec_line("Repo + branch target", bp, "repo + branch target", "branch target"),
+            _spec_line("Scope (one logical fix) / out of scope", bp, "scope"),
             "",
             "## 2. Disposition claimed               ← sign-off confirms or overrides",
-            f"- Outcome: {fields.get('disposition hint', 'Fixed')}",
+            _spec_line("Outcome", bp, "disposition hint", default="Fixed"),
             "- Confidence: medium",
             "- Recommendation: (set by Do)",
             "",
