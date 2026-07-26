@@ -29,6 +29,64 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act queue — 2026-07-25 — raised at Plan (issue_508 / issue_625 / issue_633), not an Act review
+
+> **Queued, not applied.** Raised by the planner while briefing the multipart stack; recorded
+> here so the next Act pass picks it up on cadence. No contribution disposition is re-decided,
+> and no delta below is in force yet. Evidence is one planning session plus two rounds of
+> cross-vendor plan review — `results/plan-review-codex-508-r{1,2}.md` and
+> `results/plan-review-codex-{625,633}[-r2].md`, recorded with their bundles in a separate
+> commit, not in this one.
+
+## What the cycles' records exposed
+
+- **The per-fix gate scores a compile failure as a passing RED.** `engine/scripts/run-verify.sh`
+  guards the zero-test case only on the branch where cargo exits **0** (`:420-426`, the #114
+  guard). When `run_test` returns **non-zero** — the shape a compile error takes — that block is
+  skipped and control reaches the unconditional `PASS — red without the fix` at `:433`. A bundle
+  whose test never built is therefore scored as proof that its test catches the bug, silently,
+  in the accepting direction.
+- **The cost is already being paid in prose.** All three briefs in this batch carry a paragraph
+  telling Do to out-think the defect (only base-visible symbols; no patch-added crate in a test;
+  record the executed-test count from the RED leg; do not add a dev-dependency the RED leg
+  reverts). Two of the three had a concrete instance found only by cross-vendor review — the
+  #633 alarm test would have needed a `wyrd-custodian` dev-dependency on redb, and the #625
+  reaper test cannot call `reconcile_step` because its signature moves. Mitigating a gate defect
+  per-brief scales with the number of briefs and depends on a model getting it right each time.
+- **It is the class the maintainer's standing rule excludes** (2026-07-25): *a failure scenario
+  that is permanent or leads to loss of data is never an option in Wyrd.* An evidence gate that
+  fails toward "accept" is that class, one layer up — it does not lose data, it loses the proof
+  that data is not being lost.
+
+## Process deltas — PROPOSED (apply at the next Act review)
+
+- Gates: **guard the RED leg's non-zero path**. If cargo exits non-zero **and** `TESTS_RAN == 0`,
+  report `UNVERIFIABLE` (exit 77 → §6 NEEDS-HUMAN), never PASS — mirroring the guard that already
+  exists on the cargo-succeeded branch.   (`engine/scripts/run-verify.sh:415-434`; unit-pin it in
+  `engine/tests/test_run_verify.sh`, which already exercises this script's pure helpers)
+- Ruleset: once the gate distinguishes them, **retire the per-brief defensive prose** to a single
+  line in the brief template rather than a paragraph each planner rewrites.
+  (`templates/brief.md.tpl` — `Test file` / `Falsifiability`)
+- Consider upstreaming: the defect is in the harness-rendered script, not Wyrd-specific — the
+  same false-PASS exists in every instance that renders it. → template feedback, eduralph/pdca-harness.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- Planning-principles catalogue: the maintainer's standing rule was added to
+  `docs/principles.md` §5 (Tier C) and promoted to the §6 active map in this session — see the
+  entry below. Act should confirm the promotion on cadence (§8 asks for recurrence evidence;
+  this session provides one instance, so the row is provisional).
+- Proposal correction (target repo, architecture-board authority): 0016 contradicts itself on
+  segment-group keying (§1's independent nonce vs decision 7's `group = (upload-id, epoch)`), and
+  its *Open questions* owner row for `W_ref`/`B_ops` is unbuildable in the confirmed wave order.
+  → owner: Eduard; next step: editorial pass on 0016 alongside the FU-1 ADR work.
+
+## How effectiveness will be judged
+
+- After the gate delta, a bundle whose added test fails to compile must land in §6 as
+  UNVERIFIABLE rather than passing C4-verify. Watch the next ~5 cycles for any C4-verify PASS
+  whose RED leg reports zero executed tests — there should be none.
+
 # Act review — 2026-07-21 — external-review churn analysis (out-of-band; all 158 GitHub Codex findings across ~79 published PRs, not a frozen-bundle sweep)
 
 > Out-of-band Act pass over the *published-PR* half of the loop the harness never
