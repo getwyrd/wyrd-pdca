@@ -104,7 +104,15 @@ def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
             continue
         value = [m.group(1)]
         for line in text[m.end():].splitlines()[1:]:
-            if _NEXT_FIELD_RE.match(line) or _HEADING_RE.match(line):
+            # A continuation is blank or INDENTED. Anything else at column 0 ends the value
+            # (PR #175 review round 3). Two special cases had accumulated — the next field,
+            # then ATX headings — and each was a guess at what else might appear there. The
+            # general rule subsumes both and catches what they missed: `results/issue_256`
+            # ends with a `</content>` wrapper line, which my special cases let through, so
+            # §2 rendered `likely-fix </content>` where it had been a clean `likely-fix`.
+            # Indentation is what distinguishes "part of this value" from "something else",
+            # and every real continuation in the corpus is indented.
+            if line.strip() and not line[:1].isspace():
                 break
             value.append(line)
         # Dedent CONSISTENTLY (PR #175 review). The inline remainder sits at column 0 by

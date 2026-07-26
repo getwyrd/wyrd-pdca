@@ -80,10 +80,16 @@ class WholeField(unittest.TestCase):
         self.assertIn("#442", whole)
         self.assertIn("red-green at Check", whole, "extraction must not stop at the reference")
 
-    def test_a_hash_without_a_space_is_not_a_heading(self) -> None:
-        # Even at column 0: a heading is `#{1,6}` followed by whitespace.
-        bp = self._brief("- **Success criterion:** it works\n#442 is a ticket, not a heading\n")
-        self.assertIn("#442", brief.whole_field(bp, "success criterion"))
+    def test_ANY_unindented_line_ends_the_value(self) -> None:
+        """PR #175 review round 3. Two special cases had accumulated — the next field, then
+        ATX headings — and each was a guess at what else might sit at column 0. A
+        `</content>` wrapper line in `results/issue_256/brief.md` slipped past both, so §2
+        rendered `likely-fix </content>`. The general rule is that a continuation is blank or
+        INDENTED; anything else at column 0 ends the value, whatever it happens to be."""
+        for terminator in ("</content>", "## Notes", "- **Scope:** x", "plain prose"):
+            with self.subTest(terminator=terminator):
+                bp = self._brief(f"- **Success criterion:** it works\n{terminator}\n")
+                self.assertEqual(brief.whole_field(bp, "success criterion"), "it works")
 
     def test_a_heading_ends_the_value(self) -> None:
         bp = self._brief("- **Success criterion:** it works\n\n## Notes\n\nnot the criterion\n")
