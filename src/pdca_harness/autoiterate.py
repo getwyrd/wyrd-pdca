@@ -247,9 +247,14 @@ def should_iterate(d: Path, items: list[NeedsHumanItem], cfg: Config) -> tuple[b
     # Compare against the observation from a PREVIOUS generation. Anything recorded for the
     # current one is this same Check being re-read, and comparing a Check with itself always
     # looks convergent (PR #168 review round 4).
-    prior = [n for gen, n in _observations(d) if gen < generation(d)]
+    # EXACTLY generation-1 (PR #168 review round 6). Taking the newest older observation let
+    # a GAP — auto-iterate disabled for a run, or an unreadable ledger returning before the
+    # observation — silently substitute a much older Check: observed gen 0 at 2, unobserved
+    # gen 1 at 4, then gen 2 at 3 read as a 2 -> 3 regression and halted, though the rebuild
+    # had improved 4 -> 3. A gap is not a baseline; it is the absence of one.
+    prior = [n for gen, n in _observations(d) if gen == generation(d) - 1]
     if not prior:
-        return True, ""  # no baseline to compare — keep the pre-#332 behaviour
+        return True, ""  # no observation for the preceding Check — nothing to compare against
     now, before = impl_count(items), prior[-1]
     if now > before:
         return False, (f"soft budget spent ({spent}/{cfg.soft_auto_iters}) and the "
@@ -303,6 +308,16 @@ def deferred(d: Path) -> list[str]:
     return list(rows)
 
 
+def _norm_line(line: str) -> str:
+    """A §6 line reduced to its finding text, checkbox stripped."""
+    body = line.strip()
+    for box in ("- [ ]", "- [x]", "- [X]"):
+        if body.startswith(box):
+            body = body[len(box):]
+            break
+    return " ".join(body.split()).casefold()
+
+
 def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     """Drop ledger entries the human has TICKED in §6; return what remains (PR #168 review).
 
@@ -353,8 +368,12 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     # So a tick retires exactly one entry or none. This is the same shape `_needs_human` uses
     # for two STANDING candidates: when at least one of the matches must be wrong and we
     # cannot tell which, decide for neither.
-    def _norm(x: str) -> str:
-        return " ".join(x.split()).casefold()
+    # A ledger entry that is STILL VISIBLY UNCHECKED in this §6 has not been adjudicated,
+    # whatever else fuzzy-matched (PR #168 review round 6). Without this, a newly raised
+    # finding resembling a deferred one — a renderer objection beside a deferred parser
+    # objection sharing a long "C5 Causal adequacy — guards the symptom…" opening — could be
+    # ticked and retire the OTHER entry, while the deferred row sat unticked in plain sight.
+    still_open = [_norm_line(line) for line in signoff.open_needs_human(summary_path)]
 
     retire: set[int] = set()
     for row in ticked:
@@ -363,10 +382,10 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
         # became permanently unclearable: ticking either row unchanged still matched both, so
         # neither retired, and no amount of ticking could ever drain them. An exact match is
         # not ambiguous — it is the row the ledger rendered.
-        exact = [i for i, t in enumerate(ledger) if _norm(t) == _norm(row)]
+        exact = [i for i, t in enumerate(ledger) if _norm_line(t) == _norm_line(row)]
         hits = exact if exact else [i for i, t in enumerate(ledger)
                                     if _same_finding(t, row)]
-        if len(hits) == 1:
+        if len(hits) == 1 and not any(_norm_line(ledger[hits[0]]) == o for o in still_open):
             retire.add(hits[0])
     kept = [t for i, t in enumerate(ledger) if i not in retire]
     if len(kept) != len(ledger):

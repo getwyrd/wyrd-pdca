@@ -970,6 +970,19 @@ class SoftAndHardRounds(unittest.TestCase):
         autoiterate.observe(self.d, self._items(3))          # must not raise
         self.assertEqual(autoiterate.count(self.d), 0)
 
+    def test_a_generation_GAP_is_not_a_baseline(self) -> None:
+        """PR #168 review round 6. Taking the newest OLDER observation let a gap — auto-iterate
+        off for a run, or an unreadable ledger returning early — substitute a much older Check:
+        gen 0 at 2, gen 1 unobserved at 4, gen 2 at 3 read as a 2 -> 3 regression and halted,
+        though the rebuild had improved 4 -> 3."""
+        (self.d / autoiterate.BUDGET_FILE).write_text(
+            json.dumps({"count": 3, "impl_counts": [[0, 2]]}), encoding="utf-8")
+        for _ in range(2):
+            self._rebuild()                      # now at generation 2, with gen 1 unobserved
+        self.assertEqual(autoiterate.generation(self.d), 2)
+        fire, _why = autoiterate.should_iterate(self.d, self._items(3), self.cfg)
+        self.assertTrue(fire, "a gap is the absence of a baseline, not a stale one")
+
     def test_a_legacy_flat_history_still_reads(self) -> None:
         # Pre-round-4 files hold a flat list of counts rather than [generation, count] rows.
         (self.d / autoiterate.BUDGET_FILE).write_text(
@@ -1379,6 +1392,36 @@ class DeferredFindingsSurvive(_Base):
         self.assertEqual(items[0].kind, assemble.HUMAN)
         self.assertFalse(autoiterate.eligible(assemble.collect_needs_human(d, self.cfg)),
                          "a human-only concern must not become eligible via an advisory tag")
+
+    def test_a_deferred_HUMAN_survives_a_later_IMPL_reclassification(self) -> None:
+        """PR #168 review round 6. Filtering deferred entries against the current set before
+        resolving suppressed the ledger's HUMAN copy when a later review re-raised the same
+        text as IMPL — so the IMPL classification stood alone, `eligible()` allowed another
+        unattended round, and the explicitly deferred judgment went to the builder."""
+        d = self._bundle("LEDGHUM", advisory=(
+            "- NEEDS-HUMAN [impl] — T5 Judgment — the seam is wider than the brief\n"))
+        (d / autoiterate.DEFERRED_FILE).write_text(json.dumps(
+            {"items": ["T5 Judgment — the seam is wider than the brief"]}), encoding="utf-8")
+        items = [i for i in assemble.collect_needs_human(d, self.cfg)
+                 if "seam is wider" in i.text]
+        self.assertEqual(len(items), 1, items)
+        self.assertEqual(items[0].kind, assemble.HUMAN,
+                         "the ledger's HUMAN verdict must outrank a later [impl] tag")
+
+    def test_a_visibly_unchecked_ledger_row_is_never_retired(self) -> None:
+        """PR #168 review round 6. A newly raised finding resembling a deferred one could be
+        ticked and retire the OTHER entry, while the deferred row sat unticked in plain sight."""
+        d = self._bundle("DEFER16", review=self._REVIEW)
+        deferred_row = "C5 Causal adequacy — guards the symptom in the parser, not the cause"
+        current_row = "C5 Causal adequacy — guards the symptom in the renderer, not the cause"
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            json.dumps({"items": [deferred_row]}), encoding="utf-8")
+        (d / "SUMMARY.md").write_text(
+            f"## 6. NEEDS-HUMAN\n\n- [x] {current_row}\n- [ ] {deferred_row}\n",
+            encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(autoiterate.deferred(d), [deferred_row],
+                         "an unticked row in the same §6 cannot have been adjudicated")
 
     def test_the_human_marker_is_stripped_like_impl(self) -> None:
         """PR #168 review round 2. `[human]` carries no classification — an untagged bullet is

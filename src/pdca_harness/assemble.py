@@ -263,12 +263,17 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
-    # Across EVERY source, not just within each artifact (PR #168 review round 5).
-    items = resolve_duplicates(items)
-    return items + _deferred_items(d, items)
+    # Across EVERY source, INCLUDING the ledger (PR #168 review round 6). Filtering deferred
+    # entries against the current set first was the bug: a finding stored as HUMAN that a
+    # later review re-raised as IMPL had its deferred copy suppressed by the text filter, so
+    # the IMPL classification stood alone — `eligible()` allowed another unattended round and
+    # `rationale()` handed the explicitly deferred judgment to the builder. Appending them as
+    # ordinary members and letting `resolve_duplicates` decide keeps HUMAN precedence across
+    # the ledger boundary too.
+    return resolve_duplicates(items + _deferred_items(d))
 
 
-def _deferred_items(d: Path, current: list[NeedsHumanItem]) -> list[NeedsHumanItem]:
+def _deferred_items(d: Path) -> list[NeedsHumanItem]:
     """Findings earlier auto-iterate rounds passed over, re-entering §6 (issue #332).
 
     An ``iterate-do`` archives SUMMARY.md and check-review.md, and the rebuild assembles a
@@ -295,8 +300,7 @@ def _deferred_items(d: Path, current: list[NeedsHumanItem]) -> list[NeedsHumanIt
             f"the deferred-findings ledger is unreadable — findings held over from earlier "
             f"auto-iterate rounds may be LOST; recover or reconstruct it before accepting "
             f"({exc})", HUMAN)]
-    seen = {it.text.casefold() for it in current}
-    return [NeedsHumanItem(t, HUMAN) for t in held if t.casefold() not in seen]
+    return [NeedsHumanItem(t, HUMAN) for t in held]
 
 
 def assemble_summary(d: Path, cfg: Config) -> None:
