@@ -20,7 +20,10 @@ from pathlib import Path
 
 from . import (act, brief, doctor, drift, driver, flow, gates, manual_test, merged, publish,
                queue, registry, revalidate, revert, signoff, state, waves, worktree)
-from .config import Config
+# `_parse_opt_in` is config's strict boolean (#132: anything unrecognized fails CLOSED,
+# with a warning). Underscored but package-internal, and the one place these semantics are
+# written down — a second spelling of "is this env var true" is how PR #184 r3 happened.
+from .config import Config, _parse_opt_in
 
 
 def _prog_name() -> str:
@@ -267,7 +270,8 @@ def main(argv: list[str] | None = None) -> int:
                                help="fail a contribution whose PR body lacks a user-impact opener or the tracker id (T4)")
     p_contrib.add_argument("issue_id", nargs="?")
     p_contrib.add_argument("--no-issue", action="store_true",
-                           help="pending-id: don't require the tracker trailer (still require the user-impact opener)")
+                           help="pending-id: don't require the tracker trailer (still require the user-impact opener); "
+                                "$PDCA_PENDING_ID=1|true|yes|on sets it too, for the gate row publish runs")
 
     p_reval = sub.add_parser("revalidate",
                              help="re-run gates on a COMPLETE bundle vs the current engine; write a dated stamp (never re-decides §9)")
@@ -321,7 +325,9 @@ def main(argv: list[str] | None = None) -> int:
     p_publish.add_argument("--dry-run", action="store_true", help="print the git/gh commands without running them")
     p_publish.add_argument("--no-pr", action="store_true", help="push the branch but don't open the draft PR")
     p_publish.add_argument("--no-issue", action="store_true",
-                           help="no tracker id yet: relax T4 to a flag, record id_pending (vs a magic #0000)")
+                           help="no tracker id yet: drop the T4 tracker-id requirement AND NOTHING ELSE "
+                                "(every other T4 failure still blocks the push), record id_pending "
+                                "(vs a magic #0000)")
     p_publish.add_argument("--by", default="", help="who published (recorded in publish.json)")
 
     p_doctor = sub.add_parser("doctor",
@@ -736,7 +742,14 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
     ticket — the tracker id is absent from either ``commit-msg.txt`` or ``pr-description.md``
     (the two are linted INDEPENDENTLY, so a ticketed fix needs the id in BOTH). The bundle is
     the ``issue_id`` arg or ``$PDCA_BUNDLE`` (set by the gate runner). No patch (close/no-fix)
-    ⇒ pass (default-open, like an unconfigured gate)."""
+    ⇒ pass (default-open, like an unconfigured gate).
+
+    Pending-id mode (no tracker number assigned yet) drops the id requirement and NOTHING
+    else. It arrives either as ``--no-issue`` from a human, or as ``$PDCA_PENDING_ID``
+    from ``publish --no-issue`` — which cannot pass a flag, since the gate's command line
+    is the project's to write (``pdca.toml``), not publish's (PR #184 review). The
+    variable takes a real boolean (``1/true/yes/on``); anything else — including
+    ``false`` — leaves the gate strict, and an unrecognized value warns."""
     if args.issue_id:
         d = cfg.bundle(args.issue_id)
     elif os.environ.get("PDCA_BUNDLE"):
@@ -766,7 +779,17 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
             problems.append("`**User impact:**` must come BEFORE `## Root cause`")
     # 2) The tracker id in BOTH artifacts — only for a real numeric ticket; a slug /
     #    --no-issue (pending-id) bundle legitimately carries no trailer.
-    if issue_id.isdigit() and not args.no_issue:
+    #
+    #    The environment half goes through the project's strict boolean, not a truthiness
+    #    test (PR #184 review r3). `not in ("", "0")` made `PDCA_PENDING_ID=false` ENABLE
+    #    pending-id mode — the fail-OPEN direction, on a knob whose only job is to switch
+    #    a gate off, and #132 already wrote this exact lesson down for `auto_iterate`
+    #    (`bool("false") is True`). Reuse that parser rather than grow a second dialect of
+    #    boolean: real spellings only, anything unrecognized is OFF *and* warns, so a typo
+    #    leaves the gate strict and visible instead of quietly disarmed.
+    pending = args.no_issue or _parse_opt_in(os.environ.get("PDCA_PENDING_ID", ""),
+                                             "PDCA_PENDING_ID")
+    if issue_id.isdigit() and not pending:
         needle = re.compile(r"#" + re.escape(issue_id) + r"\b")
         commit_text = commit_path.read_text(encoding="utf-8") if commit_path.is_file() else ""
         if not needle.search(pr_text):

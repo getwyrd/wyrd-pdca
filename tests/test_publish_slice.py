@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -377,6 +378,37 @@ class PublishSlice(unittest.TestCase):
         # write — the opposite of the reassurance this heartbeat exists to give.
         self.assertIsNone(beat.call_args.kwargs.get("status"))
 
+    def test_at_publish_false_opts_a_t4_check_out_of_publish_only(self) -> None:
+        """Issue #183: publish selects T4 checks on the tier and nothing else, so a
+        whole-diff review registered for CHECK is silently re-run at push time — model
+        spend Check already paid, and a fresh sample of a nondeterministic reviewer
+        after §9. `at_publish = false` opts a check out of publish while leaving it in
+        force at Check; the check itself is untouched in `cfg.gates_checks`."""
+        review = {"id": "T4-review", "tier": "T4", "cmd": "exit 1",
+                  "scope": "bundle", "at_publish": False}
+        artifacts = {"id": "T4-contribution", "tier": "T4", "cmd": "true", "scope": "bundle"}
+        self.cfg.gates_checks = [review, artifacts]
+        d = _bundle(self.cfg, "OPTOUT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()):
+            self.assertTrue(publish._t4_passes(self.cfg, d))
+        # Only the opted-in check ran — the opted-out one would have failed (`exit 1`).
+        self.assertEqual(len(beat.call_args_list), 1)
+        self.assertEqual(beat.call_args.kwargs["label"], "T4-contribution")
+        # And Check still sees both: the opt-out is publish's, not a deregistration.
+        self.assertEqual(len([c for c in self.cfg.gates_checks if c["tier"] == "T4"]), 2)
+
+    def test_every_t4_check_opted_out_is_nothing_to_enforce(self) -> None:
+        """All T4 checks opted out ⇒ the same no-op as no T4 check at all, rather than
+        a vacuous pass that still spawns a runner."""
+        self.cfg.gates_checks = [{"id": "T4-review", "tier": "T4", "cmd": "exit 1",
+                                  "scope": "bundle", "at_publish": False}]
+        d = _bundle(self.cfg, "ALLOUT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat") as beat:
+            self.assertTrue(publish._t4_passes(self.cfg, d))
+        beat.assert_not_called()
+
     def test_t4_gate_failure_still_reports_the_captured_output(self) -> None:
         """The heartbeat must not cost the evidence: a failing gate's captured output
         is still what publish prints, so the operator sees WHY it refused."""
@@ -389,20 +421,75 @@ class PublishSlice(unittest.TestCase):
             self.assertFalse(publish._t4_passes(self.cfg, d))
         self.assertIn("2 blocking", err.getvalue())
 
-    def test_no_issue_relaxes_failing_t4_to_a_flag(self) -> None:
-        """Issue #7 item3: `--no-issue` (pending_id) relaxes a failing T4 to a flag
-        instead of aborting — publish proceeds and flags it; without it a failing T4
-        still aborts. The first-class 'no tracker id yet' path (vs a magic #0000)."""
+    def test_no_issue_declares_the_mode_to_the_gate_rather_than_excusing_it(self) -> None:
+        """Issue #7 item3 / PR #184 review: `--no-issue` (pending_id) is the 'no tracker
+        id yet' path, and the thing it excuses is the missing trailer — nothing else. It
+        used to be applied to the gate's VERDICT (any nonzero relaxed to a warning), which
+        also waved through a malformed PR body, since `contribcheck` keeps the user-impact
+        requirement under --no-issue. The mode goes INTO the gate now; what still fails is
+        a real defect, and a real defect blocks the push in either mode."""
         self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "exit 1", "scope": "bundle"}]
         _bundle(self.cfg, "PEND", brief_body=_FIX_BRIEF, accepted=True)
         # default: a failing T4 aborts the publish
         self.assertEqual(publish.publish(self.cfg, "PEND", dry_run=True), 1)
-        # --no-issue: the failing T4 is relaxed to a flag; publish proceeds
+        # --no-issue: it aborts too — the gate already knew to skip the trailer check.
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             rc = publish.publish(self.cfg, "PEND", dry_run=True, pending_id=True)
-        self.assertEqual(rc, 0)
-        self.assertIn("pending-id", err.getvalue().lower())
+        self.assertEqual(rc, 1)
+        # And the refusal says why --no-issue did not save it, so the operator doesn't
+        # go looking for a tracker id to add.
+        self.assertIn("--no-issue", err.getvalue())
+
+    def test_pending_id_is_exported_to_the_gate(self) -> None:
+        """The mode reaches the checker as `$PDCA_PENDING_ID=1`, beside `$PDCA_BUNDLE`:
+        publish cannot pass `--no-issue` itself, since the gate's command line is the
+        project's to write (`pdca.toml`), not publish's."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "PENDENV", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()):
+            publish._t4_passes(self.cfg, d, pending_id=True)
+        self.assertEqual(beat.call_args.kwargs["env"]["PDCA_PENDING_ID"], "1")
+
+    def test_no_pending_id_leaves_the_gate_env_clean(self) -> None:
+        """Absent the mode the variable is absent — not "0", which a shell test like
+        `[ -n "$PDCA_PENDING_ID" ]` would read as set."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "NOPEND", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()):
+            publish._t4_passes(self.cfg, d)
+        self.assertNotIn("PDCA_PENDING_ID", beat.call_args.kwargs["env"])
+
+    def test_an_inherited_pending_id_is_scrubbed_not_honoured(self) -> None:
+        """PR #184 review r2: the mode is DERIVED from the flag, never inherited. An
+        ambient `PDCA_PENDING_ID=1` — an operator's export, a wrapper that ran a
+        --no-issue publish earlier — would otherwise silence the trailer check on a
+        publish that never asked for it, while `publish.json` records `id_pending: false`
+        beside it: the missing id neither blocked nor flagged."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "INHERIT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            publish._t4_passes(self.cfg, d)          # no pending_id: the flag says no
+        self.assertNotIn("PDCA_PENDING_ID", beat.call_args.kwargs["env"])
+
+    def test_the_bundle_env_is_likewise_publishs_to_set(self) -> None:
+        """The same rule for `$PDCA_BUNDLE`, which the runner has always overwritten:
+        an inherited value must not decide which bundle the gate lints."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "OTHERBUNDLE", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {"PDCA_BUNDLE": "/somewhere/else"}):
+            publish._t4_passes(self.cfg, d)
+        self.assertEqual(beat.call_args.kwargs["env"]["PDCA_BUNDLE"], str(d))
 
     def _stacked_dry_run(self, *, base_remote: str) -> str:
         # A `Stacks on:` dependent whose parent has a published branch — dry-run publish.
@@ -796,6 +883,52 @@ class ContribCheck(unittest.TestCase):
         self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
                           commit="Fix the crash\n\nNo trailer.\n")
         self.assertEqual(self._run("266", no_issue=True)[0], 0)
+
+    def test_pending_id_env_relaxes_the_trailer_requirement(self) -> None:
+        """PR #184 review: `publish --no-issue` runs this gate through the project's own
+        `cmd`, so it cannot append `--no-issue` — it declares the mode in the environment
+        instead, and the checker must read it as the same thing."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            self.assertEqual(self._run("266")[0], 0)
+
+    def test_pending_id_env_relaxes_the_trailer_and_nothing_else(self) -> None:
+        """The bug the flag-passthrough replaces: pending-id excuses the missing tracker
+        id, never a missing user-impact opener. Publish used to forgive both."""
+        self._bundle_with("266", "## Summary\nno opener here.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            rc, err = self._run("266")
+        self.assertEqual(rc, 1)
+        self.assertIn("User impact", err)
+
+    def test_only_a_real_true_value_is_the_pending_mode(self) -> None:
+        """PR #184 review r3: a truthiness test made `PDCA_PENDING_ID=false` *enable* the
+        exception — fail-OPEN, on a variable whose only job is to switch a gate off. The
+        env half goes through the project's strict boolean (#132's `bool("false") is
+        True` lesson), so every false spelling leaves the trailer required."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        for value in ("false", "False", "FALSE", "no", "off", "0", ""):
+            with self.subTest(off=value), mock.patch.dict(os.environ,
+                                                          {"PDCA_PENDING_ID": value}):
+                self.assertEqual(self._run("266")[0], 1, f"{value!r} must not relax it")
+        for value in ("1", "true", "TRUE", " yes ", "on"):
+            with self.subTest(on=value), mock.patch.dict(os.environ,
+                                                         {"PDCA_PENDING_ID": value}):
+                self.assertEqual(self._run("266")[0], 0, f"{value!r} must relax it")
+
+    def test_an_unrecognized_pending_id_value_is_off_and_says_so(self) -> None:
+        """Fails closed AND visibly: a typo'd knob that silently disarms a gate is the
+        failure mode worth more than the one it prevents."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "maybe"}):
+            rc, err = self._run("266")
+        self.assertEqual(rc, 1)
+        self.assertIn("PDCA_PENDING_ID", err)
+        self.assertIn("not a boolean", err)
 
     def test_slug_bundle_skips_the_trailer_requirement(self) -> None:
         # A non-numeric (slug) id has no real ticket number → only the opener is enforced.
