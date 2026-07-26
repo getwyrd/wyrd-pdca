@@ -201,7 +201,16 @@ def deferred(d: Path) -> list[str]:
     rows = raw.get("items") if isinstance(raw, dict) else raw
     if not isinstance(rows, list):
         raise DeferredLedgerUnreadable(f"{p} holds no `items` list")
-    return [str(r) for r in rows if isinstance(r, str)]
+    # A non-string entry fails CLOSED too (PR #168 review). Filtering it out would report the
+    # ledger as readable while dropping an entry we cannot interpret — and the next `defer`
+    # rewrites the file without it, so a partial recovery or a schema change would erase a
+    # held objection permanently, without ever raising the §6 warning. Syntactically valid
+    # JSON we cannot read is still a ledger we have lost.
+    bad = [r for r in rows if not isinstance(r, str)]
+    if bad:
+        raise DeferredLedgerUnreadable(
+            f"{p} holds {len(bad)} non-string entry(s) — cannot tell what was deferred")
+    return list(rows)
 
 
 def retire_cleared(d: Path, summary_path: Path) -> list[str]:
@@ -213,10 +222,13 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     recreates the entry from the ledger unchecked, and the same objection blocks accept again
     — every round, permanently, with no way to clear it.
 
-    The tick is the human's authority, so it is what retires the entry. `open_needs_human`
-    returns the still-UNCHECKED §6 lines, so anything in the ledger that no longer appears
-    there has been cleared. Entries left open survive untouched, which is the half that must
-    not regress: this must retire only what a human actually ticked.
+    The tick is the human's authority, so it is what retires the entry — and it must be read
+    POSITIVELY, from the ticked rows themselves. An earlier version inferred clearance from
+    absence ("no longer in `open_needs_human`"), which silently deleted any entry the human
+    had *edited* rather than ticked: annotating `- [ ] needs an ADR` into
+    `- [ ] needs an ADR (owner: architecture)` left it neither open under its old text nor
+    checked, so the objection vanished on the next archive despite never being adjudicated
+    (PR #168 review). Absence is not consent; only a tick is.
 
     Called at the iterate transition, while the ticked SUMMARY is still at the top level and
     before ``_archive_iteration`` moves it. Best-effort on an unreadable ledger: leave it
@@ -229,9 +241,9 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
         return []
     if not ledger:
         return []
-    still_open = {line.removeprefix("- [ ]").strip().casefold()
-                  for line in signoff.open_needs_human(summary_path)}
-    kept = [t for t in ledger if t.strip().casefold() in still_open]
+    ticked = {line[len("- [x]"):].strip().casefold()
+              for line in signoff.cleared_needs_human(summary_path)}
+    kept = [t for t in ledger if t.strip().casefold() not in ticked]
     if len(kept) != len(ledger):
         (d / DEFERRED_FILE).write_text(
             json.dumps({"items": kept}, indent=1) + "\n", encoding="utf-8")

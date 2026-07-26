@@ -68,6 +68,14 @@ _ELEMENT_RE = re.compile(r"^(C[1-5]|T[1-5]|V)\b")
 # findings stay HUMAN, so a legacy advisory file can never trigger an auto-iteration.
 _IMPL_MARKER_RE = re.compile(r"^\[impl\]\s*[—:-]*\s*", re.IGNORECASE)
 
+# `[human]` is the explicit counterpart #332 asks the advisory leaves for. It carries no
+# classification (an untagged bullet is HUMAN anyway — that is the fail-safe), so its only job
+# is to prove the leaf DECIDED rather than forgot. It must still be stripped from the stored
+# text: left in, the same objection written `- NEEDS-HUMAN [human] — X` one round and
+# `- NEEDS-HUMAN — X` the next dedups as two different findings, and §6 grows a duplicate
+# blocking box the human must clear twice (PR #168 review).
+_HUMAN_MARKER_RE = re.compile(r"^\[human\]\s*[—:-]*\s*", re.IGNORECASE)
+
 # The one STANDING row (#293) — recognised by the canonical label, not a hardcoded string, so
 # it cannot drift from the matrix the reviewer's table mirrors. `V` is the only element the
 # reviewer's prompt hard-codes to NEEDS-HUMAN on every cycle; C5/T5 are judgment too, but the
@@ -152,6 +160,12 @@ def _classify_finding(text: str, *, standing: bool = False,
     stripped = _IMPL_MARKER_RE.sub("", text, count=1)
     if stripped != text:
         return NeedsHumanItem(stripped.strip(), IMPL)
+    # `[human]` normalizes away without changing the verdict — the tag only records that the
+    # leaf made the call. Keeping it in the text would make the tagged and untagged spellings
+    # of one objection dedup as two.
+    dehumanized = _HUMAN_MARKER_RE.sub("", text, count=1)
+    if dehumanized != text:
+        return NeedsHumanItem(dehumanized.strip(), HUMAN)
     if standing:
         return NeedsHumanItem(text, STANDING)   # emitted every cycle ⇒ carries no signal (#293)
     m = _ELEMENT_RE.match(text)
@@ -178,9 +192,18 @@ def _items_from_artifact(text: str, *, allow_standing: bool = False) -> list[Nee
     and forced to HUMAN: there is no finding for a rebuild to fix, so an infra-empty must
     never be auto-iterated (#264). A real artifact is unaffected."""
     label = _LEAF_STATUS_LABEL.get(leaf_status(text), "")
-    items = [_classify_finding(f.text, standing=allow_standing and f.standing,
-                               tagged_impl=f.tagged_impl)
-             for f in _needs_human(text)]
+    # Dedup on the CLASSIFIED text, not the raw line. `_needs_human` keys its own `seen` set
+    # on the raw text, which is before the `[impl]` / `[human]` marker is stripped — so one
+    # objection written both ways in a round survives as two identical §6 boxes the human has
+    # to clear twice (PR #168 review round 2).
+    items, seen = [], set()
+    for f in _needs_human(text):
+        item = _classify_finding(f.text, standing=allow_standing and f.standing,
+                                 tagged_impl=f.tagged_impl)
+        if item.text.casefold() in seen:
+            continue
+        seen.add(item.text.casefold())
+        items.append(item)
     if not label:
         return items
     return [NeedsHumanItem(f"{label} — {it.text}", HUMAN) for it in items]

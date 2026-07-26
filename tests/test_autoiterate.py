@@ -1140,6 +1140,25 @@ class DeferredFindingsSurvive(_Base):
         autoiterate.retire_cleared(d, summary)
         self.assertEqual(autoiterate.deferred(d), [], "a ticked item must not come back")
 
+    def test_an_EDITED_but_unticked_deferral_survives(self) -> None:
+        """PR #168 review round 2. The round-1 fix inferred clearance from ABSENCE — an entry
+        no longer in `open_needs_human` was treated as adjudicated. A human who annotates an
+        unchecked row (`- [ ] needs an ADR` -> `- [ ] needs an ADR (owner: architecture)`)
+        leaves it neither open under its old text nor ticked, so the objection was deleted
+        having never been adjudicated. Absence is not consent; only a tick is."""
+        d = self._bundle("DEFER9", review=self._REVIEW)
+        self.assertTrue(self._try(d))
+        summary = d / "SUMMARY.md"
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("guards the symptom", text)
+        # Edit the row's text WITHOUT ticking it.
+        summary.write_text(text.replace("guards the symptom",
+                                        "guards the symptom (owner: architecture board)"),
+                           encoding="utf-8")
+        autoiterate.retire_cleared(d, summary)
+        self.assertTrue(any("guards the symptom" in t for t in autoiterate.deferred(d)),
+                        "an edited-but-open finding must stay deferred")
+
     def test_an_unticked_deferral_survives_retirement(self) -> None:
         # The half that must not regress: retire only what the human actually ticked.
         d = self._bundle("DEFER8", review=self._REVIEW)
@@ -1153,6 +1172,35 @@ class DeferredFindingsSurvive(_Base):
         # what the human cleared is no longer where the next assembly looks.
         src = inspect.getsource(driver.advance)
         self.assertLess(src.index("_retire_cleared_deferrals"), src.index("_archive_iteration"))
+
+    def test_a_non_string_ledger_entry_fails_closed(self) -> None:
+        """PR #168 review round 2. Syntactically valid JSON we cannot interpret is still a
+        ledger we have lost: filtering the entry out reported the file as readable, and the
+        next `defer` rewrote it without the entry — erasing a held objection permanently and
+        never raising the §6 warning."""
+        d = self._bundle("DEFER10", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            '{"items": ["a real one", {"was": "an object"}]}', encoding="utf-8")
+        with self.assertRaises(autoiterate.DeferredLedgerUnreadable):
+            autoiterate.deferred(d)
+        self.assertFalse(self._try(d))
+
+    def test_the_human_marker_is_stripped_like_impl(self) -> None:
+        """PR #168 review round 2. `[human]` carries no classification — an untagged bullet is
+        HUMAN anyway — so its only job is to prove the leaf decided. Left in the stored text,
+        the tagged and untagged spellings of ONE objection dedup as two, and §6 grows a
+        duplicate blocking box."""
+        tagged = assemble._classify_finding("[human] — the scope looks wider than the brief")
+        plain = assemble._classify_finding("the scope looks wider than the brief")
+        self.assertEqual(tagged.kind, assemble.HUMAN)
+        self.assertEqual(tagged.text, plain.text, "the two spellings must store identically")
+
+    def test_alternating_marker_spellings_do_not_duplicate_in_section6(self) -> None:
+        d = self._bundle("DEFER11", advisory=(
+            "- NEEDS-HUMAN [human] — the scope looks wider than the brief\n"
+            "- NEEDS-HUMAN — the scope looks wider than the brief\n"))
+        texts = [i.text for i in assemble.collect_needs_human(d, self.cfg)]
+        self.assertEqual(len(texts), len(set(texts)), texts)
 
     def test_the_rationale_names_what_was_addressed_and_what_was_held(self) -> None:
         items = [assemble.NeedsHumanItem("off-by-one at x.py:12", assemble.IMPL),
