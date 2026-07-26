@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -420,20 +421,50 @@ class PublishSlice(unittest.TestCase):
             self.assertFalse(publish._t4_passes(self.cfg, d))
         self.assertIn("2 blocking", err.getvalue())
 
-    def test_no_issue_relaxes_failing_t4_to_a_flag(self) -> None:
-        """Issue #7 item3: `--no-issue` (pending_id) relaxes a failing T4 to a flag
-        instead of aborting — publish proceeds and flags it; without it a failing T4
-        still aborts. The first-class 'no tracker id yet' path (vs a magic #0000)."""
+    def test_no_issue_declares_the_mode_to_the_gate_rather_than_excusing_it(self) -> None:
+        """Issue #7 item3 / PR #184 review: `--no-issue` (pending_id) is the 'no tracker
+        id yet' path, and the thing it excuses is the missing trailer — nothing else. It
+        used to be applied to the gate's VERDICT (any nonzero relaxed to a warning), which
+        also waved through a malformed PR body, since `contribcheck` keeps the user-impact
+        requirement under --no-issue. The mode goes INTO the gate now; what still fails is
+        a real defect, and a real defect blocks the push in either mode."""
         self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "exit 1", "scope": "bundle"}]
         _bundle(self.cfg, "PEND", brief_body=_FIX_BRIEF, accepted=True)
         # default: a failing T4 aborts the publish
         self.assertEqual(publish.publish(self.cfg, "PEND", dry_run=True), 1)
-        # --no-issue: the failing T4 is relaxed to a flag; publish proceeds
+        # --no-issue: it aborts too — the gate already knew to skip the trailer check.
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()):
             rc = publish.publish(self.cfg, "PEND", dry_run=True, pending_id=True)
-        self.assertEqual(rc, 0)
-        self.assertIn("pending-id", err.getvalue().lower())
+        self.assertEqual(rc, 1)
+        # And the refusal says why --no-issue did not save it, so the operator doesn't
+        # go looking for a tracker id to add.
+        self.assertIn("--no-issue", err.getvalue())
+
+    def test_pending_id_is_exported_to_the_gate(self) -> None:
+        """The mode reaches the checker as `$PDCA_PENDING_ID=1`, beside `$PDCA_BUNDLE`:
+        publish cannot pass `--no-issue` itself, since the gate's command line is the
+        project's to write (`pdca.toml`), not publish's."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "PENDENV", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()):
+            publish._t4_passes(self.cfg, d, pending_id=True)
+        self.assertEqual(beat.call_args.kwargs["env"]["PDCA_PENDING_ID"], "1")
+
+    def test_no_pending_id_leaves_the_gate_env_clean(self) -> None:
+        """Absent the mode the variable is absent — not "0", which a shell test like
+        `[ -n "$PDCA_PENDING_ID" ]` would read as set."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "true", "scope": "bundle"}]
+        d = _bundle(self.cfg, "NOPEND", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PDCA_PENDING_ID", None)
+            publish._t4_passes(self.cfg, d)
+        self.assertNotIn("PDCA_PENDING_ID", beat.call_args.kwargs["env"])
 
     def _stacked_dry_run(self, *, base_remote: str) -> str:
         # A `Stacks on:` dependent whose parent has a published branch — dry-run publish.
@@ -827,6 +858,35 @@ class ContribCheck(unittest.TestCase):
         self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
                           commit="Fix the crash\n\nNo trailer.\n")
         self.assertEqual(self._run("266", no_issue=True)[0], 0)
+
+    def test_pending_id_env_relaxes_the_trailer_requirement(self) -> None:
+        """PR #184 review: `publish --no-issue` runs this gate through the project's own
+        `cmd`, so it cannot append `--no-issue` — it declares the mode in the environment
+        instead, and the checker must read it as the same thing."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            self.assertEqual(self._run("266")[0], 0)
+
+    def test_pending_id_env_relaxes_the_trailer_and_nothing_else(self) -> None:
+        """The bug the flag-passthrough replaces: pending-id excuses the missing tracker
+        id, never a missing user-impact opener. Publish used to forgive both."""
+        self._bundle_with("266", "## Summary\nno opener here.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            rc, err = self._run("266")
+        self.assertEqual(rc, 1)
+        self.assertIn("User impact", err)
+
+    def test_pending_id_env_unset_or_zero_is_not_pending(self) -> None:
+        """`PDCA_PENDING_ID=0` / empty is the absence of the mode, not the mode — the
+        gate runner sets the variable only when it means it."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        for value in ("0", ""):
+            with self.subTest(value=value), mock.patch.dict(os.environ,
+                                                            {"PDCA_PENDING_ID": value}):
+                self.assertEqual(self._run("266")[0], 1)
 
     def test_slug_bundle_skips_the_trailer_requirement(self) -> None:
         # A non-numeric (slug) id has no real ticket number → only the opener is enforced.

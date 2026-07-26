@@ -267,7 +267,8 @@ def main(argv: list[str] | None = None) -> int:
                                help="fail a contribution whose PR body lacks a user-impact opener or the tracker id (T4)")
     p_contrib.add_argument("issue_id", nargs="?")
     p_contrib.add_argument("--no-issue", action="store_true",
-                           help="pending-id: don't require the tracker trailer (still require the user-impact opener)")
+                           help="pending-id: don't require the tracker trailer (still require the user-impact opener); "
+                                "$PDCA_PENDING_ID=1 sets it too, for the gate row publish runs")
 
     p_reval = sub.add_parser("revalidate",
                              help="re-run gates on a COMPLETE bundle vs the current engine; write a dated stamp (never re-decides §9)")
@@ -736,7 +737,12 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
     ticket — the tracker id is absent from either ``commit-msg.txt`` or ``pr-description.md``
     (the two are linted INDEPENDENTLY, so a ticketed fix needs the id in BOTH). The bundle is
     the ``issue_id`` arg or ``$PDCA_BUNDLE`` (set by the gate runner). No patch (close/no-fix)
-    ⇒ pass (default-open, like an unconfigured gate)."""
+    ⇒ pass (default-open, like an unconfigured gate).
+
+    Pending-id mode (no tracker number assigned yet) drops the id requirement and NOTHING
+    else. It arrives either as ``--no-issue`` from a human, or as ``$PDCA_PENDING_ID=1``
+    from ``publish --no-issue`` — which cannot pass a flag, since the gate's command line
+    is the project's to write (``pdca.toml``), not publish's (PR #184 review)."""
     if args.issue_id:
         d = cfg.bundle(args.issue_id)
     elif os.environ.get("PDCA_BUNDLE"):
@@ -766,7 +772,8 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
             problems.append("`**User impact:**` must come BEFORE `## Root cause`")
     # 2) The tracker id in BOTH artifacts — only for a real numeric ticket; a slug /
     #    --no-issue (pending-id) bundle legitimately carries no trailer.
-    if issue_id.isdigit() and not args.no_issue:
+    pending = args.no_issue or os.environ.get("PDCA_PENDING_ID", "") not in ("", "0")
+    if issue_id.isdigit() and not pending:
         needle = re.compile(r"#" + re.escape(issue_id) + r"\b")
         commit_text = commit_path.read_text(encoding="utf-8") if commit_path.is_file() else ""
         if not needle.search(pr_text):

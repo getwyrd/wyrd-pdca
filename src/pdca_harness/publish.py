@@ -61,10 +61,12 @@ def publish(
 
     ``pending_id`` (``--no-issue``): the first-class "no tracker id yet" path. A
     project may need to contribute before a tracker number is assigned; rather than a
-    magic ``Fixes #0000`` placeholder, declare it here. The T4 contribution gate is
-    then **relaxed to a flag** instead of a hard block, and the bundle is recorded
-    ``id_pending`` so the human adds the real id and re-gates T4 before marking the PR
-    ready. The publisher leaf omits the trailer (no invented id) in this case.
+    magic ``Fixes #0000`` placeholder, declare it here. The mode is **passed into the
+    T4 gates** (``$PDCA_PENDING_ID``, read by ``pdca contribcheck``), which drops the
+    tracker-id requirement and keeps every other contribution check in force; the
+    bundle is recorded ``id_pending`` so the human adds the real id and re-gates T4
+    before marking the PR ready. The publisher leaf omits the trailer (no invented id)
+    in this case.
     """
     d = cfg.bundle(issue_id)
     today = today or datetime.date.today().isoformat()
@@ -112,20 +114,21 @@ def publish(
         print(f"publish: {COMMIT_MSG} / {PR_BODY} still missing — aborting", file=sys.stderr)
         return 1
 
-    # T4 contribution gate — the artifacts MUST pass before anything is pushed,
-    # UNLESS pending_id (--no-issue): then a T4 failure is relaxed to a flag, since the
-    # one thing legitimately missing is the not-yet-assigned tracker id. The bundle is
-    # recorded id_pending so the human adds the id and re-gates T4 before ready.
-    if not _t4_passes(cfg, d):
-        if pending_id:
-            print(f"publish: T4 contribution gate not satisfied on {COMMIT_MSG} / "
-                  f"{PR_BODY} — proceeding in --no-issue (pending-id) mode; the "
-                  "contribution is FLAGGED. Add the tracker id and re-run T4 before "
-                  "marking the PR ready.", file=sys.stderr)
-        else:
-            print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY} — "
-                  "fix them and retry", file=sys.stderr)
-            return 1
+    # T4 contribution gate — the artifacts MUST pass before anything is pushed.
+    #
+    # pending_id (--no-issue) is passed INTO the gate rather than applied to its verdict
+    # (PR #184 review). It used to relax any nonzero T4 to a warning, on the premise that
+    # the one thing legitimately missing in this mode is the not-yet-assigned tracker id —
+    # but the gate was never told which mode it ran in, so the relaxation covered the whole
+    # checker: `contribcheck` KEEPS the `**User impact:**` opener requirement under
+    # --no-issue, and a malformed PR body was waved through as "pending id" too. Told the
+    # mode, the gate drops exactly the trailer requirement and nothing else, so what is
+    # left to fail is a real defect — and a real defect blocks the push in either mode.
+    if not _t4_passes(cfg, d, pending_id=pending_id):
+        mode = " (--no-issue: the tracker id is NOT what it wants)" if pending_id else ""
+        print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY}{mode} — "
+              "fix them and retry", file=sys.stderr)
+        return 1
 
     # Stack mode (issue #54): the brief names an existing PR's head branch — contribute a
     # commit onto it instead of a new PR. The shared spine above (guard, target, artifacts,
@@ -546,7 +549,7 @@ def _fork_owner(repo: Path, remote: str = "origin") -> str:
     return m.group(1) if m else ""
 
 
-def _t4_passes(cfg: Config, d: Path) -> bool:
+def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
     """Run the configured T4-tier gates that apply at publish. None → nothing to
     enforce (True). Keeps publish decoupled from any one project's checker.
 
@@ -563,6 +566,12 @@ def _t4_passes(cfg: Config, d: Path) -> bool:
     ``at_publish = false`` on a check opts it out of this step while leaving it fully in
     force at Check. Absent, it defaults True — unchanged behaviour for every other check.
 
+    ``pending_id`` (``--no-issue``) is exported to every gate as ``$PDCA_PENDING_ID=1``
+    beside ``$PDCA_BUNDLE`` — the caller's mode, declared to the checker that has to act
+    on it, rather than a blanket amnesty applied to its exit code afterwards. The shipped
+    checker reads it as ``contribcheck --no-issue``: no tracker-id requirement, every
+    other contribution check unchanged.
+
     Output stays captured — a failing gate's evidence is reported in one place below —
     so the gate is silent for as long as it runs, and a T4 gate is routinely a
     model-backed review measured in minutes, not seconds. Captured *and* silent reads
@@ -577,6 +586,8 @@ def _t4_passes(cfg: Config, d: Path) -> bool:
     if not t4:
         return True
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    if pending_id:
+        env["PDCA_PENDING_ID"] = "1"
     for chk in t4:
         label = chk.get("label") or chk.get("id") or chk.get("cmd", "")
         print(f"  · T4 gate {label} (a gate can take minutes; a heartbeat follows)…",
