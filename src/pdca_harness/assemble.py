@@ -233,9 +233,20 @@ def _deferred_items(d: Path, current: list[NeedsHumanItem]) -> list[NeedsHumanIt
     their own, and they no longer block a rebuild either — they simply must not be lost.
     """
     from . import autoiterate  # local import: autoiterate imports this module
+    try:
+        held = autoiterate.deferred(d)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Assembly must never crash on a bundle file (the defensive contract of this module),
+        # but it must not silently drop the ledger either — that is the failure the ledger
+        # exists to prevent. Surface it as a §6 item instead: the human sees that findings
+        # were lost, and the C6 accept-guard holds until they clear it. `flow` separately
+        # refuses to auto-iterate a bundle in this state, so no rebuild runs meanwhile.
+        return [NeedsHumanItem(
+            f"the deferred-findings ledger is unreadable — findings held over from earlier "
+            f"auto-iterate rounds may be LOST; recover or reconstruct it before accepting "
+            f"({exc})", HUMAN)]
     seen = {it.text.casefold() for it in current}
-    return [NeedsHumanItem(t, HUMAN) for t in autoiterate.deferred(d)
-            if t.casefold() not in seen]
+    return [NeedsHumanItem(t, HUMAN) for t in held if t.casefold() not in seen]
 
 
 def assemble_summary(d: Path, cfg: Config) -> None:

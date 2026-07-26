@@ -174,6 +174,16 @@ def _maybe_auto_iterate(
         return False
     if not autoiterate.eligible(items):
         return False
+    try:
+        autoiterate.deferred(d)  # readable? (PR #168 review, P1)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Rebuilding now would rewrite the ledger from the current §6 and then archive the
+        # current SUMMARY, so every earlier round's held finding would vanish from every
+        # artifact at once. Halt instead: `assemble` puts the same condition in §6, so the
+        # human is told rather than the bundle quietly continuing.
+        print(f"flow: {d.name} — {exc}; not auto-iterating (findings would be lost)",
+              file=sys.stderr)
+        return False
     spent = autoiterate.count(d)
     fire, why_not = autoiterate.should_iterate(d, items, cfg)
     if not fire:

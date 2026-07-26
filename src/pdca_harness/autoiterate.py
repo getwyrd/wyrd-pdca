@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from . import signoff
 from .assemble import HUMAN, IMPL, NeedsHumanItem
 from .config import Config
 from .leaves import SIGNOFF_DECISION
@@ -166,16 +167,75 @@ def should_iterate(d: Path, items: list[NeedsHumanItem], cfg: Config) -> tuple[b
     return True, ""
 
 
+class DeferredLedgerUnreadable(Exception):
+    """The deferred ledger exists but cannot be read (PR #168 review, P1).
+
+    Distinguished from an ABSENT ledger on purpose. Absent means "nothing has been deferred
+    yet" — the ordinary first-round state, and reading it as an empty list is correct. But a
+    file that exists and will not parse is a ledger whose contents we have LOST, and treating
+    that as empty is the one failure this whole mechanism exists to prevent: the next
+    :func:`defer` would rewrite the file from the current §6 alone, and the following
+    ``iterate-do`` would archive the current ``SUMMARY.md``, so every objection deferred in an
+    earlier round would be gone from every artifact at once.
+
+    Every other reader in this module is deliberately tolerant of a garbled file (a bundle
+    must never crash the flow). This one is not, because the tolerant reading is silently
+    destructive in the accepting direction — auto-iterate would carry on rebuilding while the
+    human's findings evaporated.
+    """
+
+
 def deferred(d: Path) -> list[str]:
-    """Every HUMAN finding this bundle has iterated past, oldest first, deduped."""
-    try:
-        raw = json.loads((d / DEFERRED_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    """Every HUMAN finding this bundle has iterated past, oldest first, deduped.
+
+    Raises :class:`DeferredLedgerUnreadable` if the file exists but does not parse — see
+    that class for why this one reader refuses to fail soft. An ABSENT file is [].
+    """
+    p = d / DEFERRED_FILE
+    if not p.exists():
         return []
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise DeferredLedgerUnreadable(f"{p} exists but cannot be read: {exc}") from exc
     rows = raw.get("items") if isinstance(raw, dict) else raw
     if not isinstance(rows, list):
-        return []
+        raise DeferredLedgerUnreadable(f"{p} holds no `items` list")
     return [str(r) for r in rows if isinstance(r, str)]
+
+
+def retire_cleared(d: Path, summary_path: Path) -> list[str]:
+    """Drop ledger entries the human has TICKED in §6; return what remains (PR #168 review).
+
+    A deferred finding re-enters §6 unchecked on every assembly. Without this, a human who
+    adjudicates one and then chooses ``iterate-do`` for some *other* reason loses that
+    adjudication: the transition archives the ticked ``SUMMARY.md``, the next assembly
+    recreates the entry from the ledger unchecked, and the same objection blocks accept again
+    — every round, permanently, with no way to clear it.
+
+    The tick is the human's authority, so it is what retires the entry. `open_needs_human`
+    returns the still-UNCHECKED §6 lines, so anything in the ledger that no longer appears
+    there has been cleared. Entries left open survive untouched, which is the half that must
+    not regress: this must retire only what a human actually ticked.
+
+    Called at the iterate transition, while the ticked SUMMARY is still at the top level and
+    before ``_archive_iteration`` moves it. Best-effort on an unreadable ledger: leave it
+    alone rather than rewrite it from a partial read — `deferred` raises there, and the
+    accept-guard already holds the bundle.
+    """
+    try:
+        ledger = deferred(d)
+    except DeferredLedgerUnreadable:
+        return []
+    if not ledger:
+        return []
+    still_open = {line.removeprefix("- [ ]").strip().casefold()
+                  for line in signoff.open_needs_human(summary_path)}
+    kept = [t for t in ledger if t.strip().casefold() in still_open]
+    if len(kept) != len(ledger):
+        (d / DEFERRED_FILE).write_text(
+            json.dumps({"items": kept}, indent=1) + "\n", encoding="utf-8")
+    return kept
 
 
 def defer(d: Path, items: list[NeedsHumanItem], *, attempt: int) -> list[str]:

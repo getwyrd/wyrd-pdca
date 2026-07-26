@@ -18,6 +18,7 @@ and never run past the hard ceiling. Offline: stub leaves, real gate commands, n
 
 from __future__ import annotations
 
+import inspect
 import io
 import os
 import shutil
@@ -1091,11 +1092,67 @@ class DeferredFindingsSurvive(_Base):
         autoiterate.defer(d, assemble.collect_needs_human(d, self.cfg), attempt=1)
         self.assertFalse(any("fitness-to-purpose" in t for t in autoiterate.deferred(d)))
 
-    def test_a_garbled_ledger_reads_as_empty(self) -> None:
+    def test_an_absent_ledger_reads_as_empty(self) -> None:
         d = self._bundle("DEFER5", review=self._REVIEW)
+        self.assertFalse((d / autoiterate.DEFERRED_FILE).exists())
+        self.assertEqual(autoiterate.deferred(d), [])   # nothing deferred yet is not an error
+
+    def test_an_unreadable_ledger_fails_closed(self) -> None:
+        """PR #168 review (codex, P1). Reading a garbled ledger as EMPTY is silently
+        destructive: the next `defer` would rewrite it from the current §6 alone and the
+        following iterate-do would archive the current SUMMARY, so every objection held over
+        from an earlier round would vanish from every artifact at once. This is the one
+        reader in the module that must not fail soft."""
+        d = self._bundle("DEFER5B", review=self._REVIEW)
         (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
-        self.assertEqual(autoiterate.deferred(d), [])
-        self.assertTrue(self._try(d))          # and never crashes the flow
+        with self.assertRaises(autoiterate.DeferredLedgerUnreadable):
+            autoiterate.deferred(d)
+
+    def test_an_unreadable_ledger_halts_the_rebuild(self) -> None:
+        d = self._bundle("DEFER5C", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        self.assertFalse(self._try(d), "a rebuild here would destroy the held findings")
+        self.assertEqual(autoiterate.count(d), 0)      # no budget spent
+
+    def test_an_unreadable_ledger_surfaces_in_section6_without_crashing(self) -> None:
+        # Assembly is defensive by contract, so it must not raise — but it must not drop the
+        # ledger silently either. It becomes a §6 item, which the C6 guard then holds on.
+        d = self._bundle("DEFER5D", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        assemble.assemble_summary(d, self.cfg)
+        self.assertTrue(any("unreadable" in t for t in
+                            signoff.open_needs_human(d / "SUMMARY.md")))
+
+    def test_a_ticked_deferral_retires_from_the_ledger(self) -> None:
+        """PR #168 review (codex, P2). Without this a human who adjudicates a deferred item
+        and then iterates for some OTHER reason loses that adjudication: the ticked SUMMARY
+        is archived, the next assembly recreates the entry unchecked from the ledger, and the
+        objection blocks accept again on every future round with no way to clear it."""
+        d = self._bundle("DEFER7", review=self._REVIEW)
+        self.assertTrue(self._try(d))                       # round 1 defers the C5 concern
+        held = autoiterate.deferred(d)
+        self.assertTrue(any("guards the symptom" in t for t in held), held)
+
+        # The human ticks it in §6, then iterates for an unrelated reason.
+        summary = d / "SUMMARY.md"
+        summary.write_text(summary.read_text(encoding="utf-8").replace("- [ ]", "- [x]"),
+                           encoding="utf-8")
+        autoiterate.retire_cleared(d, summary)
+        self.assertEqual(autoiterate.deferred(d), [], "a ticked item must not come back")
+
+    def test_an_unticked_deferral_survives_retirement(self) -> None:
+        # The half that must not regress: retire only what the human actually ticked.
+        d = self._bundle("DEFER8", review=self._REVIEW)
+        self.assertTrue(self._try(d))
+        before = autoiterate.deferred(d)
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")     # nothing ticked
+        self.assertEqual(autoiterate.deferred(d), before)
+
+    def test_retirement_runs_before_the_archive_moves_the_summary(self) -> None:
+        # Ordering is the fix: once _archive_iteration has moved SUMMARY.md, the record of
+        # what the human cleared is no longer where the next assembly looks.
+        src = inspect.getsource(driver.advance)
+        self.assertLess(src.index("_retire_cleared_deferrals"), src.index("_archive_iteration"))
 
     def test_the_rationale_names_what_was_addressed_and_what_was_held(self) -> None:
         items = [assemble.NeedsHumanItem("off-by-one at x.py:12", assemble.IMPL),

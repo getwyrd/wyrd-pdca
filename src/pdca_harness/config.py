@@ -229,12 +229,21 @@ class Config:
     # NAMED on stderr with a resume hint — never silently dropped. ``[driver].max_passes``;
     # ``PDCA_MAX_PASSES`` overrides for one run; ``--max-passes`` overrides both.
     max_passes: int = 20
-    # Auto-iterate (issue #264): when every open SUMMARY §6 item is implementation-level
-    # (a `gate` cell of the 5/5/1 — C2/C4/T1..T4), let the driver record `iterate-do` and
-    # rebuild instead of stopping for a human. A judgment cell (C5/T5/validation), an
-    # unverifiable gate, an external dependency, or an unmarked advisory finding still
-    # halts. It never auto-accepts. OFF by default. ``[driver].auto_iterate``;
-    # ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
+    # Auto-iterate (issues #264/#332): while SUMMARY §6 carries implementation-level work —
+    # a `gate` cell of the 5/5/1 (C2/C4/T1..T4), an advisory finding tagged `[impl]`, or a
+    # judgment cell the reviewer tagged `[impl]` — the driver records `iterate-do` and
+    # rebuilds instead of stopping for a human.
+    #
+    # A finding that NEEDS a human no longer halts the rebuild (#332). It is deferred into
+    # the bundle's `deferred-findings.json` and re-enters §6 at handover, so the human sees
+    # it when the rounds run out rather than when it was raised — later than before, never
+    # not at all, and the C6 accept-guard still holds until it is cleared. What bounds the
+    # iteration is the round budget below, not the finding.
+    #
+    # Two cases still halt immediately: an empty §6 (a clean bundle awaiting a human
+    # ACCEPT — this never auto-accepts) and a §6 of human findings with no implementation
+    # work beside them (nothing for a rebuild to do). OFF by default.
+    # ``[driver].auto_iterate``; ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
     auto_iterate: bool = False
     # The per-bundle cap on those automatic rounds; on exhaustion the bundle halts at
     # AWAITING_SIGNOFF for the human. Clamped below ``max_passes`` so a wave's pass budget
