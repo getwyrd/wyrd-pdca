@@ -105,7 +105,25 @@ Fill each tier with your project's domain invariants:
 - **Tier C — internal project invariants.** Documented project rules with no external
   canon. State the rationale; do **not** borrow language/framework authority for them —
   the firmest backing is your own written rule (e.g. a lint/static-analysis rule).
-  *(empty — add your project's)*
+
+  - **C-1 — A permanent or data-losing failure mode is never an acceptable cost.** `[ACTIVE]`
+    Availability, latency, capacity and operational costs may be traded and registered; a state
+    nothing can exit, a durable byte with nothing that will ever reclaim it, a published map over
+    reclaimable bytes, and an obligation larger than the store's envelope may **not** — they are
+    defects to remove, never costs to accept, and "bounded by an operator noticing" is not a
+    bound. **Sources:** maintainer's standing rule, 2026-07-25 (*"failure scenarios that are
+    permanent or lead to loss of data are never an option in Wyrd"*) — **authoritative** for this
+    project; corroborated in-tree by proposal 0016's refutation standard, which forbids disposing
+    of outcomes (a)–(d) as accepted costs and states that *"only availability, latency, capacity
+    and operational costs are acceptable trade-offs here"*
+    (`../wyrd/docs/design/proposals/draft/0016-multipart-commit-protocol.md:2802-2813`), and by the
+    custodian's load-bearing invariant *"never reclaim a referenced fragment"*, whose violation is
+    named as silent corruption (`../wyrd/crates/custodian/src/gc.rs:22-25`).
+    **Provenance tier:** internal (Tier C) — a project rule, not language or framework canon.
+    **Reading it correctly (§7):** it forbids *accepting* the class as a cost; it does not forbid
+    a bounded, evidenced, operator-exitable state (0016's foreign-clock skip, which holds an
+    admission slot behind an alarm **and** a shipped operator verb, is inside the rule, not outside
+    it — the verb is what makes it bounded).
 
 ## 6. Category → invariant mapping (the active layer) — **project-provided**
 
@@ -116,7 +134,14 @@ Fill each tier with your project's domain invariants:
 
 | Defect category | Invariant Plan must state | Cite |
 |---|---|---|
-| *(a category with a shipped failure behind it)* | *(its sourced invariant)* | *(the source)* |
+| **Storage lifecycle / reclamation** — any brief in which a durable byte's protection is created, transferred or lifted (staging, publication, teardown, GC, restore, drain), or in which a state machine gains a state | **C-1** — no permanent or data-losing failure mode is an acceptable cost: every durable byte is, at every instant, protected by a record that names it **or** evidenced for reclamation, and every state has an actor that exits it in bounded time | §5 C-1 (maintainer's rule 2026-07-25; 0016 `:2802-2813`; `gc.rs:22-25`) |
+
+**Provisional (§8):** the row above rests on **one** instance — the 2026-07-25 multipart batch,
+where a split budget authority would have shipped a legally-admitted session whose unsplittable
+reap fence could never commit (never reaped, never reclaimed), caught by cross-vendor plan review
+rather than by the brief's own discipline. §8 asks for *recurrence* before a category is active;
+this row is entered early because the failure class it guards is one the project has ruled out
+categorically. Act confirms or retires it on cadence.
 
 Everything not in this table stays reference-layer (§5); promote a category here only on
 evidence (§8).
