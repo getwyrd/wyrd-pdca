@@ -57,6 +57,54 @@ def field(brief_path: Path, *labels: str, default: str = "") -> str:
     return default
 
 
+# What ends a field's value: the NEXT top-level field, at column 0. Deliberately not
+# `_FIELD_RE`, which tolerates leading whitespace — a brief's value routinely continues as an
+# INDENTED sub-bullet (`  - **BINDING (demonstrable at Check):** …`, the shape every pointer
+# brief uses), and treating that as a new field truncated the value to nothing (issue #174).
+_NEXT_FIELD_RE = re.compile(r"^-[ \t]*\*{0,2}[^:*]+?\*{0,2}[ \t]*:")
+
+
+def whole_field(brief_path: Path, *labels: str, default: str = "") -> str:
+    """First matching field among ``labels``, as its COMPLETE value (issue #174).
+
+    :func:`parse_fields` is line-based, so :func:`field` returns only a field's first line. On a
+    real brief that is most of the value missing — `issue_508`'s success criterion is 13,357
+    characters and `field` returns 69 of them, cut mid-clause — and for a value written on the
+    lines *beneath* its label it returns nothing at all. The template invites exactly that
+    shape: `templates/brief.md.tpl` wraps the Success criterion placeholder over two lines.
+
+    This returns the inline remainder plus every continuation line, stopping at the next
+    ``- **Field:**`` or a Markdown heading, with internal newlines PRESERVED so a caller can
+    re-indent it.
+
+    Two deliberate differences from :func:`field`:
+
+    * The value is **raw** — no ``_is_placeholder`` filtering. The renderer must keep showing an
+      unfilled field exactly as it does today, and a caller that wants the filtering (the
+      `/handoff` gate does) applies it to the reassembled value itself.
+    * :func:`field` is left alone rather than widened. `publish._resolve_target` partitions its
+      value on ``@``, :func:`test_files` pulls path tokens out of one line, and
+      :func:`depends_on` parses an id list while ignoring trailing prose — all of them read a
+      first line on purpose. Widening the accessor would reach every one; widening the callers
+      that want the whole value reaches only them.
+    """
+    text = brief_path.read_text(encoding="utf-8")
+    for label in labels:
+        m = re.search(rf"^-[ \t]*\*{{0,2}}{re.escape(label)}\*{{0,2}}[ \t]*:\*{{0,2}}[ \t]*(.*)$",
+                      text, re.MULTILINE | re.IGNORECASE)
+        if not m:
+            continue
+        value = [m.group(1)]
+        for line in text[m.end():].splitlines()[1:]:
+            if _NEXT_FIELD_RE.match(line) or line.lstrip().startswith("#"):
+                break
+            value.append(line)
+        whole = "\n".join(value).strip()
+        if whole:
+            return whole
+    return default
+
+
 def disposition_hint(brief_path: Path) -> str:
     """The brief's ``- **Disposition hint:** value`` field, or "" if absent.
 
