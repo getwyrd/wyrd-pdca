@@ -69,8 +69,15 @@ instead. The driver then routes it straight back to Do without spending the huma
 attention. Keep the plain `- NEEDS-HUMAN — ` form when the finding demands a human
 **architectural / scope / fitness-to-purpose** decision — the fix targets a symptom rather
 than the cause, the brief asked for the wrong thing, the toolchain was unavailable so the
-verdict is provisional. **When in doubt, omit `[impl]`**: an unmarked finding always reaches
-the human, a mismarked one buys a wasted rebuild.
+verdict is provisional.
+
+**Tag every `NEEDS-HUMAN` bullet, one way or the other (issue #332):** `[impl]` for a build
+defect, `[human]` for a judgment call. Do not leave the choice unmade — across a 230-attempt
+corpus 139 findings arrived untagged, which is 91% of the bundles that then could not be
+rebuilt unattended. An untagged bullet still counts as `[human]`, so an omission costs
+correctness nothing; it just spends a human on work a rebuild could have done. Where the call
+is genuinely close, `[human]` is the safe side: an unmarked finding always reaches the human,
+a mismarked one buys a wasted rebuild.
 
 ## Scratch discipline — throwaway work never lands on /tmp
 

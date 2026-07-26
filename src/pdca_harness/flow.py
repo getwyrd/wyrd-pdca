@@ -113,6 +113,22 @@ def _apply_decision(
               f"{state.state(d)}); skipping record, will re-drive", file=sys.stderr)
         (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
         return None
+    # Ledger integrity is checked HERE, not in `_maybe_auto_iterate` (PR #168 review round 8).
+    # That was the wrong home for it: the function returns at its `not cfg.auto_iterate` guard,
+    # and the batch sweep never calls it at all — so a bundle whose ledger broke after assembly
+    # could be resumed with auto-iterate off, or signed off through the batch queue, and
+    # ACCEPTED against a stale SUMMARY that never mentioned the lost objections.
+    #
+    # `_apply_decision` is the choke point every path shares and where the accept guard already
+    # lives, so the condition is enforced beside C6 rather than beside the rebuild decision.
+    try:
+        autoiterate.deferred(d)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        assemble.ensure_section6_item(d / "SUMMARY.md", _LEDGER_LOST.format(exc=exc))
+        if action == "accept":
+            print(f"flow: {d.name} — cannot accept, {exc}; recorded in §6", file=sys.stderr)
+            return "blocked"
+        print(f"flow: {d.name} — {exc}; recorded in §6", file=sys.stderr)
     if action == "accept" and signoff.open_needs_human(d / "SUMMARY.md"):
         print(f"flow: {d.name} — cannot accept, §6 NEEDS-HUMAN still open (C6)", file=sys.stderr)
         return "blocked"
@@ -138,6 +154,11 @@ def _signoff_and_apply(
     """Single-issue: run the interactive sign-off leaf, then apply its decision."""
     leaves.run_signoff(d, cfg)
     return _apply_decision(cfg, d, by=by, today=today, apply_now=apply_now)
+
+
+_LEDGER_LOST = ("the deferred-findings ledger is unreadable — findings held over from earlier "
+                "auto-iterate rounds may be LOST; recover or reconstruct it before accepting "
+                "({exc})")
 
 
 def _maybe_auto_iterate(
@@ -172,17 +193,48 @@ def _maybe_auto_iterate(
         print(f"flow: {d.name} — cannot classify Check findings ({type(exc).__name__}: {exc}); "
               f"not auto-iterating", file=sys.stderr)
         return False
+    # Record this Check's implementation-finding count BEFORE any early return, so the
+    # convergence baseline is the Check immediately preceding the next rebuild whoever
+    # triggers it. Recording only on the rounds that auto-iterated left a human `iterate-do`
+    # after a growth halt comparing against a stale automatic round (PR #168 review round 3).
+    # It runs after `should_iterate` below, which needs the PREVIOUS observation to compare.
+    def _observe() -> None:
+        autoiterate.observe(d, items)
+
+    # Readability is checked BEFORE eligibility (PR #168 review round 7). It used to sit
+    # after, so a ledger that became unreadable once the SUMMARY was already assembled went
+    # unreported whenever the current Check had no IMPL finding: the eligibility test returned
+    # first, `collect_needs_human`'s synthetic warning existed only in memory, and the C6 guard
+    # then read a STALE SUMMARY — so the bundle could be ACCEPTED without the human ever
+    # learning that earlier deferred findings were no longer readable.
+    try:
+        autoiterate.deferred(d)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Put the condition into the artifact the accept-guard actually reads. Appending in
+        # place rather than re-assembling: a re-assemble would discard any §6 box the human
+        # has already ticked in this sign-off.
+        added = assemble.ensure_section6_item(d / "SUMMARY.md", _LEDGER_LOST.format(exc=exc))
+        print(f"flow: {d.name} — {exc}; not auto-iterating (findings would be lost)"
+              + ("; recorded in §6" if added else ""), file=sys.stderr)
+        _observe()
+        return False
     if not autoiterate.eligible(items):
+        _observe()
         return False
     spent = autoiterate.count(d)
-    if spent >= cfg.max_auto_iters:
-        print(f"flow: {d.name} — auto-iterate budget spent ({spent}/{cfg.max_auto_iters}); "
-              f"handing the implementation findings to the human", file=sys.stderr)
+    fire, why_not = autoiterate.should_iterate(d, items, cfg)
+    _observe()  # after the comparison — `should_iterate` reads the PREVIOUS observation
+    if not fire:
+        print(f"flow: {d.name} — {why_not}; handing the findings to the human",
+              file=sys.stderr)
         return False
+    n_impl = autoiterate.impl_count(items)
+    n_held = sum(1 for it in items if it.kind == assemble.HUMAN)
+    held = f", deferring {n_held} for the human" if n_held else ""
+    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters} "
+          f"(soft {cfg.soft_auto_iters}): rebuilding for {n_impl} implementation-level "
+          f"finding(s){held}", file=sys.stderr)
     autoiterate.write_decision(d, items)
-    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters}: "
-          f"{len(items)} implementation-level finding(s), no human judgment needed",
-          file=sys.stderr)
     return _apply_decision(cfg, d, by="auto-iterate", today=today,
                            apply_now=apply_now) == "iterate-do"
 

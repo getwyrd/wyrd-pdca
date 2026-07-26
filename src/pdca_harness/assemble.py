@@ -42,6 +42,35 @@ class NeedsHumanItem(NamedTuple):
     kind: str
 
 
+# Which classification survives when the same finding arrives twice. HUMAN wins over IMPL —
+# it reaches the human either way and never triggers a rebuild on its own — and both win over
+# STANDING, since a finding a leaf actually wrote about is not the signal-free constant however
+# it is spelled (PR #168 review rounds 3-5).
+_SAFEST = {HUMAN: 0, IMPL: 1, STANDING: 2}
+
+
+def resolve_duplicates(items: list[NeedsHumanItem]) -> list[NeedsHumanItem]:
+    """Collapse repeated findings to their SAFEST classification, keeping first position.
+
+    Applied twice on purpose. Within one artifact it stops a leaf that spells one objection
+    two ways from routing on output ORDER. Across the whole collected set it stops something
+    worse: the primary reviewer emitting a plain HUMAN judgment while an advisory tags the
+    same text `[impl]` left BOTH entries standing, and since `eligible()` now needs only one
+    IMPL item anywhere, that advisory tag sent an explicitly human-only concern to the builder
+    unattended (PR #168 review round 5).
+    """
+    out: list[NeedsHumanItem] = []
+    at: dict[str, int] = {}
+    for item in items:
+        key = item.text.casefold()
+        if key not in at:
+            at[key] = len(out)
+            out.append(item)
+        elif _SAFEST[item.kind] < _SAFEST[out[at[key]].kind]:
+            out[at[key]] = item     # keep the first POSITION, take the safer kind
+    return out
+
+
 # The implementation/architectural split is NOT a new taxonomy — it is the `kind` already
 # carried by the canonical 5/5/1 (gates._FIVE_FIVE_ONE). `gate` cells (C2/C4/T1..T4) are
 # mechanically checkable ⇒ builder-fixable. `judgment` cells (C5 causal adequacy, T5
@@ -49,12 +78,32 @@ class NeedsHumanItem(NamedTuple):
 _GATE_ELEMENTS = frozenset(e for e, _label, kind, _oracle in canonical_elements()
                            if kind == "gate")
 
+# Elements the REVIEWER may promote to builder-fixable with an `[impl]` tag (issue #332).
+# The taxonomy says where a finding sits; only the reviewer knows what it actually IS, and a
+# judgment cell routinely carries an ordinary build defect (a weak causal argument that is
+# really a missing case). So a judgment row may be promoted — but nothing else:
+#   * `input` cells (C1 spec, C3 change) are NOT promotable. A defective brief is a Plan miss,
+#     and rebuilding against the same brief cannot fix it — that is an iterate-PLAN, which
+#     this module deliberately cannot decide.
+#   * `V` is NOT promotable. It is the STANDING row, emitted every cycle whatever the reviewer
+#     found (#293); a constant carries no signal in either direction.
+_PROMOTABLE_ELEMENTS = frozenset(e for e, _label, kind, _oracle in canonical_elements()
+                                 if kind == "judgment") - {"V"}
+
 # A §6 item's leading 5/5/1 element id, when the reviewer's table row carries one.
 _ELEMENT_RE = re.compile(r"^(C[1-5]|T[1-5]|V)\b")
 
 # An advisory leaf tags a builder-fixable finding `- NEEDS-HUMAN [impl] — …`. Unmarked
 # findings stay HUMAN, so a legacy advisory file can never trigger an auto-iteration.
 _IMPL_MARKER_RE = re.compile(r"^\[impl\]\s*[—:-]*\s*", re.IGNORECASE)
+
+# `[human]` is the explicit counterpart #332 asks the advisory leaves for. It carries no
+# classification (an untagged bullet is HUMAN anyway — that is the fail-safe), so its only job
+# is to prove the leaf DECIDED rather than forgot. It must still be stripped from the stored
+# text: left in, the same objection written `- NEEDS-HUMAN [human] — X` one round and
+# `- NEEDS-HUMAN — X` the next dedups as two different findings, and §6 grows a duplicate
+# blocking box the human must clear twice (PR #168 review).
+_HUMAN_MARKER_RE = re.compile(r"^\[human\]\s*[—:-]*\s*", re.IGNORECASE)
 
 # The one STANDING row (#293) — recognised by the canonical label, not a hardcoded string, so
 # it cannot drift from the matrix the reviewer's table mirrors. `V` is the only element the
@@ -65,6 +114,28 @@ _V_LABEL = next(label for e, label, _kind, _oracle in canonical_elements() if e 
 # never enough (PR #294 review, local pass): a "## Concerns" table can carry the exact same label.
 _CANONICAL_LABELS = frozenset(label.strip().casefold()
                               for _e, label, _kind, _oracle in canonical_elements())
+
+# An Item cell's optional leading element id (issue #332). `leaves._REVIEW_PROMPT` lists the
+# matrix as `{elem} — {label}` and then asks for "the element label above" in the Item column,
+# so `V — Validation — fitness-to-purpose` is the literal reading of the instruction — and 37
+# rows of the wyrd corpus wrote exactly that, against 185 bare ones. The exact-match STANDING
+# test then failed and the constant row became a HUMAN veto: #293 returning through a
+# formatting variant. Normalize the prefix away before comparing.
+_ITEM_ELEMENT_PREFIX_RE = re.compile(r"^(?:C[1-5]|T[1-5]|V)\s*[—–-]{1,2}\s*")
+
+
+def _normalized_item_label(cell: str) -> str:
+    """An Item cell reduced to its canonical label for an EXACT comparison.
+
+    Strips a leading element id and folds an ASCII `--` to the em-dash the matrix uses (one
+    corpus row wrote `Validation -- fitness-to-purpose`). Deliberately narrow: only the
+    element prefix and the separator are normalized, never the label text. Matching the
+    label by PREFIX is what PR #294 identified as letting a real objection wear the
+    template's clothes, so the comparison stays exact — this only removes decoration the
+    prompt itself invites.
+    """
+    text = _ITEM_ELEMENT_PREFIX_RE.sub("", cell.strip(), count=1)
+    return re.sub(r"\s*--\s*", " — ", text).strip()
 
 # Leaf-status marker (issue #278). When a reviewer / advisory leaf could not produce a
 # verdict, `leaves` writes a placeholder carrying one of these as a machine-readable comment.
@@ -95,7 +166,8 @@ def leaf_status(artifact_text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _classify_finding(text: str, *, standing: bool = False) -> NeedsHumanItem:
+def _classify_finding(text: str, *, standing: bool = False,
+                      tagged_impl: bool = False) -> NeedsHumanItem:
     """Classify one reviewer / advisory §6 item, stripping any `[impl]` marker.
 
     Three kinds. IMPL — a rebuild can address it. STANDING — the reviewer's `Validation` row,
@@ -117,10 +189,23 @@ def _classify_finding(text: str, *, standing: bool = False) -> NeedsHumanItem:
     stripped = _IMPL_MARKER_RE.sub("", text, count=1)
     if stripped != text:
         return NeedsHumanItem(stripped.strip(), IMPL)
+    # `[human]` normalizes away without changing the verdict — the tag only records that the
+    # leaf made the call. Keeping it in the text would make the tagged and untagged spellings
+    # of one objection dedup as two.
+    dehumanized = _HUMAN_MARKER_RE.sub("", text, count=1)
+    if dehumanized != text:
+        return NeedsHumanItem(dehumanized.strip(), HUMAN)
     if standing:
         return NeedsHumanItem(text, STANDING)   # emitted every cycle ⇒ carries no signal (#293)
     m = _ELEMENT_RE.match(text)
     if m and m.group(1) in _GATE_ELEMENTS:
+        return NeedsHumanItem(text, IMPL)
+    # The reviewer tagged its own verdict cell `NEEDS-HUMAN [impl]` (#332). Honoured only on a
+    # judgment cell — see :data:`_PROMOTABLE_ELEMENTS`. Ordered AFTER the standing check on
+    # purpose: a tag on the V row must not turn the constant into a rebuild trigger. An
+    # unmappable row is not promotable either, since there is no element to check the tag
+    # against, and this function fails safe to HUMAN throughout.
+    if tagged_impl and m and m.group(1) in _PROMOTABLE_ELEMENTS:
         return NeedsHumanItem(text, IMPL)
     return NeedsHumanItem(text, HUMAN)
 
@@ -136,8 +221,14 @@ def _items_from_artifact(text: str, *, allow_standing: bool = False) -> list[Nee
     and forced to HUMAN: there is no finding for a rebuild to fix, so an infra-empty must
     never be auto-iterated (#264). A real artifact is unaffected."""
     label = _LEAF_STATUS_LABEL.get(leaf_status(text), "")
-    items = [_classify_finding(t, standing=allow_standing and is_standing)
-             for t, is_standing in _needs_human(text)]
+    # Dedup on the CLASSIFIED text, not the raw line. `_needs_human` keys its own `seen` set
+    # on the raw text, which is before the `[impl]` / `[human]` marker is stripped — so one
+    # objection written both ways in a round survives as two identical §6 boxes the human has
+    # to clear twice (PR #168 review round 2).
+    items = resolve_duplicates([
+        _classify_finding(f.text, standing=allow_standing and f.standing,
+                          tagged_impl=f.tagged_impl)
+        for f in _needs_human(text)])
     if not label:
         return items
     return [NeedsHumanItem(f"{label} — {it.text}", HUMAN) for it in items]
@@ -172,7 +263,76 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
-    return items
+    # Across EVERY source, INCLUDING the ledger (PR #168 review round 6). Filtering deferred
+    # entries against the current set first was the bug: a finding stored as HUMAN that a
+    # later review re-raised as IMPL had its deferred copy suppressed by the text filter, so
+    # the IMPL classification stood alone — `eligible()` allowed another unattended round and
+    # `rationale()` handed the explicitly deferred judgment to the builder. Appending them as
+    # ordinary members and letting `resolve_duplicates` decide keeps HUMAN precedence across
+    # the ledger boundary too.
+    return resolve_duplicates(items + _deferred_items(d))
+
+
+def _deferred_items(d: Path) -> list[NeedsHumanItem]:
+    """Findings earlier auto-iterate rounds passed over, re-entering §6 (issue #332).
+
+    An ``iterate-do`` archives SUMMARY.md and check-review.md, and the rebuild assembles a
+    fresh §6 from a fresh review — so a HUMAN finding raised in round 1 survives nowhere
+    unless the next reviewer independently raises it again. Auto-iterate may now run several
+    rounds past such a finding, so without this the driver could quietly iterate a real
+    architectural objection out of existence and hand the human a §6 that never mentions it.
+
+    Re-entering them here rather than only at render keeps :func:`collect_needs_human` the
+    single source it claims to be: the C6 accept-guard, the rendered §6 and the auto-iterate
+    classifier all see the same set. They are HUMAN, so they never make a bundle eligible on
+    their own, and they no longer block a rebuild either — they simply must not be lost.
+    """
+    from . import autoiterate  # local import: autoiterate imports this module
+    try:
+        held = autoiterate.deferred(d)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Assembly must never crash on a bundle file (the defensive contract of this module),
+        # but it must not silently drop the ledger either — that is the failure the ledger
+        # exists to prevent. Surface it as a §6 item instead: the human sees that findings
+        # were lost, and the C6 accept-guard holds until they clear it. `flow` separately
+        # refuses to auto-iterate a bundle in this state, so no rebuild runs meanwhile.
+        return [NeedsHumanItem(
+            f"the deferred-findings ledger is unreadable — findings held over from earlier "
+            f"auto-iterate rounds may be LOST; recover or reconstruct it before accepting "
+            f"({exc})", HUMAN)]
+    return [NeedsHumanItem(t, HUMAN) for t in held]
+
+
+def ensure_section6_item(summary_path: Path, text: str) -> bool:
+    """Append one unchecked §6 item to an ALREADY-ASSEMBLED summary; True if it was added.
+
+    For a condition discovered after assembly that the C6 accept-guard must see (PR #168
+    review round 7). Appending in place rather than re-assembling is deliberate: a
+    re-assemble regenerates §6 from the artifacts and would discard any box the human has
+    already ticked in this sign-off session.
+
+    Idempotent, and best-effort like every other writer here — a summary that cannot be read
+    or written is not worth crashing a flow over, and the caller still halts either way.
+    """
+    try:
+        body = summary_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if text.split("(")[0].strip() in body:
+        return False
+    lines, out, placed = body.splitlines(keepends=True), [], False
+    for line in lines:
+        if not placed and re.match(r"^#+\s*7\.", line):
+            out.append(f"- [ ] {text}\n\n")
+            placed = True
+        out.append(line)
+    if not placed:
+        out.append(f"\n- [ ] {text}\n")
+    try:
+        summary_path.write_text("".join(out), encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def assemble_summary(d: Path, cfg: Config) -> None:
@@ -313,8 +473,22 @@ def _missing_review_text() -> str:
     )
 
 
-def _needs_human(review_text: str) -> list[tuple[str, bool]]:
-    """Every reviewer NEEDS-HUMAN → ``(text, from_table)``, order-preserving and deduped.
+class _ReviewFinding(NamedTuple):
+    """One parsed NEEDS-HUMAN row, with the two facts the classifier needs about it."""
+
+    text: str
+    standing: bool      # IS the canonical constant Validation row (#293)
+    tagged_impl: bool   # the reviewer marked the verdict cell `[impl]` (#332)
+
+
+# The reviewer's own builder-fixability tag, in the VERDICT cell: `NEEDS-HUMAN [impl]` (#332).
+# In the verdict cell rather than a new column so the table schema is unchanged — `_needs_human`
+# already finds that cell by content, and every existing parser keeps working.
+_VERDICT_IMPL_RE = re.compile(r"\[impl\]", re.IGNORECASE)
+
+
+def _needs_human(review_text: str) -> list[_ReviewFinding]:
+    """Every reviewer NEEDS-HUMAN → ``(text, standing, tagged_impl)``, ordered and deduped.
 
     The reviewer always emits the 5/5/1 verdict table (see leaves._REVIEW_PROMPT);
     a table row whose verdict cell is NEEDS-HUMAN becomes a §6 item (Item — Basis).
@@ -332,20 +506,41 @@ def _needs_human(review_text: str) -> list[tuple[str, bool]]:
 
     Everything else keeps its signal.
     """
-    items: list[tuple[str, bool]] = []
-    seen: set[str] = set()
+    items: list[_ReviewFinding] = []
+    seen: dict[str, int] = {}
     lines = review_text.splitlines()
     verdict_table = _verdict_table_lines(lines)
 
-    def add(text: str, *, standing: bool) -> None:
+    def add(text: str, *, standing: bool, tagged_impl: bool = False) -> None:
+        """Record a finding, MERGING a duplicate's metadata rather than discarding it.
+
+        Dropping the later row outright made the HUMAN-over-IMPL resolution downstream
+        unreachable for the one shape that needs it: the same table row repeated with
+        conflicting verdicts (`NEEDS-HUMAN [impl]` then plain `NEEDS-HUMAN`) has identical
+        Item and Basis cells, so the second was dropped here and the first's `[impl]` won on
+        ORDER alone (PR #168 review round 4).
+
+        Merging keeps the safer reading of each flag: untagged beats `[impl]` (it routes to
+        the human and never triggers a rebuild by itself), and non-standing beats standing (a
+        row the reviewer wrote about twice is not the signal-free constant).
+        """
         text = text.strip()
-        if text and text.lower() not in seen:
-            seen.add(text.lower())
-            items.append((text, standing))
+        if not text:
+            return
+        key = text.lower()
+        if key not in seen:
+            seen[key] = len(items)
+            items.append(_ReviewFinding(text, standing, tagged_impl))
+            return
+        prev = items[seen[key]]
+        items[seen[key]] = _ReviewFinding(
+            prev.text, prev.standing and standing, prev.tagged_impl and tagged_impl)
 
     for i, line in enumerate(lines):
         s = line.strip()
         if s.startswith("- NEEDS-HUMAN"):
+            # A bullet's `[impl]` rides in the TEXT and is read by `_classify_finding`'s
+            # marker strip — the advisory contract, unchanged.
             add(s[len("- NEEDS-HUMAN"):].lstrip(" —:-").strip(), standing=False)
         elif s.startswith("|") and "needs-human" in s.lower():
             cells = [c.strip() for c in s.strip("|").split("|")]
@@ -356,14 +551,15 @@ def _needs_human(review_text: str) -> list[tuple[str, bool]]:
             basis = cells[vi + 1] if vi + 1 < len(cells) else ""
             add(f"{label} — {basis}" if basis else label,
                 standing=(i in verdict_table
-                          and label.strip().casefold() == _V_LABEL.casefold()))
+                          and _normalized_item_label(label).casefold() == _V_LABEL.casefold()),
+                tagged_impl=bool(_VERDICT_IMPL_RE.search(cells[vi])))
 
     # FAIL CLOSED on ambiguity. The template row is a CONSTANT — it occurs exactly once. If two
     # survive (a second verdict-shaped table, a duplicated row), at least one of them is not the
     # constant, and we cannot tell which. Grant STANDING to neither, so the bundle halts for the
     # human rather than risk archiving a real objection.
-    if sum(1 for _t, standing in items if standing) > 1:
-        return [(t, False) for t, _s in items]
+    if sum(1 for it in items if it.standing) > 1:
+        return [it._replace(standing=False) for it in items]
     return items
 
 
@@ -392,7 +588,12 @@ def _verdict_table_lines(lines: list[str]) -> set[int]:
         while j < len(lines) and lines[j].strip().startswith("|"):
             j += 1
         block = range(i, j)
-        labels = {lines[k].strip().strip("|").split("|")[0].strip().casefold() for k in block}
+        # Normalized like the STANDING test itself (#332): the prompt invites a `C4 — ` style
+        # element prefix on every Item cell, so a table written that way carries ZERO cells
+        # that match exactly and would not be recognised as the mandated table at all — which
+        # then denies its Validation row the exemption for a second, independent reason.
+        labels = {_normalized_item_label(lines[k].strip().strip("|").split("|")[0]).casefold()
+                  for k in block}
         if len(labels & _CANONICAL_LABELS) >= 2:
             out.update(block)
         i = j

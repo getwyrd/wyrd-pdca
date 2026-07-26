@@ -64,6 +64,28 @@ def iteration_delta(summary_path: Path) -> str:
     return (m.group(1).strip() if m else "")
 
 
+def cleared_needs_human(summary_path: Path) -> list[str]:
+    """Ticked ``- [x]`` items under §6 NEEDS-HUMAN — what the human positively adjudicated.
+
+    The counterpart to :func:`open_needs_human`, and needed because "not open" is NOT the
+    same as "cleared": a human who edits an unchecked row (annotating it with an owner, say)
+    leaves it neither in the open set under its old text nor ticked. Anything deciding to
+    DISCARD a finding must key on this positive signal — see `autoiterate.retire_cleared`,
+    where inferring clearance from absence would delete a live objection (PR #168 review).
+
+    Same defensive contract as the rest of this module: an absent SUMMARY is "nothing
+    cleared", never a crash.
+    """
+    if not summary_path.exists():
+        return []
+    section = _section(summary_path.read_text(encoding="utf-8"), "6. NEEDS-HUMAN")
+    return [
+        line.strip()
+        for line in section.splitlines()
+        if line.lstrip().startswith("- [x]") or line.lstrip().startswith("- [X]")
+    ]
+
+
 def open_needs_human(summary_path: Path) -> list[str]:
     """Unchecked ``- [ ]`` items under §6 NEEDS-HUMAN (must be empty before accept).
 

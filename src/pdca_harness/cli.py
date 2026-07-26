@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     p_flow.add_argument("--by", default="", help="who signed off (recorded in §9)")
     p_flow.add_argument("--lanes", type=int, help="unattended Do+Check worker-pool size (docs 09; overrides [driver].lanes / PDCA_LANES)")
     p_flow.add_argument("--max-passes", type=int, help="sign-off pass budget before the driver stops driving a bundle (#260; overrides [driver].max_passes / PDCA_MAX_PASSES)")
-    p_flow.add_argument("--auto-iterate", action="store_true", help="rebuild without stopping when every Check finding is implementation-level; a judgment finding still halts (#264; overrides [driver].auto_iterate / PDCA_AUTO_ITERATE)")
+    p_flow.add_argument("--auto-iterate", action="store_true", help="rebuild without stopping while Check finds implementation-level work; findings needing a human are DEFERRED into the bundle and re-enter \u00a76 at handover, not shown before it. Bounded by [driver].soft_auto_iters / max_auto_iters, never auto-accepts (#264/#332; overrides [driver].auto_iterate / PDCA_AUTO_ITERATE)")
     p_flow.add_argument("--no-inhibit", action="store_true", help="don't hold a suspend inhibitor for the run (also PDCA_NO_INHIBIT=1) — for CI/containers where it's unavailable or unwanted (#244)")
 
     p_status = sub.add_parser("status", help="list bundle states (cheap-first queue)")

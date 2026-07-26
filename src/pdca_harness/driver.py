@@ -68,11 +68,13 @@ def advance(d: Path, cfg: Config) -> None:
         n = _next_iteration_no(d)
         _say(f"→ {d.name}: iterate-to-Do — archiving the attempt to iteration-v{n}/, rebuilding…")
         _carry_forward_into_brief(d, n)  # fold prior insight into the surviving brief
+        _retire_cleared_deferrals(d)     # the human's ticks are their adjudication (#332)
         _archive_iteration(d, n, include_brief=False)  # rebuild against the annotated brief
     elif s == state.ITERATE_PLAN:
         n = _next_iteration_no(d)
         _say(f"→ {d.name}: iterate-to-Plan — archiving the attempt to iteration-v{n}/, re-planning…")
         _carry_forward_into_brief(d, n)  # appended to the brief, archived with it
+        _retire_cleared_deferrals(d)     # the human's ticks are their adjudication (#332)
         _archive_iteration(d, n, include_brief=True)  # brief archived too → UNPLANNED
     # UNPLANNED / AWAITING_SIGNOFF / COMPLETE / DISCONTINUED: nothing for the driver to do.
 
@@ -165,6 +167,24 @@ def _next_iteration_no(d: Path) -> int:
 # ----------------------------------------------------------------------------
 # Iterate carry-forward — persist the WHY into the one input the next beat reads.
 # ----------------------------------------------------------------------------
+def _retire_cleared_deferrals(d: Path) -> None:
+    """Drop deferred findings the human ticked in §6, BEFORE the archive moves the SUMMARY.
+
+    Ordering is the whole point: `_archive_iteration` moves ``SUMMARY.md`` into
+    ``iteration-v<N>/``, and once it has, the record of which items the human cleared is no
+    longer where the next assembly looks. Retiring here means a tick is honoured; retiring
+    after would mean the ledger re-raises an adjudicated objection on every future round,
+    with no way for the human to ever clear it (PR #168 review).
+
+    Best-effort: this must never break a transition, exactly like `_carry_forward_into_brief`.
+    """
+    from . import autoiterate  # local import: autoiterate imports assemble, which imports us
+    try:
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+    except (OSError, ValueError):
+        pass
+
+
 def _carry_forward_into_brief(d: Path, n: int) -> None:
     """Fold the previous iteration's insight into ``brief.md`` BEFORE the attempt is
     archived — so the next Do/Plan isn't blind. On iterate-do the brief stays at the
