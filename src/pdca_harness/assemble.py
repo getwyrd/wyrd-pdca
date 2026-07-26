@@ -455,15 +455,34 @@ def _needs_human(review_text: str) -> list[_ReviewFinding]:
     Everything else keeps its signal.
     """
     items: list[_ReviewFinding] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     lines = review_text.splitlines()
     verdict_table = _verdict_table_lines(lines)
 
     def add(text: str, *, standing: bool, tagged_impl: bool = False) -> None:
+        """Record a finding, MERGING a duplicate's metadata rather than discarding it.
+
+        Dropping the later row outright made the HUMAN-over-IMPL resolution downstream
+        unreachable for the one shape that needs it: the same table row repeated with
+        conflicting verdicts (`NEEDS-HUMAN [impl]` then plain `NEEDS-HUMAN`) has identical
+        Item and Basis cells, so the second was dropped here and the first's `[impl]` won on
+        ORDER alone (PR #168 review round 4).
+
+        Merging keeps the safer reading of each flag: untagged beats `[impl]` (it routes to
+        the human and never triggers a rebuild by itself), and non-standing beats standing (a
+        row the reviewer wrote about twice is not the signal-free constant).
+        """
         text = text.strip()
-        if text and text.lower() not in seen:
-            seen.add(text.lower())
+        if not text:
+            return
+        key = text.lower()
+        if key not in seen:
+            seen[key] = len(items)
             items.append(_ReviewFinding(text, standing, tagged_impl))
+            return
+        prev = items[seen[key]]
+        items[seen[key]] = _ReviewFinding(
+            prev.text, prev.standing and standing, prev.tagged_impl and tagged_impl)
 
     for i, line in enumerate(lines):
         s = line.strip()

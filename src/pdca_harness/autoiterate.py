@@ -137,6 +137,47 @@ def count(d: Path) -> int:
         return 0
 
 
+def generation(d: Path) -> int:
+    """Which Check this is: the number of rebuilds archived so far (PR #168 review round 4).
+
+    An observation has to be tied to the Check that produced it, not merely appended. Without
+    that, re-evaluating an UNCHANGED bundle rewrote the baseline with its own count — so a
+    growth halt at 2 -> 4 became 4 -> 4 on the next look, which reads as convergent, and the
+    round that was just refused fired with no rebuild and no human in between. A batch
+    sign-off pass that records no decision, or an operator re-running `pdca flow`, is enough
+    to trigger it.
+
+    `iteration-v*` is the right generation counter because the archive is what a rebuild
+    creates: same Check re-read ⇒ same generation ⇒ the observation is REPLACED, not appended.
+    """
+    return len(list(d.glob("iteration-v*")))
+
+
+def _observations(d: Path) -> list[list[int]]:
+    """Raw ``[generation, impl_count]`` rows, oldest first. Tolerant of the pre-round-4 shape
+    (a flat list of counts), which is read as one row per generation in order."""
+    raw = _state(d).get("impl_counts")
+    if not isinstance(raw, list):
+        return []
+    out: list[list[int]] = []
+    for i, row in enumerate(raw):
+        if isinstance(row, list) and len(row) == 2 and all(
+                isinstance(v, int) and not isinstance(v, bool) for v in row):
+            out.append([row[0], row[1]])
+        elif isinstance(row, int) and not isinstance(row, bool):
+            out.append([i, row])          # legacy flat entry
+    return out
+
+
+def _record_observation(d: Path, items: list[NeedsHumanItem]) -> list[list[int]]:
+    """This Check's observation, REPLACING any earlier one for the same generation."""
+    gen, now = generation(d), impl_count(items)
+    rows = [r for r in _observations(d) if r[0] != gen]
+    rows.append([gen, now])
+    rows.sort()
+    return rows
+
+
 def impl_history(d: Path) -> list[int]:
     """The IMPL count observed at each Check that reached sign-off, oldest first.
 
@@ -149,10 +190,7 @@ def impl_history(d: Path) -> list[int]:
     :func:`should_iterate` reads an absent baseline as "cannot test convergence, fire" —
     the pre-#332 behaviour, rather than halting a bundle on a comparison we cannot make.
     """
-    raw = _state(d).get("impl_counts")
-    if not isinstance(raw, list):
-        return []
-    return [int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)]
+    return [n for _gen, n in _observations(d)]
 
 
 def observe(d: Path, items: list[NeedsHumanItem]) -> None:
@@ -165,10 +203,12 @@ def observe(d: Path, items: list[NeedsHumanItem]) -> None:
     2 -> 4 followed by a human-driven improvement to 3 was then read as 2 -> 3 and halted
     again, while a drop to 2 could restart automatic rounds that should not have resumed.
     """
-    st = _state(d)
-    history = impl_history(d) + [impl_count(items)]
+    # `count(d)` rather than a direct int() on the raw field: `count` is tolerant of a
+    # garbled or legacy value by design, and `observe` now runs at EVERY Check that reaches
+    # sign-off, so raising here would abort the flow on a corrupted field that every other
+    # reader in this module degrades past (PR #168 review round 4).
     (d / BUDGET_FILE).write_text(
-        json.dumps({"count": int(st.get("count", 0) or 0), "impl_counts": history}) + "\n",
+        json.dumps({"count": count(d), "impl_counts": _record_observation(d, items)}) + "\n",
         encoding="utf-8")
 
 
@@ -204,10 +244,13 @@ def should_iterate(d: Path, items: list[NeedsHumanItem], cfg: Config) -> tuple[b
         return False, f"hard budget spent ({spent}/{cfg.max_auto_iters})"
     if upcoming <= cfg.soft_auto_iters:
         return True, ""
-    history = impl_history(d)
-    if not history:
-        return True, ""  # legacy ledger: no baseline to compare — keep the old behaviour
-    now, before = impl_count(items), history[-1]
+    # Compare against the observation from a PREVIOUS generation. Anything recorded for the
+    # current one is this same Check being re-read, and comparing a Check with itself always
+    # looks convergent (PR #168 review round 4).
+    prior = [n for gen, n in _observations(d) if gen < generation(d)]
+    if not prior:
+        return True, ""  # no baseline to compare — keep the pre-#332 behaviour
+    now, before = impl_count(items), prior[-1]
     if now > before:
         return False, (f"soft budget spent ({spent}/{cfg.soft_auto_iters}) and the "
                        f"implementation findings did not converge ({before} → {now})")
@@ -300,7 +343,22 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     # annotation) and text trimmed from it. Both sides are long sentences lifted from §6, so
     # an accidental match between two distinct findings is not a realistic shape — and this
     # only ever fires on a row the human positively ticked, which is the guard that matters.
-    kept = [t for t in ledger if not any(_same_finding(t, row) for row in ticked)]
+    # FAIL CLOSED on an ambiguous tick (PR #168 review round 4). The proportional match from
+    # round 3 survives a human's edit, but two genuinely distinct findings can share a long
+    # opening — "C5 Causal adequacy — guards the symptom in the parser" and the corresponding
+    # renderer objection — and merging them would retire an UNADJUDICATED objection off the
+    # back of a tick meant for its neighbour. That is unrecoverable; a finding that lingers is
+    # merely visible.
+    #
+    # So a tick retires exactly one entry or none. This is the same shape `_needs_human` uses
+    # for two STANDING candidates: when at least one of the matches must be wrong and we
+    # cannot tell which, decide for neither.
+    retire: set[int] = set()
+    for row in ticked:
+        hits = [i for i, t in enumerate(ledger) if _same_finding(t, row)]
+        if len(hits) == 1:
+            retire.add(hits[0])
+    kept = [t for i, t in enumerate(ledger) if i not in retire]
     if len(kept) != len(ledger):
         (d / DEFERRED_FILE).write_text(
             json.dumps({"items": kept}, indent=1) + "\n", encoding="utf-8")

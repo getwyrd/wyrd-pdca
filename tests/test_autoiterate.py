@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -870,11 +871,19 @@ class SoftAndHardRounds(unittest.TestCase):
                    for i in range(n_human)])
 
     def _spend(self, n_impl: int) -> None:
-        # Mirrors `flow._maybe_auto_iterate`: the observation is recorded at every Check,
-        # separately from spending a round.
+        """Mirrors a real round: observe this Check, decide, then let the rebuild ARCHIVE.
+
+        The archive matters — `iteration-v*` is the generation counter, so without it every
+        Check looks like the same one and no observation is ever a baseline for the next.
+        """
         items = self._items(n_impl)
         autoiterate.observe(self.d, items)
         autoiterate.write_decision(self.d, items)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        """What `driver._archive_iteration` leaves behind: the next generation."""
+        (self.d / f"iteration-v{autoiterate.generation(self.d) + 1}").mkdir()
 
     def test_the_worked_example(self) -> None:
         """soft 3 / hard 5, counts 5 → 7 → 3, then the round-4 branch.
@@ -908,8 +917,13 @@ class SoftAndHardRounds(unittest.TestCase):
         self.assertFalse(fire)
         autoiterate.observe(self.d, self._items(4))
         self.assertEqual(autoiterate.impl_history(self.d), [5, 4, 2, 4])
-        # The human iterates by hand and the rebuild improves 4 -> 3. That is convergence
-        # against the Check that actually preceded it, not against the stale 2.
+        # Re-reading the SAME halted Check must not turn the refusal into a pass: 4 vs 4 is
+        # not convergence, it is the same Check compared with itself (round 4).
+        fire, _ = autoiterate.should_iterate(self.d, self._items(4), self.cfg)
+        self.assertFalse(fire, "re-evaluating an unchanged Check must stay halted")
+        # The human iterates by hand; the rebuild archives, and improves 4 -> 3. That is
+        # convergence against the Check that actually preceded it, not against the stale 2.
+        self._rebuild()
         fire, why = autoiterate.should_iterate(self.d, self._items(3), self.cfg)
         self.assertTrue(fire, f"4 -> 3 is converging; got {why!r}")
 
@@ -946,6 +960,21 @@ class SoftAndHardRounds(unittest.TestCase):
         (self.d / autoiterate.BUDGET_FILE).write_text('{"count": 4}\n', encoding="utf-8")
         self.assertEqual(autoiterate.impl_history(self.d), [])
         self.assertTrue(autoiterate.should_iterate(self.d, self._items(99), self.cfg)[0])
+
+    def test_a_garbled_count_does_not_crash_observe(self) -> None:
+        """PR #168 review round 4. `count()` is tolerant of a garbled field by design, and
+        `observe` now runs at EVERY Check that reaches sign-off — so raising here would abort
+        the flow on a value every other reader in the module degrades past."""
+        (self.d / autoiterate.BUDGET_FILE).write_text(
+            '{"count": "three", "impl_counts": []}', encoding="utf-8")
+        autoiterate.observe(self.d, self._items(3))          # must not raise
+        self.assertEqual(autoiterate.count(self.d), 0)
+
+    def test_a_legacy_flat_history_still_reads(self) -> None:
+        # Pre-round-4 files hold a flat list of counts rather than [generation, count] rows.
+        (self.d / autoiterate.BUDGET_FILE).write_text(
+            '{"count": 2, "impl_counts": [5, 3]}', encoding="utf-8")
+        self.assertEqual(autoiterate.impl_history(self.d), [5, 3])
 
     def test_a_garbled_budget_file_does_not_crash_the_gate(self) -> None:
         (self.d / autoiterate.BUDGET_FILE).write_text("{ not json", encoding="utf-8")
@@ -1222,6 +1251,38 @@ class DeferredFindingsSurvive(_Base):
         self.assertFalse(autoiterate._same_finding("short one", "short two"),
                          "short rows must not collide on a shared opening")
 
+    def test_an_AMBIGUOUS_tick_retires_nothing(self) -> None:
+        """PR #168 review round 4. The proportional match from round 3 survives a human's
+        edit, but two genuinely distinct findings can share a long opening — and merging them
+        would retire an UNADJUDICATED objection off the back of a tick meant for its
+        neighbour. Losing a finding is unrecoverable; one that lingers is merely visible, so
+        an ambiguous tick decides for neither."""
+        d = self._bundle("DEFER13", review=self._REVIEW)
+        near = ["C5 Causal adequacy — guards the symptom in the parser, not the cause",
+                "C5 Causal adequacy — guards the symptom in the renderer, not the cause"]
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            json.dumps({"items": near}), encoding="utf-8")
+        self.assertTrue(autoiterate._same_finding(near[0], near[1]),
+                        "fixture must actually be ambiguous for this test to mean anything")
+        (d / "SUMMARY.md").write_text(
+            f"## 6. NEEDS-HUMAN\n\n- [x] {near[0]}\n", encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(len(autoiterate.deferred(d)), 2,
+                         "an ambiguous tick must retire neither entry")
+
+    def test_an_UNambiguous_tick_still_retires(self) -> None:
+        # The fail-closed rule must not swallow the ordinary case.
+        d = self._bundle("DEFER14", review=self._REVIEW)
+        (d / autoiterate.DEFERRED_FILE).write_text(json.dumps({"items": [
+            "C5 Causal adequacy — guards the symptom, not the cause",
+            "T5 Judgment — the slice is too large to review in one pass"]}), encoding="utf-8")
+        (d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — guards the symptom, not the "
+            "cause (owner: board)\n", encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(autoiterate.deferred(d),
+                         ["T5 Judgment — the slice is too large to review in one pass"])
+
     def test_an_unticked_deferral_survives_retirement(self) -> None:
         # The half that must not regress: retire only what the human actually ticked.
         d = self._bundle("DEFER8", review=self._REVIEW)
@@ -1257,6 +1318,24 @@ class DeferredFindingsSurvive(_Base):
                 d = self._bundle(f"DUP{first[1]}", advisory=(
                     f"- NEEDS-HUMAN {first} — the seam is wider than the brief\n"
                     f"- NEEDS-HUMAN {second} — the seam is wider than the brief\n"))
+                items = [i for i in assemble.collect_needs_human(d, self.cfg)
+                         if "seam is wider" in i.text]
+                self.assertEqual(len(items), 1, items)
+                self.assertEqual(items[0].kind, assemble.HUMAN)
+
+    def test_a_conflicting_TABLE_row_resolves_to_human_in_both_orders(self) -> None:
+        """PR #168 review round 4. The primary review can repeat one row with conflicting
+        verdicts — `NEEDS-HUMAN [impl]` then plain `NEEDS-HUMAN` — and since the Item and
+        Basis cells are identical, `_needs_human`'s own dedup dropped the second before the
+        HUMAN-over-IMPL resolution could see it. Routing stayed order-dependent."""
+        for first, second in (("NEEDS-HUMAN [impl]", "NEEDS-HUMAN"),
+                              ("NEEDS-HUMAN", "NEEDS-HUMAN [impl]")):
+            with self.subTest(order=(first, second)):
+                review = ("# Review\n\n| Item | Verdict | Basis |\n|---|---|---|\n"
+                          "| C1 Spec | PASS | ok |\n"
+                          f"| T5 Judgment | {first} | the seam is wider than the brief |\n"
+                          f"| T5 Judgment | {second} | the seam is wider than the brief |\n")
+                d = self._bundle(f"TBLDUP{len(first)}", review=review)
                 items = [i for i in assemble.collect_needs_human(d, self.cfg)
                          if "seam is wider" in i.text]
                 self.assertEqual(len(items), 1, items)
