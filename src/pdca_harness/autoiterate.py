@@ -280,6 +280,17 @@ class DeferredLedgerUnreadable(Exception):
     """
 
 
+def _read_items(d: Path) -> list[str]:
+    """The ledger's items, tolerating absence. For `defer`, which creates the file."""
+    try:
+        return deferred(d)
+    except DeferredLedgerUnreadable:
+        p = d / DEFERRED_FILE
+        if not p.exists():
+            return []
+        raise
+
+
 def deferred(d: Path) -> list[str]:
     """Every HUMAN finding this bundle has iterated past, oldest first, deduped.
 
@@ -288,6 +299,22 @@ def deferred(d: Path) -> list[str]:
     """
     p = d / DEFERRED_FILE
     if not p.exists():
+        # Absence is only innocent BEFORE the first round (PR #168 review round 9). `defer`
+        # runs on every `write_decision`, immediately after `bump`, and writes unconditionally
+        # — an empty `items` list included. So on a bundle that has SPENT a round under this
+        # code, a missing file means the write was interrupted between bump and defer, or the
+        # file was deleted. Reading that as "nothing was deferred" would let `_apply_decision`
+        # accept against a stale SUMMARY and discard earlier rounds' HUMAN findings for good,
+        # which is the same fail-open the unreadable-content path already closes.
+        #
+        # A PRE-#332 bundle also has a count and no ledger, and must stay innocent — it ran
+        # before the ledger existed. `impl_counts` is the discriminator: only this code writes
+        # that key, so its presence proves the new flow ran on this bundle.
+        st = _state(d)
+        if int(st.get("count", 0) or 0) >= 1 and "impl_counts" in st:
+            raise DeferredLedgerUnreadable(
+                f"{p} is absent though this bundle has spent {st['count']} auto-iterate "
+                f"round(s) — the ledger was deleted or its write was interrupted")
         return []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
@@ -401,7 +428,10 @@ def defer(d: Path, items: list[NeedsHumanItem], *, attempt: int) -> list[str]:
     round must not grow the handover §6 by one copy per round. STANDING is not recorded — it
     is emitted every cycle whatever the reviewer found, so it is not something being deferred.
     """
-    ledger = deferred(d)
+    # Read tolerantly: this function CREATES the ledger, so it cannot go through the
+    # absence guard in `deferred()` — on the first round the file legitimately does not
+    # exist yet.
+    ledger = _read_items(d)
     seen = {text.casefold() for text in ledger}
     for item in items:
         if item.kind != HUMAN or item.text.casefold() in seen:
@@ -445,7 +475,12 @@ def write_decision(d: Path, items: list[NeedsHumanItem]) -> None:
     """
     if not eligible(items):
         raise ValueError("auto-iterate: refusing to decide on a non-implementation finding set")
+    # Ledger FIRST, then the counter (PR #168 review round 9). The absence guard in
+    # `deferred()` reads "count >= 1 with no ledger" as a lost file, so the two writes must
+    # happen in the order that keeps that true under interruption: a crash between them then
+    # leaves a ledger and no spent round, which is harmless, rather than a spent round whose
+    # ledger never appeared, which now reads as data loss.
+    defer(d, items, attempt=count(d) + 1)
     attempt = bump(d)
-    defer(d, items, attempt=attempt)
     (d / SIGNOFF_DECISION).write_text(
         f"{DECISION}\n{rationale(items, attempt=attempt)}\n", encoding="utf-8")

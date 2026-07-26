@@ -1156,9 +1156,38 @@ class DeferredFindingsSurvive(_Base):
         autoiterate.defer(d, assemble.collect_needs_human(d, self.cfg), attempt=1)
         self.assertFalse(any("fitness-to-purpose" in t for t in autoiterate.deferred(d)))
 
-    def test_an_absent_ledger_reads_as_empty(self) -> None:
+    def test_an_absent_ledger_after_a_SPENT_round_fails_closed(self) -> None:
+        """PR #168 review round 9 (P1). `defer` runs on every `write_decision` and writes
+        unconditionally — an empty `items` list included — so on a bundle that has spent a
+        round under this code, a missing file means deletion or an interrupted write. Reading
+        it as "nothing deferred" would let `_apply_decision` accept against a stale SUMMARY
+        and discard earlier rounds' HUMAN findings for good."""
+        d = self._bundle("LEDGGONE", review=self._REVIEW)
+        self.assertTrue(self._try(d))
+        self.assertTrue((d / autoiterate.DEFERRED_FILE).exists())
+        (d / autoiterate.DEFERRED_FILE).unlink()          # deleted after a spent round
+        with self.assertRaises(autoiterate.DeferredLedgerUnreadable):
+            autoiterate.deferred(d)
+
+    def test_a_PRE_332_bundle_with_no_ledger_stays_innocent(self) -> None:
+        # A bundle that spent rounds BEFORE the ledger existed also has a count and no file,
+        # and must not be read as data loss. `impl_counts` is the discriminator: only the
+        # post-#332 code writes that key.
+        d = self._bundle("LEGACY", review=self._REVIEW)
+        (d / autoiterate.BUDGET_FILE).write_text('{"count": 3}', encoding="utf-8")
+        self.assertFalse((d / autoiterate.DEFERRED_FILE).exists())
+        self.assertEqual(autoiterate.deferred(d), [])
+
+    def test_the_ledger_is_written_before_the_round_is_spent(self) -> None:
+        # The absence guard reads "count >= 1 with no ledger" as loss, so the two writes have
+        # to happen in the order that keeps that true under interruption.
+        src = inspect.getsource(autoiterate.write_decision)
+        self.assertLess(src.index("defer(d, items"), src.index("bump(d)"))
+
+    def test_an_absent_ledger_BEFORE_any_round_reads_as_empty(self) -> None:
         d = self._bundle("DEFER5", review=self._REVIEW)
         self.assertFalse((d / autoiterate.DEFERRED_FILE).exists())
+        self.assertEqual(autoiterate.count(d), 0)
         self.assertEqual(autoiterate.deferred(d), [])   # nothing deferred yet is not an error
 
     def test_an_unreadable_ledger_fails_closed(self) -> None:
