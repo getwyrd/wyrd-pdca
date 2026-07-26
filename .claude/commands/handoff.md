@@ -39,6 +39,12 @@ must know into the channels your role already owns — the brief's fields for `p
 scripts/handoff-check --leaf <your leaf> $ARGUMENTS
 ```
 
+For `act`, name the entry you appended so the gate can tell it from an earlier run's:
+
+```bash
+scripts/handoff-check --leaf act --entry "<the heading you wrote>"
+```
+
 It is deterministic — file existence and set membership, reusing the driver's own predicates
 so it cannot disagree with the harness about what a valid artifact is. With an id it requires
 the artifacts to be present; with no id it scans and reports only *malformed* ones, because a
@@ -49,7 +55,7 @@ planner legitimately briefs some issues and not others.
 fix is to remove it, not to work around the check. If a failure needs the human, say so
 plainly and stop; do not exit on a red gate and leave it to be found three beats later.
 
-**On PASS:** the gate records `handoff.json` in each bundle it checked.
+**On PASS:** nothing is written. The gate's verdict is its exit status and its report — it writes no artifact into any bundle, because only your role's named artifacts belong there.
 
 ## 4. Hand back
 

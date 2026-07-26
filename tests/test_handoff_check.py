@@ -51,6 +51,7 @@ _BRIEF = """# Brief
 
 - **Slug:** fix-the-thing
 - **Success criterion:** the reaper commits its fence under a concurrent abort
+- **Falsifiability:** revert the fence commit; the reaper conformance clause goes RED
 - **Repo + branch target:** `getwyrd/wyrd` @ `main`
 - **Test file:** crates/x/tests/thing.rs
 """
@@ -100,6 +101,7 @@ class Planner(_Base):
         returns [] for it — the driver only uses it to unlink a shipped test on iterate. A
         gate that failed them would false-positive on 7% of the corpus."""
         self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                    "- **Falsifiability:** revert it\n"
                     "- **Repo + branch target:** `o/r` @ `main`\n- **Test file:**\n")
         self.assertTrue(self._ok(hc.check_planner(self.d, named=True)))
 
@@ -122,6 +124,7 @@ class Planner(_Base):
         committed bundles do (256/258/364/366). Failing them would be a parser artifact, not
         a contract breach."""
         self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+                    "- **Falsifiability:** revert it\n"
                     "- **Success criterion:**\n"
                     "  - **BINDING:** the under-replicated count rises and returns to zero\n")
         self.assertTrue(self._ok(hc.check_planner(self.d, named=True)))
@@ -160,6 +163,50 @@ class Planner(_Base):
         self.assertFalse(self._ok(results))
         self.assertTrue(any("owner/repo" in r.label for r in results), results)
 
+    def test_a_WRAPPED_placeholder_is_not_authored(self) -> None:
+        """PR #169 review round 2. The stock placeholders WRAP, so the first line opened with
+        `<` and the continuation did not — and the continuation was read as authored text, so
+        an entirely untouched template field passed."""
+        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+                    "- **Falsifiability:** revert the commit; the clause goes RED\n"
+                    "- **Success criterion:** <the observable condition that means it is "
+                    "fixed — must be\n  demonstrable by C4-verify on the target harness>\n")
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("success criterion" in r.label for r in results), results)
+
+    def test_falsifiability_is_required_for_a_NAMED_bundle(self) -> None:
+        """PR #169 review round 2. agents/planner.md:157-164 calls an unavailable RED
+        environment a Plan-BLOCKING gap."""
+        self._brief(_BRIEF.replace(
+            "- **Falsifiability:** revert the fence commit; the reaper conformance clause "
+            "goes RED\n", ""))
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("falsifiability" in r.label for r in results), results)
+
+    def test_falsifiability_is_NOT_required_when_scanning(self) -> None:
+        """It entered the template at v0.52.1, so 52 of the 85 committed briefs predate the
+        field. Holding a historical bundle to a field its template never had is a false
+        positive, not a finding — hence the named/scanned split."""
+        self._brief(_BRIEF.replace(
+            "- **Falsifiability:** revert the fence commit; the reaper conformance clause "
+            "goes RED\n", ""))
+        self.assertTrue(self._ok(hc.check_planner(self.d, named=False)))
+
+    def test_a_target_with_an_empty_side_fails(self) -> None:
+        # PR #169 review round 2: `owner/` and `/repo` both contain a slash but name nothing.
+        # `owner/` is the dangerous one — `publish._checkout_path` resolves the empty last
+        # segment to cfg.root.parent, aiming later git operations at the wrong directory.
+        for target in ("`getwyrd/` @ `main`", "`/wyrd` @ `main`"):
+            with self.subTest(target=target):
+                self._brief(f"# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                            f"- **Falsifiability:** revert it\n"
+                            f"- **Repo + branch target:** {target}\n")
+                results = hc.check_planner(self.d, named=True)
+                self.assertFalse(self._ok(results), target)
+                self.assertTrue(any("owner/repo" in r.label for r in results), results)
+
     def test_an_unfilled_optional_field_warns_but_does_not_fail(self) -> None:
         self._brief(_BRIEF + "- **Ordering note:** <optional free text>\n")
         results = hc.check_planner(self.d, named=True)
@@ -168,8 +215,25 @@ class Planner(_Base):
 
 
 class Signoff(_Base):
+    def setUp(self) -> None:
+        super().setUp()
+        # A summary must exist for a decision to be recorded against — see
+        # test_a_missing_summary_fails_the_signoff for why the gate now insists.
+        (self.d / "SUMMARY.md").write_text("## 6. NEEDS-HUMAN\n\n", encoding="utf-8")
+
     def _decision(self, text: str) -> None:
         (self.d / leaves.SIGNOFF_DECISION).write_text(text, encoding="utf-8")
+
+    def test_a_missing_summary_fails_the_signoff(self) -> None:
+        """PR #169 review round 2. `open_needs_human` and `outcome_token` both return
+        "nothing" for an absent SUMMARY by their own defensive contract, so an accept sailed
+        through — and `flow._apply_decision` then discarded the decision and re-drove the
+        bundle with the session gone. Green exactly where downstream rejects it."""
+        (self.d / "SUMMARY.md").unlink()
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("SUMMARY.md is absent" in r.label for r in results), results)
 
     def test_a_bare_accept_passes(self) -> None:
         self._decision("accept\n")
@@ -255,12 +319,15 @@ class Publisher(_Base):
 
 
 class Act(unittest.TestCase):
-    """The date alone cannot say whether THIS session wrote anything (PR #169 review).
+    """The leaf NAMES the entry it wrote; the gate verifies that entry (PR #169 review r2).
 
-    Act legitimately runs more than once a day — the committed log carries several such
-    dates — so an entry from the morning would satisfy every later handoff whether or not the
-    current session appended a thing. The committed log is the baseline for "new".
+    Three things the earlier versions got wrong: date membership is not authorship (Act runs
+    more than once a day), HEAD is not the session boundary (the leaf appends and does not
+    commit, so a prior UNCOMMITTED entry already made the tree longer than HEAD), and a
+    heading is not a review.
     """
+
+    HEAD = "# Act review — 2026-07-26 — the morning run\n\nConsidered 505, 509. No delta.\n"
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -273,100 +340,106 @@ class Act(unittest.TestCase):
     def _log(self, text: str) -> None:
         (self.tmp / "process" / "act-log.md").write_text(text, encoding="utf-8")
 
-    def _check(self, today: str, *, committed: str | None):
+    def _check(self, entry: str, *, committed: str | None):
         with mock.patch.object(hc, "_committed_act_log", return_value=committed):
-            return hc.check_act(self.cfg, today)
+            return hc.check_act(self.cfg, "2026-07-26", entry)
 
     def _ok(self, results) -> bool:
         return not [r for r in results if not r.ok and not r.warn]
 
-    def test_a_new_entry_dated_today_passes(self) -> None:
-        self._log("# Act review — 2026-07-26 — the thing\n")
-        self.assertTrue(self._ok(self._check("2026-07-26", committed="")))
+    def test_a_new_substantive_entry_passes(self) -> None:
+        self._log(self.HEAD + "\n# Act review — 2026-07-26 — the afternoon run\n\n"
+                  "Considered 634, 638. The prose gate is conditional, not closed.\n")
+        self.assertTrue(self._ok(self._check("the afternoon run", committed=self.HEAD)))
 
-    def test_an_earlier_same_day_entry_is_not_evidence(self) -> None:
-        # THE finding: the log already had today's entry before this session started, and
-        # this session appended nothing.
-        log = "# Act review — 2026-07-26 — the morning run\n"
-        self._log(log)
-        results = self._check("2026-07-26", committed=log)
+    def test_a_stale_entry_no_longer_passes_automatically(self) -> None:
+        """The round-2 finding was that a growth-vs-HEAD check passed for a session that
+        wrote nothing, because the leaf appends without committing and a prior UNCOMMITTED
+        entry already made the tree longer than HEAD.
+
+        Naming the entry removes the automatic pass: the gate no longer infers authorship
+        from the log being longer, so a session that writes nothing has nothing to name and
+        gets `no --entry`. What it cannot do is catch a leaf that names someone ELSE'S
+        uncommitted entry — that needs a session-START snapshot, which an end-of-session
+        command cannot take. Documented as a residual limit rather than papered over.
+        """
+        self._log(self.HEAD)
+        self.assertFalse(self._ok(self._check("", committed="")))       # nothing named
+        # And the committed case, which IS detectable, fails:
+        self.assertFalse(self._ok(self._check("the morning run", committed=self.HEAD)))
+
+    def test_an_entry_already_in_HEAD_fails(self) -> None:
+        self._log(self.HEAD)
+        results = self._check("the morning run", committed=self.HEAD)
         self.assertFalse(self._ok(results))
-        self.assertIn("none NEWER than HEAD", results[0].label)
+        self.assertTrue(any("already in HEAD" in r.label for r in results), results)
 
-    def test_a_second_same_day_entry_passes(self) -> None:
-        # The supported shape: two Act runs in one day, the second having actually written.
-        committed = "# Act review — 2026-07-26 — the morning run\n"
-        self._log(committed + "\n# Act review — 2026-07-26 — the afternoon run\n")
-        self.assertTrue(self._ok(self._check("2026-07-26", committed=committed)))
-
-    def test_only_older_entries_fails_and_names_the_newest(self) -> None:
-        self._log("# Act review — 2026-07-21 — older\n")
-        results = self._check("2026-07-26", committed="")
+    def test_a_heading_with_no_body_fails(self) -> None:
+        """A heading is not a review: the cycles considered, what they exposed and the agreed
+        delta are Act's only durable output. 'No delta warranted' is valid and still needs
+        writing down."""
+        self._log("# Act review — 2026-07-26 — the afternoon run\n")
+        results = self._check("the afternoon run", committed="")
         self.assertFalse(self._ok(results))
-        self.assertIn("2026-07-21", results[0].detail)
+        self.assertTrue(any("no body" in r.label for r in results), results)
+
+    def test_a_missing_entry_argument_fails(self) -> None:
+        self._log(self.HEAD)
+        results = self._check("", committed="")
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("no --entry" in r.label for r in results), results)
+
+    def test_an_unmatched_entry_fails(self) -> None:
+        self._log(self.HEAD)
+        results = self._check("a heading that was never written", committed="")
+        self.assertFalse(self._ok(results))
+
+    def test_an_ambiguous_entry_fails(self) -> None:
+        self._log(self.HEAD + "\n# Act review — 2026-07-26 — the morning run\n\nagain\n")
+        results = self._check("the morning run", committed="")
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("cannot tell which" in r.label for r in results), results)
+
+    def test_the_date_is_not_recomputed(self) -> None:
+        """The driver hands Act the flow's `today` and an interactive session can outlive it.
+        Recomputing the date here failed a correctly authored entry across midnight; naming
+        the entry removes the date from the question entirely."""
+        self._log("# Act review — 2026-07-25 — yesterday by the flow's clock\n\nbody\n")
+        self.assertTrue(self._ok(self._check("yesterday by the flow's clock", committed="")))
 
     def test_an_absent_log_fails(self) -> None:
-        self.assertFalse(self._ok(self._check("2026-07-26", committed="")))
-
-    def test_an_act_queue_heading_counts(self) -> None:
-        # `process/act-log.md` carries both "Act review" and "Act queue" headings.
-        self._log("# Act queue — 2026-07-26 — raised at Plan\n")
-        self.assertTrue(self._ok(self._check("2026-07-26", committed="")))
+        self.assertFalse(self._ok(self._check("anything", committed="")))
 
     def test_an_unreadable_baseline_degrades_to_a_warning(self) -> None:
-        # Untracked file or no git: the weaker date check still runs, but says so rather
-        # than claiming a guarantee it cannot make.
-        self._log("# Act review — 2026-07-26 — the thing\n")
-        results = self._check("2026-07-26", committed=None)
+        self._log(self.HEAD)
+        results = self._check("the morning run", committed=None)
         self.assertTrue(self._ok(results))
         self.assertTrue(any(r.warn for r in results), results)
 
 
-class TheMarker(_Base):
-    """The gate records its verdict only on a clean pass — a marker is a claim."""
+class NoBundleWrites(_Base):
+    """The gate writes NOTHING into a bundle (PR #169 review round 2).
+
+    It used to record `handoff.json`, which no role names — a fourth write for sign-off,
+    whose contract is "exactly three things, nothing else". Invoking a deterministic helper
+    from inside a leaf does not make its output a driver artifact.
+    """
 
     def _run(self, *argv: str) -> int:
         with redirect_stdout(io.StringIO()):
             return hc.main(list(argv))
 
-    def test_a_pass_records_the_marker(self) -> None:
+    def test_a_passing_run_leaves_the_bundle_untouched(self) -> None:
         self._brief()
-        cfg = mock.Mock(bundle_root=self.tmp, process_dir=self.tmp / "process")
+        before = {p.name for p in self.d.iterdir()}
+        cfg = mock.Mock(root=self.tmp, bundle_root=self.tmp, process_dir=self.tmp / "process")
         cfg.find_bundle.return_value = self.d
         with mock.patch.object(hc.Config, "load", return_value=cfg):
             self.assertEqual(self._run("--leaf", "planner", "1"), 0)
-        stamp = json.loads((self.d / hc.MARKER).read_text(encoding="utf-8"))
-        self.assertEqual(stamp["leaf"], "planner")
+        self.assertEqual({p.name for p in self.d.iterdir()}, before)
 
-    def test_a_failure_records_nothing(self) -> None:
-        cfg = mock.Mock(bundle_root=self.tmp, process_dir=self.tmp / "process")
-        cfg.find_bundle.return_value = self.d
-        with mock.patch.object(hc.Config, "load", return_value=cfg):
-            self.assertEqual(self._run("--leaf", "planner", "1"), 1)
-        self.assertFalse((self.d / hc.MARKER).exists())
-
-    def test_a_scan_records_no_marker_anywhere(self) -> None:
-        """PR #169 review. A bare scan walks every bundle carrying the leaf's artifacts —
-        dozens of historical ones — so stamping them would claim this session touched them
-        and write outside the bundle scope the role boundary allows. Scanning stays
-        read-only; only named ids get a marker."""
-        self._brief()
-        other = self.tmp / "issue_999"
-        other.mkdir()
-        (other / "brief.md").write_text(_BRIEF, encoding="utf-8")
-        cfg = mock.Mock(root=self.tmp, bundle_root=self.tmp, process_dir=self.tmp / "process")
-        with mock.patch.object(hc.Config, "load", return_value=cfg):
-            self.assertEqual(self._run("--leaf", "planner"), 0)   # no ids = scan
-        self.assertFalse((self.d / hc.MARKER).exists())
-        self.assertFalse((other / hc.MARKER).exists(), "an unrelated bundle must not be stamped")
-
-    def test_no_record_suppresses_the_marker_on_a_pass(self) -> None:
-        self._brief()
-        cfg = mock.Mock(bundle_root=self.tmp, process_dir=self.tmp / "process")
-        cfg.find_bundle.return_value = self.d
-        with mock.patch.object(hc.Config, "load", return_value=cfg):
-            self.assertEqual(self._run("--leaf", "planner", "1", "--no-record"), 0)
-        self.assertFalse((self.d / hc.MARKER).exists())
+    def test_no_handoff_json_constant_survives(self) -> None:
+        self.assertFalse(hasattr(hc, "MARKER"), "the in-bundle marker must be gone entirely")
 
 
 if __name__ == "__main__":
