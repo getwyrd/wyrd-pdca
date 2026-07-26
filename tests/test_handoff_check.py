@@ -50,6 +50,7 @@ hc = _load()
 _BRIEF = """# Brief
 
 - **Slug:** fix-the-thing
+- **Success criterion:** the reaper commits its fence under a concurrent abort
 - **Repo + branch target:** `getwyrd/wyrd` @ `main`
 - **Test file:** crates/x/tests/thing.rs
 """
@@ -89,7 +90,7 @@ class Planner(_Base):
     def test_a_missing_branch_target_fails(self) -> None:
         # The one field with no fallback: `publish._resolve_target` partitions on `@` and
         # an empty value yields an empty repo spec AND an empty base.
-        self._brief("# Brief\n\n- **Slug:** fix-the-thing\n")
+        self._brief("# Brief\n\n- **Slug:** fix-the-thing\n- **Success criterion:** it works\n")
         results = hc.check_planner(self.d, named=True)
         self.assertFalse(self._ok(results))
         self.assertTrue(any("repo + branch target" in r.label for r in results), results)
@@ -98,9 +99,66 @@ class Planner(_Base):
         """Seven committed bundles ship `Test file` empty on purpose, and `brief.test_files`
         returns [] for it — the driver only uses it to unlink a shipped test on iterate. A
         gate that failed them would false-positive on 7% of the corpus."""
-        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
-                    "- **Test file:**\n")
+        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n- **Test file:**\n")
         self.assertTrue(self._ok(hc.check_planner(self.d, named=True)))
+
+    def test_a_missing_success_criterion_fails(self) -> None:
+        """PR #169 review. `agents/planner.md:22` names this THE load-bearing field — the
+        sentence Check later tests "did this work" against. Nothing in the driver reads it
+        mechanically, which is why the first draft of this gate classified it optional; the
+        contract requires it, and Do/Check otherwise proceed without the condition they exist
+        to implement and verify."""
+        self._brief("# Brief\n\n- **Slug:** s\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n")
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("success criterion" in r.label for r in results), results)
+
+    def test_a_multiline_success_criterion_is_authored(self) -> None:
+        """PR #169 review, second pass. `brief.parse_fields` is line-based, so a value
+        indented BENEATH its label parses as empty — and that is a real brief shape: pointer
+        briefs (`plan-pointer.md.tpl`) and any long criterion write it that way. Four
+        committed bundles do (256/258/364/366). Failing them would be a parser artifact, not
+        a contract breach."""
+        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+                    "- **Success criterion:**\n"
+                    "  - **BINDING:** the under-replicated count rises and returns to zero\n")
+        self.assertTrue(self._ok(hc.check_planner(self.d, named=True)))
+
+    def test_a_label_with_nothing_under_it_still_fails(self) -> None:
+        # The other direction: tolerating multi-line must not tolerate an EMPTY field.
+        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:**\n"
+                    "- **Repo + branch target:** `o/r` @ `main`\n")
+        self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
+
+    def test_a_multiline_placeholder_still_fails(self) -> None:
+        self._brief("# Brief\n\n- **Slug:** s\n- **Repo + branch target:** `o/r` @ `main`\n"
+                    "- **Success criterion:**\n  <the observable condition that means it is "
+                    "fixed>\n")
+        self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
+
+    def test_a_placeholder_success_criterion_fails(self) -> None:
+        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** <the observable "
+                    "condition>\n- **Repo + branch target:** `o/r` @ `main`\n")
+        self.assertFalse(self._ok(hc.check_planner(self.d, named=True)))
+
+    def test_a_target_without_a_branch_fails(self) -> None:
+        """PR #169 review. `brief.field` is truthy for `owner/repo` with no `@ branch`, so a
+        presence check passes while `_resolve_target` yields an empty base and publish aborts
+        — after the interactive session is gone."""
+        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                    "- **Repo + branch target:** `getwyrd/wyrd`\n")
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("@ <branch>" in r.label for r in results), results)
+
+    def test_a_target_without_an_owner_fails(self) -> None:
+        self._brief("# Brief\n\n- **Slug:** s\n- **Success criterion:** it works\n"
+                    "- **Repo + branch target:** `wyrd` @ `main`\n")
+        results = hc.check_planner(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("owner/repo" in r.label for r in results), results)
 
     def test_an_unfilled_optional_field_warns_but_does_not_fail(self) -> None:
         self._brief(_BRIEF + "- **Ordering note:** <optional free text>\n")
@@ -145,6 +203,31 @@ class Signoff(_Base):
         self.assertFalse(self._ok(hc.check_signoff(self.d, named=True)))
         self.assertEqual(hc.check_signoff(self.d, named=False), [])
 
+    def test_an_accept_with_open_section6_items_fails(self) -> None:
+        """PR #169 review. `flow._apply_decision` refuses an accept while §6 has open items,
+        so passing one here sends the human away and leaves the flow blocked with the
+        interactive context gone — the exact contradiction this gate exists to catch. Runs
+        the same `signoff.open_needs_human` predicate the driver runs."""
+        self._decision("accept\n")
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n", encoding="utf-8")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("§6 item(s) still open" in r.label for r in results), results)
+
+    def test_an_iterate_with_open_section6_items_is_fine(self) -> None:
+        # C6 guards ACCEPT only — an iterate is exactly what you record when §6 is not clear.
+        self._decision("iterate-do\nthe cause was misread\n")
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n", encoding="utf-8")
+        self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
+
+    def test_an_accept_with_every_item_cleared_passes(self) -> None:
+        self._decision("accept\n")
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — adjudicated\n", encoding="utf-8")
+        self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
+
     def test_a_model_authored_section9_fails(self) -> None:
         """§9 is the driver's to write, under the C6 accept-guard (`signoff.record`). This
         runs BEFORE the flow applies the decision, so a set §9 can only be the session's."""
@@ -172,10 +255,17 @@ class Publisher(_Base):
 
 
 class Act(unittest.TestCase):
+    """The date alone cannot say whether THIS session wrote anything (PR #169 review).
+
+    Act legitimately runs more than once a day — the committed log carries several such
+    dates — so an entry from the morning would satisfy every later handoff whether or not the
+    current session appended a thing. The committed log is the baseline for "new".
+    """
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "process").mkdir()
-        self.cfg = mock.Mock(process_dir=self.tmp / "process")
+        self.cfg = mock.Mock(root=self.tmp, process_dir=self.tmp / "process")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -183,23 +273,53 @@ class Act(unittest.TestCase):
     def _log(self, text: str) -> None:
         (self.tmp / "process" / "act-log.md").write_text(text, encoding="utf-8")
 
-    def test_an_entry_dated_today_passes(self) -> None:
+    def _check(self, today: str, *, committed: str | None):
+        with mock.patch.object(hc, "_committed_act_log", return_value=committed):
+            return hc.check_act(self.cfg, today)
+
+    def _ok(self, results) -> bool:
+        return not [r for r in results if not r.ok and not r.warn]
+
+    def test_a_new_entry_dated_today_passes(self) -> None:
         self._log("# Act review — 2026-07-26 — the thing\n")
-        self.assertTrue(all(r.ok for r in hc.check_act(self.cfg, "2026-07-26")))
+        self.assertTrue(self._ok(self._check("2026-07-26", committed="")))
+
+    def test_an_earlier_same_day_entry_is_not_evidence(self) -> None:
+        # THE finding: the log already had today's entry before this session started, and
+        # this session appended nothing.
+        log = "# Act review — 2026-07-26 — the morning run\n"
+        self._log(log)
+        results = self._check("2026-07-26", committed=log)
+        self.assertFalse(self._ok(results))
+        self.assertIn("none NEWER than HEAD", results[0].label)
+
+    def test_a_second_same_day_entry_passes(self) -> None:
+        # The supported shape: two Act runs in one day, the second having actually written.
+        committed = "# Act review — 2026-07-26 — the morning run\n"
+        self._log(committed + "\n# Act review — 2026-07-26 — the afternoon run\n")
+        self.assertTrue(self._ok(self._check("2026-07-26", committed=committed)))
 
     def test_only_older_entries_fails_and_names_the_newest(self) -> None:
         self._log("# Act review — 2026-07-21 — older\n")
-        results = hc.check_act(self.cfg, "2026-07-26")
-        self.assertFalse(all(r.ok for r in results))
+        results = self._check("2026-07-26", committed="")
+        self.assertFalse(self._ok(results))
         self.assertIn("2026-07-21", results[0].detail)
 
     def test_an_absent_log_fails(self) -> None:
-        self.assertFalse(all(r.ok for r in hc.check_act(self.cfg, "2026-07-26")))
+        self.assertFalse(self._ok(self._check("2026-07-26", committed="")))
 
     def test_an_act_queue_heading_counts(self) -> None:
         # `process/act-log.md` carries both "Act review" and "Act queue" headings.
         self._log("# Act queue — 2026-07-26 — raised at Plan\n")
-        self.assertTrue(all(r.ok for r in hc.check_act(self.cfg, "2026-07-26")))
+        self.assertTrue(self._ok(self._check("2026-07-26", committed="")))
+
+    def test_an_unreadable_baseline_degrades_to_a_warning(self) -> None:
+        # Untracked file or no git: the weaker date check still runs, but says so rather
+        # than claiming a guarantee it cannot make.
+        self._log("# Act review — 2026-07-26 — the thing\n")
+        results = self._check("2026-07-26", committed=None)
+        self.assertTrue(self._ok(results))
+        self.assertTrue(any(r.warn for r in results), results)
 
 
 class TheMarker(_Base):
@@ -224,6 +344,21 @@ class TheMarker(_Base):
         with mock.patch.object(hc.Config, "load", return_value=cfg):
             self.assertEqual(self._run("--leaf", "planner", "1"), 1)
         self.assertFalse((self.d / hc.MARKER).exists())
+
+    def test_a_scan_records_no_marker_anywhere(self) -> None:
+        """PR #169 review. A bare scan walks every bundle carrying the leaf's artifacts —
+        dozens of historical ones — so stamping them would claim this session touched them
+        and write outside the bundle scope the role boundary allows. Scanning stays
+        read-only; only named ids get a marker."""
+        self._brief()
+        other = self.tmp / "issue_999"
+        other.mkdir()
+        (other / "brief.md").write_text(_BRIEF, encoding="utf-8")
+        cfg = mock.Mock(root=self.tmp, bundle_root=self.tmp, process_dir=self.tmp / "process")
+        with mock.patch.object(hc.Config, "load", return_value=cfg):
+            self.assertEqual(self._run("--leaf", "planner"), 0)   # no ids = scan
+        self.assertFalse((self.d / hc.MARKER).exists())
+        self.assertFalse((other / hc.MARKER).exists(), "an unrelated bundle must not be stamped")
 
     def test_no_record_suppresses_the_marker_on_a_pass(self) -> None:
         self._brief()

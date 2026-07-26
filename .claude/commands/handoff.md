@@ -15,31 +15,23 @@ Do these in order. Do not skip the gate because the work "obviously" succeeded.
 You are exactly one of `planner`, `signoff`, `publisher`, `act` — read it off your own role
 prompt. If you genuinely cannot tell, stop and ask; guessing runs the wrong contract.
 
-## 2. Capture what this session established
+## 2. Do not invent an artifact
 
-For `planner` and `signoff`, write `results/issue_<id>/handoff-notes.md` (one per bundle you
-worked). This is the half that dies with the session otherwise: the driver's
-`_carry_forward_into_brief` folds the §9 rationale and the failing gates into the next
-attempt, but it runs *after* you are gone and can only recover what was already recorded as an
-artifact. What you reasoned about and never wrote down is lost.
+You write only what your role names. `AGENTS.md` § Boundaries is explicit about this, and
+`agents/signoff.md` states its list three times over ("write exactly three things, nothing
+else … That is the complete list").
 
-```markdown
-# Handoff notes — issue_<id> — <leaf> — <YYYY-MM-DD>
+An earlier draft of this command asked `planner` and `signoff` for a `handoff-notes.md`
+carrying decisions-and-why, considered-and-rejected, and open questions — the context that
+dies with the session, since `driver._carry_forward_into_brief` runs after you are gone and
+can only recover what was already an artifact. That is a real gap, but closing it here would
+have meant widening a deliberately tight write boundary for a file nothing reads.
 
-## Decisions taken, and why
-<each decision with the reason it went that way, not just the outcome>
-
-## Considered and rejected
-<the options you ruled out and what ruled them out — this is what stops the next
-session re-deriving them, or worse, re-adopting them>
-
-## Open questions
-<what remains genuinely undecided, and who owns it>
-```
-
-Skip this for `publisher` (its artifacts are self-describing) and `act` (the act-log entry
-*is* the record). Write nothing rather than filler — an empty section is worse than an absent
-one, because it reads as "considered, nothing found".
+**So it is deferred to eduralph/pdca-harness#331 item 3**, where the *consuming* half is
+built: the driver merges the session's contribution into the brief's carry-forward. Registering
+the artifact and consuming it belong in the same change. Until then, put anything the next beat
+must know into the channels your role already owns — the brief's fields for `planner`, the
+`signoff-decision` rationale lines and §10 Act candidates for `signoff`.
 
 ## 3. Run the gate
 
@@ -62,7 +54,9 @@ plainly and stop; do not exit on a red gate and leave it to be found three beats
 ## 4. Hand back
 
 Report, in this order: the gate verdict, the artifacts you wrote, and anything the human must
-pick up. Then say the session is ready to close.
+pick up — including anything you reasoned about that no artifact carries, since that is what
+the deferred carry-forward (step 2) would otherwise have caught. Then say the session is ready
+to close.
 
 **You cannot end the session yourself** — a slash command is a prompt expansion, not a
 process signal. Ask the human to press Ctrl-D (or `/exit`), which is what releases the
