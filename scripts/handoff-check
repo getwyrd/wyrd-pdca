@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+"""Handoff gate — verify an interactive leaf discharged its artifact contract before it exits.
+
+Why: `leaves._invoke` runs every `interactive = true` leaf as a bare `subprocess.run(...)`
+with no `check=` and no capture. The driver blocks until the `claude` process exits and
+DISCARDS the exit code, so "the human pressed Ctrl-D" and "the leaf discharged its contract"
+are the same event as far as the driver is concerned. Whether the work actually happened is
+discovered later, by artifact reads further from the cause: the flow validates
+`signoff-decision` against `VALID_DECISIONS` only once the session is gone, and a planner
+session that ends with a malformed `brief.md` advances the bundle regardless.
+
+Every interactive leaf has a checkable contract and none of them is checked at the boundary.
+This is that check, run by `/handoff` as the leaf's last act (getwyrd/wyrd-pdca#166).
+
+    scripts/handoff-check --leaf signoff issue_508
+    scripts/handoff-check --leaf act
+
+MISSING vs MALFORMED. An artifact that is absent is a failure only for a bundle the caller
+NAMED: a planner session legitimately briefs some issues and not others, so "no brief" for an
+unnamed bundle means "not this session's job", not a defect. An artifact that EXISTS but does
+not satisfy its contract is always a failure — whoever wrote it wrote it wrong, and no scoping
+argument excuses it. So an unnamed scan reports only malformed artifacts, while naming ids
+additionally requires them to be present.
+
+Deterministic by construction: every check here is file existence or set membership, and it
+reuses the harness's own predicates (`brief.is_placeholder`, `leaves.VALID_DECISIONS`,
+`signoff.outcome_token`) rather than restating them, so the gate cannot disagree with the
+driver about what a valid artifact is.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+from contextlib import redirect_stderr
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from pdca_harness import brief, leaves, publish, signoff  # noqa: E402
+from pdca_harness.config import Config  # noqa: E402
+
+# No marker is written. An earlier version recorded `handoff.json` in each checked bundle,
+# which is an artifact no role names — a FOURTH write for sign-off, whose contract says
+# "exactly three things, nothing else" (AGENTS.md § Boundaries; agents/signoff.md). Calling a
+# deterministic helper from inside the leaf does not make its output a driver artifact. The
+# gate's verdict is its exit status and its report; nothing consumed the marker anyway, and a
+# post-session driver-written record belongs with the engine work in
+# eduralph/pdca-harness#331 (PR #169 review round 2).
+LEAVES = ("planner", "signoff", "publisher", "act")
+
+# An act-log entry opens with a dated heading: `# Act review — 2026-07-21 — …`.
+_ACT_HEADING_RE = re.compile(r"^#+\s+Act\b.*?(\d{4}-\d{2}-\d{2})", re.MULTILINE)
+
+# `act.scaffold_entry` pre-fills bundles and patterns and leaves the DELTAS — the irreducible
+# human work — as TODO. Those placeholders make the body non-empty, so a body-emptiness test
+# passed an untouched scaffold as a completed review (PR #169 review round 3).
+_ACT_SCAFFOLD_MARKERS = (
+    "## Process deltas  (TODO",
+    "<field added/clarified/removed>",
+)
+
+# The two brief fields this gate requires, each checked by a DIFFERENT predicate because they
+# fail in different ways (see `_authored` and `_target_faults`):
+#
+#   success criterion     `agents/planner.md:22` — "The load-bearing field is the **success
+#                         criterion** — the sentence Check later tests 'did this work'
+#                         against." The driver never parses it, so this is a CONTRACT
+#                         requirement and `_authored` checks it tolerantly, counting a value
+#                         written on the following lines (PR #169 review).
+#   repo + branch target  `publish._resolve_target` partitions it on `@` with nothing to fall
+#                         back to, so the PARSED value is what matters and a multi-line one
+#                         is genuinely broken. `_target_faults` checks both components.
+#
+# Fields that look required and are NOT — each one a false positive the committed corpus
+# caught, and the reason this gate is checked against `results/` rather than reasoned about:
+#   slug        `_resolve_target` falls back to the issue id, and an unauthored slug is
+#               already caught by `brief.is_placeholder` (#113) — a second test is dead code.
+#   test file   `brief.test_files` returns [] for an empty field and the driver tolerates it
+#               (it drives the iterate-time unlink, nothing more). Seven committed bundles
+#               ship it empty on purpose.
+# And the shape that caught the gate out: a POINTER brief (`plan-pointer.md.tpl`) and any
+# brief with a multi-line value write `- **Field:**` with the content indented beneath, which
+# the line-based `brief.parse_fields` reads as empty. Four committed bundles are that shape.
+_CONTRACT_FIELDS = ("success criterion", "repo + branch target")
+
+
+class Result:
+    """One check's outcome. `ok=False` fails the gate; a warning never does."""
+
+    def __init__(self, ok: bool, label: str, detail: str = "", *, warn: bool = False) -> None:
+        self.ok, self.label, self.detail, self.warn = ok, label, detail, warn
+
+    def line(self) -> str:
+        mark = "WARN" if self.warn else ("PASS" if self.ok else "FAIL")
+        return f"  [{mark}] {self.label}" + (f"\n         {self.detail}" if self.detail else "")
+
+
+def _authored(bp: Path, label: str) -> bool:
+    """Is ``label`` filled in, counting a value written on the FOLLOWING lines?
+
+    `brief.parse_fields` is line-based, so `- **Success criterion:**` with its value indented
+    beneath parses as empty — a real and common brief shape (`issue_366` writes a multi-line
+    BINDING criterion exactly that way, and `issue_256`/`258`/`364` are pointer briefs with
+    the same layout). Failing those would be a parser artifact, not a contract breach: the
+    field IS authored.
+
+    So a CONTRACT field — one the driver never parses, required because a role prompt says
+    so — is checked here, tolerantly. A field the driver actually READS is not: for
+    `repo + branch target` a multi-line value genuinely breaks `publish._resolve_target`, so
+    `_target_faults` checks the parsed value and is right to.
+    """
+    text = bp.read_text(encoding="utf-8")
+    m = re.search(rf"^- \*\*{re.escape(label)}:?\*\*:?(.*)$", text,
+                  re.MULTILINE | re.IGNORECASE)
+    if not m:
+        return False
+    # Collect the WHOLE value — the inline remainder plus every continuation line — before
+    # judging it. Judging line-by-line was wrong: the stock template placeholders WRAP, e.g.
+    #   - **Success criterion:** <the observable condition that means it is fixed — must be
+    #     demonstrable by C4-verify …>
+    # so the first line opened with `<` and the second did not, and the second was read as
+    # authored text. The whole untouched placeholder then passed (PR #169 review round 2).
+    value = [m.group(1)]
+    for line in text[m.end():].splitlines()[1:]:
+        if re.match(r"^- \*\*|^#", line):
+            break
+        value.append(line)
+    whole = " ".join(v.strip() for v in value).strip()
+    if not whole:
+        return False
+    # A `<…>` placeholder, however many lines it wraps over: it opens with `<` and either
+    # closes with `>` or never closes at all — the same two shapes `brief._is_placeholder`
+    # recognises, applied to the reassembled value rather than one line of it.
+    if whole.startswith("<") and (whole.endswith(">") or ">" not in whole):
+        return False
+    return True
+
+
+def _target_faults(d: Path) -> list[str]:
+    """What is wrong with the brief's target once PARSED, not merely present (PR #169 review).
+
+    `brief.field` is truthy for `owner/repo` with no `@ branch`, so a check on the raw field
+    passes while `publish._resolve_target` — which partitions the same value on `@` — yields
+    an empty base and `publish.publish` aborts, after the interactive session is gone.
+    Resolving it through the driver's own parser is the only way this gate agrees with what
+    publish will actually do; re-deriving the split here would just be a second parser to
+    drift.
+    """
+    if not (d / "brief.md").exists():
+        return []
+    repo_spec, base, _slug = publish._resolve_target(d)
+    faults = []
+    # An untouched `<branch>` / `<owner/repo>` placeholder is NON-EMPTY, so the emptiness
+    # tests below both pass and publish later builds a ref like `upstream/<branch>` that
+    # fails at checkout — after the interactive planning context is gone (PR #169 review
+    # round 4). `brief.field` cannot filter these: it only recognises a placeholder as the
+    # WHOLE field value, and `<owner/repo> @ <branch>` is two of them joined by the separator.
+    for name, value in (("repository", repo_spec), ("branch", base)):
+        if value.startswith("<") and value.endswith(">"):
+            faults.append(f"`repo + branch target` {name} is still the placeholder "
+                          f"{value!r} — resolve it at Plan, not at publish")
+    if not repo_spec:
+        faults.append("`repo + branch target` has no repository — publish cannot resolve a "
+                      "checkout")
+    if not base:
+        faults.append("`repo + branch target` has no `@ <branch>` — publish resolves an "
+                      "empty base branch and aborts")
+    else:
+        owner, _, repo = repo_spec.partition("/")
+        if not owner.strip() or not repo.strip():
+            # `owner/` and `/repo` both contain a slash but name nothing. The first is the
+            # dangerous one: `publish._checkout_path` resolves the empty last segment to
+            # `cfg.root.parent`, pointing later git operations at the wrong directory
+            # (PR #169 review round 2).
+            faults.append(f"`repo + branch target` repository {repo_spec!r} is not "
+                          f"`owner/repo` — both sides of the slash must name something")
+    return faults
+
+
+def check_planner(d: Path, *, named: bool) -> list[Result]:
+    bp = d / "brief.md"
+    if not bp.exists():
+        if not named:
+            return []
+        return [Result(False, f"{d.name}: brief.md is absent",
+                       "Plan's only artifact. The bundle stays UNPLANNED and the next flow "
+                       "re-plans it.")]
+    if brief.is_placeholder(bp):
+        return [Result(False, f"{d.name}: brief.md is still the unfilled template",
+                       "`Slug` is missing or an angle-bracket placeholder, so `state` reads "
+                       "the bundle as UNPLANNED (#113) — the planner was silently skipped.")]
+
+    out = [Result(True, f"{d.name}: brief.md is authored")]
+    # Two fields, two DIFFERENT correct checks — see `_authored`.
+    if not _authored(bp, "scope"):
+        out.append(Result(False, f"{d.name}: `scope` is unfilled",
+                          "agents/planner.md:24 — state scope / out of scope so Do cannot "
+                          "sprawl. Without it the gate hands implementation an unbounded "
+                          "slice and cannot tell that Do chose the wrong boundary. Authored "
+                          "in all 85 committed briefs, so this is not a legacy gap."))
+    if not _authored(bp, "success criterion"):
+        out.append(Result(False, f"{d.name}: `success criterion` is unfilled",
+                          "The sentence Check later tests \"did this work\" against — "
+                          "agents/planner.md:22 names it THE load-bearing field. Do and "
+                          "Check otherwise proceed without the condition they exist to "
+                          "implement and verify."))
+    # `Falsifiability` is required only for a bundle the caller NAMED — i.e. one this session
+    # planned, which must meet today's contract. It entered the template at v0.52.1, so 52 of
+    # the 85 committed briefs predate the field entirely; holding a historical bundle to a
+    # field its template never had would be a false positive, not a finding (PR #169 review
+    # round 2, which asked for exactly this scoping).
+    if named and not _authored(bp, "falsifiability"):
+        out.append(Result(False, f"{d.name}: `falsifiability` is unfilled",
+                          "Where the binding criterion can be made to go RED, and on which "
+                          "harness. agents/planner.md:157-164 calls an unavailable RED "
+                          "environment a Plan-BLOCKING gap — not something for Do to "
+                          "discover after three cycles."))
+    out.extend(Result(False, f"{d.name}: {fault}") for fault in _target_faults(d))
+    unfilled = sorted(k for k, v in brief.parse_fields(bp).items()
+                      if v.strip().startswith("<") and k not in _CONTRACT_FIELDS)
+    if unfilled:
+        out.append(Result(True, f"{d.name}: {len(unfilled)} optional field(s) left as template "
+                                f"placeholders", ", ".join(unfilled), warn=True))
+    return out
+
+
+# EXACTLY the syntax `signoff.record` can replace — case-sensitive, no leading whitespace
+# (PR #169 review round 3). A tolerant regex reported `- outcome:` or an indented variant as
+# writable, so the gate passed an accept the recorder would then silently fail to write.
+# The §6 heading itself. An over-reaching leaf can delete the section, and every consumer of
+# its ITEMS then reads "nothing open" — including the driver's own accept-guard.
+_SECTION6_RE = re.compile(r"^#+\s*6\.\s*NEEDS-HUMAN", re.MULTILINE | re.IGNORECASE)
+
+_WRITABLE_FIELDS = {
+    "outcome": re.compile(r"^- Outcome:", re.MULTILINE),
+    # An iterate's rationale needs its own writable line: without it `signoff.record` cannot
+    # insert the reason, the flow deletes signoff-decision, and `_carry_forward_into_brief`
+    # reads an empty delta — so the next attempt loses the human's actionable rejection and
+    # can repeat the same approach.
+    "iteration delta": re.compile(r"^- Iteration delta \(if iterating\):", re.MULTILINE),
+}
+
+
+def _missing_writable_fields(summary_path: Path, *, iterating: bool) -> list[str]:
+    """§9 fields `signoff.record` must be able to replace, that are not there."""
+    section = signoff._section(summary_path.read_text(encoding="utf-8"), "9. Check sign-off")
+    need = ["outcome"] + (["iteration delta"] if iterating else [])
+    return [name for name in need if not _WRITABLE_FIELDS[name].search(section)]
+
+
+def check_signoff(d: Path, *, named: bool) -> list[Result]:
+    dp = d / leaves.SIGNOFF_DECISION
+    if not dp.exists():
+        if not named:
+            return []
+        return [Result(False, f"{d.name}: {leaves.SIGNOFF_DECISION} is absent",
+                       "The flow reads this file to route the bundle; without it the "
+                       "sign-off session decided nothing.")]
+
+    summary = d / "SUMMARY.md"
+    # `open_needs_human` and `outcome_token` both return "nothing" for an ABSENT SUMMARY by
+    # their own defensive contract, so an accept on an unassembled or leaf-deleted bundle
+    # sailed through — and `flow._apply_decision` then discarded the decision and re-drove the
+    # bundle with the session gone (PR #169 review round 2).
+    if not summary.exists():
+        return [Result(False, f"{d.name}: SUMMARY.md is absent",
+                       "The decision is recorded against §9 of a summary that does not "
+                       "exist; the flow will discard it and re-drive the bundle.")]
+
+    lines = dp.read_text(encoding="utf-8").splitlines()
+    token = lines[0].strip() if lines else ""
+    if token not in leaves.VALID_DECISIONS:
+        return [Result(False, f"{d.name}: decision token {token!r} is not recognized",
+                       f"Must be one of: {', '.join(sorted(leaves.VALID_DECISIONS))}.")]
+    out = [Result(True, f"{d.name}: decision is {token!r}")]
+    iterating = token.startswith("iterate")
+
+    # The §9 lines `signoff.record` must be able to REPLACE. It only ever replaces; it never
+    # inserts. So a missing field is a decision silently dropped, the flow deleting
+    # `signoff-decision`, and the bundle back at sign-off with the session gone — and for an
+    # iterate, `_carry_forward_into_brief` reading an empty delta, so the next attempt loses
+    # the human's rejection reason and can repeat the same approach (round 2 + round 3).
+    for name in _missing_writable_fields(summary, iterating=iterating):
+        out.append(Result(False, f"{d.name}: §9 has no writable `{name}` field",
+                          "The driver records the decision by replacing that exact line; "
+                          "absent, the record is silently dropped."))
+
+    if not iterating and token != "accept" and not "\n".join(lines[1:]).strip():
+        out.append(Result(False, f"{d.name}: {token!r} carries no rationale",
+                          "A discontinue must say where the work goes instead."))
+    if iterating and not "\n".join(lines[1:]).strip():
+        out.append(Result(False, f"{d.name}: {token!r} carries no rationale",
+                          "An iterate must say why — the driver folds it into the brief's "
+                          "carry-forward so the next beat isn't blind."))
+
+    if token == "accept":
+        # The §6 SECTION itself must exist, not merely be empty of open items (round 3). An
+        # over-reaching leaf that deletes the heading and body leaves `open_needs_human`
+        # returning [], and the driver applies the same empty-list guard — so a malformed
+        # summary could reach COMPLETE without the human ever seeing the mandatory section.
+        # Detect the HEADING, not `_section`: that helper returns the whole document when the
+        # heading is absent, so an emptiness test on it can never fire.
+        if not _SECTION6_RE.search(summary.read_text(encoding="utf-8")):
+            out.append(Result(False, f"{d.name}: §6 NEEDS-HUMAN is absent or empty",
+                              "An accept means the human cleared that section. If it is not "
+                              "there, nothing was cleared and the guard has nothing to check."))
+        # C6: `flow._apply_decision` refuses an accept while §6 has open items, so passing one
+        # here sends the human away and leaves the flow blocked (round 1).
+        open_items = signoff.open_needs_human(summary)
+        if open_items:
+            out.append(Result(
+                False, f"{d.name}: accept with {len(open_items)} §6 item(s) still open",
+                "The C6 accept-guard will refuse this decision. Clear each item with the "
+                "human's explicit OK, or record an iterate instead: "
+                + "; ".join(i[:60] for i in open_items[:3])))
+
+    # §9 is the driver's to write, under the C6 guard. A leaf that has authored it has taken a
+    # decision the deterministic layer owns; this runs BEFORE the flow applies the decision, so
+    # a set §9 can only be the session's own doing.
+    #
+    # `is_set`, NOT the truthiness of `outcome_token` (round 3, and the worst defect I shipped
+    # in this series). On the shape `assemble_summary` actually emits, the empty `- Outcome:`
+    # line is followed immediately by `- Iteration delta (if iterating):`, and outcome_token's
+    # `\s*` swallows the newline and returns THAT label — truthy — so this check failed EVERY
+    # legitimate sign-off handoff. The test passed only because its fixture put nothing after
+    # the Outcome line, a shape the product never emits. `is_set` compares against
+    # VALID_OUTCOMES, which no field label can satisfy.
+    if signoff.is_set(summary):
+        out.append(Result(False, f"{d.name}: §9 Outcome is already set",
+                          "The driver records §9 under the C6 accept-guard; a leaf must "
+                          "not author it."))
+    return out
+
+
+def _contrib_faults(cfg: Config, d: Path, *, pending_id: bool = False) -> list[str]:
+    """The repo's own T4 contribution lint, run over the drafted artifacts (PR #169 review).
+
+    `cli._contribcheck` already encodes the deterministic half of the publisher's prose
+    contract — a non-empty `**User impact:**` opener that PRECEDES `## Root cause`, and the
+    tracker id in BOTH `commit-msg.txt` and `pr-description.md` for a numeric ticket. Round 1
+    declined to run the configured `T4-batch-review` gate here, correctly (three `codex exec`
+    passes over `patch.diff`, minutes each, and it never reads the prose) — but that was not a
+    reason to stop at non-emptiness when this predicate is right there and costs nothing.
+
+    Its own default-open cases are preserved by calling it rather than reimplementing: no
+    patch (a close/no-fix bundle) and no drafted PR body both pass.
+    """
+    from pdca_harness import cli  # local import: keeps the gate cheap for the other leaves
+    # Address the bundle by PATH, not by id (PR #169 review round 2). `_bundles` resolves a
+    # named id through `Config.find_bundle`, which may land on `results/completed/issue_<id>`
+    # — and re-deriving the id there sent the lint to the ACTIVE path instead, where the
+    # absent patch.diff made it default-open and report malformed prose as PASS.
+    # `$PDCA_BUNDLE` is the gate runner's own contract for exactly this.
+    args = argparse.Namespace(issue_id=None, no_issue=pending_id)
+    buf = io.StringIO()
+    prev = os.environ.get("PDCA_BUNDLE")
+    os.environ["PDCA_BUNDLE"] = str(d)
+    try:
+        with redirect_stderr(buf):
+            rc = cli._contribcheck(cfg, args)
+    except Exception as exc:  # noqa: BLE001 — a lint must never crash the gate
+        return [f"contribution lint could not run ({type(exc).__name__}: {exc})"]
+    finally:
+        if prev is None:
+            os.environ.pop("PDCA_BUNDLE", None)
+        else:
+            os.environ["PDCA_BUNDLE"] = prev
+    if rc == 0:
+        return []
+    return [ln.removeprefix("contribcheck: ") for ln in buf.getvalue().splitlines() if ln.strip()]
+
+
+def check_publisher(d: Path, *, named: bool, cfg: Config | None = None,
+                    pending_id: bool = False) -> list[Result]:
+    out: list[Result] = []
+    for artifact in (publish.COMMIT_MSG, publish.PR_BODY):
+        p = d / artifact
+        if not p.exists():
+            if named:
+                out.append(Result(False, f"{d.name}: {artifact} is absent",
+                                  "Publish's contribution artifacts — the T4 gate's inputs."))
+            continue
+        if not p.read_text(encoding="utf-8").strip():
+            out.append(Result(False, f"{d.name}: {artifact} is empty"))
+        else:
+            out.append(Result(True, f"{d.name}: {artifact} is written"))
+    # NAMED bundles only, for the same reason `falsifiability` is: the `**User impact:**` rule
+    # arrived with template v0.50.0, so 43 committed bundles were published before it existed
+    # and fail a lint their contract never carried. A bundle this session drafted must meet
+    # today's contract; a historical one being scanned must not be judged by it.
+    if named and cfg is not None and any(r.ok for r in out):
+        out.extend(Result(False, f"{d.name}: {fault}")
+                   for fault in _contrib_faults(cfg, d, pending_id=pending_id))
+    return out
+
+
+def _committed_act_log(cfg: Config) -> str | None:
+    """`process/act-log.md` as HEAD has it, or None if that cannot be read."""
+    rel = cfg.process_dir.relative_to(cfg.root) / "act-log.md"
+    try:
+        r = subprocess.run(["git", "show", f"HEAD:{rel.as_posix()}"], cwd=cfg.root,
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _act_entries(text: str) -> list[tuple[str, str]]:
+    """(heading line, body) for every dated Act entry, in order."""
+    out, lines = [], text.splitlines()
+    starts = [i for i, ln in enumerate(lines) if _ACT_HEADING_RE.match(ln)]
+    for n, i in enumerate(starts):
+        stop = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        out.append((lines[i].strip(), "\n".join(lines[i + 1:stop]).strip()))
+    return out
+
+
+def check_act(cfg: Config, today: str, entry: str = "") -> list[Result]:
+    """Did THIS Act session record a substantive entry?
+
+    Three things the naive version got wrong, all found in PR #169 review:
+
+    * **Date membership is not authorship.** Act runs more than once a day, so an earlier
+      entry satisfied every later handoff.
+    * **HEAD is not the session boundary.** The Act leaf appends the log and does not commit
+      it, so a prior UNCOMMITTED entry already made the working tree longer than HEAD — and a
+      session that wrote nothing still passed a growth check.
+    * **A heading is not a review.** Any dated line starting with `Act` counted, so a bare
+      heading with no cycles considered, nothing exposed and no delta satisfied the contract
+      that those are Act's only durable output.
+
+    So the leaf NAMES the entry it wrote (``--entry``) and the gate verifies that entry
+    exists, carries a body, and is not already in HEAD. Naming it also removes the date from
+    the equation, which fixes the midnight case: the driver hands Act the flow's ``today`` and
+    an interactive session can outlive it, so recomputing the date here failed a correctly
+    authored entry.
+
+    RESIDUAL LIMIT, stated rather than papered over: this removes the AUTOMATIC pass — a
+    session that wrote nothing has nothing to name — but it cannot catch a leaf that names an
+    earlier session's still-uncommitted entry. Distinguishing those needs a baseline taken at
+    session START, and this command runs only at the end. Closing it properly means the
+    driver snapshotting the log before it dispatches the Act leaf, which is engine work
+    (eduralph/pdca-harness#331).
+    """
+    log = cfg.process_dir / "act-log.md"
+    if not log.exists():
+        return [Result(False, f"{log} is absent", "Act's only artifact.")]
+
+    entries = _act_entries(log.read_text(encoding="utf-8"))
+    if not entries:
+        return [Result(False, "act-log.md carries no dated Act entry")]
+
+    if not entry:
+        return [Result(False, "no --entry given",
+                       "Pass the heading of the entry this session appended: "
+                       "`--entry \"<the heading text>\"`. Without it the gate can only check "
+                       "that SOME entry exists, which an earlier same-day run already "
+                       "satisfies.")]
+
+    matched = [(h, b) for h, b in entries if entry.strip().casefold() in h.casefold()]
+    if not matched:
+        return [Result(False, f"no act-log entry matches {entry!r}",
+                       "Newest heading is " + entries[-1][0])]
+    if len(matched) > 1:
+        return [Result(False, f"{len(matched)} entries match {entry!r} — cannot tell which "
+                              f"is this session's", "Use a heading that identifies it.")]
+
+    heading, body = matched[0]
+    out: list[Result] = []
+    left = [ph for ph in _ACT_SCAFFOLD_MARKERS if ph in body]
+    if left:
+        return [Result(False, f"the entry {heading!r} is still the untouched scaffold",
+                       f"`act.scaffold_entry` placeholders remain ({', '.join(left)}). The "
+                       f"deltas are the irreducible human work the scaffold leaves as TODO — "
+                       f"a body full of them records no decision. 'No delta warranted' is a "
+                       f"valid outcome and still has to be written.")]
+    if not body:
+        return [Result(False, f"the entry {heading!r} has no body",
+                       "An Act entry records the cycles considered, what they exposed, and "
+                       "the agreed deltas. 'No delta warranted' is a valid finding and still "
+                       "needs writing down — a bare heading is indistinguishable from a "
+                       "session that never ran.")]
+    out.append(Result(True, f"act-log.md carries {heading!r} with a body"))
+
+    baseline = _committed_act_log(cfg)
+    if baseline is None:
+        out.append(Result(True, "could not read the committed act-log to confirm the entry is "
+                                "NEW (untracked, or git unavailable)",
+                          "Falling back to presence: an entry written by an earlier session "
+                          "and not yet committed would also satisfy this.", warn=True))
+    elif any(entry.strip().casefold() in h.casefold() for h, _ in _act_entries(baseline)):
+        out.append(Result(False, f"{heading!r} is already in HEAD — this session added nothing",
+                          "Append this session's own entry."))
+    return out
+
+
+def _bundles(cfg: Config, ids: list[str]) -> list[tuple[Path, bool]]:
+    """(bundle, was_named) for each bundle to check.
+
+    Named ids are resolved through `Config.find_bundle` so an archived bundle still
+    resolves. With no ids, scan every bundle in the leaf's actionable state — those are the
+    ones the session was invoked over — and treat each as unnamed, so only MALFORMED
+    artifacts fail.
+    """
+    if ids:
+        return [(cfg.find_bundle(i.removeprefix("issue_")), True) for i in ids]
+    if not cfg.bundle_root.is_dir():
+        return []
+    return [(d, False) for d in sorted(cfg.bundle_root.glob("issue_*")) if d.is_dir()]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--leaf", required=True, choices=LEAVES)
+    ap.add_argument("ids", nargs="*", help="bundle ids; omit to scan for malformed artifacts")
+    ap.add_argument("--date", default=date.today().isoformat(),
+                    help="unused for act since --entry identifies the entry; kept for callers")
+    ap.add_argument("--entry", default="",
+                    help="--leaf act: the heading of the entry this session appended")
+    ap.add_argument("--no-issue", action="store_true",
+                    help="--leaf publisher: pending-id mode, as `pdca publish --no-issue` — "
+                         "the tracker reference is legitimately absent")
+    args = ap.parse_args(argv)
+
+    cfg = Config.load(Path(__file__).resolve().parent.parent)
+    results: list[Result] = []
+    checked: list[Path] = []
+
+    # The bundle leaves REQUIRE ids (PR #169 review round 3). A scan cannot know which bundles
+    # this session touched, and both directions of that were wrong: a newly authored brief was
+    # exempted from the named-only checks, while any unrelated pre-existing valid brief
+    # supplied a PASS even when the session wrote nothing. Deriving the set needs a
+    # session-START baseline, which an end-of-session command cannot take — that is driver
+    # knowledge, and it belongs with eduralph/pdca-harness#331. Until then, naming the ids is
+    # the only honest input, and it is also what makes MISSING checkable at all.
+    if args.leaf != "act" and not args.ids:
+        print(f"handoff-check --leaf {args.leaf}: name the bundle ids this session worked, "
+              f"e.g. `--leaf {args.leaf} 508 625`.\n\nA bare scan cannot tell which bundles "
+              f"are this session's output: it would exempt a brief you just wrote from the "
+              f"checks that only apply to your own work, and pass on somebody else's valid "
+              f"artifact even if you wrote nothing.", file=sys.stderr)
+        return 2
+
+    if args.leaf == "act":
+        results = check_act(cfg, args.date, args.entry)
+    else:
+        checker = {"planner": check_planner, "signoff": check_signoff,
+                   "publisher": check_publisher}[args.leaf]
+        for d, named in _bundles(cfg, args.ids):
+            if not d.exists():
+                results.append(Result(False, f"{d.name}: bundle directory does not exist"))
+                continue
+            kw = ({"cfg": cfg, "pending_id": args.no_issue}
+                  if args.leaf == "publisher" else {})
+            found = checker(d, named=named, **kw)
+            if found:
+                checked.append(d)
+            results.extend(found)
+
+
+    print(f"handoff-check --leaf {args.leaf}"
+          + (f" ({', '.join(args.ids)})" if args.ids else " (scan)"))
+    for r in results:
+        print(r.line())
+
+    failed = [r for r in results if not r.ok and not r.warn]
+    print(f"\n{'FAIL' if failed else 'PASS'}: {len(failed)} failing check(s), "
+          f"{sum(1 for r in results if r.warn)} warning(s)")
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
