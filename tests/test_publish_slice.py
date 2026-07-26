@@ -377,6 +377,37 @@ class PublishSlice(unittest.TestCase):
         # write — the opposite of the reassurance this heartbeat exists to give.
         self.assertIsNone(beat.call_args.kwargs.get("status"))
 
+    def test_at_publish_false_opts_a_t4_check_out_of_publish_only(self) -> None:
+        """Issue #183: publish selects T4 checks on the tier and nothing else, so a
+        whole-diff review registered for CHECK is silently re-run at push time — model
+        spend Check already paid, and a fresh sample of a nondeterministic reviewer
+        after §9. `at_publish = false` opts a check out of publish while leaving it in
+        force at Check; the check itself is untouched in `cfg.gates_checks`."""
+        review = {"id": "T4-review", "tier": "T4", "cmd": "exit 1",
+                  "scope": "bundle", "at_publish": False}
+        artifacts = {"id": "T4-contribution", "tier": "T4", "cmd": "true", "scope": "bundle"}
+        self.cfg.gates_checks = [review, artifacts]
+        d = _bundle(self.cfg, "OPTOUT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat",
+                               return_value=(0, "", True)) as beat, \
+                redirect_stderr(io.StringIO()):
+            self.assertTrue(publish._t4_passes(self.cfg, d))
+        # Only the opted-in check ran — the opted-out one would have failed (`exit 1`).
+        self.assertEqual(len(beat.call_args_list), 1)
+        self.assertEqual(beat.call_args.kwargs["label"], "T4-contribution")
+        # And Check still sees both: the opt-out is publish's, not a deregistration.
+        self.assertEqual(len([c for c in self.cfg.gates_checks if c["tier"] == "T4"]), 2)
+
+    def test_every_t4_check_opted_out_is_nothing_to_enforce(self) -> None:
+        """All T4 checks opted out ⇒ the same no-op as no T4 check at all, rather than
+        a vacuous pass that still spawns a runner."""
+        self.cfg.gates_checks = [{"id": "T4-review", "tier": "T4", "cmd": "exit 1",
+                                  "scope": "bundle", "at_publish": False}]
+        d = _bundle(self.cfg, "ALLOUT", brief_body=_FIX_BRIEF, accepted=True)
+        with mock.patch.object(publish.progress, "run_with_heartbeat") as beat:
+            self.assertTrue(publish._t4_passes(self.cfg, d))
+        beat.assert_not_called()
+
     def test_t4_gate_failure_still_reports_the_captured_output(self) -> None:
         """The heartbeat must not cost the evidence: a failing gate's captured output
         is still what publish prints, so the operator sees WHY it refused."""

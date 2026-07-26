@@ -547,8 +547,21 @@ def _fork_owner(repo: Path, remote: str = "origin") -> str:
 
 
 def _t4_passes(cfg: Config, d: Path) -> bool:
-    """Run every configured T4-tier gate over the bundle. No T4 gate → nothing to
+    """Run the configured T4-tier gates that apply at publish. None → nothing to
     enforce (True). Keeps publish decoupled from any one project's checker.
+
+    **What belongs here.** Publish's T4 step exists for the checks whose subject is the
+    contribution artifacts it just drafted — ``commit-msg.txt`` / ``pr-description.md``,
+    which do not exist at Check time, so Check *cannot* have validated them
+    (``pdca contribcheck`` is the shipped one). It selects on the tier and nothing else,
+    which makes the tier string load-bearing in a way no config says out loud: register a
+    whole-diff review at T4 for Check, and publish silently inherits it and re-runs it at
+    push time — minutes of model spend Check already paid, and a *fresh sample* of a
+    nondeterministic reviewer, so a bundle green at Check can be refused at publish over a
+    finding that did not exist when the human signed it off (issue #183).
+
+    ``at_publish = false`` on a check opts it out of this step while leaving it fully in
+    force at Check. Absent, it defaults True — unchanged behaviour for every other check.
 
     Output stays captured — a failing gate's evidence is reported in one place below —
     so the gate is silent for as long as it runs, and a T4 gate is routinely a
@@ -559,13 +572,14 @@ def _t4_passes(cfg: Config, d: Path) -> bool:
     and tick a heartbeat through :mod:`pdca_harness.progress` — the single place that
     pattern lives, already used by the Check-time gates (``gates.py``) and the leaves.
     """
-    t4 = [c for c in cfg.gates_checks if c.get("tier") == "T4"]
+    t4 = [c for c in cfg.gates_checks
+          if c.get("tier") == "T4" and c.get("at_publish", True)]
     if not t4:
         return True
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
     for chk in t4:
         label = chk.get("label") or chk.get("id") or chk.get("cmd", "")
-        print(f"  · T4 gate {label} (a model-backed review gate can take minutes)…",
+        print(f"  · T4 gate {label} (a gate can take minutes; a heartbeat follows)…",
               file=sys.stderr, flush=True)
         # No `status` probe here, deliberately. `bundle_activity` reports the newest
         # write in the bundle — the right signal for a Do leaf or a Check gate, which
