@@ -303,6 +303,38 @@ def _deferred_items(d: Path) -> list[NeedsHumanItem]:
     return [NeedsHumanItem(t, HUMAN) for t in held]
 
 
+def ensure_section6_item(summary_path: Path, text: str) -> bool:
+    """Append one unchecked §6 item to an ALREADY-ASSEMBLED summary; True if it was added.
+
+    For a condition discovered after assembly that the C6 accept-guard must see (PR #168
+    review round 7). Appending in place rather than re-assembling is deliberate: a
+    re-assemble regenerates §6 from the artifacts and would discard any box the human has
+    already ticked in this sign-off session.
+
+    Idempotent, and best-effort like every other writer here — a summary that cannot be read
+    or written is not worth crashing a flow over, and the caller still halts either way.
+    """
+    try:
+        body = summary_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if text.split("(")[0].strip() in body:
+        return False
+    lines, out, placed = body.splitlines(keepends=True), [], False
+    for line in lines:
+        if not placed and re.match(r"^#+\s*7\.", line):
+            out.append(f"- [ ] {text}\n\n")
+            placed = True
+        out.append(line)
+    if not placed:
+        out.append(f"\n- [ ] {text}\n")
+    try:
+        summary_path.write_text("".join(out), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def assemble_summary(d: Path, cfg: Config) -> None:
     fields = brief.parse_fields(d / "brief.md")
     gates = json.loads((d / "check-gates.json").read_text(encoding="utf-8"))

@@ -1178,6 +1178,33 @@ class DeferredFindingsSurvive(_Base):
         self.assertFalse(self._try(d), "a rebuild here would destroy the held findings")
         self.assertEqual(autoiterate.count(d), 0)      # no budget spent
 
+    def test_an_unreadable_ledger_reaches_section6_with_NO_impl_finding(self) -> None:
+        """PR #168 review round 7 (P1). The readability check sat AFTER the eligibility test,
+        so when the ledger became unreadable once the SUMMARY was already assembled and the
+        current Check had no IMPL finding, the eligibility test returned first: the synthetic
+        warning existed only in memory, and the C6 guard then read a STALE SUMMARY — so the
+        bundle could be ACCEPTED without the human learning the held findings were lost."""
+        d = self._bundle("LEDGP1")                      # clean review ⇒ no IMPL item
+        self.assertFalse(autoiterate.eligible(assemble.collect_needs_human(d, self.cfg)))
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        self.assertFalse(self._try(d))
+        self.assertTrue(any("unreadable" in t
+                            for t in signoff.open_needs_human(d / "SUMMARY.md")),
+                        signoff.open_needs_human(d / "SUMMARY.md"))
+
+    def test_the_ledger_warning_does_not_wipe_a_human_tick(self) -> None:
+        # Appended in place, not re-assembled: a re-assemble regenerates §6 from the
+        # artifacts and would discard a box the human already ticked in this sign-off.
+        d = self._bundle("LEDGTICK", review=self._REVIEW)
+        summary = d / "SUMMARY.md"
+        summary.write_text(summary.read_text(encoding="utf-8").replace("- [ ]", "- [x]", 1),
+                           encoding="utf-8")
+        (d / autoiterate.DEFERRED_FILE).write_text("{ not json", encoding="utf-8")
+        self._try(d)
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("- [x]", text, "an existing tick must survive")
+        self.assertIn("unreadable", text)
+
     def test_an_unreadable_ledger_surfaces_in_section6_without_crashing(self) -> None:
         # Assembly is defensive by contract, so it must not raise — but it must not drop the
         # ledger silently either. It becomes a §6 item, which the C6 guard then holds on.
