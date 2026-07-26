@@ -353,9 +353,19 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     # So a tick retires exactly one entry or none. This is the same shape `_needs_human` uses
     # for two STANDING candidates: when at least one of the matches must be wrong and we
     # cannot tell which, decide for neither.
+    def _norm(x: str) -> str:
+        return " ".join(x.split()).casefold()
+
     retire: set[int] = set()
     for row in ticked:
-        hits = [i for i, t in enumerate(ledger) if _same_finding(t, row)]
+        # EXACT first (PR #168 review round 5). The round-4 fail-closed rule counted an exact
+        # match and a fuzzy one as equally ambiguous, so a pair of near-identical findings
+        # became permanently unclearable: ticking either row unchanged still matched both, so
+        # neither retired, and no amount of ticking could ever drain them. An exact match is
+        # not ambiguous — it is the row the ledger rendered.
+        exact = [i for i, t in enumerate(ledger) if _norm(t) == _norm(row)]
+        hits = exact if exact else [i for i, t in enumerate(ledger)
+                                    if _same_finding(t, row)]
         if len(hits) == 1:
             retire.add(hits[0])
     kept = [t for i, t in enumerate(ledger) if i not in retire]

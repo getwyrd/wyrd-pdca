@@ -1264,11 +1264,31 @@ class DeferredFindingsSurvive(_Base):
             json.dumps({"items": near}), encoding="utf-8")
         self.assertTrue(autoiterate._same_finding(near[0], near[1]),
                         "fixture must actually be ambiguous for this test to mean anything")
+        # The tick must be an EDITED row, so there is no exact match to disambiguate it —
+        # a verbatim tick is unambiguous by definition and is covered by the test below.
+        edited = near[0].replace("not the cause", "not the cause (owner: board)")
         (d / "SUMMARY.md").write_text(
-            f"## 6. NEEDS-HUMAN\n\n- [x] {near[0]}\n", encoding="utf-8")
+            f"## 6. NEEDS-HUMAN\n\n- [x] {edited}\n", encoding="utf-8")
         autoiterate.retire_cleared(d, d / "SUMMARY.md")
         self.assertEqual(len(autoiterate.deferred(d)), 2,
-                         "an ambiguous tick must retire neither entry")
+                         "an edited tick matching two entries must retire neither")
+
+    def test_an_EXACT_tick_beats_ambiguity(self) -> None:
+        """PR #168 review round 5. Round 4 counted an exact match and a fuzzy one as equally
+        ambiguous, so a pair of near-identical findings became permanently unclearable:
+        ticking either row unchanged matched both, neither retired, and no amount of ticking
+        could drain them. An exact match is not ambiguous — it is the row the ledger
+        rendered."""
+        d = self._bundle("DEFER15", review=self._REVIEW)
+        near = ["C5 Causal adequacy — guards the symptom in the parser, not the cause",
+                "C5 Causal adequacy — guards the symptom in the renderer, not the cause"]
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            json.dumps({"items": near}), encoding="utf-8")
+        (d / "SUMMARY.md").write_text(
+            f"## 6. NEEDS-HUMAN\n\n- [x] {near[0]}\n- [ ] {near[1]}\n", encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(autoiterate.deferred(d), [near[1]],
+                         "the exactly-ticked entry retires; its near-twin stays")
 
     def test_an_UNambiguous_tick_still_retires(self) -> None:
         # The fail-closed rule must not swallow the ordinary case.
@@ -1340,6 +1360,25 @@ class DeferredFindingsSurvive(_Base):
                          if "seam is wider" in i.text]
                 self.assertEqual(len(items), 1, items)
                 self.assertEqual(items[0].kind, assemble.HUMAN)
+
+    def test_an_advisory_impl_tag_cannot_override_the_reviewer_human_verdict(self) -> None:
+        """PR #168 review round 5, and the highest-consequence of the series: the merge was
+        confined to ONE artifact while `collect_needs_human` concatenates the primary review
+        and every advisory. A plain HUMAN judgment from the reviewer plus the same text tagged
+        `[impl]` by an advisory left both entries standing — and since `eligible()` needs only
+        one IMPL item anywhere, that advisory tag sent an explicitly human-only concern to the
+        builder unattended."""
+        review = ("# Review\n\n| Item | Verdict | Basis |\n|---|---|---|\n"
+                  "| C1 Spec | PASS | ok |\n"
+                  "| T5 Judgment | NEEDS-HUMAN | the seam is wider than the brief |\n")
+        d = self._bundle("XART", review=review, advisory=(
+            "- NEEDS-HUMAN [impl] — T5 Judgment — the seam is wider than the brief\n"))
+        items = [i for i in assemble.collect_needs_human(d, self.cfg)
+                 if "seam is wider" in i.text]
+        self.assertEqual(len(items), 1, items)
+        self.assertEqual(items[0].kind, assemble.HUMAN)
+        self.assertFalse(autoiterate.eligible(assemble.collect_needs_human(d, self.cfg)),
+                         "a human-only concern must not become eligible via an advisory tag")
 
     def test_the_human_marker_is_stripped_like_impl(self) -> None:
         """PR #168 review round 2. `[human]` carries no classification — an untagged bullet is

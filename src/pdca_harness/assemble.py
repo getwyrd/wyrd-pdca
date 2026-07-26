@@ -42,6 +42,35 @@ class NeedsHumanItem(NamedTuple):
     kind: str
 
 
+# Which classification survives when the same finding arrives twice. HUMAN wins over IMPL —
+# it reaches the human either way and never triggers a rebuild on its own — and both win over
+# STANDING, since a finding a leaf actually wrote about is not the signal-free constant however
+# it is spelled (PR #168 review rounds 3-5).
+_SAFEST = {HUMAN: 0, IMPL: 1, STANDING: 2}
+
+
+def resolve_duplicates(items: list[NeedsHumanItem]) -> list[NeedsHumanItem]:
+    """Collapse repeated findings to their SAFEST classification, keeping first position.
+
+    Applied twice on purpose. Within one artifact it stops a leaf that spells one objection
+    two ways from routing on output ORDER. Across the whole collected set it stops something
+    worse: the primary reviewer emitting a plain HUMAN judgment while an advisory tags the
+    same text `[impl]` left BOTH entries standing, and since `eligible()` now needs only one
+    IMPL item anywhere, that advisory tag sent an explicitly human-only concern to the builder
+    unattended (PR #168 review round 5).
+    """
+    out: list[NeedsHumanItem] = []
+    at: dict[str, int] = {}
+    for item in items:
+        key = item.text.casefold()
+        if key not in at:
+            at[key] = len(out)
+            out.append(item)
+        elif _SAFEST[item.kind] < _SAFEST[out[at[key]].kind]:
+            out[at[key]] = item     # keep the first POSITION, take the safer kind
+    return out
+
+
 # The implementation/architectural split is NOT a new taxonomy — it is the `kind` already
 # carried by the canonical 5/5/1 (gates._FIVE_FIVE_ONE). `gate` cells (C2/C4/T1..T4) are
 # mechanically checkable ⇒ builder-fixable. `judgment` cells (C5 causal adequacy, T5
@@ -196,25 +225,10 @@ def _items_from_artifact(text: str, *, allow_standing: bool = False) -> list[Nee
     # on the raw text, which is before the `[impl]` / `[human]` marker is stripped — so one
     # objection written both ways in a round survives as two identical §6 boxes the human has
     # to clear twice (PR #168 review round 2).
-    # A duplicate resolves to the SAFER classification, not to whichever came first (PR #168
-    # review round 3). An artifact repeating one finding with conflicting tags — `[impl]` then
-    # `[human]` — otherwise routed on output ORDER: `[impl]` first sent it to an unattended
-    # rebuild and never recorded it as deferred, while reversing the two lines did the
-    # opposite. HUMAN wins over IMPL (it reaches the human either way, and never triggers a
-    # rebuild on its own), and both win over STANDING, since a finding the leaf actually wrote
-    # about is not the signal-free constant however it is spelled.
-    _SAFEST = {HUMAN: 0, IMPL: 1, STANDING: 2}
-    items: list[NeedsHumanItem] = []
-    at: dict[str, int] = {}
-    for f in _needs_human(text):
-        item = _classify_finding(f.text, standing=allow_standing and f.standing,
-                                 tagged_impl=f.tagged_impl)
-        key = item.text.casefold()
-        if key not in at:
-            at[key] = len(items)
-            items.append(item)
-        elif _SAFEST[item.kind] < _SAFEST[items[at[key]].kind]:
-            items[at[key]] = item   # keep the first POSITION, take the safer kind
+    items = resolve_duplicates([
+        _classify_finding(f.text, standing=allow_standing and f.standing,
+                          tagged_impl=f.tagged_impl)
+        for f in _needs_human(text)])
     if not label:
         return items
     return [NeedsHumanItem(f"{label} — {it.text}", HUMAN) for it in items]
@@ -249,6 +263,8 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
+    # Across EVERY source, not just within each artifact (PR #168 review round 5).
+    items = resolve_duplicates(items)
     return items + _deferred_items(d, items)
 
 
