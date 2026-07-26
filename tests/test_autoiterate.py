@@ -870,7 +870,11 @@ class SoftAndHardRounds(unittest.TestCase):
                    for i in range(n_human)])
 
     def _spend(self, n_impl: int) -> None:
-        autoiterate.write_decision(self.d, self._items(n_impl))
+        # Mirrors `flow._maybe_auto_iterate`: the observation is recorded at every Check,
+        # separately from spending a round.
+        items = self._items(n_impl)
+        autoiterate.observe(self.d, items)
+        autoiterate.write_decision(self.d, items)
 
     def test_the_worked_example(self) -> None:
         """soft 3 / hard 5, counts 5 → 7 → 3, then the round-4 branch.
@@ -890,6 +894,24 @@ class SoftAndHardRounds(unittest.TestCase):
             with self.subTest(round4=probe):
                 fire, _why = autoiterate.should_iterate(self.d, self._items(probe), self.cfg)
                 self.assertIs(fire, expected)
+
+    def test_a_manual_iterate_updates_the_convergence_baseline(self) -> None:
+        """PR #168 review round 3. `impl_counts` used to be appended only by automatic rounds,
+        so after a growth halt a HUMAN `iterate-do` left the baseline pointing at the last
+        automatic round's input: a halt at 2 -> 4 followed by a human-driven improvement to 3
+        read as 2 -> 3 and halted again, and a drop to 2 could restart automatic rounds."""
+        for n in (5, 4, 2):                      # three rounds through the soft floor
+            self.assertTrue(autoiterate.should_iterate(self.d, self._items(n), self.cfg)[0])
+            self._spend(n)
+        # Round 4 is conditional and the count GREW, so it halts — and still observes.
+        fire, _ = autoiterate.should_iterate(self.d, self._items(4), self.cfg)
+        self.assertFalse(fire)
+        autoiterate.observe(self.d, self._items(4))
+        self.assertEqual(autoiterate.impl_history(self.d), [5, 4, 2, 4])
+        # The human iterates by hand and the rebuild improves 4 -> 3. That is convergence
+        # against the Check that actually preceded it, not against the stale 2.
+        fire, why = autoiterate.should_iterate(self.d, self._items(3), self.cfg)
+        self.assertTrue(fire, f"4 -> 3 is converging; got {why!r}")
 
     def test_the_hard_ceiling_is_absolute(self) -> None:
         for n in (5, 4, 3, 3, 2):          # five rounds, converging throughout
@@ -1159,6 +1181,47 @@ class DeferredFindingsSurvive(_Base):
         self.assertTrue(any("guards the symptom" in t for t in autoiterate.deferred(d)),
                         "an edited-but-open finding must stay deferred")
 
+    def test_an_ANNOTATED_and_ticked_deferral_retires(self) -> None:
+        """PR #168 review round 3 — the mirror of round 2. Round 2 made retirement require a
+        positive tick; matching that tick by exact TEXT then meant a human who annotated the
+        row while ticking it (`- [x] needs an ADR (owner: architecture)`) had their explicit
+        adjudication ignored, and the entry came back unchecked on the next assembly."""
+        d = self._bundle("DEFER12", review=self._REVIEW)
+        self.assertTrue(self._try(d))
+        summary = d / "SUMMARY.md"
+        text = summary.read_text(encoding="utf-8")
+        # Tick it AND annotate it in one edit.
+        marked = text.replace("- [ ] C5 Causal adequacy — guards the symptom",
+                              "- [x] C5 Causal adequacy — guards the symptom (owner: board)")
+        self.assertNotEqual(marked, text)
+        summary.write_text(marked, encoding="utf-8")
+        autoiterate.retire_cleared(d, summary)
+        self.assertFalse(any("guards the symptom" in t for t in autoiterate.deferred(d)),
+                         autoiterate.deferred(d))
+
+    def test_the_finding_match_discriminates(self) -> None:
+        """The retirement match must survive a human's edit without conflating two findings.
+        Over-matching loses an objection; under-matching resurrects an adjudicated one."""
+        LEDGER = "C5 Causal adequacy — guards the symptom, not the cause"
+        same = [
+            ("C5 Causal adequacy — guards the symptom (owner: board), not the cause",
+             "annotated in the middle"),
+            ("C5 Causal adequacy — guards the symptom, not the cause (owner: board)",
+             "annotated at the end"),
+            (LEDGER, "untouched"),
+        ]
+        other = [
+            ("C5 Causal adequacy — the executor probe is unnecessary here",
+             "a DIFFERENT finding on the same element"),
+            ("T5 Judgment — the slice is too large to review as one", "a different element"),
+        ]
+        for row, why in same:
+            self.assertTrue(autoiterate._same_finding(LEDGER, row), why)
+        for row, why in other:
+            self.assertFalse(autoiterate._same_finding(LEDGER, row), why)
+        self.assertFalse(autoiterate._same_finding("short one", "short two"),
+                         "short rows must not collide on a shared opening")
+
     def test_an_unticked_deferral_survives_retirement(self) -> None:
         # The half that must not regress: retire only what the human actually ticked.
         d = self._bundle("DEFER8", review=self._REVIEW)
@@ -1184,6 +1247,20 @@ class DeferredFindingsSurvive(_Base):
         with self.assertRaises(autoiterate.DeferredLedgerUnreadable):
             autoiterate.deferred(d)
         self.assertFalse(self._try(d))
+
+    def test_a_conflicting_duplicate_resolves_to_the_safer_kind(self) -> None:
+        """PR #168 review round 3. One finding repeated with conflicting tags routed on output
+        ORDER: `[impl]` first sent it to an unattended rebuild and never deferred it, while
+        reversing the lines did the opposite. HUMAN wins regardless of order."""
+        for first, second in (("[impl]", "[human]"), ("[human]", "[impl]")):
+            with self.subTest(order=(first, second)):
+                d = self._bundle(f"DUP{first[1]}", advisory=(
+                    f"- NEEDS-HUMAN {first} — the seam is wider than the brief\n"
+                    f"- NEEDS-HUMAN {second} — the seam is wider than the brief\n"))
+                items = [i for i in assemble.collect_needs_human(d, self.cfg)
+                         if "seam is wider" in i.text]
+                self.assertEqual(len(items), 1, items)
+                self.assertEqual(items[0].kind, assemble.HUMAN)
 
     def test_the_human_marker_is_stripped_like_impl(self) -> None:
         """PR #168 review round 2. `[human]` carries no classification — an untagged bullet is

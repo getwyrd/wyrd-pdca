@@ -196,14 +196,25 @@ def _items_from_artifact(text: str, *, allow_standing: bool = False) -> list[Nee
     # on the raw text, which is before the `[impl]` / `[human]` marker is stripped — so one
     # objection written both ways in a round survives as two identical §6 boxes the human has
     # to clear twice (PR #168 review round 2).
-    items, seen = [], set()
+    # A duplicate resolves to the SAFER classification, not to whichever came first (PR #168
+    # review round 3). An artifact repeating one finding with conflicting tags — `[impl]` then
+    # `[human]` — otherwise routed on output ORDER: `[impl]` first sent it to an unattended
+    # rebuild and never recorded it as deferred, while reversing the two lines did the
+    # opposite. HUMAN wins over IMPL (it reaches the human either way, and never triggers a
+    # rebuild on its own), and both win over STANDING, since a finding the leaf actually wrote
+    # about is not the signal-free constant however it is spelled.
+    _SAFEST = {HUMAN: 0, IMPL: 1, STANDING: 2}
+    items: list[NeedsHumanItem] = []
+    at: dict[str, int] = {}
     for f in _needs_human(text):
         item = _classify_finding(f.text, standing=allow_standing and f.standing,
                                  tagged_impl=f.tagged_impl)
-        if item.text.casefold() in seen:
-            continue
-        seen.add(item.text.casefold())
-        items.append(item)
+        key = item.text.casefold()
+        if key not in at:
+            at[key] = len(items)
+            items.append(item)
+        elif _SAFEST[item.kind] < _SAFEST[items[at[key]].kind]:
+            items[at[key]] = item   # keep the first POSITION, take the safer kind
     if not label:
         return items
     return [NeedsHumanItem(f"{label} — {it.text}", HUMAN) for it in items]

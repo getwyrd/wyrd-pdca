@@ -172,7 +172,16 @@ def _maybe_auto_iterate(
         print(f"flow: {d.name} — cannot classify Check findings ({type(exc).__name__}: {exc}); "
               f"not auto-iterating", file=sys.stderr)
         return False
+    # Record this Check's implementation-finding count BEFORE any early return, so the
+    # convergence baseline is the Check immediately preceding the next rebuild whoever
+    # triggers it. Recording only on the rounds that auto-iterated left a human `iterate-do`
+    # after a growth halt comparing against a stale automatic round (PR #168 review round 3).
+    # It runs after `should_iterate` below, which needs the PREVIOUS observation to compare.
+    def _observe() -> None:
+        autoiterate.observe(d, items)
+
     if not autoiterate.eligible(items):
+        _observe()
         return False
     try:
         autoiterate.deferred(d)  # readable? (PR #168 review, P1)
@@ -186,6 +195,7 @@ def _maybe_auto_iterate(
         return False
     spent = autoiterate.count(d)
     fire, why_not = autoiterate.should_iterate(d, items, cfg)
+    _observe()  # after the comparison — `should_iterate` reads the PREVIOUS observation
     if not fire:
         print(f"flow: {d.name} — {why_not}; handing the findings to the human",
               file=sys.stderr)

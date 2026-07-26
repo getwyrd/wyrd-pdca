@@ -63,6 +63,33 @@ DEFERRED_FILE = "deferred-findings.json"
 # The only token this module is ever allowed to write.
 DECISION = "iterate-do"
 
+# Matching a ticked §6 row to a ledger entry when the human edited the MIDDLE of the row, so
+# neither string contains the other. A fixed character threshold is brittle exactly where it
+# matters — the two strings in the motivating case share 39 characters and diverge on the 40th
+# — so the test is PROPORTIONAL: the shared opening must be most of the shorter string.
+#
+# That is what discriminates. Two different findings on the same 5/5/1 element share only the
+# element and label (~21 characters of "C5 Causal adequacy — ") before diverging, which is a
+# small fraction of a full §6 row; one finding and its annotated self share nearly all of it.
+_MATCH_RATIO = 0.6      # of the shorter string
+_MATCH_FLOOR = 20       # …and never fewer than this many characters, so short rows can't match
+
+
+def _same_finding(a: str, b: str) -> bool:
+    """Do these two §6 texts name the same finding, allowing for a human's edit?"""
+    a, b = " ".join(a.split()).casefold(), " ".join(b.split()).casefold()
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    shared = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        shared += 1
+    shortest = min(len(a), len(b))
+    return shared >= max(_MATCH_FLOOR, int(shortest * _MATCH_RATIO))
+
 
 def eligible(items: list[NeedsHumanItem]) -> bool:
     """True iff there is implementation work a rebuild can do: at least one IMPL finding.
@@ -111,7 +138,11 @@ def count(d: Path) -> int:
 
 
 def impl_history(d: Path) -> list[int]:
-    """The IMPL count observed at each Check that spent a round, oldest first.
+    """The IMPL count observed at each Check that reached sign-off, oldest first.
+
+    Appended by :func:`observe` on EVERY such Check — including ones that halted — so the
+    baseline always represents the Check immediately preceding the next rebuild, whoever
+    triggered it (PR #168 review round 3). It is deliberately not tied to the round counter.
 
     Empty for a pre-#332 budget file, which is the compatibility case that matters: a bundle
     already mid-iteration when this ships has a count but no history, and
@@ -124,12 +155,28 @@ def impl_history(d: Path) -> list[int]:
     return [int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)]
 
 
-def bump(d: Path, observed_impl: int) -> int:
-    """Spend one automatic iteration, recording the IMPL count that justified it."""
-    n = count(d) + 1
-    history = impl_history(d) + [int(observed_impl)]
+def observe(d: Path, items: list[NeedsHumanItem]) -> None:
+    """Record this Check's IMPL count as the convergence baseline (PR #168 review round 3).
+
+    Called at EVERY Check that reaches sign-off, not only at the ones that auto-iterate — the
+    history has to represent the Check immediately preceding the next rebuild, whoever
+    triggered it. When only automatic rounds appended, a human `iterate-do` taken after a
+    growth halt left the baseline pointing at the last AUTOMATIC round's input: a halt at
+    2 -> 4 followed by a human-driven improvement to 3 was then read as 2 -> 3 and halted
+    again, while a drop to 2 could restart automatic rounds that should not have resumed.
+    """
+    st = _state(d)
+    history = impl_history(d) + [impl_count(items)]
     (d / BUDGET_FILE).write_text(
-        json.dumps({"count": n, "impl_counts": history}) + "\n", encoding="utf-8")
+        json.dumps({"count": int(st.get("count", 0) or 0), "impl_counts": history}) + "\n",
+        encoding="utf-8")
+
+
+def bump(d: Path) -> int:
+    """Spend one automatic iteration. The observation is recorded separately by `observe`."""
+    n = count(d) + 1
+    (d / BUDGET_FILE).write_text(
+        json.dumps({"count": n, "impl_counts": impl_history(d)}) + "\n", encoding="utf-8")
     return n
 
 
@@ -241,9 +288,19 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
         return []
     if not ledger:
         return []
-    ticked = {line[len("- [x]"):].strip().casefold()
-              for line in signoff.cleared_needs_human(summary_path)}
-    kept = [t for t in ledger if t.strip().casefold() not in ticked]
+    ticked = [line[len("- [x]"):].strip().casefold()
+              for line in signoff.cleared_needs_human(summary_path)]
+    # Match by CONTAINMENT, not equality (PR #168 review round 3). A human who annotates a row
+    # while ticking it — `- [x] needs an ADR (owner: architecture)` — has adjudicated it just
+    # as definitely as one who ticked it untouched, but the text no longer equals the ledger
+    # entry, so an exact test left it deferred and the next assembly recreated it UNCHECKED.
+    # An explicitly cleared finding would then block sign-off again, forever.
+    #
+    # Containment in either direction covers both edits: text appended to the row (the common
+    # annotation) and text trimmed from it. Both sides are long sentences lifted from §6, so
+    # an accidental match between two distinct findings is not a realistic shape — and this
+    # only ever fires on a row the human positively ticked, which is the guard that matters.
+    kept = [t for t in ledger if not any(_same_finding(t, row) for row in ticked)]
     if len(kept) != len(ledger):
         (d / DEFERRED_FILE).write_text(
             json.dumps({"items": kept}, indent=1) + "\n", encoding="utf-8")
@@ -301,7 +358,7 @@ def write_decision(d: Path, items: list[NeedsHumanItem]) -> None:
     """
     if not eligible(items):
         raise ValueError("auto-iterate: refusing to decide on a non-implementation finding set")
-    attempt = bump(d, impl_count(items))
+    attempt = bump(d)
     defer(d, items, attempt=attempt)
     (d / SIGNOFF_DECISION).write_text(
         f"{DECISION}\n{rationale(items, attempt=attempt)}\n", encoding="utf-8")
