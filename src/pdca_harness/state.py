@@ -61,6 +61,31 @@ DOWNSTREAM_GLOBS = (
     "*.error.log",
 )
 
+# Cycle evidence the archive deliberately does NOT move (issue #170) — the one place where
+# "what `_archive_iteration` moves" and "what `is_resolved` counts as evidence" must DIFFER.
+#
+# Both files ACCUMULATE across rebuilds, which is why they are kept out of the two lists
+# above, and both are unambiguous proof a cycle ran — a bundle cannot hold `auto-iterate.json`
+# without having auto-iterated. Counting them was simply missed when the evidence guard was
+# built (#150/#164): a bundle stripped to one of them plus a stray `resolved` notes.json read
+# RESOLVED, left the resume set, and had Plan skip it, abandoning a real iteration history
+# with nothing reported.
+#
+# Do NOT "tidy" this by folding these names into DOWNSTREAM_OF_BRIEF. The archive would then
+# move them, and each has a distinct failure if it does:
+#   auto-iterate.json       the round budget resets every iterate ⇒ auto-iterate never
+#                           terminates (`autoiterate.BUDGET_FILE`)
+#   deferred-findings.json  a deferred human finding vanishes into iteration-v<N>/ ⇒ exactly
+#                           the loss it exists to prevent (`autoiterate.DEFERRED_FILE`)
+#
+# The names are literals rather than imports because `autoiterate` imports `assemble`, which
+# would cycle back here. `test_state_resolved` pins them against those constants, so a rename
+# breaks the test rather than silently reopening the misclassification.
+CYCLE_EVIDENCE_ONLY = (
+    "auto-iterate.json",
+    "deferred-findings.json",
+)
+
 # §9 outcome token → bundle state. state owns the state names, so the mapping
 # lives here; signoff knows only the tokens (no import cycle).
 _OUTCOME_TO_STATE = {
@@ -84,7 +109,8 @@ def is_resolved(d: Path) -> bool:
     forever. The ``resolved`` record makes it terminal ([`RESOLVED`]).
 
     A bundle carrying **any** evidence a cycle ran — ``brief.md``, any artifact in
-    [`DOWNSTREAM_OF_BRIEF`] or matching [`DOWNSTREAM_GLOBS`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
+    [`DOWNSTREAM_OF_BRIEF`] or matching [`DOWNSTREAM_GLOBS`], one of the accumulators in
+    [`CYCLE_EVIDENCE_ONLY`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
     ``resolved`` key can never reclassify it (including a rejected cycle left briefless by
     ``iterate-to-Plan``, which archives ``brief.md`` + everything downstream and must stay
     UNPLANNED for its re-plan). A malformed / unreadable ``notes.json`` is "not resolved",
@@ -95,6 +121,8 @@ def is_resolved(d: Path) -> bool:
         (d / "brief.md").exists()
         or any((d / f).exists() for f in DOWNSTREAM_OF_BRIEF)
         or any(q.is_file() for g in DOWNSTREAM_GLOBS for q in d.glob(g))
+        # The accumulators the archive skips (#170) — evidence, but never moved.
+        or any((d / f).exists() for f in CYCLE_EVIDENCE_ONLY)
         or any(d.glob("iteration-v*"))
     ):
         return False

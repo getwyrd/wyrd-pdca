@@ -14,6 +14,7 @@ briefless bundles so a real cycle bundle with a stray key is untouched; RESOLVED
 
 from __future__ import annotations
 
+import fnmatch
 import inspect
 import json
 import tempfile
@@ -134,6 +135,53 @@ class ResolvedStateTest(unittest.TestCase):
         src = inspect.getsource(driver._archive_iteration)
         self.assertIn("state.DOWNSTREAM_GLOBS", src)
         self.assertNotIn('d.glob("check-advisory-*.md")', src)
+
+    def test_briefless_with_only_an_accumulator_is_not_resolved(self) -> None:
+        # Issue #170. `auto-iterate.json` and `deferred-findings.json` are kept OUT of the
+        # two sets above so they survive the archive and accumulate across rebuilds — and
+        # that exclusion also dropped them from the evidence guard. A bundle cannot hold
+        # either without having run a cycle, so neither may read as a notes-only tracker.
+        for artifact in state.CYCLE_EVIDENCE_ONLY:
+            d = _bundle(self.root, f"issue_acc_{artifact.replace('.', '_')}")
+            (d / artifact).write_text("{}\n", encoding="utf-8")
+            (d / "notes.json").write_text(
+                json.dumps({"resolved": {"github_state": "closed"}}), encoding="utf-8"
+            )
+            self.assertFalse(
+                state.is_resolved(d), f"{artifact} present must block RESOLVED"
+            )
+            self.assertEqual(state.state(d), state.UNPLANNED)
+
+    def test_the_accumulators_are_evidence_but_never_archived(self) -> None:
+        """The asymmetry IS the fix (#170), so pin it in both directions.
+
+        Folding these names into DOWNSTREAM_OF_BRIEF would fix the misclassification and
+        break something worse: the archive would move them, resetting auto-iterate's round
+        budget every iterate (so it never terminates) and dropping the deferred findings
+        into iteration-v<N>/ (the exact loss the ledger exists to prevent).
+        """
+        for artifact in state.CYCLE_EVIDENCE_ONLY:
+            self.assertNotIn(artifact, state.DOWNSTREAM_OF_BRIEF, artifact)
+            self.assertFalse(
+                any(fnmatch.fnmatch(artifact, g) for g in state.DOWNSTREAM_GLOBS),
+                f"{artifact} must not be swept up by an archive glob either",
+            )
+
+    def test_the_accumulator_names_match_their_owning_constants(self) -> None:
+        # state.py cannot import autoiterate (it imports assemble, which cycles back), so the
+        # names are literals. This is what makes a rename break loudly instead of silently
+        # reopening the misclassification.
+        from pdca_harness import autoiterate
+
+        owned = {autoiterate.BUDGET_FILE}
+        # DEFERRED_FILE arrives with #332; tolerate its absence so this fix does not depend
+        # on that branch having merged.
+        if hasattr(autoiterate, "DEFERRED_FILE"):
+            owned.add(autoiterate.DEFERRED_FILE)
+        self.assertTrue(
+            owned <= set(state.CYCLE_EVIDENCE_ONLY),
+            f"{owned - set(state.CYCLE_EVIDENCE_ONLY)} is an accumulator the guard misses",
+        )
 
     def test_downstream_of_brief_is_the_shared_source_of_truth(self) -> None:
         # driver re-exports state's list — one source, so is_resolved and the iterate
