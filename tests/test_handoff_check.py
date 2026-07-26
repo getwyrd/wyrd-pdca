@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest import mock
 
 from pdca_harness import leaves
+from pdca_harness.config import Config
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "handoff-check"
 
@@ -244,6 +245,23 @@ class Planner(_Base):
         self.assertFalse(self._ok(results))
         self.assertTrue(any("`scope`" in r.label for r in results), results)
 
+    def test_a_placeholder_branch_target_fails(self) -> None:
+        """PR #169 review round 4. `<branch>` is NON-EMPTY, so both emptiness tests passed and
+        publish later built a ref like `upstream/<branch>` that fails at checkout — after the
+        planning context is gone. `brief.field` cannot filter it: it recognises a placeholder
+        only as the WHOLE field value, and `<owner/repo> @ <branch>` is two of them joined."""
+        for target, which in (("`getwyrd/wyrd` @ `<branch>`", "branch"),
+                              ("`<owner/repo>` @ `main`", "repository")):
+            with self.subTest(target=target):
+                self._brief("# Brief\n\n- **Slug:** s\n- **Scope:** one path\n"
+                            "- **Success criterion:** it works\n"
+                            "- **Falsifiability:** revert it\n"
+                            f"- **Repo + branch target:** {target}\n")
+                results = hc.check_planner(self.d, named=True)
+                self.assertFalse(self._ok(results), target)
+                self.assertTrue(any("placeholder" in r.label and which in r.label
+                                    for r in results), results)
+
     def test_an_unfilled_optional_field_warns_but_does_not_fail(self) -> None:
         self._brief(_BRIEF + "- **Ordering note:** <optional free text>\n")
         results = hc.check_planner(self.d, named=True)
@@ -415,6 +433,33 @@ class Signoff(_Base):
 
 
 class Publisher(_Base):
+    """Every case here runs the REAL code path, `cfg` included (PR #169 review round 4).
+
+    Calling `check_publisher` without `cfg` skipped the contribution-lint branch entirely —
+    which is how a `NameError` from a function I had accidentally deleted shipped: the gate
+    crashed on every real `--leaf publisher <id>` while the suite stayed green.
+    """
+
+    def _cfg(self):
+        return Config.load(Path(__file__).resolve().parent.parent)
+
+    def test_the_real_path_with_cfg_does_not_crash(self) -> None:
+        (self.d / "patch.diff").write_text("--- a\n+++ b\n", encoding="utf-8")
+        (self.d / "commit-msg.txt").write_text("fix: the thing (#1)\n", encoding="utf-8")
+        (self.d / "pr-description.md").write_text(
+            "**User impact:** the thing works\n\n## Root cause\n\nx #1\n", encoding="utf-8")
+        hc.check_publisher(self.d, named=True, cfg=self._cfg())   # must not raise
+
+    def test_the_contribution_lint_actually_fires(self) -> None:
+        # A PR body with no `**User impact:**` opener must FAIL through the real lint, not
+        # pass because the branch was skipped.
+        (self.d / "patch.diff").write_text("--- a\n+++ b\n", encoding="utf-8")
+        (self.d / "commit-msg.txt").write_text("fix: the thing\n", encoding="utf-8")
+        (self.d / "pr-description.md").write_text("## What\n\nthe thing\n", encoding="utf-8")
+        results = hc.check_publisher(self.d, named=True, cfg=self._cfg())
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("User impact" in r.label for r in results), results)
+
     def test_both_artifacts_present_passes(self) -> None:
         (self.d / "commit-msg.txt").write_text("fix: the thing\n", encoding="utf-8")
         (self.d / "pr-description.md").write_text("## What\n\nthe thing\n", encoding="utf-8")
