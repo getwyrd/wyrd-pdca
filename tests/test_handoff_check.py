@@ -25,6 +25,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -459,6 +460,50 @@ class Publisher(_Base):
         results = hc.check_publisher(self.d, named=True, cfg=self._cfg())
         self.assertFalse(self._ok(results))
         self.assertTrue(any("User impact" in r.label for r in results), results)
+
+    def _drafted_without_the_trailer(self) -> None:
+        # Bundle `issue_1` — a numeric ticket, so the tracker-id half of the lint applies.
+        (self.d / "patch.diff").write_text("--- a\n+++ b\n", encoding="utf-8")
+        (self.d / "commit-msg.txt").write_text("fix: the thing\n", encoding="utf-8")
+        (self.d / "pr-description.md").write_text(
+            "**User impact:** the thing works\n\n## Root cause\n\nx\n", encoding="utf-8")
+
+    def test_an_ambient_pending_id_cannot_relax_this_gate(self) -> None:
+        """PR #184 review r3: `_contribcheck` reads `$PDCA_PENDING_ID` as a second source
+        of the pending-id mode, so an exported one would override the `--no-issue` this
+        gate was NOT given, and a numeric bundle would pass the publisher handoff with
+        the tracker id missing from both artifacts. The call states both variables the
+        checker reads — as it always has for `$PDCA_BUNDLE`, for the same reason."""
+        self._drafted_without_the_trailer()
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            results = hc.check_publisher(self.d, named=True, cfg=self._cfg())
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("tracker id" in r.label for r in results), results)
+
+    def test_the_flag_is_how_pending_id_is_declared_here(self) -> None:
+        """The other direction: given the mode, the trailer is not required — with
+        nothing in the environment saying so."""
+        self._drafted_without_the_trailer()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PDCA_PENDING_ID", None)
+            results = hc.check_publisher(self.d, named=True, cfg=self._cfg(),
+                                         pending_id=True)
+        self.assertTrue(self._ok(results), results)
+
+    def test_the_callers_environment_survives_the_lint(self) -> None:
+        """Scoped, not clobbered: the gate runs mid-flow, and both variables belong to
+        whoever set them once it returns."""
+        self._drafted_without_the_trailer()
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1", "PDCA_BUNDLE": "/elsewhere"}):
+            hc.check_publisher(self.d, named=True, cfg=self._cfg(), pending_id=True)
+            self.assertEqual(os.environ["PDCA_PENDING_ID"], "1")
+            self.assertEqual(os.environ["PDCA_BUNDLE"], "/elsewhere")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PDCA_PENDING_ID", None)
+            os.environ.pop("PDCA_BUNDLE", None)
+            hc.check_publisher(self.d, named=True, cfg=self._cfg(), pending_id=True)
+            self.assertNotIn("PDCA_PENDING_ID", os.environ)  # unset stays unset
+            self.assertNotIn("PDCA_BUNDLE", os.environ)
 
     def test_both_artifacts_present_passes(self) -> None:
         (self.d / "commit-msg.txt").write_text("fix: the thing\n", encoding="utf-8")

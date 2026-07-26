@@ -903,15 +903,32 @@ class ContribCheck(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("User impact", err)
 
-    def test_pending_id_env_unset_or_zero_is_not_pending(self) -> None:
-        """`PDCA_PENDING_ID=0` / empty is the absence of the mode, not the mode — the
-        gate runner sets the variable only when it means it."""
+    def test_only_a_real_true_value_is_the_pending_mode(self) -> None:
+        """PR #184 review r3: a truthiness test made `PDCA_PENDING_ID=false` *enable* the
+        exception — fail-OPEN, on a variable whose only job is to switch a gate off. The
+        env half goes through the project's strict boolean (#132's `bool("false") is
+        True` lesson), so every false spelling leaves the trailer required."""
         self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
                           commit="Fix the crash\n\nNo trailer.\n")
-        for value in ("0", ""):
-            with self.subTest(value=value), mock.patch.dict(os.environ,
-                                                            {"PDCA_PENDING_ID": value}):
-                self.assertEqual(self._run("266")[0], 1)
+        for value in ("false", "False", "FALSE", "no", "off", "0", ""):
+            with self.subTest(off=value), mock.patch.dict(os.environ,
+                                                          {"PDCA_PENDING_ID": value}):
+                self.assertEqual(self._run("266")[0], 1, f"{value!r} must not relax it")
+        for value in ("1", "true", "TRUE", " yes ", "on"):
+            with self.subTest(on=value), mock.patch.dict(os.environ,
+                                                         {"PDCA_PENDING_ID": value}):
+                self.assertEqual(self._run("266")[0], 0, f"{value!r} must relax it")
+
+    def test_an_unrecognized_pending_id_value_is_off_and_says_so(self) -> None:
+        """Fails closed AND visibly: a typo'd knob that silently disarms a gate is the
+        failure mode worth more than the one it prevents."""
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "maybe"}):
+            rc, err = self._run("266")
+        self.assertEqual(rc, 1)
+        self.assertIn("PDCA_PENDING_ID", err)
+        self.assertIn("not a boolean", err)
 
     def test_slug_bundle_skips_the_trailer_requirement(self) -> None:
         # A non-numeric (slug) id has no real ticket number → only the opener is enforced.
