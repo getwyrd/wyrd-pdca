@@ -1,0 +1,4081 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6380f79..6c2a58a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4958,6 +4958,7 @@ dependencies = [
+  "tempfile",
+  "tokio",
+  "wyrd-chunk-format",
++ "wyrd-testkit",
+  "wyrd-traits",
+ ]
+ 
+@@ -4978,6 +4979,7 @@ dependencies = [
+  "wyrd-core",
+  "wyrd-custodian",
+  "wyrd-proto",
++ "wyrd-testkit",
+  "wyrd-traits",
+ ]
+ 
+diff --git a/crates/chunkstore-fs/Cargo.toml b/crates/chunkstore-fs/Cargo.toml
+index d829dad..d43a093 100644
+--- a/crates/chunkstore-fs/Cargo.toml
++++ b/crates/chunkstore-fs/Cargo.toml
+@@ -11,6 +11,12 @@ publish.workspace = true
+ [dependencies]
+ wyrd-traits.workspace = true
+ wyrd-chunk-format.workspace = true
++# The Clock seam (ADR-0009/ADR-0024): the fragment-write authorization deadline
++# (`W_write`, issue #638) is compared against this store's own clock at the point it
++# publishes a write, so expiry is exercised under a manual/simulated clock instead of
++# a bare `SystemTime::now()` (#619). Same production dependency `coordination-mem`
++# takes for lease expiry.
++wyrd-testkit.workspace = true
+ async-trait.workspace = true
+ bytes.workspace = true
+ # Off-reactor offload of the blocking `std::fs` syscalls (issue #204): the async
+diff --git a/crates/chunkstore-fs/src/lib.rs b/crates/chunkstore-fs/src/lib.rs
+index 7fbaee2..7a182a4 100644
+--- a/crates/chunkstore-fs/src/lib.rs
++++ b/crates/chunkstore-fs/src/lib.rs
+@@ -15,16 +15,27 @@ use std::fs;
+ use std::io::ErrorKind;
+ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::Arc;
+ 
+ use async_trait::async_trait;
+ use bytes::Bytes;
+ use wyrd_chunk_format::{decode, FragmentError};
++use wyrd_testkit::{Clock, SystemClock};
+ use wyrd_traits::{
+     ChunkId, ChunkStore, FragmentId, Health, IntegrityFault, PlacementChunkStore, Result,
++    WriteDeadlineExpired,
+ };
+ 
+ /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
+-pub struct FsChunkStore {
++///
++/// Generic over the [`Clock`] that decides fragment-write deadline expiry (issue #638):
++/// the real [`SystemClock`] by default, a test-controlled clock through
++/// [`FsChunkStore::open_with_clock`] — the seam AGENTS.md § Review rubric prescribes for
++/// code that needs controllable time (ADR-0024), rather than a bare `SystemTime::now()`
++/// (#619). This store, as the write's **acceptor**, is one of the two evaluation sites
++/// `δ_clock` bounds the skew between in `G_orphan > W_write + δ_clock` (`0016:1478`); the
++/// other is the authorizer that chose the deadline.
++pub struct FsChunkStore<C: Clock = SystemClock> {
+     root: PathBuf,
+     /// Monotonic sequence that makes each write's scratch file name unique
+     /// *within this store*, so two concurrent writes of the same [`FragmentId`]
+@@ -36,17 +47,32 @@ pub struct FsChunkStore {
+     /// every concurrent writer a private scratch path with no shared *global*
+     /// mutable state (which would couple otherwise-independent simulation nodes).
+     scratch_seq: AtomicU64,
++    /// The clock the fragment-write deadline is compared against, held behind an
++    /// [`Arc`] so the publish step can carry it into the blocking closure that owns
++    /// the rename (issue #638) without demanding `Clone` of a caller's clock.
++    clock: Arc<C>,
+ }
+ 
+-impl FsChunkStore {
++impl FsChunkStore<SystemClock> {
+     /// Open a store rooted at `root`, creating the directory if it does not
+-    /// exist.
++    /// exist. Write deadlines are judged against the real wall clock.
+     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
++        Self::open_with_clock(root, SystemClock)
++    }
++}
++
++impl<C: Clock> FsChunkStore<C> {
++    /// Like [`FsChunkStore::open`], but judges fragment-write deadlines against
++    /// `clock` — the injection point for a manual/simulated clock, so deadline
++    /// expiry is exercised deterministically instead of by real waiting (ADR-0024,
++    /// issue #638).
++    pub fn open_with_clock(root: impl Into<PathBuf>, clock: C) -> Result<Self> {
+         let root = root.into();
+         fs::create_dir_all(&root)?;
+         let store = Self {
+             root,
+             scratch_seq: AtomicU64::new(0),
++            clock: Arc::new(clock),
+         };
+         // Clear write scratch orphaned by a crash before this store was opened.
+         // Unique per-write scratch names (issue #203) no longer self-clean the
+@@ -176,8 +202,13 @@ where
+ }
+ 
+ #[async_trait]
+-impl ChunkStore for FsChunkStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++impl<C: Clock + Send + Sync + 'static> ChunkStore for FsChunkStore<C> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         // Verify integrity and that the fragment belongs under this id before
+         // acknowledging the write. A verify failure here is a **malformed fragment
+         // the caller offered** — surfaced as a seam-level `IntegrityFault` so the
+@@ -188,10 +219,30 @@ impl ChunkStore for FsChunkStore {
+             detail: e.to_string(),
+         })?;
+ 
++        // **Admission refusal** (issue #638): a write that is *already* past its
++        // authorization deadline when it arrives is refused before any disk work, so an
++        // expired write costs no I/O and leaves not even a chunk directory behind. This
++        // is deliberately NOT the bound — everything after it (the blocking pool's
++        // queue, the scratch write, the publishing rename) can consume arbitrary time,
++        // so a check that happens *before* the write is applied cannot say when it took
++        // effect. The bound is the post-publication verification inside the closure.
++        if let Some(deadline_millis) = deadline_millis {
++            if let Some(refusal) =
++                WriteDeadlineExpired::if_elapsed(id, deadline_millis, self.clock.now_millis())
++            {
++                return Err(Box::new(refusal));
++            }
++        }
++
+         // Compute the paths on the reactor (no I/O — a per-call atomic bump and
+         // path joins), then perform every blocking syscall off the reactor.
+         let final_path = self.fragment_path(id);
+         let temp = self.temp_path(id);
++        // The store's clock travels into the blocking closure so the deadline is
++        // judged *there*, around the publish point (issue #638) — the same clock this
++        // lifecycle read above, never a second time source (AGENTS.md § Review rubric,
++        // "one clock per correctness lifecycle").
++        let clock = Arc::clone(&self.clock);
+         offload(move || -> Result<()> {
+             // Write to a per-call private scratch file, then atomically rename it
+             // onto the final path: the rename is the only publish point, so a
+@@ -222,10 +273,70 @@ impl ChunkStore for FsChunkStore {
+                     return Err(e.into());
+                 }
+             }
++            // Did this fragment already exist before *our* rename? Read once, only
++            // when a deadline rides along (a deadline-less write is byte-for-byte the
++            // pre-#638 path, one `stat` included). It decides whether a retraction
++            // below would be undoing **our own** publication or destroying somebody
++            // else's: for a content-addressed id the bytes are identical either way
++            // (see the rename note above), so if the fragment was already published,
++            // our rename changed nothing observable and there is nothing to retract —
++            // removing it would delete a fragment an *earlier, live* write (or an
++            // idempotent retry of this one) was already acknowledged for.
++            //
++            // The read and the rename are not one atomic step, so a *concurrent* write
++            // of this same id that publishes in between is seen as absent and its
++            // (byte-identical) fragment can be retracted with ours. That is a
++            // duplicate-write race inside one store — the boundary this store's
++            // per-write scratch already reasons about (issue #203) — and it costs a
++            // repairable missing fragment, not a late one left in place; the other
++            // direction would silently keep an out-of-window write, which is the
++            // failure 0016 decision 5 exists to exclude.
++            let published_over_existing = deadline_millis.is_some() && is_published(&final_path);
++
+             if let Err(e) = fs::rename(&temp, &final_path) {
+                 let _ = fs::remove_file(&temp);
+                 return Err(e.into());
+             }
++
++            // **The bound** (issue #638, proposal 0016 decision 5): the publication has
++            // now happened, so this is the first moment the store can say when the
++            // write *took effect* — and that is what `W_write` bounds. Reading the
++            // clock **after** the rename returns is the only way to cover the rename
++            // itself: a check placed before it bounds when the store *decided* to
++            // publish, not when the bytes became visible, and `δ_clock` in
++            // `G_orphan > W_write + δ_clock` (`0016:1478`) covers clock resolution and
++            // skew — never unbounded syscall latency. If the publication landed late,
++            // the write is **retracted**, leaving the store as if it had never
++            // happened, and the caller gets the refusal. (Leaving it and merely
++            // refusing the caller is 0016 outcome (a), the leak this prevents.)
++            //
++            // A retraction that FAILS is not reported as a deadline refusal: that class
++            // asserts the write did not take effect, and here it may still be present.
++            // It surfaces as [`FsChunkStoreError::RetractionFailed`] instead, so the
++            // caller sees an indeterminate backend fault rather than a false "nothing
++            // happened".
++            //
++            // The residual window is between the rename returning and the retraction
++            // completing: a concurrent reader can observe the fragment there. It is
++            // bounded by one `unlink` on the same directory, and the durable state a
++            // later reader (GC, scrub, the read path) sees is retracted — which is the
++            // state 0016's argument is about.
++            if let Some(deadline_millis) = deadline_millis {
++                if let Some(refusal) =
++                    WriteDeadlineExpired::if_elapsed(id, deadline_millis, clock.now_millis())
++                {
++                    if !published_over_existing {
++                        retract_publication(&final_path).map_err(|source| {
++                            FsChunkStoreError::RetractionFailed {
++                                id,
++                                deadline_millis,
++                                source,
++                            }
++                        })?;
++                    }
++                    return Err(Box::new(refusal));
++                }
++            }
+             Ok(())
+         })
+         .await
+@@ -331,7 +442,7 @@ impl ChunkStore for FsChunkStore {
+ /// addressed by `FragmentId`, so it is a single-D-server [`PlacementChunkStore`] and
+ /// uses the trait's identity defaults (the placement record is advisory here — the
+ /// store routes by `FragmentId`). Proposal 0005, M3.1.
+-impl PlacementChunkStore for FsChunkStore {}
++impl<C: Clock + Send + Sync + 'static> PlacementChunkStore for FsChunkStore<C> {}
+ 
+ /// Errors specific to the filesystem chunk store; surfaced through the trait's
+ /// boxed error.
+@@ -347,6 +458,24 @@ pub enum FsChunkStoreError {
+         /// The id recorded in the fragment header.
+         found: FragmentId,
+     },
++    /// A write that turned out to have been **published after its authorization
++    /// deadline** could not be retracted (issue #638): the publishing rename
++    /// succeeded, the post-publication clock read showed the deadline had elapsed,
++    /// and removing the freshly published file failed.
++    ///
++    /// It is deliberately **not** a [`wyrd_traits::WriteDeadlineExpired`]: that class
++    /// tells a caller the write definitively did **not** take effect, and here the
++    /// bytes may still be on disk. Reporting this as a clean deadline refusal would
++    /// be the one lie the refusal class must never tell, so it surfaces as this
++    /// backend fault instead — indeterminate for the caller, loud for the operator.
++    RetractionFailed {
++        /// The fragment whose late publication could not be undone.
++        id: FragmentId,
++        /// The authorization deadline the publication overran, epoch milliseconds.
++        deadline_millis: u64,
++        /// The filesystem error the removal failed with.
++        source: std::io::Error,
++    },
+ }
+ 
+ impl fmt::Display for FsChunkStoreError {
+@@ -359,6 +488,18 @@ impl fmt::Display for FsChunkStoreError {
+                  chunk {:032x} index {}",
+                 expected.chunk, expected.index, found.chunk, found.index
+             ),
++            FsChunkStoreError::RetractionFailed {
++                id,
++                deadline_millis,
++                source,
++            } => write!(
++                f,
++                "fragment {:032x} index {} was published AFTER its authorization deadline \
++                 ({deadline_millis} ms, epoch) and could not be retracted: {source}. The \
++                 bytes may still be present, so this is NOT a clean deadline refusal — \
++                 treat the write's effect as unknown (issue #638)",
++                id.chunk, id.index,
++            ),
+         }
+     }
+ }
+@@ -368,10 +509,41 @@ impl std::error::Error for FsChunkStoreError {
+         match self {
+             FsChunkStoreError::NotAFragment(e) => Some(e),
+             FsChunkStoreError::IdMismatch { .. } => None,
++            FsChunkStoreError::RetractionFailed { source, .. } => Some(source),
+         }
+     }
+ }
+ 
++/// Whether a published fragment already occupies `final_path` — read once per
++/// deadline-carrying write, just before its publishing rename (issue #638), to tell
++/// "our rename created this entry" from "our rename replaced an identical one".
++///
++/// An **unreadable** answer counts as *not* published, which is the fail-closed
++/// direction for `W_write`: the write this guards is one whose publication may land
++/// after its deadline, and 0016 decision 5's whole argument is that such a write must
++/// not remain in effect. The cost of being wrong is a byte-identical duplicate the
++/// custodian's scrub/reconstruction repairs; the cost of the other mistake is the
++/// unevidenced late fragment (outcome (a)).
++fn is_published(final_path: &Path) -> bool {
++    final_path.try_exists().unwrap_or(false)
++}
++
++/// Undo a publication that turned out to be past its deadline (issue #638): remove the
++/// file the rename just published, so the store is left as if the write had never
++/// happened.
++///
++/// A `NotFound` is success, not a failure — the fragment is gone, which is the state
++/// asked for (a concurrent `delete_fragment`/GC reclaim got there first). Every other
++/// error is propagated: the caller must not be told "not applied" while the bytes are
++/// still on disk.
++fn retract_publication(final_path: &Path) -> std::io::Result<()> {
++    match fs::remove_file(final_path) {
++        Ok(()) => Ok(()),
++        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
++        Err(e) => Err(e),
++    }
++}
++
+ /// The path a fragment for `id` would occupy under `root`. Exposed so tests (and
+ /// a future scrubber) can locate a fragment on disk.
+ pub fn fragment_path(root: &Path, id: FragmentId) -> PathBuf {
+@@ -492,4 +664,67 @@ mod tests {
+             "NotAFragment carries its FragmentError as the error source"
+         );
+     }
++
++    /// Retracting a late publication (issue #638) succeeds when the file goes away and
++    /// when it was **already** gone — a concurrent `delete_fragment`/GC reclaim leaves
++    /// exactly the state the retraction wanted, so `NotFound` is success, not a fault.
++    /// Every other failure propagates: the caller must never be told "not applied"
++    /// while the bytes are still there.
++    #[test]
++    fn retracting_a_publication_is_idempotent_but_never_swallows_a_real_failure() {
++        let dir = tempfile::tempdir().unwrap();
++        let published = dir.path().join("00000.frag");
++        std::fs::write(&published, b"published too late").unwrap();
++
++        assert!(
++            retract_publication(&published).is_ok(),
++            "the published file is removed"
++        );
++        assert!(!published.exists(), "and it is really gone");
++        assert!(
++            retract_publication(&published).is_ok(),
++            "an already-absent fragment is the state asked for, not an error"
++        );
++
++        // A removal that genuinely cannot happen (the path is a directory) must be
++        // surfaced, so `put_fragment` reports `RetractionFailed` — an indeterminate
++        // backend fault — instead of a clean deadline refusal that would claim the
++        // write did not take effect.
++        let err = retract_publication(dir.path())
++            .expect_err("removing a directory as a file cannot succeed");
++        let wrapped = FsChunkStoreError::RetractionFailed {
++            id: FragmentId {
++                chunk: 0x638,
++                index: 0,
++            },
++            deadline_millis: 10_000,
++            source: err,
++        };
++        assert!(
++            !wyrd_traits::is_write_deadline_expired(&wrapped),
++            "a failed retraction must NOT classify as a deadline refusal: {wrapped}"
++        );
++        assert!(
++            std::error::Error::source(&wrapped).is_some(),
++            "it carries the filesystem error that stopped it"
++        );
++        let rendered = wrapped.to_string();
++        assert!(
++            rendered.contains("may still be present"),
++            "and it says so for the operator: {rendered}"
++        );
++    }
++
++    /// The retraction guard (issue #638): `is_published` distinguishes "our rename
++    /// created this entry" from "it was already there". Mutating it to a constant makes
++    /// a late duplicate write either destroy an already-acknowledged fragment (always
++    /// `false`) or leave its own late publication in place (always `true`).
++    #[test]
++    fn is_published_reports_a_fragment_that_already_exists() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("00000.frag");
++        assert!(!is_published(&path), "nothing published yet");
++        std::fs::write(&path, b"published").unwrap();
++        assert!(is_published(&path), "now it is published");
++    }
+ }
+diff --git a/crates/chunkstore-fs/tests/concurrent_put.rs b/crates/chunkstore-fs/tests/concurrent_put.rs
+index 8647737..2ee1495 100644
+--- a/crates/chunkstore-fs/tests/concurrent_put.rs
++++ b/crates/chunkstore-fs/tests/concurrent_put.rs
+@@ -56,7 +56,7 @@ fn race_same_id(
+             .map(|_| {
+                 scope.spawn(|| {
+                     barrier.wait();
+-                    block_on(store.put_fragment(id, frag.clone())).map_err(|e| e.to_string())
++                    block_on(store.put_fragment(id, frag.clone(), None)).map_err(|e| e.to_string())
+                 })
+             })
+             .collect();
+diff --git a/crates/chunkstore-fs/tests/conformance.rs b/crates/chunkstore-fs/tests/conformance.rs
+index 63ed801..df91c71 100644
+--- a/crates/chunkstore-fs/tests/conformance.rs
++++ b/crates/chunkstore-fs/tests/conformance.rs
+@@ -36,7 +36,7 @@ fn store() -> (FsChunkStore, tempfile::TempDir) {
+ 
+ async fn round_trips(store: &impl ChunkStore, id: FragmentId, payload: &[u8]) {
+     let frag = fragment(id, payload);
+-    store.put_fragment(id, frag.clone()).await.unwrap();
++    store.put_fragment(id, frag.clone(), None).await.unwrap();
+     let got = store.get_fragment(id).await.unwrap();
+     assert_eq!(
+         got.as_deref(),
+@@ -66,10 +66,10 @@ fn fragments_of_one_chunk_are_addressed_independently_by_index() {
+     block_on(async {
+         let (s, _dir) = store();
+         let chunk = 0x5151;
+-        s.put_fragment(fid(chunk, 0), fragment(fid(chunk, 0), b"index zero"))
++        s.put_fragment(fid(chunk, 0), fragment(fid(chunk, 0), b"index zero"), None)
+             .await
+             .unwrap();
+-        s.put_fragment(fid(chunk, 1), fragment(fid(chunk, 1), b"index one"))
++        s.put_fragment(fid(chunk, 1), fragment(fid(chunk, 1), b"index one"), None)
+             .await
+             .unwrap();
+ 
+@@ -111,7 +111,9 @@ fn list_and_delete_walk_the_store() {
+ 
+         let ids = [fid(0x11, 0), fid(0x11, 4), fid(0x22, 0)];
+         for &id in &ids {
+-            s.put_fragment(id, fragment(id, b"walked")).await.unwrap();
++            s.put_fragment(id, fragment(id, b"walked"), None)
++                .await
++                .unwrap();
+         }
+         let listed: std::collections::HashSet<_> =
+             s.list_fragments().await.unwrap().into_iter().collect();
+@@ -144,7 +146,9 @@ fn list_skips_foreign_and_temp_entries() {
+     block_on(async {
+         let (s, dir) = store();
+         let id = fid(0x33, 0);
+-        s.put_fragment(id, fragment(id, b"real")).await.unwrap();
++        s.put_fragment(id, fragment(id, b"real"), None)
++            .await
++            .unwrap();
+ 
+         // A leftover `.tmp` (an interrupted put) and a foreign directory/file
+         // must not surface as phantom fragments — the walk parses names strictly.
+@@ -168,7 +172,7 @@ fn corruption_is_detected_on_read() {
+     block_on(async {
+         let (s, dir) = store();
+         let id = fid(7, 0);
+-        s.put_fragment(id, fragment(id, b"important"))
++        s.put_fragment(id, fragment(id, b"important"), None)
+             .await
+             .unwrap();
+ 
+@@ -191,7 +195,7 @@ fn put_rejects_non_fragment_bytes() {
+     block_on(async {
+         let (s, _dir) = store();
+         let err = s
+-            .put_fragment(fid(1, 0), Bytes::from_static(b"not a fragment"))
++            .put_fragment(fid(1, 0), Bytes::from_static(b"not a fragment"), None)
+             .await;
+         assert!(err.is_err(), "garbage must be rejected, not stored");
+         assert!(s.get_fragment(fid(1, 0)).await.unwrap().is_none());
+@@ -204,17 +208,367 @@ fn put_rejects_chunk_or_index_mismatch() {
+         let (s, _dir) = store();
+         // Header chunk id differs from the key's chunk.
+         assert!(
+-            s.put_fragment(fid(0x2222, 0), fragment(fid(0x1111, 0), b"payload"))
++            s.put_fragment(fid(0x2222, 0), fragment(fid(0x1111, 0), b"payload"), None)
+                 .await
+                 .is_err(),
+             "a fragment must be filed under the chunk its header records"
+         );
+         // Header index differs from the key's index.
+         assert!(
+-            s.put_fragment(fid(0x1111, 1), fragment(fid(0x1111, 0), b"payload"))
++            s.put_fragment(fid(0x1111, 1), fragment(fid(0x1111, 0), b"payload"), None)
+                 .await
+                 .is_err(),
+             "a fragment must be filed under the index its header records"
+         );
+     });
+ }
++
++// ---- Issue #638 — the fragment-write authorization deadline (`W_write`) ----
++//
++// `chunkstore-fs` must honour the identical contract a networked D server does
++// (leg E, `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`):
++// a caller must not get a weaker guarantee by holding a local store. Asserted
++// directly against the real `FsChunkStore::put_fragment`, "cheaply, in the same
++// file" per the brief — this is the local-store peer of
++// `crates/chunkstore-grpc/tests/write_deadline.rs`'s wire-level legs.
++//
++// Time is injected through the store's `Clock` seam (ADR-0024) rather than slept
++// through, so every leg is deterministic and needs no wall clock in the test.
++
++/// A store whose deadline judgments run on `clock`, so the test owns time.
++fn store_with_clock<C: wyrd_testkit::Clock>(clock: C) -> (FsChunkStore<C>, tempfile::TempDir) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let store = FsChunkStore::open_with_clock(dir.path(), clock).expect("open store");
++    (store, dir)
++}
++
++/// Scratch (`*.tmp`) files still lying under the store root — a refused write must
++/// leave none, exactly as a failed write does.
++fn scratch_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
++    let mut found = Vec::new();
++    for chunk_dir in std::fs::read_dir(root).expect("read root").flatten() {
++        if !chunk_dir.file_type().expect("file type").is_dir() {
++            continue;
++        }
++        for entry in std::fs::read_dir(chunk_dir.path())
++            .expect("read chunk dir")
++            .flatten()
++        {
++            if entry.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
++                found.push(entry.path());
++            }
++        }
++    }
++    found
++}
++
++#[test]
++fn put_refuses_an_expired_deadline_at_admission_without_touching_the_disk() {
++    block_on(async {
++        // The store's clock stands at 10_000; the write was authorized until 9_000.
++        let (s, dir) = store_with_clock(wyrd_testkit::ManualClock::new(10_000));
++        let id = fid(0xf00d_0000_0000_0000_0000_0000_0000_0001, 0);
++        let frag = fragment(id, b"authorized too long ago");
++
++        let err = s
++            .put_fragment(id, frag, Some(9_000))
++            .await
++            .expect_err("a write whose deadline already elapsed must be refused");
++        assert!(
++            wyrd_traits::is_write_deadline_expired(err.as_ref()),
++            "must classify as WriteDeadlineExpired, not a generic/backend fault: {err}"
++        );
++        assert!(
++            s.get_fragment(id).await.unwrap().is_none(),
++            "a refused write must not be stored"
++        );
++        // A write that is doomed on arrival costs the D server *nothing*: no chunk
++        // directory, no scratch, no rename-then-retract cycle. That is what the
++        // admission check buys over relying on the post-publication bound alone.
++        assert!(
++            !dir.path().join(format!("{:032x}", id.chunk)).exists(),
++            "an already-expired write must be refused before any disk work"
++        );
++        assert!(
++            scratch_files(dir.path()).is_empty(),
++            "a refused write must leave no scratch behind: {:?}",
++            scratch_files(dir.path())
++        );
++    });
++}
++
++#[test]
++fn put_within_its_deadline_is_unaffected() {
++    block_on(async {
++        let (s, _dir) = store_with_clock(wyrd_testkit::ManualClock::new(10_000));
++        let id = fid(0xf00d_0000_0000_0000_0000_0000_0000_0002, 0);
++        let frag = fragment(id, b"comfortably inside its window");
++
++        s.put_fragment(id, frag.clone(), Some(70_000))
++            .await
++            .expect("a live write comfortably inside its deadline must succeed");
++        assert_eq!(
++            s.get_fragment(id).await.unwrap().as_deref(),
++            Some(frag.as_ref())
++        );
++    });
++}
++
++/// A [`wyrd_testkit::Clock`] anchored to the store's **actual publication**, not to a
++/// read count (issue #638).
++///
++/// `FsChunkStore` publishes by renaming its private scratch (`<index>.<seq>.tmp`) onto
++/// `<index>.frag`; that rename is the only publish point, and it is a syscall a test can
++/// neither slow down nor step through. So this clock *looks at the store's own chunk
++/// directory* on every read and answers:
++///
++/// * `live` — while the fragment is not on disk (nothing written yet, or the scratch is
++///   still lying there un-renamed);
++/// * `late` — from the first read taken with the `.frag` **present**, i.e. strictly on
++///   the far side of the rename.
++///
++/// That makes "time advances across the publication syscall" a fact about the store's
++/// on-disk state rather than an assumption about which read is which — the distinction a
++/// scripted-reads clock cannot make, since it can only call *some* read "the
++/// publication", including one taken before the rename. A store that judges the deadline
++/// only before renaming never gets a `late` reading at all: it publishes the write, and
++/// the leg below goes red.
++///
++/// Every reading is recorded with what the directory looked like when it was taken, and
++/// that record is the evidence the test asserts on.
++#[derive(Clone)]
++struct AcrossPublication {
++    inner: std::sync::Arc<AcrossPublicationInner>,
++}
++
++struct AcrossPublicationInner {
++    chunk_dir: std::path::PathBuf,
++    live: u64,
++    late: u64,
++    reads: std::sync::Mutex<Vec<ClockRead>>,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct ClockRead {
++    answer: u64,
++    scratch_present: bool,
++    fragment_present: bool,
++}
++
++impl AcrossPublication {
++    fn new(chunk_dir: std::path::PathBuf, live: u64, late: u64) -> Self {
++        Self {
++            inner: std::sync::Arc::new(AcrossPublicationInner {
++                chunk_dir,
++                live,
++                late,
++                reads: std::sync::Mutex::new(Vec::new()),
++            }),
++        }
++    }
++
++    fn reads(&self) -> Vec<ClockRead> {
++        self.inner.reads.lock().expect("clock reads").clone()
++    }
++}
++
++impl wyrd_testkit::Clock for AcrossPublication {
++    fn now_millis(&self) -> u64 {
++        let (mut scratch_present, mut fragment_present) = (false, false);
++        if let Ok(entries) = std::fs::read_dir(&self.inner.chunk_dir) {
++            for entry in entries.flatten() {
++                match entry.path().extension().and_then(|e| e.to_str()) {
++                    Some("tmp") => scratch_present = true,
++                    Some("frag") => fragment_present = true,
++                    _ => {}
++                }
++            }
++        }
++        let answer = if fragment_present {
++            self.inner.late
++        } else {
++            self.inner.live
++        };
++        self.inner
++            .reads
++            .lock()
++            .expect("clock reads")
++            .push(ClockRead {
++                answer,
++                scratch_present,
++                fragment_present,
++            });
++        answer
++    }
++}
++
++/// **The bound itself** (issue #638, the enforcement claim of 0016 decision 5): a write
++/// whose deadline elapses *across the publication* must not remain in effect. The
++/// guarantee is about when the write **takes effect**, and the publishing `rename` is
++/// itself a syscall that can block — so a deadline judged only *before* it bounds when
++/// the store decided to publish, never when the bytes became visible, and `δ_clock` in
++/// `G_orphan > W_write + δ_clock` (`0016:1478`) covers clock resolution and skew, not
++/// unbounded I/O latency.
++///
++/// [`AcrossPublication`] puts the elapsing exactly there: it reports the write live until
++/// the store's own directory shows the rename has completed (scratch gone, `.frag`
++/// present), and past the deadline from that instant on. The store must then **retract**
++/// the publication — the fragment unreadable, the file gone, no scratch left — and return
++/// the typed refusal.
++///
++/// A build that checks the deadline only before the rename publishes this write and never
++/// takes a reading on the far side: both the "not stored" assertions and the
++/// `judged_after_publication` one below fail. That is the defect this leg exists to catch.
++#[test]
++fn a_write_published_past_its_deadline_is_retracted_not_left_in_place() {
++    block_on(async {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let id = fid(0xf00d_0000_0000_0000_0000_0000_0000_0003, 0);
++        let clock =
++            AcrossPublication::new(dir.path().join(format!("{:032x}", id.chunk)), 9_500, 10_500);
++        let s = FsChunkStore::open_with_clock(dir.path(), clock.clone()).expect("open store");
++        let frag = fragment(id, b"live at the rename, late once it landed");
++
++        let err = s.put_fragment(id, frag, Some(10_000)).await.expect_err(
++            "a write whose deadline elapses across the publishing rename must be refused \
++             — a check that precedes the rename cannot bound the rename itself",
++        );
++        assert!(
++            wyrd_traits::is_write_deadline_expired(err.as_ref()),
++            "the refusal must be the typed deadline class, not an I/O error: {err}"
++        );
++
++        let reads = clock.reads();
++        assert!(
++            reads
++                .iter()
++                .any(|r| r.fragment_present && !r.scratch_present && r.answer == 10_500),
++            "the store must judge the deadline on the far side of the publication: no \
++             clock read was taken with the fragment on disk and the scratch renamed away \
++             — the reads were {reads:?}"
++        );
++        assert!(
++            s.get_fragment(id).await.unwrap().is_none(),
++            "the late publication must be RETRACTED, not merely refused to the caller: \
++             leaving the bytes is precisely 0016 outcome (a), the unreferenced and \
++             unevidenced fragment"
++        );
++        assert!(
++            !fragment_path(dir.path(), id).exists(),
++            "and the published file itself is gone from disk, not just unreadable"
++        );
++        assert!(
++            scratch_files(dir.path()).is_empty(),
++            "no scratch litter either: {:?}",
++            scratch_files(dir.path())
++        );
++    });
++}
++
++/// The retraction is **attributable**: it undoes *this* write's publication and nothing
++/// else (issue #638). A fragment an earlier write already published — a live write from
++/// another writer, or an idempotent retry of this one — must survive a later write's late
++/// publication of the identical bytes, because that fragment's presence is explained by an
++/// authorization that was not late.
++///
++/// Without the guard the retraction is a plain `remove_file` and this test goes red: a
++/// straggling duplicate would delete a fragment the store had already acknowledged, turning
++/// a deadline mechanism into a data-loss mechanism.
++///
++/// The clock is scripted by *read* here, not anchored to the publication as in the leg
++/// above — the fragment is already on disk before the straggler starts, so its presence
++/// cannot mark the straggler's own rename. Four readings, two per `put_fragment`
++/// (admission, then post-publication), with only the last one past a deadline; the
++/// `remaining()` assertion pins that the store took exactly those reads, so dropping
++/// either check is caught here as well.
++#[test]
++fn a_late_duplicate_does_not_retract_an_already_published_fragment() {
++    block_on(async {
++        let clock = wyrd_testkit::SteppedClock::new([9_500, 9_500, 9_500, 10_500]);
++        let (s, dir) = store_with_clock(clock.clone());
++        let id = fid(0xf00d_0000_0000_0000_0000_0000_0000_0005, 0);
++        let frag = fragment(id, b"published by a write that was in time");
++
++        // First, a write that lands well inside its window (the acknowledged fragment).
++        s.put_fragment(id, frag.clone(), Some(9_900))
++            .await
++            .expect("the first write is live and must be stored");
++        assert_eq!(
++            s.get_fragment(id).await.unwrap().as_deref(),
++            Some(frag.as_ref()),
++            "precondition: the fragment is published"
++        );
++
++        // Now a straggler for the same id: live on arrival, late once it has published.
++        let err = s
++            .put_fragment(id, frag.clone(), Some(10_000))
++            .await
++            .expect_err("the straggler is past its deadline once published and is refused");
++        assert!(
++            wyrd_traits::is_write_deadline_expired(err.as_ref()),
++            "{err}"
++        );
++        assert_eq!(
++            clock.remaining(),
++            0,
++            "each put takes exactly two readings — admission and post-publication; an \
++             unconsumed reading means one of the two checks is gone"
++        );
++
++        assert_eq!(
++            s.get_fragment(id).await.unwrap().as_deref(),
++            Some(frag.as_ref()),
++            "the fragment the FIRST, live write published must still be there — a late \
++             duplicate retracts its own publication, never somebody else's"
++        );
++        assert!(
++            scratch_files(dir.path()).is_empty(),
++            "and it leaves no scratch: {:?}",
++            scratch_files(dir.path())
++        );
++    });
++}
++
++/// The control for the leg above (issue #638 leg F, the "genuine backend fault" half): a
++/// **real** I/O failure from the same production store — the chunk directory's path is
++/// occupied by a *file*, so the scratch write fails `ENOTDIR` — must NOT read as a deadline
++/// refusal. Without this control, "the refusal is classifiable" would rest on the deadline
++/// side alone, and a store that reported every failure as a deadline refusal would pass.
++#[test]
++fn a_genuine_backend_fault_is_not_a_deadline_refusal() {
++    block_on(async {
++        let (s, dir) = store_with_clock(wyrd_testkit::ManualClock::new(10_000));
++        let id = fid(0xf00d_0000_0000_0000_0000_0000_0000_0004, 0);
++        // Occupy the chunk directory's path with a file: every write beneath it now fails
++        // with a real `ENOTDIR` from the filesystem, on any platform and as any user.
++        std::fs::write(
++            dir.path().join(format!("{:032x}", id.chunk)),
++            b"not a directory",
++        )
++        .expect("plant the obstruction");
++
++        let err = s
++            .put_fragment(id, fragment(id, b"doomed by the disk"), Some(70_000))
++            .await
++            .expect_err("a genuine I/O failure must surface as an error");
++        assert!(
++            !wyrd_traits::is_write_deadline_expired(err.as_ref()),
++            "a broken backend must never be reported as 'refused, too late' — a caller \
++             would stop re-authorizing and start ignoring a real fault: {err}"
++        );
++        assert!(
++            err.downcast_ref::<std::io::Error>().is_some(),
++            "it stays the backend's own I/O error: {err}"
++        );
++        // And the deadline refusal is not an I/O error either — the two are disjoint.
++        let refusal = s
++            .put_fragment(id, fragment(id, b"too late"), Some(9_000))
++            .await
++            .expect_err("an expired deadline is refused");
++        assert!(wyrd_traits::is_write_deadline_expired(refusal.as_ref()));
++        assert!(
++            refusal.downcast_ref::<std::io::Error>().is_none(),
++            "a deadline refusal is an expected outcome, not a backend fault: {refusal}"
++        );
++    });
++}
+diff --git a/crates/chunkstore-grpc/Cargo.toml b/crates/chunkstore-grpc/Cargo.toml
+index 7215869..b41363c 100644
+--- a/crates/chunkstore-grpc/Cargo.toml
++++ b/crates/chunkstore-grpc/Cargo.toml
+@@ -50,6 +50,10 @@ tempfile.workspace = true
+ # provides the in-process coordination backend for the test-local Custodian::elect.
+ wyrd-custodian.workspace = true
+ wyrd-coordination-mem.workspace = true
++# The Clock seam (ADR-0024): the write-deadline tests (issue #638) drive the hosted
++# store's own clock — a manual/scripted one — so a deadline elapsing between the D
++# server accepting a write and applying it is deterministic, not slept through.
++wyrd-testkit.workspace = true
+ 
+ # Inherit the workspace lint policy (single source of truth in the root
+ # Cargo.toml [workspace.lints.*]).
+diff --git a/crates/chunkstore-grpc/src/client.rs b/crates/chunkstore-grpc/src/client.rs
+index 234891f..57bb7be 100644
+--- a/crates/chunkstore-grpc/src/client.rs
++++ b/crates/chunkstore-grpc/src/client.rs
+@@ -12,7 +12,7 @@ use wyrd_proto::v0::{
+ };
+ use wyrd_traits::{
+     BlockReadFault, BoxError, ChunkStore, ErrorClass, FragmentId, Health, IntegrityFault, Result,
+-    TransientFault,
++    TransientFault, WriteDeadlineExpired,
+ };
+ 
+ use crate::conv;
+@@ -144,6 +144,29 @@ fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
+     }
+ }
+ 
++/// Classify a `put_fragment` error status (issue #638). `FAILED_PRECONDITION` reconstructs
++/// a typed [`WriteDeadlineExpired`] — the D server's refusal of a write whose authorization
++/// deadline had elapsed when it reached the point of applying it (proposal 0016 decision 5)
++/// — so a caller tells "refused, too late" apart from a genuine backend fault by
++/// `wyrd_traits::is_write_deadline_expired`, exactly the trick `classify_get_status` plays
++/// for `get_fragment`'s fault categories. The refusal's `detail` is the **server's own**
++/// rendering (its deadline and its clock reading), carried verbatim: this side never read
++/// that clock, so it must not fabricate the readings — only restore the *class*.
++///
++/// `put_fragment`'s other special status, `INVALID_ARGUMENT` (a malformed fragment), keeps
++/// surfacing through the wire `Status` code as it did before this issue, and everything else
++/// falls to [`transport_error`]'s generic mapping (the transient trio plus the fail-safe
++/// terminal default).
++fn classify_put_status(id: FragmentId, status: Status) -> BoxError {
++    match status.code() {
++        Code::FailedPrecondition => Box::new(WriteDeadlineExpired {
++            id,
++            detail: status.message().to_string(),
++        }),
++        _ => transport_error(status),
++    }
++}
++
+ /// A [`ChunkStore`] implemented over a gRPC channel to one D server.
+ ///
+ /// The trait's `&self` methods clone the inner tonic client per call — tonic
+@@ -205,16 +228,39 @@ impl GrpcChunkStore {
+ 
+ #[async_trait]
+ impl ChunkStore for GrpcChunkStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    /// `deadline_millis` travels to the D server as `FragmentPutRequest.deadline_millis`
++    /// (issue #638) and is enforced **there**, around the point the write is applied —
++    /// including *after* its publish step, which is why a late publication is retracted
++    /// rather than left in place: this is the half of `W_write` a caller cannot provide
++    /// for itself (proposal 0016 `:1557-1564`). The caller-side half — a bounded, fail-closed await — is the
++    /// channel's own request timeout, wired at composition by
++    /// [`GrpcChunkStore::connect_with_timeout`] (`crates/server/src/cli.rs:1441`); a
++    /// second per-call bound here was reviewed and rejected as a duplicate
++    /// (`results/issue_508/review-rejected.md:10`), and cancelling the await *at* the
++    /// deadline would additionally destroy the verdict this field exists to deliver —
++    /// the server's definite "not applied", which a client-side timeout can never
++    /// distinguish from "may still land".
++    ///
++    /// **Mixed-version caveat:** an old D server ignores the field, so a new client
++    /// talking to one degrades to today's unenforced behaviour rather than failing. There
++    /// is no capability exchange yet — a mixed-version fleet does **not** get the
++    /// guarantee.
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         let mut client = self.client.clone();
+         let request = FragmentPutRequest {
+             id: Some(conv::to_wire_fragment_id(id)),
+             fragment: fragment.to_vec(),
++            deadline_millis,
+         };
+         client
+             .put_fragment(Request::new(request))
+             .await
+-            .map_err(transport_error)?;
++            .map_err(|status| classify_put_status(id, status))?;
+         Ok(())
+     }
+ 
+diff --git a/crates/chunkstore-grpc/src/fanout.rs b/crates/chunkstore-grpc/src/fanout.rs
+index 63bb818..ea60554 100644
+--- a/crates/chunkstore-grpc/src/fanout.rs
++++ b/crates/chunkstore-grpc/src/fanout.rs
+@@ -76,8 +76,20 @@ impl<C: ChunkStore> FanoutChunkStore<C> {
+ 
+ #[async_trait]
+ impl<C: ChunkStore> ChunkStore for FanoutChunkStore<C> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.route(id.index).put_fragment(id, fragment).await
++    /// Routes to the placed backend and forwards `deadline_millis` **unchanged** (issue
++    /// #638). The fan-out is deliberately *not* an enforcement point: it is still
++    /// caller-side, and a second gateway — or a retry — reaches the D server's service
++    /// directly, so a deadline honoured only here would bound nothing (proposal 0016
++    /// decision 5).
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.route(id.index)
++            .put_fragment(id, fragment, deadline_millis)
++            .await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+@@ -149,8 +161,11 @@ impl<C: ChunkStore> PlacementChunkStore for FanoutChunkStore<C> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+-        self.route_dserver(dserver).put_fragment(id, fragment).await
++        self.route_dserver(dserver)
++            .put_fragment(id, fragment, deadline_millis)
++            .await
+     }
+ }
+ 
+@@ -162,10 +177,14 @@ mod tests {
+ 
+     /// An in-memory `ChunkStore` with a fixed reported health, cheap to clone so a
+     /// test can keep a handle after the store is moved into the fan-out and inspect
+-    /// which backend a put landed on.
++    /// which backend a put landed on — and, since issue #638, *what deadline it was
++    /// routed with*.
+     #[derive(Clone)]
+     struct MemStore {
+         frags: Arc<Mutex<HashMap<FragmentId, Bytes>>>,
++        /// The `deadline_millis` of the last `put_fragment` this backend received, so a
++        /// test can assert the fan-out forwards it rather than dropping it on the floor.
++        last_deadline: Arc<Mutex<Option<Option<u64>>>>,
+         health: Health,
+     }
+ 
+@@ -173,6 +192,7 @@ mod tests {
+         fn with_health(health: Health) -> Self {
+             Self {
+                 frags: Arc::new(Mutex::new(HashMap::new())),
++                last_deadline: Arc::new(Mutex::new(None)),
+                 health,
+             }
+         }
+@@ -182,11 +202,22 @@ mod tests {
+         fn has(&self, id: FragmentId) -> bool {
+             self.frags.lock().unwrap().contains_key(&id)
+         }
++        /// The deadline the last put carried: `None` = no put reached this backend,
++        /// `Some(None)` = a put with no deadline, `Some(Some(d))` = a put with `d`.
++        fn last_deadline(&self) -> Option<Option<u64>> {
++            *self.last_deadline.lock().unwrap()
++        }
+     }
+ 
+     #[async_trait]
+     impl ChunkStore for MemStore {
+-        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        async fn put_fragment(
++            &self,
++            id: FragmentId,
++            fragment: Bytes,
++            deadline_millis: Option<u64>,
++        ) -> Result<()> {
++            *self.last_deadline.lock().unwrap() = Some(deadline_millis);
+             self.frags.lock().unwrap().insert(id, fragment);
+             Ok(())
+         }
+@@ -233,14 +264,14 @@ mod tests {
+         let fanout = FanoutChunkStore::new(vec![a.clone(), b.clone()]);
+ 
+         fanout
+-            .put_fragment(fid(1), Bytes::from_static(b"x"))
++            .put_fragment(fid(1), Bytes::from_static(b"x"), None)
+             .await
+             .unwrap();
+         assert!(b.has(fid(1)), "index 1 routes to store[1] (1 % 2)");
+         assert!(!a.has(fid(1)), "index 1 is not on store[0]");
+ 
+         fanout
+-            .put_fragment(fid(2), Bytes::from_static(b"y"))
++            .put_fragment(fid(2), Bytes::from_static(b"y"), None)
+             .await
+             .unwrap();
+         assert!(a.has(fid(2)), "index 2 wraps to store[0] (2 % 2)");
+@@ -252,11 +283,11 @@ mod tests {
+     async fn list_fragments_unions_every_backend() {
+         let fanout = FanoutChunkStore::new(vec![MemStore::healthy(), MemStore::healthy()]);
+         fanout
+-            .put_fragment(fid(0), Bytes::from_static(b"x"))
++            .put_fragment(fid(0), Bytes::from_static(b"x"), None)
+             .await
+             .unwrap();
+         fanout
+-            .put_fragment(fid(1), Bytes::from_static(b"y"))
++            .put_fragment(fid(1), Bytes::from_static(b"y"), None)
+             .await
+             .unwrap();
+ 
+@@ -329,7 +360,7 @@ mod tests {
+         // The fragment already lives where a custodian's evacuation placed it: on the
+         // backend the moved placement names, written directly so this test isolates
+         // the READ side (`get_fragment_at`) from any write-side routing.
+-        b.put_fragment(id, Bytes::from_static(b"moved-fragment"))
++        b.put_fragment(id, Bytes::from_static(b"moved-fragment"), None)
+             .await
+             .unwrap();
+ 
+@@ -371,7 +402,7 @@ mod tests {
+             // have left it — independent of `put_fragment_at`, so this isolates the
+             // read side.
+             stores[dserver as usize]
+-                .put_fragment(id, Bytes::from(format!("frag-{index}")))
++                .put_fragment(id, Bytes::from(format!("frag-{index}")), None)
+                 .await
+                 .unwrap();
+         }
+@@ -403,7 +434,7 @@ mod tests {
+         let moved_dserver: DServerId = 1;
+ 
+         fanout
+-            .put_fragment_at(moved_dserver, id, Bytes::from_static(b"x"))
++            .put_fragment_at(moved_dserver, id, Bytes::from_static(b"x"), None)
+             .await
+             .unwrap();
+ 
+@@ -416,4 +447,45 @@ mod tests {
+             "must NOT fall back to stores[index % n] (store[0])"
+         );
+     }
++
++    /// `:84` / `:159` (issue #638) — routing must carry the write's authorization deadline
++    /// to the backend **unchanged**, on both entry points. The deadline is enforced by the
++    /// store this routes to, so a wrapper that swallowed it (passing `None` onwards) would
++    /// silently disable `W_write` for every write that goes through a fan-out — and no
++    /// existing assertion would notice, because the write would simply succeed.
++    #[tokio::test]
++    async fn routing_forwards_the_authorization_deadline_unchanged() {
++        let a = MemStore::healthy();
++        let b = MemStore::healthy();
++        let fanout = FanoutChunkStore::new(vec![a.clone(), b.clone()]);
++
++        fanout
++            .put_fragment(fid(1), Bytes::from_static(b"x"), Some(1_234))
++            .await
++            .unwrap();
++        assert_eq!(
++            b.last_deadline(),
++            Some(Some(1_234)),
++            "put_fragment must hand the deadline to the routed backend, not drop it"
++        );
++
++        fanout
++            .put_fragment_at(1, fid(0), Bytes::from_static(b"y"), Some(5_678))
++            .await
++            .unwrap();
++        assert_eq!(
++            b.last_deadline(),
++            Some(Some(5_678)),
++            "put_fragment_at must forward the deadline too — the placement-resolved path is \
++             what the custodian and reconstruction writers use"
++        );
++
++        // And an absent deadline stays absent (additive compatibility): a fan-out must not
++        // invent one.
++        fanout
++            .put_fragment(fid(0), Bytes::from_static(b"z"), None)
++            .await
++            .unwrap();
++        assert_eq!(a.last_deadline(), Some(None));
++    }
+ }
+diff --git a/crates/chunkstore-grpc/src/server.rs b/crates/chunkstore-grpc/src/server.rs
+index 4f4ac3c..89fa666 100644
+--- a/crates/chunkstore-grpc/src/server.rs
++++ b/crates/chunkstore-grpc/src/server.rs
+@@ -69,17 +69,40 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
+     ) -> std::result::Result<Response<FragmentPutResponse>, Status> {
+         let request = request.into_inner();
+         let id = conv::from_wire_fragment_id(request.id)?;
+-        // The store verifies the fragment's checksums before acknowledging
+-        // (write step 2). A malformed/failing-integrity fragment is the **client's**
+-        // fault — surface it as `INVALID_ARGUMENT`, not `INTERNAL`, so the caller
+-        // does not retry bytes that can never verify; a true I/O failure stays
+-        // internal.
++        // `deadline_millis` is additive-optional on the wire (issue #638): absent is
++        // today's unbounded behaviour, so a pre-#638 client is unaffected. The
++        // deadline is **passed to the store**, which enforces it around the point it
++        // applies the write — deliberately not checked here. A check in this handler
++        // would bound only when the D server *accepted* the write, leaving the gap
++        // 0016 decision 5 is about (this handler's future can be dropped by a client
++        // reset while the store's blocking write runs on to its publish point), and it
++        // would give an embedded caller that holds the store directly (`FsChunkStore`,
++        // leg E) a weaker guarantee than a networked one.
+         self.inner
+-            .put_fragment(id, Bytes::from(request.fragment))
++            .put_fragment(id, Bytes::from(request.fragment), request.deadline_millis)
+             .await
+             .map_err(|e| {
++                // The store verifies the fragment's checksums before acknowledging
++                // (write step 2). A malformed/failing-integrity fragment is the
++                // **client's** fault — surface it as `INVALID_ARGUMENT`, not
++                // `INTERNAL`, so the caller does not retry bytes that can never
++                // verify; a true I/O failure stays internal.
+                 if wyrd_traits::is_integrity_fault(e.as_ref()) {
+                     Status::invalid_argument(e.to_string())
++                } else if wyrd_traits::is_write_deadline_expired(e.as_ref()) {
++                    // The deadline refusal (issue #638) is an **expected, non-fault**
++                    // outcome — the write was too late, this D server is healthy — so
++                    // it rides its own code, distinct from `INVALID_ARGUMENT`'s "bad
++                    // bytes" and from the transient/internal fault path, and
++                    // reconstructs client-side as a typed
++                    // `wyrd_traits::WriteDeadlineExpired` (`client.rs`'s
++                    // `classify_put_status`). `FAILED_PRECONDITION` is the gRPC code
++                    // for "the system is not in the state this operation requires and
++                    // the client should not retry until that changes" — here, not
++                    // until the write is re-authorized. It is unambiguous on this RPC:
++                    // `put_fragment` has never produced it (its `BlockReadFault`
++                    // meaning is `get_fragment`'s alone).
++                    Status::new(Code::FailedPrecondition, e.to_string())
+                 } else {
+                     transient_or_internal(&e)
+                 }
+diff --git a/crates/chunkstore-grpc/tests/error_class.rs b/crates/chunkstore-grpc/tests/error_class.rs
+index 6788981..8af5451 100644
+--- a/crates/chunkstore-grpc/tests/error_class.rs
++++ b/crates/chunkstore-grpc/tests/error_class.rs
+@@ -148,7 +148,7 @@ async fn a_genuine_integrity_fault_classifies_integrity_over_grpc() {
+ 
+     let id = fid(0xC0DE_0000_0000_0000_0000_0000_0000_0577, 0);
+     client
+-        .put_fragment(id, fragment(id, b"healthy until it rots"))
++        .put_fragment(id, fragment(id, b"healthy until it rots"), None)
+         .await
+         .unwrap();
+     let path = fragment_path(dir.path(), id);
+@@ -325,7 +325,7 @@ async fn transient_and_terminal_are_distinguishable_across_the_seam() {
+     let (client, dir, server) = stand_up().await;
+     let id = fid(0xBEEF, 0);
+     client
+-        .put_fragment(id, fragment(id, b"rots in a moment"))
++        .put_fragment(id, fragment(id, b"rots in a moment"), None)
+         .await
+         .unwrap();
+     let path = fragment_path(dir.path(), id);
+@@ -412,7 +412,12 @@ struct BrieflyUnavailableStore;
+ 
+ #[async_trait::async_trait]
+ impl ChunkStore for BrieflyUnavailableStore {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> wyrd_traits::Result<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> wyrd_traits::Result<()> {
+         unreachable!("this test only drives get_fragment")
+     }
+ 
+@@ -444,8 +449,13 @@ struct ParkedStore {
+ 
+ #[async_trait::async_trait]
+ impl ChunkStore for ParkedStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> wyrd_traits::Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> wyrd_traits::Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, _id: FragmentId) -> wyrd_traits::Result<Option<Bytes>> {
+diff --git a/crates/chunkstore-grpc/tests/list_delete.rs b/crates/chunkstore-grpc/tests/list_delete.rs
+index 22c94f6..e4be9cc 100644
+--- a/crates/chunkstore-grpc/tests/list_delete.rs
++++ b/crates/chunkstore-grpc/tests/list_delete.rs
+@@ -87,7 +87,7 @@ async fn list_and_delete_round_trip(store: &impl ChunkStore) {
+     let ids = [fid(chunk_a, 0), fid(chunk_a, 3), fid(chunk_b, 0)];
+     for &id in &ids {
+         store
+-            .put_fragment(id, fragment(id, b"a fragment to be walked"))
++            .put_fragment(id, fragment(id, b"a fragment to be walked"), None)
+             .await
+             .unwrap();
+     }
+diff --git a/crates/chunkstore-grpc/tests/read_fault_seam.rs b/crates/chunkstore-grpc/tests/read_fault_seam.rs
+index d709ee0..c74b283 100644
+--- a/crates/chunkstore-grpc/tests/read_fault_seam.rs
++++ b/crates/chunkstore-grpc/tests/read_fault_seam.rs
+@@ -59,7 +59,12 @@ struct EioStore;
+ 
+ #[async_trait]
+ impl ChunkStore for EioStore {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> WyrdResult<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> WyrdResult<()> {
+         Ok(())
+     }
+ 
+@@ -88,7 +93,12 @@ struct GenericErrStore;
+ 
+ #[async_trait]
+ impl ChunkStore for GenericErrStore {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> WyrdResult<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> WyrdResult<()> {
+         Ok(())
+     }
+ 
+diff --git a/crates/chunkstore-grpc/tests/round_trip.rs b/crates/chunkstore-grpc/tests/round_trip.rs
+index f254154..69a9a53 100644
+--- a/crates/chunkstore-grpc/tests/round_trip.rs
++++ b/crates/chunkstore-grpc/tests/round_trip.rs
+@@ -38,9 +38,22 @@ async fn connected() -> (
+     GrpcChunkStore,
+     tempfile::TempDir,
+     tokio::task::JoinHandle<()>,
++) {
++    connected_with_clock(wyrd_testkit::SystemClock).await
++}
++
++/// Like [`connected`], but the hosted `FsChunkStore` judges write deadlines against
++/// `clock` (issue #638) — the D server's *own* clock, which is the site 0016 decision 5
++/// requires to enforce `W_write`.
++async fn connected_with_clock<C: wyrd_testkit::Clock + Send + Sync + 'static>(
++    clock: C,
++) -> (
++    GrpcChunkStore,
++    tempfile::TempDir,
++    tokio::task::JoinHandle<()>,
+ ) {
+     let dir = tempfile::tempdir().expect("temp dir");
+-    let store = FsChunkStore::open(dir.path()).expect("open store");
++    let store = FsChunkStore::open_with_clock(dir.path(), clock).expect("open store");
+     let service = ChunkStoreService::new(store);
+ 
+     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+@@ -75,7 +88,7 @@ async fn put_get_health_round_trip_over_grpc() {
+     // put then get — byte-identical across the wire, at a non-zero EC index.
+     let id = fid(0xdead_beef_cafe_babe_0000_0000_1234_5678, 3);
+     let frag = fragment(id, b"a parity fragment over the wire");
+-    client.put_fragment(id, frag.clone()).await.unwrap();
++    client.put_fragment(id, frag.clone(), None).await.unwrap();
+     let got = client.get_fragment(id).await.unwrap();
+     assert_eq!(
+         got.as_deref(),
+@@ -86,7 +99,7 @@ async fn put_get_health_round_trip_over_grpc() {
+     // the store verifies on put: garbage is rejected, not stored.
+     assert!(
+         client
+-            .put_fragment(fid(1, 0), Bytes::from_static(b"not a fragment"))
++            .put_fragment(fid(1, 0), Bytes::from_static(b"not a fragment"), None)
+             .await
+             .is_err(),
+         "a non-fragment put must be rejected by the D server"
+@@ -136,7 +149,7 @@ async fn get_of_a_rotten_fragment_is_an_integrity_fault_over_grpc() {
+     // Store a valid fragment, then rot its on-disk bytes behind the server's back.
+     let id = fid(0xC0DE_0000_0000_0000_0000_0000_0000_0001, 0);
+     client
+-        .put_fragment(id, fragment(id, b"healthy until it rots"))
++        .put_fragment(id, fragment(id, b"healthy until it rots"), None)
+         .await
+         .unwrap();
+     let path = fragment_path(dir.path(), id);
+@@ -171,7 +184,7 @@ async fn put_of_a_malformed_fragment_is_invalid_argument_over_grpc() {
+     let (client, _dir, server) = connected().await;
+ 
+     let err = client
+-        .put_fragment(fid(7, 0), Bytes::from_static(b"not a fragment"))
++        .put_fragment(fid(7, 0), Bytes::from_static(b"not a fragment"), None)
+         .await
+         .expect_err("a non-fragment put must be rejected");
+ 
+@@ -183,3 +196,129 @@ async fn put_of_a_malformed_fragment_is_invalid_argument_over_grpc() {
+ 
+     server.abort();
+ }
++
++// ---- Issue #638 — the D-server-enforced write deadline, production client path ----
++//
++// The wire-level red→green proof lives in `tests/write_deadline.rs` (hand-encoded
++// protobuf, so it compiles and fails by *assertion* against the base seam, where this
++// Rust API cannot express a deadline at all). These two legs exercise what that file
++// deliberately cannot: the shipped `GrpcChunkStore` client type and the D server's own
++// `Clock`.
++
++/// Every await on the D server is bounded, fail-closed — the rubric's await discipline
++/// (`AGENTS.md:181-183`) applies to tests too: a regression that hangs the RPC must fail
++/// this test, not stall the suite. The bound is *generous* (orders of magnitude past every
++/// deadline used below), so it can never be what produces a refusal.
++const RPC_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
++
++async fn bounded<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
++    tokio::time::timeout(RPC_WATCHDOG, f)
++        .await
++        .unwrap_or_else(|_| panic!("{what} did not complete within {RPC_WATCHDOG:?}"))
++}
++
++/// Issue #638 — the **production** `GrpcChunkStore::put_fragment` sends an expired
++/// authorization deadline, and the D server's refusal reconstructs client-side as a typed
++/// `wyrd_traits::WriteDeadlineExpired`, the same way `IntegrityFault`/`BlockReadFault`
++/// already reconstruct (`client.rs::classify_put_status`) — so a caller branches on the
++/// class instead of matching a string.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn put_with_an_expired_deadline_is_refused_and_reconstructs_as_write_deadline_expired() {
++    // The D server's clock stands at 10_000 ms; the write was authorized until 9_000 ms.
++    // No wall clock is involved: the refusal is decided by the *server's* clock, which is
++    // the point of 0016 decision 5.
++    let (client, _dir, server) = connected_with_clock(wyrd_testkit::ManualClock::new(10_000)).await;
++
++    let id = fid(0xdead_beef_0000_0000_0000_0000_0000_0001, 0);
++    let err = bounded(
++        "an expired-deadline put",
++        client.put_fragment(id, fragment(id, b"authorized too long ago"), Some(9_000)),
++    )
++    .await
++    .expect_err("an expired deadline must be refused by the production client path too");
++    assert!(
++        wyrd_traits::is_write_deadline_expired(err.as_ref()),
++        "the production client must reconstruct WriteDeadlineExpired: {err}"
++    );
++    assert!(
++        bounded("the read-back", client.get_fragment(id))
++            .await
++            .unwrap()
++            .is_none(),
++        "a refused write must not be stored"
++    );
++
++    // A live write on the same server, in the same class of call, still lands — so the
++    // refusal above is the deadline's work, not a server that rejects everything.
++    let live = fid(0xdead_beef_0000_0000_0000_0000_0000_0002, 0);
++    let frag = fragment(live, b"comfortably inside its window");
++    bounded(
++        "a live put",
++        client.put_fragment(live, frag.clone(), Some(70_000)),
++    )
++    .await
++    .expect("a write inside its deadline must be stored");
++    assert_eq!(
++        bounded("the read-back", client.get_fragment(live))
++            .await
++            .unwrap()
++            .as_deref(),
++        Some(frag.as_ref())
++    );
++
++    server.abort();
++}
++
++/// Issue #638, 0016's own failure-mode row (`0016:1784`) at the **server**: a write the D
++/// server *accepted* while it was live, but which expires before the server applies it,
++/// must be refused there — and this is the leg a caller-side timeout cannot fake, because
++/// the client below is never bounded by anything near the deadline (30 s watchdog vs a
++/// 10 s-scale deadline) and is waiting happily when the refusal arrives.
++///
++/// The server's scripted clock reads 9_500 when the store admits the write and 10_500 once
++/// it has published it, straddling the write's 10_000 deadline: a D server that judges the
++/// deadline only when it *accepts* the request stores the fragment and this test goes red.
++/// (The script assumes exactly those two reads, which is what `remaining()` below pins.
++/// *Where* the second read falls — before or after the publishing rename — is not
++/// observable over the wire; that is pinned on the store itself, by
++/// `chunkstore-fs/tests/conformance.rs`'s publication-anchored clock.)
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_write_that_expires_before_the_server_applies_it_is_refused_over_grpc() {
++    let clock = wyrd_testkit::SteppedClock::new([9_500, 10_500]);
++    let (client, _dir, server) = connected_with_clock(clock.clone()).await;
++
++    let id = fid(0xdead_beef_0000_0000_0000_0000_0000_0003, 0);
++    let err = bounded(
++        "a put that expires before it is applied",
++        client.put_fragment(
++            id,
++            fragment(id, b"live on arrival, late at the rename"),
++            Some(10_000),
++        ),
++    )
++    .await
++    .expect_err(
++        "the D server must refuse a write whose deadline elapsed between acceptance and \
++         application — nothing on the client side bounds this call near its deadline",
++    );
++    assert!(
++        wyrd_traits::is_write_deadline_expired(err.as_ref()),
++        "the server's refusal must cross the wire as the deadline class, not as a transient \
++         or internal fault a caller would retry: {err}"
++    );
++    assert_eq!(
++        clock.remaining(),
++        0,
++        "the server must read its clock again at the publish point — an unconsumed reading \
++         means the deadline was judged only on acceptance"
++    );
++    assert!(
++        bounded("the read-back", client.get_fragment(id))
++            .await
++            .unwrap()
++            .is_none(),
++        "and the refused write must never become observable (0016 outcome (a))"
++    );
++
++    server.abort();
++}
+diff --git a/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+index 401db80..c555fb2 100644
+--- a/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
++++ b/crates/chunkstore-grpc/tests/tier1_jepsen_consistency.rs
+@@ -813,7 +813,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
+             index: index as u16,
+         };
+         clients[index]
+-            .put_fragment(frag_id, fragment_bytes)
++            .put_fragment(frag_id, fragment_bytes, None)
+             .await
+             .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
+     }
+@@ -1379,7 +1379,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
+             index: index as u16,
+         };
+         clients[index]
+-            .put_fragment(frag_id, fragment_bytes)
++            .put_fragment(frag_id, fragment_bytes, None)
+             .await
+             .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
+     }
+diff --git a/crates/chunkstore-grpc/tests/tier2_kill_reconstruct.rs b/crates/chunkstore-grpc/tests/tier2_kill_reconstruct.rs
+index 13ec722..a51fc25 100644
+--- a/crates/chunkstore-grpc/tests/tier2_kill_reconstruct.rs
++++ b/crates/chunkstore-grpc/tests/tier2_kill_reconstruct.rs
+@@ -511,7 +511,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
+             index: index as u16,
+         };
+         clients[index]
+-            .put_fragment(frag_id, fragment_bytes)
++            .put_fragment(frag_id, fragment_bytes, None)
+             .await
+             .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
+     }
+diff --git a/crates/chunkstore-grpc/tests/write_deadline.rs b/crates/chunkstore-grpc/tests/write_deadline.rs
+new file mode 100644
+index 0000000..7b0bba7
+--- /dev/null
++++ b/crates/chunkstore-grpc/tests/write_deadline.rs
+@@ -0,0 +1,581 @@
++//! Issue #638 — the D-server-**enforced** fragment-write authorization deadline
++//! (`W_write`, proposal 0016 decision 5's end-to-end-deadline argument,
++//! `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`).
++//!
++//! A caller-side `await` timeout alone (`crates/chunkstore-grpc/src/client.rs:169-190`)
++//! bounds only how long the *writer waits*, never when an already-accepted write *takes
++//! effect* — 0016 requires the D server itself to refuse, not queue, a write whose deadline
++//! has elapsed, or `G_orphan > W_write + δ_clock` (`0016:1478`) bounds nothing and 0016
++//! outcome (a) — an unreferenced *and* unevidenced fragment — is reachable.
++//!
++//! Every leg below drives the **real, unmodified** `ChunkStoreService` over a real tonic
++//! loopback connection with the real `FsChunkStore` behind it; only the client's request
++//! *bytes* are hand-rolled, for the reason in the next paragraph.
++//!
++//! **Falsifiability.** On the base seam a deadline cannot be expressed in Rust at all:
++//! `ChunkStore::put_fragment` takes `(id, fragment)` and `FragmentPutRequest` carries only
++//! `id`/`fragment`. Calling the patched 3-argument method (or naming the patched request
++//! field) would make the base fail to **compile** rather than fail an **assertion** — a red
++//! an exit-code check cannot tell from a spurious break, and one that proves nothing about
++//! the behaviour gap this issue closes. So every `PutFragment` here is sent as hand-encoded
++//! raw protobuf over a bare `tonic::client::Grpc<Channel>`: proto3's forward-compatible wire
++//! format means a pre-#638 server decodes the two fields it knows, ignores the third,
++//! applies the write — and the assertion "refused, and not stored" genuinely fails. The
++//! *typed* client-side reconstruction (`WriteDeadlineExpired`), the D server's own clock, and
++//! the **post-publication** half of the enforcement (a write that expires across the
++//! publishing rename is retracted, not left in place) need the patched API to even name, so
++//! they are asserted in existing files this base-compiles bar does not apply to:
++//! `tests/round_trip.rs` (production client + a scripted server clock),
++//! `crates/chunkstore-fs/tests/conformance.rs` (the local store, leg E, with a clock
++//! anchored to the store's own publication), and the seeded network case in
++//! `crates/dst/tests/network.rs` (a write parked past its deadline by a D server whose
++//! store is the real `FsChunkStore`, applied after its caller has given up).
++
++#![forbid(unsafe_code)]
++
++use std::future::Future;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use bytes::{Buf, BufMut, Bytes};
++use tokio_stream::wrappers::TcpListenerStream;
++use tonic::client::Grpc;
++use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
++use tonic::codegen::http::uri::PathAndQuery;
++use tonic::codegen::http::{Request as HttpRequest, Response as HttpResponse};
++use tonic::codegen::Service;
++use tonic::server::NamedService;
++use tonic::transport::{Channel, Endpoint, Server};
++use tonic::{Code, Status};
++use wyrd_chunk_format::{encode as encode_fragment, FragmentHeader};
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, GrpcChunkStore};
++use wyrd_traits::{ChunkId, ChunkStore, FragmentId};
++
++/// Every await on the D server is bounded, fail-closed — the rubric's await discipline
++/// (`AGENTS.md:181-183`) binds tests too: a regression that hangs the RPC must fail this
++/// file, not stall the suite. It is **generous by design** — orders of magnitude past every
++/// deadline and park below — so a client-side bound can never be what produces a refusal
++/// (the brief's leg A requirement).
++const WATCHDOG: Duration = Duration::from_secs(30);
++
++async fn bounded<T>(what: &str, f: impl Future<Output = T>) -> T {
++    tokio::time::timeout(WATCHDOG, f)
++        .await
++        .unwrap_or_else(|_| panic!("{what} did not complete within {WATCHDOG:?}"))
++}
++
++fn fid(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// A valid v1 fragment whose header records `id`'s chunk and index.
++fn fragment(id: FragmentId, payload: &[u8]) -> Bytes {
++    let mut header = FragmentHeader::new_v1(id.chunk, payload.len() as u64);
++    header.ec_fragment_index = id.index;
++    Bytes::from(encode_fragment(&header, payload))
++}
++
++fn epoch_millis(t: SystemTime) -> u64 {
++    t.duration_since(UNIX_EPOCH)
++        .expect("system clock is after the epoch")
++        .as_millis() as u64
++}
++
++/// The clock these deadlines are stated against: the **D server's own wall clock**, which
++/// owns the write-deadline lifecycle (`FsChunkStore::put_fragment` reads it to judge
++/// expiry). The test must derive its past/future deadlines from that same source rather
++/// than a virtualised one, or the two evaluation sites would disagree by construction
++/// (#619, AGENTS.md § Review rubric — "one clock per correctness lifecycle").
++fn dserver_clock_now() -> u64 {
++    // wall-clock exempt: see above — this IS the acceptor's clock, read from the test side.
++    #[allow(clippy::disallowed_methods)]
++    let now = SystemTime::now();
++    epoch_millis(now)
++}
++
++/// Comfortably in the past — any implementation enforcing `W_write` must refuse it.
++fn already_expired_deadline() -> u64 {
++    dserver_clock_now().saturating_sub(60_000)
++}
++
++/// Comfortably in the future — a live write must be unaffected by it.
++fn comfortably_future_deadline() -> u64 {
++    dserver_clock_now() + 60_000
++}
++
++// ---------------------------------------------------------------------------
++// Hand-rolled wire encoding for `PutFragment`, deliberately bypassing the generated
++// `FragmentPutRequest` Rust field and the `ChunkStore` trait's changed `put_fragment`
++// arity (see the module doc's Falsifiability note). Depends on nothing but `bytes` —
++// already an ordinary, unpatched dependency of this crate — so the encoder carries no
++// manifest change to keep in step with the base seam either.
++// ---------------------------------------------------------------------------
++
++/// A protobuf varint: 7 bits per byte, LSB first, continuation bit (`0x80`) set on every
++/// byte but the last (the wire format prost's own `encode_varint` uses).
++fn write_varint(mut value: u64, out: &mut Vec<u8>) {
++    loop {
++        let byte = (value & 0x7f) as u8;
++        value >>= 7;
++        if value != 0 {
++            out.push(byte | 0x80);
++        } else {
++            out.push(byte);
++            break;
++        }
++    }
++}
++
++/// A protobuf field key: `(field_number << 3) | wire_type`, varint-encoded. Wire types used
++/// below: `0` varint, `1` 64-bit (fixed64), `2` length-delimited.
++fn write_tag(field: u32, wire_type: u8, out: &mut Vec<u8>) {
++    write_varint((u64::from(field) << 3) | u64::from(wire_type), out);
++}
++
++/// `ChunkId { fixed64 hi = 1; fixed64 lo = 2; }` — two `fixed64` (wire type 1,
++/// little-endian per the protobuf spec) fields.
++fn encode_wire_chunk_id(chunk: ChunkId, out: &mut Vec<u8>) {
++    let hi = (chunk >> 64) as u64;
++    let lo = chunk as u64;
++    write_tag(1, 1, out);
++    out.put_u64_le(hi);
++    write_tag(2, 1, out);
++    out.put_u64_le(lo);
++}
++
++/// `FragmentId { ChunkId chunk = 1; uint32 index = 2; }` — mirrors
++/// `crates/chunkstore-grpc/src/conv.rs::to_wire_fragment_id` (private to that crate),
++/// inlined here since these two messages are untouched by this issue. The submessage is
++/// encoded into a scratch buffer first so its length prefix is exact, not assumed.
++fn encode_wire_fragment_id(id: FragmentId, out: &mut Vec<u8>) {
++    let mut chunk_bytes = Vec::new();
++    encode_wire_chunk_id(id.chunk, &mut chunk_bytes);
++    // field 1 (`id.chunk`, the `ChunkId` submessage), wire type 2 (length-delimited).
++    write_tag(1, 2, out);
++    write_varint(chunk_bytes.len() as u64, out);
++    out.extend_from_slice(&chunk_bytes);
++    // field 2 (`id.index`), wire type 0 (varint).
++    write_tag(2, 0, out);
++    write_varint(u64::from(id.index), out);
++}
++
++/// Hand-encode a `FragmentPutRequest` — `FragmentId id = 1; bytes fragment = 2; optional
++/// uint64 deadline_millis = 3;` — as raw protobuf bytes. `id`/`fragment` are the base seam's
++/// own two fields; `deadline_millis`, when present, is appended as field 3 exactly as the
++/// additive proto change adds it. Never touches the generated struct, so this compiles
++/// unchanged whether or not that struct carries the new field.
++fn encode_put_fragment_request(
++    id: FragmentId,
++    payload: &[u8],
++    deadline_millis: Option<u64>,
++) -> Vec<u8> {
++    let mut out = Vec::new();
++    let mut id_bytes = Vec::new();
++    encode_wire_fragment_id(id, &mut id_bytes);
++    // field 1 (`id`, the `FragmentId` submessage), wire type 2 (length-delimited) — `id`'s
++    // own fields are encoded into a scratch buffer first (above) so this length prefix is
++    // exact, matching how `encode_wire_fragment_id` wraps its own `chunk` submessage.
++    write_tag(1, 2, &mut out);
++    write_varint(id_bytes.len() as u64, &mut out);
++    out.extend_from_slice(&id_bytes);
++    // field 2 (`fragment`), wire type 2 (length-delimited).
++    write_tag(2, 2, &mut out);
++    write_varint(payload.len() as u64, &mut out);
++    out.extend_from_slice(payload);
++    if let Some(deadline) = deadline_millis {
++        // field 3 (`deadline_millis`), wire type 0 (varint) — proto3 `optional`, so its
++        // absence in the `None` branch is byte-for-byte a pre-#638 request: additive
++        // compatibility, asserted over the wire (leg D).
++        write_tag(3, 0, &mut out);
++        write_varint(deadline, &mut out);
++    }
++    out
++}
++
++/// Opaque already-encoded request bytes, sent as-is by [`RawEncoder`].
++struct RawRequest(Vec<u8>);
++
++struct RawEncoder;
++
++impl Encoder for RawEncoder {
++    type Item = RawRequest;
++    type Error = Status;
++
++    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
++        dst.put_slice(&item.0);
++        Ok(())
++    }
++}
++
++/// Decodes a `FragmentPutResponse` (`message FragmentPutResponse {}`, untouched by this
++/// issue) by hand — trivial, since it carries no fields: any bytes present are unknown
++/// fields a well-behaved peer never sends here, so an empty response decodes to `Some(())`.
++struct RawResponseDecoder;
++
++impl Decoder for RawResponseDecoder {
++    type Item = ();
++    type Error = Status;
++
++    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
++        src.advance(src.remaining());
++        Ok(Some(()))
++    }
++}
++
++struct RawCodec;
++
++impl Codec for RawCodec {
++    type Encode = RawRequest;
++    type Decode = ();
++    type Encoder = RawEncoder;
++    type Decoder = RawResponseDecoder;
++
++    fn encoder(&mut self) -> Self::Encoder {
++        RawEncoder
++    }
++
++    fn decoder(&mut self) -> Self::Decoder {
++        RawResponseDecoder
++    }
++}
++
++/// Send one `PutFragment` RPC over `channel` with hand-encoded bytes (see the module doc).
++/// Exactly the path the generated `ChunkStoreClient::put_fragment` uses —
++/// `/wyrd.v0.ChunkStore/PutFragment` over the same `tonic::client::Grpc` dispatch — so this
++/// still drives the real tonic wire machinery, not a fake transport. Only the codec differs.
++///
++/// Both awaits are watchdog-bounded: a server that hangs fails the test instead of parking
++/// the suite forever, and the bound is far too generous to produce a deadline refusal.
++async fn put_fragment_raw(
++    channel: Channel,
++    id: FragmentId,
++    payload: &[u8],
++    deadline_millis: Option<u64>,
++) -> Result<(), Status> {
++    let mut grpc = Grpc::new(channel);
++    bounded("the channel becoming ready", grpc.ready())
++        .await
++        .map_err(|e| Status::unknown(e.to_string()))?;
++    let bytes = encode_put_fragment_request(id, payload, deadline_millis);
++    let path = PathAndQuery::from_static("/wyrd.v0.ChunkStore/PutFragment");
++    bounded(
++        "the PutFragment rpc",
++        grpc.unary(tonic::Request::new(RawRequest(bytes)), path, RawCodec),
++    )
++    .await
++    .map(|_| ())
++}
++
++// ---------------------------------------------------------------------------
++// Server-side "parked in the accept queue" seam (leg B) — a thin wrapper that delays every
++// request before it reaches the real generated `ChunkStoreServer`. Implemented directly
++// against `tonic::codegen::Service` / `tonic::server::NamedService` (both re-exported by
++// `tonic`, an ordinary unpatched dependency here) rather than a `tower::Layer`, so it needs
++// no new dependency and compiles identically against base and patched code. Only the
++// *store* behind it enforces the deadline.
++// ---------------------------------------------------------------------------
++
++#[derive(Clone)]
++struct DelayedService<S> {
++    inner: S,
++    delay: Duration,
++}
++
++impl<S: NamedService> NamedService for DelayedService<S> {
++    const NAME: &'static str = S::NAME;
++}
++
++impl<S, B> Service<HttpRequest<B>> for DelayedService<S>
++where
++    S: Service<
++            HttpRequest<B>,
++            Response = HttpResponse<tonic::body::Body>,
++            Error = std::convert::Infallible,
++        > + Clone
++        + Send
++        + 'static,
++    S::Future: Send + 'static,
++    B: Send + 'static,
++{
++    type Response = S::Response;
++    type Error = S::Error;
++    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
++        // Swap in a ready clone so the delayed call doesn't hold up `poll_ready`'s caller —
++        // the standard "clone then call" pattern for a `Clone` inner service whose `call`
++        // needs to outlive this borrow.
++        let mut inner = self.inner.clone();
++        let delay = self.delay;
++        Box::pin(async move {
++            tokio::time::sleep(delay).await;
++            inner.call(req).await
++        })
++    }
++}
++
++/// Stand up the **real, unmodified** `ChunkStoreService<FsChunkStore>` over a real tonic
++/// server on an ephemeral loopback port, with every request delayed by `delay` before it
++/// reaches the service (0016's "parked in the accept queue", `0016:1784`, when non-zero;
++/// `Duration::ZERO` for the other legs). Returns the bound `Channel` (for the raw client
++/// above) and a typed [`GrpcChunkStore`] for `get_fragment`, whose signature this issue does
++/// not change — so the production read path is safe to use here.
++///
++/// The client channel is dialed **without any timeout**: nothing client-side may be able to
++/// produce the refusals asserted below.
++async fn serve(
++    delay: Duration,
++) -> (
++    Channel,
++    GrpcChunkStore,
++    tempfile::TempDir,
++    tokio::task::JoinHandle<()>,
++) {
++    let dir = tempfile::tempdir().expect("temp dir");
++    serve_in(dir, delay).await
++}
++
++async fn serve_in(
++    dir: tempfile::TempDir,
++    delay: Duration,
++) -> (
++    Channel,
++    GrpcChunkStore,
++    tempfile::TempDir,
++    tokio::task::JoinHandle<()>,
++) {
++    let store = FsChunkStore::open(dir.path()).expect("open store");
++    let service = ChunkStoreService::new(store);
++
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind loopback");
++    let addr = listener.local_addr().expect("local addr");
++
++    let server = tokio::spawn(async move {
++        Server::builder()
++            .add_service(DelayedService {
++                inner: ChunkStoreServer::new(service),
++                delay,
++            })
++            .serve_with_incoming(TcpListenerStream::new(listener))
++            .await
++            .expect("serve");
++    });
++
++    let channel = bounded(
++        "dialing the D server",
++        Endpoint::new(format!("http://{addr}"))
++            .expect("endpoint")
++            .connect(),
++    )
++    .await
++    .expect("connect raw channel");
++    let client = GrpcChunkStore::new(channel.clone());
++    (channel, client, dir, server)
++}
++
++// ---- (A) an already-expired deadline is refused AT THE SERVER, and never stored ----
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn expired_deadline_is_refused_by_the_server_and_never_stored() {
++    let (channel, client, _dir, server) = serve(Duration::ZERO).await;
++
++    let id = fid(0xdead_0000_0000_0000_0000_0000_0000_0001, 0);
++    let frag = fragment(id, b"authorized too long ago");
++
++    let err = put_fragment_raw(channel, id, &frag, Some(already_expired_deadline()))
++        .await
++        .expect_err("a write whose deadline already elapsed must be refused by the D server");
++    assert_eq!(
++        err.code(),
++        Code::FailedPrecondition,
++        "the refusal must ride a distinct, operator-classifiable status, not a bare or \
++         internal error: {err}"
++    );
++
++    // Asserting only the error would pass an implementation that refuses the caller AFTER
++    // persisting the bytes — the exact outcome (a) leak this slice prevents.
++    let got = bounded("the read-back", client.get_fragment(id))
++        .await
++        .unwrap();
++    assert!(
++        got.is_none(),
++        "a refused write must NOT be observable via get_fragment afterwards"
++    );
++
++    server.abort();
++}
++
++// ---- (B) a write parked past its deadline is refused when it is finally processed ----
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_write_parked_past_its_deadline_is_refused_when_finally_applied() {
++    // The service sits behind a 300 ms delay before every request reaches it — 0016's own
++    // failure-mode row: "authorize a fragment write, park it in the D server's accept queue
++    // past `W_write` … and assert it is refused" (`0016:1784`).
++    let (channel, client, _dir, server) = serve(Duration::from_millis(300)).await;
++
++    let id = fid(0xdead_0000_0000_0000_0000_0000_0000_0002, 0);
++    let frag = fragment(id, b"authorized, then parked past its window");
++    // Authorized now with only 50 ms of headroom; the 300 ms park guarantees the deadline
++    // has elapsed by the time the store is asked to apply the write. The caller is bounded
++    // by nothing but the 30 s watchdog — 600× the deadline — so a caller-timeout-only design
++    // cannot fail this: the client is still waiting happily. Only server-side enforcement
++    // can produce the refusal.
++    let deadline = dserver_clock_now() + 50;
++
++    let err = put_fragment_raw(channel, id, &frag, Some(deadline))
++        .await
++        .expect_err(
++            "a write parked past its deadline must be refused once the D server finally \
++             attempts to apply it",
++        );
++    assert_eq!(
++        err.code(),
++        Code::FailedPrecondition,
++        "must classify as a deadline refusal: {err}"
++    );
++
++    let got = bounded("the read-back", client.get_fragment(id))
++        .await
++        .unwrap();
++    assert!(
++        got.is_none(),
++        "the parked-then-refused write must never be observable — asserting only the error \
++         would pass an implementation that stores the bytes and refuses the caller \
++         afterwards (0016 outcome (a))"
++    );
++
++    server.abort();
++}
++
++// ---- (C) a live write, comfortably inside its deadline, is unaffected ----
++//
++// Without this, legs A/B/F could pass by refusing every write, deadline or not.
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_live_write_within_its_deadline_stores_and_reads_back_byte_identical() {
++    let (channel, client, _dir, server) = serve(Duration::ZERO).await;
++
++    let id = fid(0xdead_0000_0000_0000_0000_0000_0000_0003, 0);
++    let frag = fragment(id, b"comfortably inside its window");
++
++    put_fragment_raw(channel, id, &frag, Some(comfortably_future_deadline()))
++        .await
++        .expect("a live write well inside its deadline must succeed");
++
++    let got = bounded("the read-back", client.get_fragment(id))
++        .await
++        .unwrap();
++    assert_eq!(
++        got.as_deref(),
++        Some(frag.as_ref()),
++        "a live write must round-trip byte-identical"
++    );
++
++    server.abort();
++}
++
++// ---- (D) an absent deadline stores exactly as before #638, asserted over the wire ----
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn absent_deadline_stores_exactly_as_before_issue_638() {
++    let (channel, client, _dir, server) = serve(Duration::ZERO).await;
++
++    let id = fid(0xdead_0000_0000_0000_0000_0000_0000_0004, 0);
++    let frag = fragment(id, b"no deadline at all");
++
++    // The request bytes are byte-for-byte a pre-#638 request (field 3 simply absent), which
++    // is what keeps every existing writer — the ordinary write path, backfill,
++    // reconstruction, rebalance — working unchanged.
++    put_fragment_raw(channel, id, &frag, None)
++        .await
++        .expect("a request carrying no deadline field must store exactly as it did before");
++
++    let got = bounded("the read-back", client.get_fragment(id))
++        .await
++        .unwrap();
++    assert_eq!(got.as_deref(), Some(frag.as_ref()));
++
++    server.abort();
++}
++
++// ---- (F) the refusal is classifiable — against BOTH neighbours, not just one ----
++//
++// A caller must be able to tell an expected "refused, too late" from (i) a malformed
++// fragment it offered and (ii) a genuine backend fault ("the disk is broken"). The second
++// control is the one that matters most: without it, a server that reported *every* failure
++// as a deadline refusal would pass this leg.
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_deadline_refusal_is_distinguishable_from_both_a_client_fault_and_a_disk_fault() {
++    let dir = tempfile::tempdir().expect("temp dir");
++
++    // A chunk whose directory path is occupied by a *file*: every write beneath it fails
++    // with a real `ENOTDIR` from the filesystem — a genuine backend fault, on any platform
++    // and as any user (no chmod, so it holds under a root test runner too).
++    let broken = fid(0xdead_0000_0000_0000_0000_0000_0000_0007, 0);
++    std::fs::write(
++        dir.path().join(format!("{:032x}", broken.chunk)),
++        b"not a directory",
++    )
++    .expect("plant the obstruction");
++
++    let (channel, _client, _dir, server) = serve_in(dir, Duration::ZERO).await;
++
++    let id = fid(0xdead_0000_0000_0000_0000_0000_0000_0005, 0);
++    let deadline_err = put_fragment_raw(
++        channel.clone(),
++        id,
++        &fragment(id, b"authorized too long ago, again"),
++        Some(already_expired_deadline()),
++    )
++    .await
++    .expect_err("an expired deadline must be refused");
++    assert_eq!(deadline_err.code(), Code::FailedPrecondition);
++
++    let malformed_err = put_fragment_raw(
++        channel.clone(),
++        fid(0xdead_0000_0000_0000_0000_0000_0000_0006, 0),
++        b"not a fragment",
++        None,
++    )
++    .await
++    .expect_err("a malformed fragment must still be rejected");
++    assert_eq!(
++        malformed_err.code(),
++        Code::InvalidArgument,
++        "a malformed-fragment fault keeps its own distinct code"
++    );
++
++    let disk_err = put_fragment_raw(
++        channel,
++        broken,
++        &fragment(broken, b"doomed by the disk"),
++        Some(comfortably_future_deadline()),
++    )
++    .await
++    .expect_err("a genuine backend I/O failure must surface as an error");
++    assert_eq!(
++        disk_err.code(),
++        Code::Internal,
++        "a broken backend stays an internal fault — reporting it as a deadline refusal \
++         would have a caller stop re-authorizing and start ignoring a real fault: {disk_err}"
++    );
++
++    // The three outcomes are mutually distinguishable, which is the property a caller
++    // branches on (and, seam-side, `wyrd_traits::is_write_deadline_expired` — asserted on
++    // the typed error in `tests/round_trip.rs` and the fs conformance suite).
++    assert_ne!(deadline_err.code(), malformed_err.code());
++    assert_ne!(deadline_err.code(), disk_err.code());
++    assert_ne!(malformed_err.code(), disk_err.code());
++
++    server.abort();
++}
+diff --git a/crates/core/src/read.rs b/crates/core/src/read.rs
+index 8ebd7c2..021e246 100644
+--- a/crates/core/src/read.rs
++++ b/crates/core/src/read.rs
+@@ -674,7 +674,12 @@ mod tests {
+ 
+     #[async_trait]
+     impl ChunkStore for UnreachableStore {
+-        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++        async fn put_fragment(
++            &self,
++            _id: FragmentId,
++            _fragment: Bytes,
++            _deadline_millis: Option<u64>,
++        ) -> Result<()> {
+             unreachable!("no write path is exercised by this read-only regression")
+         }
+ 
+@@ -705,7 +710,12 @@ mod tests {
+ 
+     #[async_trait]
+     impl ChunkStore for EmptyChunks {
+-        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++        async fn put_fragment(
++            &self,
++            _id: FragmentId,
++            _fragment: Bytes,
++            _deadline_millis: Option<u64>,
++        ) -> Result<()> {
+             Ok(())
+         }
+         async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/core/src/write.rs b/crates/core/src/write.rs
+index 451d90a..8bbd13b 100644
+--- a/crates/core/src/write.rs
++++ b/crates/core/src/write.rs
+@@ -245,7 +245,7 @@ pub async fn write_fragments(chunks: &impl PlacementChunkStore, plan: &WritePlan
+                 .get(*index as usize)
+                 .copied()
+                 .unwrap_or_else(|| DServerId::from(*index));
+-            chunks.put_fragment_at(dserver, id, fragment.clone())
++            chunks.put_fragment_at(dserver, id, fragment.clone(), None)
+         })
+     });
+     futures_util::future::try_join_all(puts).await?;
+@@ -444,7 +444,7 @@ async fn intent_and_write_chunk(
+             .get(*index as usize)
+             .copied()
+             .unwrap_or_else(|| DServerId::from(*index));
+-        chunks.put_fragment_at(dserver, frag_id, fragment.clone())
++        chunks.put_fragment_at(dserver, frag_id, fragment.clone(), None)
+     });
+     futures_util::future::try_join_all(puts).await?;
+     Ok(PlannedChunk {
+diff --git a/crates/core/tests/domain_placement.rs b/crates/core/tests/domain_placement.rs
+index a57ba2a..0799894 100644
+--- a/crates/core/tests/domain_placement.rs
++++ b/crates/core/tests/domain_placement.rs
+@@ -76,7 +76,12 @@ impl Fleet {
+ impl ChunkStore for Fleet {
+     // Supertrait obligation. The placement-aware path uses `*_at`; a stateless
+     // `index % n` caller would route here and miss a moved fragment.
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         Err("Fleet: write must address a D server by id (use put_fragment_at)".into())
+     }
+ 
+@@ -118,6 +123,7 @@ impl PlacementChunkStore for Fleet {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        _deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         self.servers
+             .get(&dserver)
+diff --git a/crates/core/tests/fragment_identity.rs b/crates/core/tests/fragment_identity.rs
+index 6504429..125a929 100644
+--- a/crates/core/tests/fragment_identity.rs
++++ b/crates/core/tests/fragment_identity.rs
+@@ -88,7 +88,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -172,6 +177,7 @@ async fn ec_read_rejects_a_same_chunk_wrong_index_fragment() {
+                 index: 0,
+             },
+             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -183,6 +189,7 @@ async fn ec_read_rejects_a_same_chunk_wrong_index_fragment() {
+                 index: 1,
+             },
+             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -259,6 +266,7 @@ async fn ec_read_rejects_a_fragment_whose_ec_tuple_disagrees_with_scheme() {
+                 index: 0,
+             },
+             Bytes::from(wrong_ec),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -270,6 +278,7 @@ async fn ec_read_rejects_a_fragment_whose_ec_tuple_disagrees_with_scheme() {
+                 index: 1,
+             },
+             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -343,6 +352,7 @@ async fn ec_read_rejects_a_same_scheme_type_wrong_geometry_fragment() {
+                 index: 0,
+             },
+             encode_ec_fragment(chunk_id, 0, 3, 1, &shards[1]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -354,6 +364,7 @@ async fn ec_read_rejects_a_same_scheme_type_wrong_geometry_fragment() {
+                 index: 1,
+             },
+             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
++            None,
+         )
+         .await
+         .unwrap();
+diff --git a/crates/core/tests/mutation_regressions.rs b/crates/core/tests/mutation_regressions.rs
+index 3ddee93..599f93b 100644
+--- a/crates/core/tests/mutation_regressions.rs
++++ b/crates/core/tests/mutation_regressions.rs
+@@ -75,7 +75,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -265,6 +270,7 @@ async fn read_with_fewer_than_k_fragments_reports_insufficient() {
+                 index: 0,
+             },
+             write::encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
++            None,
+         )
+         .await
+         .unwrap();
+diff --git a/crates/core/tests/mutation_regressions_round2.rs b/crates/core/tests/mutation_regressions_round2.rs
+index b11f322..56f6811 100644
+--- a/crates/core/tests/mutation_regressions_round2.rs
++++ b/crates/core/tests/mutation_regressions_round2.rs
+@@ -71,7 +71,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/core/tests/placement_record.rs b/crates/core/tests/placement_record.rs
+index 02b828b..a71007b 100644
+--- a/crates/core/tests/placement_record.rs
++++ b/crates/core/tests/placement_record.rs
+@@ -75,7 +75,12 @@ impl ChunkStore for Fleet {
+     // Supertrait obligation. The placement-aware read never calls these (it uses
+     // `*_at`); a stateless `index % n` caller would route here — and find nothing for a
+     // moved fragment, the gap the placement record exists to close.
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.server(self.index_route(id.index))
+             .lock()
+             .unwrap()
+@@ -126,6 +131,7 @@ impl PlacementChunkStore for Fleet {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        _deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         self.server(dserver).lock().unwrap().insert(id, fragment);
+         Ok(())
+@@ -218,6 +224,7 @@ fn moved_fragment_resolved_from_record_after_reopen() {
+                         index: *index,
+                     },
+                     bytes.clone(),
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -314,6 +321,7 @@ fn empty_placement_ec_none_resolves_via_identity_fallback() {
+                     index: *index,
+                 },
+                 bytes.clone(),
++                None,
+             )
+             .await
+             .unwrap();
+@@ -364,6 +372,7 @@ fn empty_placement_rs_6_3_resolves_via_identity_fallback() {
+                         index: *index,
+                     },
+                     bytes.clone(),
++                    None,
+                 )
+                 .await
+                 .unwrap();
+@@ -428,6 +437,7 @@ fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
+                         index: *index,
+                     },
+                     bytes.clone(),
++                    None,
+                 )
+                 .await
+                 .unwrap();
+diff --git a/crates/core/tests/read_block_fault_repair.rs b/crates/core/tests/read_block_fault_repair.rs
+index 08121e4..51f10f2 100644
+--- a/crates/core/tests/read_block_fault_repair.rs
++++ b/crates/core/tests/read_block_fault_repair.rs
+@@ -89,7 +89,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -127,8 +132,13 @@ struct BlockFaultingStore {
+ 
+ #[async_trait]
+ impl ChunkStore for BlockFaultingStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+@@ -221,6 +231,7 @@ async fn ec_read_around_block_fault_still_enqueues_repair_with_non_corruption_re
+                     index: index as u16,
+                 },
+                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
++                None,
+             )
+             .await
+             .unwrap();
+@@ -323,7 +334,7 @@ async fn none_scheme_block_fault_fails_the_read_but_still_enqueues_repair() {
+     // cannot read the sector: every fetch returns `BlockReadFault`.
+     let inner = MemChunks::default();
+     inner
+-        .put_fragment(frag_id, fragment(chunk_id, data))
++        .put_fragment(frag_id, fragment(chunk_id, data), None)
+         .await
+         .unwrap();
+     let chunks = BlockFaultingStore {
+diff --git a/crates/core/tests/read_repair.rs b/crates/core/tests/read_repair.rs
+index 451ecea..6b7df48 100644
+--- a/crates/core/tests/read_repair.rs
++++ b/crates/core/tests/read_repair.rs
+@@ -80,7 +80,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -122,8 +127,13 @@ struct IntegrityFaultingStore {
+ 
+ #[async_trait]
+ impl ChunkStore for IntegrityFaultingStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+@@ -205,6 +215,7 @@ async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
+                     index: index as u16,
+                 },
+                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
++                None,
+             )
+             .await
+             .unwrap();
+@@ -218,6 +229,7 @@ async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
+                 index: 0,
+             },
+             Bytes::from(rotten),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -278,6 +290,7 @@ async fn unrecoverable_read_still_enqueues_the_corrupt_chunk() {
+                 index: 0,
+             },
+             Bytes::from(rotten),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -338,6 +351,7 @@ async fn none_read_rejects_a_misplaced_but_intact_fragment() {
+                 index: 0,
+             },
+             fragment(foreign_chunk, foreign_payload),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -409,6 +423,7 @@ async fn ec_read_enqueues_integrity_fault_shard_for_repair_and_reconstructs() {
+                     index: index as u16,
+                 },
+                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
++                None,
+             )
+             .await
+             .unwrap();
+@@ -481,7 +496,7 @@ async fn none_read_enqueues_integrity_fault_fragment_for_repair() {
+     // returns them — it always returns `IntegrityFault` for `fault_id`.
+     let inner = MemChunks::default();
+     inner
+-        .put_fragment(fault_id, fragment(chunk_id, payload))
++        .put_fragment(fault_id, fragment(chunk_id, payload), None)
+         .await
+         .unwrap();
+     let chunks = IntegrityFaultingStore { inner, fault_id };
+@@ -554,6 +569,7 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
+                 index: 0,
+             },
+             encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -565,6 +581,7 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
+                 index: 1,
+             },
+             fragment(foreign_chunk, &vec![0xFF; shard_len]),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -605,8 +622,13 @@ struct TransientlyFailingStore {
+ 
+ #[async_trait]
+ impl ChunkStore for TransientlyFailingStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+         if id == self.fail_id {
+@@ -714,6 +736,7 @@ async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver()
+                     index: index as u16,
+                 },
+                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
++                None,
+             )
+             .await
+             .unwrap();
+@@ -728,6 +751,7 @@ async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver()
+                 index: 0,
+             },
+             Bytes::from(rotten),
++            None,
+         )
+         .await
+         .unwrap();
+@@ -808,6 +832,7 @@ async fn a_transient_dserver_failure_is_no_longer_silent() {
+                     index: index as u16,
+                 },
+                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
++                None,
+             )
+             .await
+             .unwrap();
+diff --git a/crates/core/tests/write_fanout.rs b/crates/core/tests/write_fanout.rs
+index 79de6ec..6c54133 100644
+--- a/crates/core/tests/write_fanout.rs
++++ b/crates/core/tests/write_fanout.rs
+@@ -43,7 +43,12 @@ impl FaultStore {
+ 
+ #[async_trait]
+ impl ChunkStore for FaultStore {
+-    async fn put_fragment(&self, id: FragmentId, _fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if self.fail_index == Some(id.index) {
+             return Err(format!("injected put failure at fragment {}", id.index).into());
+         }
+diff --git a/crates/custodian/src/rebalance.rs b/crates/custodian/src/rebalance.rs
+index c0b2b40..2a23b82 100644
+--- a/crates/custodian/src/rebalance.rs
++++ b/crates/custodian/src/rebalance.rs
+@@ -266,7 +266,7 @@ async fn evacuate_chunk(
+         if !repair::fragment_intact(&bytes, frag, plan.prior.chunk_map[plan.chunk_index].scheme) {
+             return Ok(EvacOutcome::Aborted);
+         }
+-        target_store.put_fragment(frag, bytes).await?;
++        target_store.put_fragment(frag, bytes, None).await?;
+         displaced.push((source, frag));
+         new_placement[index] = target;
+     }
+diff --git a/crates/custodian/src/reconstruction.rs b/crates/custodian/src/reconstruction.rs
+index b77dc15..bc83c3a 100644
+--- a/crates/custodian/src/reconstruction.rs
++++ b/crates/custodian/src/reconstruction.rs
+@@ -553,7 +553,7 @@ async fn repair_chunk(
+             chunk: chunk_id,
+             index: index as u16,
+         };
+-        target_store.put_fragment(frag, frag_bytes).await?;
++        target_store.put_fragment(frag, frag_bytes, None).await?;
+ 
+         let old = plan.placement[index];
+         if old != target {
+diff --git a/crates/custodian/tests/gc.rs b/crates/custodian/tests/gc.rs
+index 2b9fbb0..edaee0e 100644
+--- a/crates/custodian/tests/gc.rs
++++ b/crates/custodian/tests/gc.rs
+@@ -101,7 +101,12 @@ impl MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/custodian/tests/gc_delete_backstop.rs b/crates/custodian/tests/gc_delete_backstop.rs
+index 6a703f4..b586cc3 100644
+--- a/crates/custodian/tests/gc_delete_backstop.rs
++++ b/crates/custodian/tests/gc_delete_backstop.rs
+@@ -89,7 +89,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -125,7 +130,7 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
+     let placed_dserver: DServerId = 1;
+     let chunk: ChunkId = 0xDE_1E;
+     let frag = FragmentId { chunk, index: 0 };
+-    d1.put_fragment(frag, Bytes::from_static(b"object bytes"))
++    d1.put_fragment(frag, Bytes::from_static(b"object bytes"), None)
+         .await
+         .unwrap();
+     let record = InodeRecord {
+@@ -212,7 +217,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
+         chunk: old_chunk,
+         index: 0,
+     };
+-    d1.put_fragment(old_frag, Bytes::from_static(b"old object bytes"))
++    d1.put_fragment(old_frag, Bytes::from_static(b"old object bytes"), None)
+         .await
+         .unwrap();
+     let v1 = InodeRecord {
+@@ -239,7 +244,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
+         chunk: new_chunk,
+         index: 0,
+     };
+-    d1.put_fragment(new_frag, Bytes::from_static(b"new object bytes"))
++    d1.put_fragment(new_frag, Bytes::from_static(b"new object bytes"), None)
+         .await
+         .unwrap();
+     let new_map = vec![ChunkRef {
+diff --git a/crates/custodian/tests/gc_telemetry.rs b/crates/custodian/tests/gc_telemetry.rs
+index 4242670..96ed55f 100644
+--- a/crates/custodian/tests/gc_telemetry.rs
++++ b/crates/custodian/tests/gc_telemetry.rs
+@@ -91,7 +91,12 @@ impl MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/custodian/tests/rebalance.rs b/crates/custodian/tests/rebalance.rs
+index 3feb544..440d935 100644
+--- a/crates/custodian/tests/rebalance.rs
++++ b/crates/custodian/tests/rebalance.rs
+@@ -112,7 +112,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -153,9 +158,14 @@ impl<'a> Fleet<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for Fleet<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if let Some(store) = self.store(DServerId::from(id.index)) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -203,9 +213,10 @@ impl PlacementChunkStore for Fleet<'_> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         if let Some(store) = self.store(dserver) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+diff --git a/crates/custodian/tests/reconstruction.rs b/crates/custodian/tests/reconstruction.rs
+index ac0b1aa..1c6b7c1 100644
+--- a/crates/custodian/tests/reconstruction.rs
++++ b/crates/custodian/tests/reconstruction.rs
+@@ -105,7 +105,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -146,11 +151,16 @@ impl<'a> Fleet<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for Fleet<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         // Unused: the write path places via `put_fragment_at`. Route to id-as-server so
+         // the trait is total.
+         if let Some(store) = self.store(DServerId::from(id.index)) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -198,9 +208,10 @@ impl PlacementChunkStore for Fleet<'_> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         if let Some(store) = self.store(dserver) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -535,7 +546,9 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
+     // shard — the scrub / read finding. It must be EXCLUDED (never decoded), not absorbed.
+     let mut rotten = d1.get_fragment(frag(1)).await.unwrap().unwrap().to_vec();
+     rotten[CORE_HEADER_LEN as usize] ^= 0xff;
+-    d1.put_fragment(frag(1), Bytes::from(rotten)).await.unwrap();
++    d1.put_fragment(frag(1), Bytes::from(rotten), None)
++        .await
++        .unwrap();
+     repair::enqueue_repair(&meta, CHUNK, "scrub").await.unwrap();
+ 
+     // Reconstruction over the full (alive) fleet: the corrupt fragment is treated as
+@@ -760,7 +773,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
+     // placement `vec![9]` (len 1 != fragment_count 3): the fabricated tail would resolve
+     // indices 1,2 by identity to servers 1,2 — but a maintenance loop must never trust it.
+     let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
+-    d9.put_fragment(frag(0), bytes0).await.unwrap();
++    d9.put_fragment(frag(0), bytes0, None).await.unwrap();
+     let prior = read_inode(&meta).await;
+     let mut chunk_map = prior.chunk_map.clone();
+     chunk_map[0].placement = vec![9];
+@@ -1108,8 +1121,13 @@ struct FaultGetStore {
+ 
+ #[async_trait]
+ impl ChunkStore for FaultGetStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/custodian/tests/restore_reconcile.rs b/crates/custodian/tests/restore_reconcile.rs
+index e4186b5..79da710 100644
+--- a/crates/custodian/tests/restore_reconcile.rs
++++ b/crates/custodian/tests/restore_reconcile.rs
+@@ -89,7 +89,12 @@ impl MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/custodian/tests/scrub.rs b/crates/custodian/tests/scrub.rs
+index e73cf81..957ee56 100644
+--- a/crates/custodian/tests/scrub.rs
++++ b/crates/custodian/tests/scrub.rs
+@@ -93,7 +93,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -227,7 +232,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
+ 
+     // A referenced, intact fragment scrub must verify and pass.
+     let chunk: ChunkId = 0xA1;
+-    d0.put_fragment(frag(chunk, 0), valid_fragment(chunk))
++    d0.put_fragment(frag(chunk, 0), valid_fragment(chunk), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 1, "intact", chunk, 0).await;
+@@ -236,7 +241,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
+     // map) — GC's concern, NOT a scrub finding even though it is also "valid" bytes
+     // here. Scrub must skip it: it verifies only what the chunk map references.
+     let orphan: ChunkId = 0xB2;
+-    d0.put_fragment(frag(orphan, 0), corrupt_fragment(orphan))
++    d0.put_fragment(frag(orphan, 0), corrupt_fragment(orphan), None)
+         .await
+         .unwrap();
+ 
+@@ -273,7 +278,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
+     // A committed chunk map references (chunk, 0) on d0, but its stored bytes carry
+     // an injected bit-flip — its payload checksum no longer verifies.
+     let chunk: ChunkId = 0xC3;
+-    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
++    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 1, "rotten", chunk, 0).await;
+@@ -342,7 +347,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
+     // payload checksum verifies, yet its header names `foreign`, not `chunk`.
+     let chunk: ChunkId = 0xC8;
+     let foreign: ChunkId = 0x9999;
+-    d0.put_fragment(frag(chunk, 0), valid_fragment(foreign))
++    d0.put_fragment(frag(chunk, 0), valid_fragment(foreign), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 1, "misplaced", chunk, 0).await;
+@@ -397,13 +402,13 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
+     // One intact and one corrupt referenced fragment, so both the coverage metric
+     // (two fragments walked + verified) and the corruption metric (one finding) emit.
+     let intact: ChunkId = 0xD4;
+-    d0.put_fragment(frag(intact, 0), valid_fragment(intact))
++    d0.put_fragment(frag(intact, 0), valid_fragment(intact), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 1, "intact", intact, 0).await;
+ 
+     let rotten: ChunkId = 0xE5;
+-    d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten))
++    d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 2, "rotten", rotten, 0).await;
+@@ -463,7 +468,12 @@ struct TransientDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for TransientDServer {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         Ok(())
+     }
+ 
+@@ -500,7 +510,7 @@ async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
+     let intact: ChunkId = 0xF3;
+     for chunk in [rotten_a, rotten_b, intact] {
+         store
+-            .put_fragment(frag(chunk, 0), valid_fragment(chunk))
++            .put_fragment(frag(chunk, 0), valid_fragment(chunk), None)
+             .await
+             .unwrap();
+     }
+@@ -651,7 +661,7 @@ async fn detects_corruption_on_an_empty_placement_none_chunk() {
+     let d0 = MemDServer::default();
+ 
+     let chunk: ChunkId = 0xF9_00;
+-    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
++    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk), None)
+         .await
+         .unwrap();
+     commit_chunk(
+@@ -701,7 +711,7 @@ async fn detects_corruption_on_an_empty_placement_rs_chunk_above_index_zero() {
+     let d1 = MemDServer::default();
+ 
+     let chunk: ChunkId = 0xF9_01;
+-    d1.put_fragment(frag(chunk, 1), corrupt_fragment(chunk))
++    d1.put_fragment(frag(chunk, 1), corrupt_fragment(chunk), None)
+         .await
+         .unwrap();
+     commit_chunk(
+@@ -768,7 +778,7 @@ async fn short_placement_is_malformed_scrub_fails_safe() {
+     let d2 = MemDServer::default();
+ 
+     let chunk: ChunkId = 0xF9_02;
+-    d2.put_fragment(frag(chunk, 2), corrupt_fragment(chunk))
++    d2.put_fragment(frag(chunk, 2), corrupt_fragment(chunk), None)
+         .await
+         .unwrap();
+     commit_chunk(
+@@ -831,7 +841,7 @@ async fn detects_corruption_in_a_full_rs_6_3_placement() {
+             valid_fragment(chunk)
+         };
+         server
+-            .put_fragment(frag(chunk, index as u16), bytes)
++            .put_fragment(frag(chunk, index as u16), bytes, None)
+             .await
+             .unwrap();
+     }
+diff --git a/crates/custodian/tests/tier1_disk_faults.rs b/crates/custodian/tests/tier1_disk_faults.rs
+index dca89ee..16788a7 100644
+--- a/crates/custodian/tests/tier1_disk_faults.rs
++++ b/crates/custodian/tests/tier1_disk_faults.rs
+@@ -369,7 +369,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
+         };
+         // put_fragment verifies the checksum — valid fragments from plan_write pass.
+         stores_for_write[i]
+-            .put_fragment(frag_id, frag_bytes.clone())
++            .put_fragment(frag_id, frag_bytes.clone(), None)
+             .await
+             .unwrap_or_else(|e| panic!("put_fragment index {i} failed: {e}"));
+     }
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index a5e741e..f1e8cfa 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -199,7 +199,12 @@ struct CrashStore<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for CrashStore<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if self.armed.load(Ordering::Relaxed) {
+             // The write dies in flight: nothing is stored, and the fault surfaces to the
+             // reconciler exactly as a real backend's interrupted write would.
+@@ -207,7 +212,7 @@ impl ChunkStore for CrashStore<'_> {
+                 "simulated mid-write crash: the rebuilt fragment write never completed",
+             )));
+         }
+-        self.inner.put_fragment(id, fragment).await
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+@@ -236,7 +241,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -277,9 +287,14 @@ impl<'a> Fleet<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for Fleet<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if let Some(store) = self.store(DServerId::from(id.index)) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -327,9 +342,10 @@ impl PlacementChunkStore for Fleet<'_> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         if let Some(store) = self.store(dserver) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -513,7 +529,9 @@ async fn apply_storage_faults(d: &[MemDServer; 4], plan: &SeededStorageFaults) {
+                 // Flip the first payload byte (past the self-describing header) so the
+                 // crc32c no longer matches — bit rot the checksum must catch.
+                 bytes[CORE_HEADER_LEN as usize] ^= 0xff;
+-                d[i].put_fragment(f, Bytes::from(bytes)).await.unwrap();
++                d[i].put_fragment(f, Bytes::from(bytes), None)
++                    .await
++                    .unwrap();
+             }
+         }
+     }
+@@ -842,7 +860,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
+         chunk: LIVE,
+         index: 0,
+     };
+-    d[0].put_fragment(live, Bytes::from_static(b"live"))
++    d[0].put_fragment(live, Bytes::from_static(b"live"), None)
+         .await
+         .unwrap();
+     commit_reference(&meta, 0).await;
+@@ -855,6 +873,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
+             index: 0,
+         },
+         Bytes::from_static(b"leak"),
++        None,
+     )
+     .await
+     .unwrap();
+@@ -877,10 +896,10 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
+         chunk: ORPH_NEW,
+         index: 0,
+     };
+-    d[2].put_fragment(old, Bytes::from_static(b"old"))
++    d[2].put_fragment(old, Bytes::from_static(b"old"), None)
+         .await
+         .unwrap();
+-    d[3].put_fragment(new, Bytes::from_static(b"new"))
++    d[3].put_fragment(new, Bytes::from_static(b"new"), None)
+         .await
+         .unwrap();
+     mark_orphaned(&meta, 2, old, reclaimable_at).await.unwrap();
+diff --git a/crates/dst/tests/network.rs b/crates/dst/tests/network.rs
+index 1f0af6a..8620cbc 100644
+--- a/crates/dst/tests/network.rs
++++ b/crates/dst/tests/network.rs
+@@ -43,7 +43,7 @@ use madsim::runtime::Handle;
+ use madsim::task::NodeId;
+ use madsim::time::{sleep, timeout};
+ use tonic::transport::Server;
+-use wyrd_chunk_format::decode;
++use wyrd_chunk_format::{decode, encode, FragmentHeader};
+ use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, FanoutChunkStore, GrpcChunkStore};
+ use wyrd_core::metadata::EcScheme;
+ use wyrd_core::{read, write};
+@@ -100,14 +100,50 @@ impl DStore {
+             fault,
+         }
+     }
++
++    /// The simulated wall clock this D server judges deadlines against — madsim
++    /// virtualises `SystemTime`, so this is the *simulator's* clock and stays
++    /// seed-deterministic (ADR-0009; the wall-clock exemption the rubric grants exactly
++    /// this case, #619). It is the same source the production `FsChunkStore` reads
++    /// through its `SystemClock` when it runs under the simulator (property 6 below).
++    fn now_millis() -> u64 {
++        #[allow(clippy::disallowed_methods)]
++        let now = std::time::SystemTime::now();
++        now.duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_millis() as u64
++    }
+ }
+ 
+ #[async_trait]
+ impl ChunkStore for DStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    /// This store's publication is a single map insert under its own lock, so its
++    /// application point is reached synchronously: one deadline judgment there is the
++    /// contract's whole requirement for it (`wyrd_traits::ChunkStore::put_fragment`),
++    /// and a refusal stores nothing. It is deliberately **not** a re-implementation of
++    /// `FsChunkStore`'s two-phase enforcement — the parked-write scenario (0016's
++    /// failure-mode row) is driven against the *real* `FsChunkStore` in property 6, so
++    /// nothing here stands in for production enforcement (the rubric's test-fidelity
++    /// rule: a sim model must not be a stronger or weaker variant of the adapter it
++    /// mirrors).
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         // Verify integrity before acknowledging (the D-server contract); a
+         // non-fragment is rejected, exactly as `FsChunkStore` would.
+         decode(&fragment).map_err(|e| Box::new(e) as wyrd_traits::BoxError)?;
++        if let Some(deadline_millis) = deadline_millis {
++            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(
++                id,
++                deadline_millis,
++                Self::now_millis(),
++            ) {
++                return Err(Box::new(refusal));
++            }
++        }
+         self.fragments
+             .lock()
+             .unwrap()
+@@ -512,6 +548,197 @@ async fn exactly_one_concurrent_writer_wins_over_network() {
+     .await;
+ }
+ 
++/// A D server whose **accept queue** is modelled: it takes a `put_fragment`, holds it for
++/// `park` of simulated time, and only then applies it — against the **real, production**
++/// [`FsChunkStore`] behind it (issue #638; 0016's failure-mode row, `0016:1784`).
++///
++/// Two properties make it a faithful model rather than a convenient one:
++///
++/// * **The application outlives the request.** The parked write runs on a spawned task,
++///   so dropping the request future — a client that reset the stream or gave up on its
++///   own await — does **not** cancel it. That mirrors production exactly: the D server's
++///   store hands its work to `spawn_blocking` (`crates/chunkstore-fs/src/lib.rs:216`),
++///   and a cancelled tonic handler leaves that closure running on to its publish point.
++///   A model that parked *inside* the request future could not reproduce 0016's scenario
++///   at all — the caller "has long since timed out" there, so the write under test is
++///   precisely one that is no longer attached to a caller.
++/// * **It enforces nothing itself.** It only delays and delegates; every deadline
++///   judgment below is made by the production `FsChunkStore`, reading the simulator's
++///   clock through its own `SystemClock` (madsim virtualises `SystemTime`, ADR-0009).
++struct ParkedFsDServer {
++    inner: Arc<wyrd_chunkstore_fs::FsChunkStore>,
++    park: Duration,
++}
++
++#[async_trait]
++impl ChunkStore for ParkedFsDServer {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        let inner = Arc::clone(&self.inner);
++        let park = self.park;
++        // Detached on purpose (see the type's doc): the write is already accepted, and
++        // from here on nothing the caller does can stop it landing — which is the whole
++        // hazard `W_write` exists to bound.
++        let applied = madsim::task::spawn(async move {
++            sleep(park).await;
++            inner.put_fragment(id, fragment, deadline_millis).await
++        });
++        // The store's own error object travels back unchanged (`BoxError` is `Send +
++        // Sync`), so a refusal still reaches the service as the typed
++        // `WriteDeadlineExpired` and is mapped to its own status — nothing here
++        // re-classifies anything.
++        applied.await.expect("the parked write task must not panic")
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        self.inner.get_fragment(id).await
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        self.inner.list_fragments().await
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.inner.delete_fragment(id).await
++    }
++
++    async fn health(&self) -> Result<Health> {
++        self.inner.health().await
++    }
++}
++
++/// Property 6 (issue #638) — 0016's own failure-mode row (`0016:1784`): "authorize a
++/// fragment write, park it in the D server's accept queue past `W_write` (the caller has
++/// long since timed out), fence and reap the session, and let the parked write proceed. The
++/// D server MUST refuse it as past its deadline."
++///
++/// Staged exactly that way, and against the **real** `FsChunkStore` (the D server's
++/// production store, reading the simulator's clock): the caller authorizes a write with
++/// 200 ms of headroom, gives up on its await after 500 ms — so it is gone, learning
++/// nothing, long before anything is applied — and the D server applies the parked write two
++/// simulated seconds later. No caller-side bound can produce the outcome asserted here: the
++/// caller has already stopped waiting, and its own timeout cannot reach a write the server
++/// has accepted (the status quo 0016 rejects at `:1557-1564`), which would land after its
++/// authorization elapsed — outcome (a), the unreferenced *and* unevidenced fragment.
++///
++/// The **control** is the same run's second write: identical park, identical abandoned
++/// caller, no deadline. It lands. That is what makes the first write's absence attributable
++/// to the deadline rather than to the caller's disappearance — without it, a D server that
++/// simply dropped abandoned writes would pass.
++#[madsim::test]
++async fn a_write_parked_past_its_deadline_is_refused_by_the_real_d_server() {
++    let handle = Handle::current();
++    let ip: IpAddr = "10.0.0.2".parse().unwrap();
++    let dserver = handle.create_node().name("d-parked").ip(ip).build();
++    let addr = format!("{ip}:{PORT}").parse().unwrap();
++    dserver.spawn(async move {
++        // A real on-disk store, as a D server runs it; the tempdir is held for the
++        // lifetime of the server task.
++        let dir = tempfile::tempdir().expect("temp dir");
++        let store = Arc::new(ParkedFsDServer {
++            inner: Arc::new(wyrd_chunkstore_fs::FsChunkStore::open(dir.path()).expect("fs store")),
++            park: Duration::from_secs(2),
++        });
++        Server::builder()
++            .add_service(ChunkStoreServer::new(ChunkStoreService::from_arc(store)))
++            .serve(addr)
++            .await
++            .expect("d-server serve");
++    });
++
++    let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
++    let client_node = handle.create_node().name("client").ip(client_ip).build();
++    // Let the server bind before the client dials (deterministic in sim time).
++    sleep(Duration::from_secs(1)).await;
++
++    let endpoint = format!("http://{ip}:{PORT}");
++    client_node
++        .spawn(async move {
++            let client = GrpcChunkStore::connect(endpoint).await.expect("connect");
++            let parked = FragmentId {
++                chunk: 0x0016_0638,
++                index: 0,
++            };
++            let control = FragmentId {
++                chunk: 0x0016_0639,
++                index: 0,
++            };
++            let body = |id: FragmentId| {
++                let mut header = FragmentHeader::new_v1(id.chunk, 4);
++                header.ec_fragment_index = id.index;
++                Bytes::from(encode(&header, b"park"))
++            };
++
++            // Authorized now with 200 ms of headroom: live when the D server accepts the
++            // write, long elapsed by the time it applies it. madsim virtualises
++            // `SystemTime`, so this reads the simulator's clock — the same one the D
++            // server's `FsChunkStore` judges against (ADR-0009, #619).
++            #[allow(clippy::disallowed_methods)]
++            let now = std::time::SystemTime::now();
++            let deadline_millis = now
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_millis() as u64
++                + 200;
++
++            // The caller gives up after 500 ms — a quarter of the park. From here it is
++            // not waiting for anything, exactly as 0016 stages it.
++            assert!(
++                timeout(
++                    Duration::from_millis(500),
++                    client.put_fragment(parked, body(parked), Some(deadline_millis)),
++                )
++                .await
++                .is_err(),
++                "the caller must still be parked when it gives up — if the D server \
++                 answered inside 500 ms the scenario did not happen"
++            );
++            assert!(
++                timeout(
++                    Duration::from_millis(500),
++                    client.put_fragment(control, body(control), None),
++                )
++                .await
++                .is_err(),
++                "the control write is parked the same way and abandoned the same way"
++            );
++
++            // Let both parked writes proceed to their application point, then look at
++            // what the D server actually holds. Bounded, fail-closed reads (the rubric's
++            // await discipline, `AGENTS.md:181-183`).
++            sleep(Duration::from_secs(4)).await;
++
++            let got = timeout(Duration::from_secs(60), client.get_fragment(parked))
++                .await
++                .expect("the read-back must be answered")
++                .unwrap();
++            assert!(
++                got.is_none(),
++                "the parked write landed after its authorization deadline and MUST have \
++                 been refused by the D server — a caller-side bound cannot produce this: \
++                 the caller stopped waiting 1.5 s before the write was applied"
++            );
++
++            let control_got = timeout(Duration::from_secs(60), client.get_fragment(control))
++                .await
++                .expect("the read-back must be answered")
++                .unwrap();
++            assert_eq!(
++                control_got.as_deref(),
++                Some(body(control).as_ref()),
++                "the control — same park, same abandoned caller, no deadline — must land, \
++                 which is what makes the refusal above the deadline's doing rather than \
++                 the caller's disappearance"
++            );
++        })
++        .await
++        .expect("client task");
++}
++
+ /// A seed-derived RNG for the per-test fault selection, drawn from madsim's
+ /// seeded global RNG so the whole campaign — *which* links are faulted included —
+ /// reproduces from the run seed (ADR-0009).
+diff --git a/crates/proto/proto/wyrd/v0/chunk.proto b/crates/proto/proto/wyrd/v0/chunk.proto
+index 7ba2bc5..80e263f 100644
+--- a/crates/proto/proto/wyrd/v0/chunk.proto
++++ b/crates/proto/proto/wyrd/v0/chunk.proto
+@@ -26,6 +26,23 @@ message FragmentPutRequest {
+   FragmentId id = 1;
+   // The stored fragment bytes, exactly as specified by chunk-format (ADR-0019).
+   bytes fragment = 2;
++  // The write's authorization deadline (epoch milliseconds), enforced by the D
++  // server itself against its own clock — proposal 0016 decision 5's `W_write`
++  // (issue #638):
++  // `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`. A
++  // caller-side timeout alone bounds only how long the writer waits, not when an
++  // already-accepted write takes effect, so the deadline travels with the write.
++  // The server refuses an already-elapsed write outright and, since publishing is
++  // itself a step that can block, retracts a publication that turns out to have
++  // landed past the deadline: a refused write leaves nothing stored.
++  //
++  // **Additive and optional** (explicit proto3 presence, not zero-means-absent):
++  // an absent field is today's unbounded behaviour, so every existing writer is
++  // unaffected. Mixed-fleet caveat, stated honestly: an **old** D server ignores
++  // this field, so a new client talking to one degrades to unenforced (no
++  // capability exchange exists yet); a new server sees no field from an old client
++  // and behaves exactly as before.
++  optional uint64 deadline_millis = 3;
+ }
+ 
+ message FragmentPutResponse {}
+diff --git a/crates/proto/tests/stubs.rs b/crates/proto/tests/stubs.rs
+index 27eabc2..ffbcad6 100644
+--- a/crates/proto/tests/stubs.rs
++++ b/crates/proto/tests/stubs.rs
+@@ -20,6 +20,7 @@ fn requests_are_fragment_addressed() {
+             index: 7,
+         }),
+         fragment: vec![0xab, 0xcd],
++        deadline_millis: None,
+     };
+     assert_eq!(req.id.unwrap().index, 7);
+ 
+diff --git a/crates/server/tests/custodian_day_one.rs b/crates/server/tests/custodian_day_one.rs
+index 586a4ed..15e593f 100644
+--- a/crates/server/tests/custodian_day_one.rs
++++ b/crates/server/tests/custodian_day_one.rs
+@@ -128,7 +128,12 @@ struct MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -168,7 +173,12 @@ fn unreachable() -> wyrd_traits::BoxError {
+ 
+ #[async_trait]
+ impl ChunkStore for DeadDServer {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         Err(unreachable())
+     }
+ 
+@@ -198,7 +208,12 @@ struct FaultyDServer;
+ 
+ #[async_trait]
+ impl ChunkStore for FaultyDServer {
+-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        _id: FragmentId,
++        _fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         Err(unreachable())
+     }
+ 
+@@ -265,9 +280,14 @@ impl<'a> Fleet<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for Fleet<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if let Some(store) = self.store(DServerId::from(id.index)) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -315,9 +335,10 @@ impl PlacementChunkStore for Fleet<'_> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         if let Some(store) = self.store(dserver) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+diff --git a/crates/server/tests/custodian_gc.rs b/crates/server/tests/custodian_gc.rs
+index 804f106..52934dd 100644
+--- a/crates/server/tests/custodian_gc.rs
++++ b/crates/server/tests/custodian_gc.rs
+@@ -165,7 +165,12 @@ impl MemDServer {
+ 
+ #[async_trait]
+ impl ChunkStore for MemDServer {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+@@ -212,9 +217,14 @@ impl<'a> Fleet<'a> {
+ 
+ #[async_trait]
+ impl ChunkStore for Fleet<'_> {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         if let Some(store) = self.store(DServerId::from(id.index)) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -262,9 +272,10 @@ impl PlacementChunkStore for Fleet<'_> {
+         dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+         if let Some(store) = self.store(dserver) {
+-            store.put_fragment(id, fragment).await?;
++            store.put_fragment(id, fragment, deadline_millis).await?;
+         }
+         Ok(())
+     }
+@@ -600,6 +611,7 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
+             index: 0,
+         },
+         Bytes::from_static(b"leased fan-out fragment 0"),
++        None,
+     )
+     .await
+     .unwrap();
+@@ -609,6 +621,7 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
+             index: 1,
+         },
+         Bytes::from_static(b"leased fan-out fragment 1"),
++        None,
+     )
+     .await
+     .unwrap();
+@@ -680,6 +693,7 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
+             index: 0,
+         },
+         Bytes::from_static(b"in-flight fan-out fragment 0"),
++        None,
+     )
+     .await
+     .unwrap();
+@@ -689,6 +703,7 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
+             index: 1,
+         },
+         Bytes::from_static(b"in-flight fan-out fragment 1"),
++        None,
+     )
+     .await
+     .unwrap();
+@@ -881,6 +896,7 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
+                 index: idx,
+             },
+             Bytes::from(format!("leased fan-out fragment {idx}")),
++            None,
+         )
+         .await
+         .unwrap();
+diff --git a/crates/server/tests/dserver.rs b/crates/server/tests/dserver.rs
+index 53dfe1b..c5be361 100644
+--- a/crates/server/tests/dserver.rs
++++ b/crates/server/tests/dserver.rs
+@@ -148,7 +148,7 @@ async fn d_servers_register_serve_and_are_discovered() {
+     let client = GrpcChunkStore::connect(endpoints[0].clone()).await.unwrap();
+     let id = fid(0xabc_def, 4);
+     let frag = fragment(id, b"a fragment to a discovered D server");
+-    client.put_fragment(id, frag.clone()).await.unwrap();
++    client.put_fragment(id, frag.clone(), None).await.unwrap();
+     assert_eq!(
+         client.get_fragment(id).await.unwrap().as_deref(),
+         Some(frag.as_ref()),
+@@ -183,8 +183,13 @@ struct GateStore {
+ 
+ #[async_trait]
+ impl ChunkStore for GateStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/server/tests/dst_read_fanout.rs b/crates/server/tests/dst_read_fanout.rs
+index aa5e77e..c31bff2 100644
+--- a/crates/server/tests/dst_read_fanout.rs
++++ b/crates/server/tests/dst_read_fanout.rs
+@@ -191,8 +191,13 @@ impl ArrivalStore {
+ 
+ #[async_trait]
+ impl ChunkStore for ArrivalStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/server/tests/gateway_lease_expiry.rs b/crates/server/tests/gateway_lease_expiry.rs
+index 37f92fb..460e1aa 100644
+--- a/crates/server/tests/gateway_lease_expiry.rs
++++ b/crates/server/tests/gateway_lease_expiry.rs
+@@ -75,7 +75,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/server/tests/gateway_multi_writer.rs b/crates/server/tests/gateway_multi_writer.rs
+index 2a7c92d..9edcd10 100644
+--- a/crates/server/tests/gateway_multi_writer.rs
++++ b/crates/server/tests/gateway_multi_writer.rs
+@@ -96,7 +96,12 @@ struct MemChunks {
+ 
+ #[async_trait]
+ impl ChunkStore for MemChunks {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
+         self.frags.lock().unwrap().insert(id, fragment);
+         Ok(())
+     }
+diff --git a/crates/server/tests/health_probe.rs b/crates/server/tests/health_probe.rs
+index f33faff..e250bfd 100644
+--- a/crates/server/tests/health_probe.rs
++++ b/crates/server/tests/health_probe.rs
+@@ -107,8 +107,13 @@ struct ControllableStore {
+ 
+ #[async_trait]
+ impl ChunkStore for ControllableStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+@@ -999,7 +1004,7 @@ async fn health_check_answers_while_the_data_plane_is_saturated() {
+         b"a fragment that never gets read while the slot is held",
+     );
+     data_client
+-        .put_fragment(id, frag)
++        .put_fragment(id, frag, None)
+         .await
+         .expect("seed the fragment");
+     let admitted = tokio::spawn(async move { data_client.get_fragment(id).await });
+diff --git a/crates/server/tests/read_fanout.rs b/crates/server/tests/read_fanout.rs
+index 6a05c22..cfd5806 100644
+--- a/crates/server/tests/read_fanout.rs
++++ b/crates/server/tests/read_fanout.rs
+@@ -61,8 +61,13 @@ struct FaultStore {
+ 
+ #[async_trait]
+ impl ChunkStore for FaultStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/server/tests/request_capacity_planes.rs b/crates/server/tests/request_capacity_planes.rs
+index 9309d2f..8177914 100644
+--- a/crates/server/tests/request_capacity_planes.rs
++++ b/crates/server/tests/request_capacity_planes.rs
+@@ -764,8 +764,13 @@ struct GateStore {
+ 
+ #[async_trait]
+ impl ChunkStore for GateStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/server/tests/s3_http_wire.rs b/crates/server/tests/s3_http_wire.rs
+index 4905ca0..529f160 100644
+--- a/crates/server/tests/s3_http_wire.rs
++++ b/crates/server/tests/s3_http_wire.rs
+@@ -879,7 +879,12 @@ mod streaming_behaviour {
+ 
+     #[async_trait]
+     impl ChunkStore for RecordingChunkStore {
+-        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        async fn put_fragment(
++            &self,
++            id: FragmentId,
++            fragment: Bytes,
++            _deadline_millis: Option<u64>,
++        ) -> Result<()> {
+             let mut first = self.first_write_at.lock().unwrap();
+             if first.is_none() {
+                 *first = Some(self.pieces_pulled.load(Ordering::SeqCst));
+diff --git a/crates/server/tests/s3_range_conditional.rs b/crates/server/tests/s3_range_conditional.rs
+index ff6f648..0105007 100644
+--- a/crates/server/tests/s3_range_conditional.rs
++++ b/crates/server/tests/s3_range_conditional.rs
+@@ -107,8 +107,13 @@ struct CountingChunkStore {
+ 
+ #[async_trait]
+ impl ChunkStore for CountingChunkStore {
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+-        self.inner.put_fragment(id, fragment).await
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.inner.put_fragment(id, fragment, deadline_millis).await
+     }
+ 
+     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+diff --git a/crates/testkit/src/lib.rs b/crates/testkit/src/lib.rs
+index 2830c1c..c02fc6d 100644
+--- a/crates/testkit/src/lib.rs
++++ b/crates/testkit/src/lib.rs
+@@ -77,6 +77,65 @@ impl Clock for ManualClock {
+     }
+ }
+ 
++/// A [`Clock`] that hands out a **scripted sequence** of readings — one per read, then
++/// repeating the last — so a test can make time pass *between* two clock reads inside the
++/// code under test, with no real waiting and no race.
++///
++/// [`ManualClock`] cannot express that: advancing it requires a moment when the test holds
++/// control, and the interesting window (between a store admitting a write and the instant it
++/// has published it, issue #638) is precisely a window in which it does not. Scripting the
++/// readings puts the *elapsing* inside the production call: reading 1 says the write is
++/// live, reading 2 says its deadline has passed. A guard that exists only on entry
++/// therefore lets the write land and the test goes red, which is the property being pinned.
++///
++/// It scripts *readings*, so it pins **how many** clock reads the code takes and what each
++/// one says — not **where** they happen. A test that must show a read falls on the far side
++/// of a specific syscall needs a clock anchored to an observable effect of that syscall
++/// instead (`chunkstore-fs/tests/conformance.rs` builds one over the store's own directory).
++#[derive(Debug, Clone)]
++pub struct SteppedClock {
++    readings: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u64>>>,
++    last: std::sync::Arc<std::sync::atomic::AtomicU64>,
++}
++
++impl SteppedClock {
++    /// A clock that returns `readings` in order, one per [`Clock::now_millis`] call, and
++    /// keeps returning the final one afterwards.
++    ///
++    /// # Panics
++    /// Panics on an empty script — a clock that cannot answer its first read is a test bug.
++    pub fn new(readings: impl IntoIterator<Item = u64>) -> Self {
++        let readings: std::collections::VecDeque<u64> = readings.into_iter().collect();
++        let first = *readings.front().expect("a SteppedClock needs a reading");
++        Self {
++            readings: std::sync::Arc::new(std::sync::Mutex::new(readings)),
++            last: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(first)),
++        }
++    }
++
++    /// How many readings are still unconsumed — lets a test assert the code under test
++    /// really took the reads its script assumed (an unconsumed tail means it did not).
++    pub fn remaining(&self) -> usize {
++        self.readings.lock().expect("stepped clock").len()
++    }
++}
++
++impl Clock for SteppedClock {
++    fn now_millis(&self) -> u64 {
++        let mut readings = self.readings.lock().expect("stepped clock");
++        match readings.pop_front() {
++            Some(reading) => {
++                self.last
++                    .store(reading, std::sync::atomic::Ordering::Relaxed);
++                reading
++            }
++            // The script is exhausted: time stops rather than wrapping or panicking, so a
++            // later read (a retry, another call) sees the last scripted instant.
++            None => self.last.load(std::sync::atomic::Ordering::Relaxed),
++        }
++    }
++}
++
+ /// Abstract durable storage. Production code performs disk I/O through this seam
+ /// so the simulator can model latency, reordering, and faults deterministically.
+ pub trait Disk {
+@@ -792,6 +851,31 @@ mod tests {
+         assert!(!faults.should_fail(FaultPoint::DiskWrite));
+     }
+ 
++    /// [`SteppedClock`] hands out its script in order, then holds the last reading —
++    /// and `remaining()` reports the *unconsumed tail*, which is how a test pins that
++    /// the code under test really took the reads its script assumed (issue #638). A
++    /// `remaining()` that answered a constant would silently make those assertions
++    /// vacuous, so the count is pinned at every step, not just at zero.
++    #[test]
++    fn a_stepped_clock_reports_each_reading_once_and_counts_what_is_left() {
++        let clock = SteppedClock::new([9_500, 10_500]);
++        assert_eq!(clock.remaining(), 2, "nothing consumed yet");
++        assert_eq!(clock.now_millis(), 9_500);
++        assert_eq!(clock.remaining(), 1, "one reading consumed");
++        assert_eq!(clock.now_millis(), 10_500);
++        assert_eq!(clock.remaining(), 0, "the script is exhausted");
++        assert_eq!(
++            clock.now_millis(),
++            10_500,
++            "past the end, time stops at the last reading rather than wrapping"
++        );
++        assert_eq!(clock.remaining(), 0);
++        // A clone shares the script, so the handle a test keeps sees what the code
++        // under test consumed.
++        let handle = clock.clone();
++        assert_eq!(handle.remaining(), 0);
++    }
++
+     #[test]
+     fn seeded_net_faults_pick_is_reproducible_and_bounded() {
+         // The network-seam promise: the faulted-link selection is a pure
+diff --git a/crates/traits/src/lib.rs b/crates/traits/src/lib.rs
+index d7d8f17..6635524 100644
+--- a/crates/traits/src/lib.rs
++++ b/crates/traits/src/lib.rs
+@@ -549,6 +549,104 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ErrorClass {
+     ErrorClass::Terminal
+ }
+ 
++/// A [`ChunkStore::put_fragment`] **refused** because its authorization deadline had
++/// elapsed by the time the store applied it — proposal 0016 decision 5's server-enforced
++/// `W_write` bound (issue #638,
++/// `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`).
++///
++/// A caller-side `await` timeout alone bounds only how long the *writer waits*, not when
++/// an already-accepted write *takes effect*: a write parked between acceptance and
++/// application could otherwise land arbitrarily late — after the reaper's `orphan:` grace
++/// elapsed and the evidence protecting it was reclaimed (0016 outcome (a), the leak the
++/// strict margin `G_orphan > W_write + δ_clock` (`0016:1478`) exists to prevent). So the
++/// acceptor enforces the deadline itself, **around the point the write is applied**, and
++/// this is what it raises instead.
++///
++/// Receiving it is a **definite** verdict: the write did not take effect. A store that
++/// discovers the overrun only after its publish step retracts the publication before
++/// raising this, and if that retraction fails it raises its own backend fault instead
++/// (see [`ChunkStore::put_fragment`]'s contract) — never this class, whose whole value
++/// to a caller is that it distinguishes "certainly not applied" from a timeout's "may
++/// still land".
++///
++/// This is an **expected, non-fault** outcome — the write was too late, the backend is
++/// healthy — so, exactly like [`IntegrityFault`] / [`BlockReadFault`] / [`ScanCapExceeded`],
++/// it lives in the seam crate: **every** backend raises the *same* type, and a caller tells
++/// "refused, too late" apart from "the disk is broken" the same way on any of them
++/// ([`is_write_deadline_expired`]). It classifies [`Terminal`](ErrorClass::Terminal) through
++/// [`classify`]'s fail-safe default, which is correct without a special arm: re-sending the
++/// *same* expired authorization can never succeed, so the caller must re-authorize rather
++/// than retry.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct WriteDeadlineExpired {
++    /// The fragment write that was refused.
++    pub id: FragmentId,
++    /// Detail for the durability audit trail: the deadline the write carried and what the
++    /// **acceptor's** clock read when it refused — the two evaluation sites `δ_clock`
++    /// bounds the skew between. Rendered by [`WriteDeadlineExpired::if_elapsed`] at the
++    /// store that enforced it, and carried verbatim across the wire when the gRPC client
++    /// reconstructs the class (the same shape [`IntegrityFault`] uses, for the same
++    /// reason: the reconstruction must not fabricate readings it never took).
++    pub detail: String,
++}
++
++impl WriteDeadlineExpired {
++    /// The **one** place the seam decides whether a write is too late: `Some(refusal)` iff
++    /// the acceptor's clock has reached `deadline_millis`, `None` while the write is still
++    /// live. Every backend calls this rather than re-deriving the comparison, so
++    /// `chunkstore-fs`, the gRPC D server and any future store cannot disagree about what
++    /// the deadline *means* (the reason a caller may not get a weaker guarantee by holding
++    /// a local store, issue #638 leg E).
++    ///
++    /// The comparison is `now >= deadline` — **inclusive**, i.e. the deadline instant
++    /// itself is already too late. That is the fail-closed direction, and it matches GC's
++    /// own inclusive grace test (`crates/custodian/src/gc.rs:174`), so the arithmetic
++    /// `G_orphan > W_write + δ_clock` (`0016:1478`) composes without a boundary tick that
++    /// belongs to neither side.
++    ///
++    /// It takes `now_millis` rather than reading a clock: the seam crate owns no clock, and
++    /// the read belongs to the lifecycle that applies the write (the store's own clock —
++    /// AGENTS.md § Review rubric, "one clock per correctness lifecycle").
++    pub fn if_elapsed(id: FragmentId, deadline_millis: u64, now_millis: u64) -> Option<Self> {
++        (now_millis >= deadline_millis).then(|| Self {
++            id,
++            detail: format!(
++                "authorization deadline {deadline_millis} ms (epoch) had elapsed by the \
++                 time the store applied the write; the store's clock read {now_millis} ms"
++            ),
++        })
++    }
++}
++
++impl fmt::Display for WriteDeadlineExpired {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "fragment write refused and NOT applied (chunk {:032x} index {}): {} \
++             (proposal 0016 decision 5's W_write — re-authorize, do not retry)",
++            self.id.chunk, self.id.index, self.detail,
++        )
++    }
++}
++
++impl std::error::Error for WriteDeadlineExpired {}
++
++/// Whether `err` is a [`WriteDeadlineExpired`] refusal anywhere in its source chain — the
++/// seam-level classifier a caller uses to tell an **expected** "refused, too late" apart
++/// from a genuine backend fault, mirroring [`is_integrity_fault`] /
++/// [`is_block_read_fault`]. Walks [`source`](std::error::Error::source) so a backend (or
++/// the gRPC client) may wrap the refusal in its own type and still be classified.
++pub fn is_write_deadline_expired(err: &(dyn std::error::Error + 'static)) -> bool {
++    let mut next = Some(err);
++    while let Some(e) = next {
++        if e.is::<WriteDeadlineExpired>() {
++            return true;
++        }
++        next = e.source();
++    }
++    false
++}
++
+ /// A coarse health signal a backend reports about itself.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Health {
+@@ -574,7 +672,47 @@ pub enum Health {
+ pub trait ChunkStore: Send + Sync {
+     /// Persist a fragment's bytes under `id`. Implementations verify the
+     /// fragment's self-describing checksums before acknowledging.
+-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()>;
++    ///
++    /// `deadline_millis` is the write's **authorization deadline** in epoch
++    /// milliseconds — proposal 0016 decision 5's `W_write` (issue #638,
++    /// `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`).
++    /// A caller-side timeout bounds only how long the writer *waits*, so the
++    /// deadline travels with the write and **the implementation itself must
++    /// enforce it**:
++    ///
++    /// * It **refuses** a write whose deadline has elapsed, returning
++    ///   [`WriteDeadlineExpired`] ([`WriteDeadlineExpired::if_elapsed`] is the shared
++    ///   comparison, so every backend means the same thing by "too late").
++    /// * The deadline is judged against the clock **once the write has been applied**
++    ///   — after the implementation's publish step, not merely on entry. The bound is
++    ///   about when the write *takes effect*, and everything before that step (a
++    ///   thread-pool queue, an accept queue, slow I/O) *and the step itself* can
++    ///   consume arbitrary time; a check that precedes the publication bounds only
++    ///   when the store *decided* to publish. An implementation may of course refuse
++    ///   an already-expired write on entry as well — that costs no I/O — but that
++    ///   check is never the bound.
++    /// * A write whose publication turns out to have landed past its deadline is
++    ///   **retracted**: the store is left as if it had never happened, so the fragment
++    ///   MUST NOT be observable through [`ChunkStore::get_fragment`] afterwards, and no
++    ///   scratch may be left behind. Refusing the caller while *keeping* the bytes is
++    ///   precisely the leak (0016 outcome (a)) the deadline exists to prevent.
++    ///   (An implementation whose publication is genuinely instantaneous — an in-memory
++    ///   map insert under its own lock — satisfies this with one check at that point.)
++    /// * If a retraction **fails**, the implementation MUST NOT return
++    ///   [`WriteDeadlineExpired`]: that class asserts the write did not take effect,
++    ///   and the bytes may still be present. It reports the backend fault instead, so
++    ///   the caller treats the outcome as indeterminate rather than as a clean refusal.
++    ///
++    /// `None` means the caller supplied no deadline: the write is unbounded —
++    /// **exactly the pre-#638 behaviour** — which is what keeps every existing
++    /// writer (the ordinary write path, backfill, reconstruction, rebalance)
++    /// working unchanged.
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()>;
+ 
+     /// Fetch a fragment's bytes, or `Ok(None)` if this store holds no fragment
+     /// for `id`. Implementations verify integrity before returning bytes.
+@@ -643,14 +781,17 @@ pub trait PlacementChunkStore: ChunkStore {
+     }
+ 
+     /// Place fragment `id` on the D server `dserver`. The default ignores `dserver`
+-    /// and delegates to [`ChunkStore::put_fragment`].
++    /// and delegates to [`ChunkStore::put_fragment`], forwarding `deadline_millis`
++    /// **unchanged** — routing a write must never strip its authorization deadline
++    /// (issue #638), since the store it routes to is the site that enforces it.
+     async fn put_fragment_at(
+         &self,
+         _dserver: DServerId,
+         id: FragmentId,
+         fragment: Bytes,
++        deadline_millis: Option<u64>,
+     ) -> Result<()> {
+-        self.put_fragment(id, fragment).await
++        self.put_fragment(id, fragment, deadline_millis).await
+     }
+ }
+ 
+@@ -1140,4 +1281,74 @@ mod error_class_tests {
+             "an undetermined commit is neither — that is why the partition is not binary"
+         );
+     }
++
++    /// `:if_elapsed` — the **one** comparison every backend shares (issue #638), pinned at
++    /// its boundary. A write is live strictly *before* its deadline and too late from the
++    /// deadline instant on (the fail-closed direction, matching GC's inclusive grace test at
++    /// `crates/custodian/src/gc.rs:174` so `G_orphan > W_write + δ_clock` has no tick that
++    /// belongs to neither side). Mutating `>=` to `>` — the tempting "one more tick" — is
++    /// caught here.
++    #[test]
++    fn a_write_is_live_before_its_deadline_and_refused_from_the_deadline_instant_on() {
++        assert!(
++            WriteDeadlineExpired::if_elapsed(frag(), 1_000, 999).is_none(),
++            "one millisecond before its deadline the write is still live"
++        );
++        assert!(
++            WriteDeadlineExpired::if_elapsed(frag(), 1_000, 1_000).is_some(),
++            "the deadline instant itself is already too late (fail-closed)"
++        );
++        let refusal = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 5_000)
++            .expect("well past the deadline is refused");
++        assert_eq!(refusal.id, frag());
++        // Both evaluation sites' readings survive into the audit trail: the authorizer's
++        // deadline and the acceptor's own clock (what `δ_clock` bounds the skew between).
++        let rendered = refusal.to_string();
++        assert!(
++            rendered.contains("1000") && rendered.contains("5000"),
++            "the refusal must record the deadline AND the acceptor's clock reading: {rendered}"
++        );
++        assert!(
++            rendered.contains("NOT applied"),
++            "an operator must be able to read off that the write did not happen: {rendered}"
++        );
++    }
++
++    /// A deadline refusal is classifiable across the seam (issue #638 leg F): recognised by
++    /// type — through a wrapper, so a backend or the gRPC client may add context — and
++    /// **never** confused with a genuine backend fault. It classifies `Terminal` (re-sending
++    /// the same expired authorization can never succeed) but, unlike a fault, it says the
++    /// write definitively did not happen.
++    #[test]
++    fn a_deadline_refusal_is_typed_distinguishable_and_terminal() {
++        let refusal = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 2_000).expect("expired");
++        assert!(is_write_deadline_expired(&refusal));
++        let wrapped = Wrapper(Box::new(refusal.clone()));
++        assert!(
++            is_write_deadline_expired(&wrapped),
++            "the classifier must walk the source chain, like is_integrity_fault"
++        );
++        assert_eq!(classify(&refusal), ErrorClass::Terminal);
++
++        // The other direction: genuine backend faults must never read as a deadline
++        // refusal, or a caller would silently treat a broken disk as "just too late".
++        for fault in [
++            Box::new(IntegrityFault {
++                id: frag(),
++                detail: "checksum mismatch".into(),
++            }) as BoxError,
++            Box::new(BlockReadFault::new(frag(), "dead sector")),
++            Box::new(std::io::Error::from_raw_os_error(5)),
++            Box::new(TransientFault::new("the D server did not answer")),
++        ] {
++            assert!(
++                !is_write_deadline_expired(fault.as_ref()),
++                "a genuine backend fault is not a deadline refusal: {fault}"
++            );
++        }
++        assert!(
++            !is_integrity_fault(&refusal) && !is_block_read_fault(&refusal),
++            "and a deadline refusal is not a fault: {refusal}"
++        );
++    }
+ }
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index 0babc7e..e990512 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -103,6 +103,7 @@ The system **fails closed** under pressure: a write is admitted only when identi
+ - **Zone full** — per-failure-domain utilization is the binding capacity signal (section 7.3): when a domain has no room for the configured EC scheme, placement (L2) redirects new writes to a zone with capacity, or rejects if residency policy forbids the redirect. Running out of room *in one domain* blocks EC writes before total capacity is exhausted.
+ - **Metadata tier saturated** — backpressure propagates to clients; the metadata tier is shardable (goal 2), so sustained pressure is a scaling signal surfaced by telemetry, not a failure.
+ - **Repair vs. serve** — see section 6.3: repair reads are throttled below foreground reads, but their priority rises as redundancy falls, so a chunk near its durability floor preempts. Durability (goal 1) outranks latency.
++- **Fragment-write authorization deadline (`W_write`)** — a caller-side timeout bounds only how long a writer *waits*, never when an already-accepted fragment write *takes effect*. So the `ChunkStore::put_fragment` seam and the `PutFragment` RPC (`FragmentPutRequest.deadline_millis`) carry an optional authorization deadline in epoch milliseconds, and **the D server enforces it against its own clock around the point it applies the write** — refusing an already-elapsed write outright, and, because the publishing step is itself a syscall that can block, judging the deadline again *once the write has been published* and **retracting** a publication that landed late, so a refused write leaves nothing stored. The refusal is a typed, operator-classifiable outcome (`WriteDeadlineExpired` → `FAILED_PRECONDITION` on the wire), distinct from a backend fault: it says the write definitively did not happen, so the caller re-authorizes instead of retrying. The field is **additive**: an absent deadline is the pre-existing unbounded behaviour, so every current writer is unchanged — and, until a capability exchange exists, an *old* D server silently ignores it, so a mixed-version fleet does not get the guarantee. This is the mechanism only; the deadline's *value* and its strict margin against the reclaimer's orphan grace (`G_orphan > W_write + δ_clock`, where `δ_clock` absorbs the skew between the authorizing and applying clocks) belong to the multipart-commit protocol (proposal 0016 decision 5) and the window-sizing slice.
+ 
+ The principle throughout: shed or slow load predictably, surface it on the capacity and durability planes (section 8.3), and never trade correctness for admission.
+ 

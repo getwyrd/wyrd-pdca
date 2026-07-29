@@ -1,0 +1,9 @@
+# Batched review — 3 passes, union of findings
+
+- [ ] `crates/chunkstore-fs/src/lib.rs:389` **BUG** (seen by 1 pass): The deadline check is non-atomic with `rename`, so descheduling or a slow syscall can publish after the deadline, and the subsequent `Unknown` error leaves those bytes in place, defeating `W_write`’s landing-time bound.
+- [ ] `crates/chunkstore-fs/src/lib.rs:389` **BUG** (seen by 1 pass): The deadline check is not atomic with `rename`, so descheduling or a stalled syscall can publish after `W_write`; the post-check merely returns `Unknown` and retains bytes, allowing an abandoned request to land after orphan evidence expires.
+- [ ] `crates/chunkstore-fs/src/lib.rs:389` **BUG** (seen by 1 pass): The final refusal check precedes an explicitly unbounded `rename`, so publication can occur after both `W_write` and its orphan evidence grace; returning `Unknown` afterward cannot restore the required landing bound.
+- [ ] `crates/chunkstore-grpc/src/client.rs:273` **BUG** (seen by 1 pass): An older D server silently ignores this safety-critical optional field and can return `Ok` without enforcing the deadline, violating the new `ChunkStore` success contract during normal one-version rolling upgrades.
+- [ ] `crates/dst/tests/network.rs:156` **TEST-GAP** (seen by 1 pass): The simulation makes the deadline verdict and map insertion unschedulable as a pair, so seeded DST cannot expose the production precheck-to-rename race that permits publication after `W_write`.
+
+Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale — not re-reviewed to silence. The gate blocks while any finding here is unchecked.
