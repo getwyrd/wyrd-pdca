@@ -36,6 +36,7 @@ import json
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -287,7 +288,8 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
                           file=sys.stderr, flush=True)
                 continue
             configured.append(_run_one(chk, cwd=cwd, bundle=bundle, runner=cfg.gates_runner,
-                                       worktree_path=wt))
+                                       worktree_path=wt,
+                                       default_timeout_secs=cfg.gates_default_timeout_secs))
     finally:
         if ovf_primary is not None and wt is not None:
             worktree.overflow_remove(ovf_primary, wt)
@@ -314,11 +316,38 @@ def _delegated_cmd(chk: dict, runner: str) -> tuple[str, str]:
     return f"{runner} {subcmd}", ""
 
 
+def _timeout_for(chk: dict, default_secs: int) -> int | None:
+    """The wall-clock bound for one check, or ``None`` for unbounded.
+
+    Resolution order: the check's own ``timeout_secs``, else ``[gates]
+    default_timeout_secs``. An explicit ``0`` on the check is a deliberate opt-OUT
+    (\"this one really may run as long as it likes\"), so it beats the default rather
+    than falling through to it — otherwise a project-wide default could not be
+    escaped by the one gate that genuinely needs to. A malformed value — a typo, or a
+    NEGATIVE bound, which is not the documented opt-out and is far likelier a mistake
+    than an intent to run unbounded — falls back to the default rather than crashing the
+    gate run or silently unbounding the gate.
+    """
+    raw = chk.get("timeout_secs", None)
+    if raw is None:
+        raw = default_secs
+    try:
+        secs = int(raw)
+    except (TypeError, ValueError):
+        secs = -1  # malformed → fall back below, exactly as a negative value does
+    if secs < 0:
+        secs = max(0, int(default_secs))
+    return secs if secs > 0 else None
+
+
 def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
-             worktree_path: Path | None = None) -> dict:
+             worktree_path: Path | None = None, default_timeout_secs: int = 0) -> dict:
     cmd, cmd_error = _delegated_cmd(chk, runner)
     gating = bool(chk.get("gating", True))
     label = f"{chk.get('id', '')}: {chk.get('label', '')}".strip(": ")
+    # Per-check bound wins over the [gates] default; 0 / absent on BOTH ⇒ unbounded
+    # (the pre-#187 behaviour, so a project that has not set a default is unchanged).
+    timeout_secs = _timeout_for(chk, default_timeout_secs)
     if cmd_error:
         # Misconfigured delegation — surface as a failing row with a fix hint, never crash.
         print(f"  · gate {label}: {cmd_error}", file=sys.stderr, flush=True)
@@ -371,9 +400,18 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
         # a long, silent gate (e.g. a Docker-backed test suite) doesn't look hung.
         rc, output, _ = progress.run_with_heartbeat(
             cmd, cwd=cwd, shell=True, env=_merged_env(env), capture=True, label=label,
-            status=lambda: progress.bundle_activity(watch),
+            timeout=timeout_secs, status=lambda: progress.bundle_activity(watch),
         )
         result, evidence = _classify(rc, output)
+    except subprocess.TimeoutExpired:
+        # A bound gate that ran out of wall clock is UNVERIFIABLE, not failed (issue #46):
+        # the oracle never answered, so it has no verdict to give — reporting `fail` would
+        # blame the fix for the gate's own hang, and on a gating row would block a
+        # possibly-good patch. The human sees it in §6 and re-runs or adjudicates.
+        result = "unverifiable"
+        evidence = [f"gate exceeded its {timeout_secs}s timeout and was killed (no verdict "
+                    f"— re-run it, or raise the check's timeout_secs / "
+                    f"[gates] default_timeout_secs)"]
     except Exception as exc:  # command not found, etc. — a failing gate, surfaced
         result, evidence = "fail", [str(exc)]
     return _row(
