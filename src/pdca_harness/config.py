@@ -209,6 +209,11 @@ class Config:
     # (e.g. "cargo xtask"). A check's bare ``subcmd`` is run as ``<runner> <subcmd>``, so
     # PDCA orchestrates the host runner instead of re-declaring the gates. "" ⇒ inline only.
     gates_runner: str = ""
+    # Wall-clock bound applied to every gate that doesn't set its own ``timeout_secs``
+    # (issue #187). 0 ⇒ unbounded, the pre-#187 behaviour. A gate that outruns its bound
+    # is killed (whole process group) and recorded ``unverifiable``, never ``fail``: the
+    # oracle gave no verdict, so it has none to hold against the fix.
+    gates_default_timeout_secs: int = 0
     # Target-aware gate selection (docs 04). A check may carry ``target`` (a label or
     # list); it runs iff its labels are a SUBSET of the bundle's label set. The bundle is
     # classified from its brief on two axes: a PRIMARY one (``gate_target_match``: label →
@@ -432,6 +437,10 @@ class Config:
         gates = data.get("gates", {})
         gates_checks = list(gates.get("checks", []))
         gates_runner = gates.get("runner", "")
+        try:  # a typo'd bound must not crash config load — unbounded is the safe read
+            gates_default_timeout_secs = max(0, int(gates.get("default_timeout_secs", 0)))
+        except (TypeError, ValueError):
+            gates_default_timeout_secs = 0
         registry_consistency = dict(gates.get("registry_consistency", {}))
         install_extra_bootstrap = data.get("install", {}).get("extra_bootstrap", "")
         # `pdca try <id>` launch command (project-specific); "" ⇒ the command errors with a hint.
@@ -608,6 +617,7 @@ class Config:
             builder_escalation=builder_escalation,
             builder_variants=builder_variants,
             gates_runner=gates_runner,
+            gates_default_timeout_secs=gates_default_timeout_secs,
             lanes=lanes,
             max_passes=max_passes,
             auto_iterate=auto_iterate,

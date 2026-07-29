@@ -12,7 +12,9 @@ yet, how long since the last write), not just that time passed.
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -20,6 +22,41 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a timed-out child and everything it spawned — SIGTERM, then SIGKILL.
+
+    The child was started with ``start_new_session=True``, so its pid IS its process
+    group id and one ``killpg`` reaches the whole tree. That matters most under
+    ``shell=True``, where ``proc`` is only the shell: signalling it alone leaves the
+    real work (a ``cargo`` build tree, a container) running and holding the CPU.
+    Falls back to the direct child if the group is already gone.
+
+    SIGKILL is sent UNCONDITIONALLY after the SIGTERM grace, never skipped just because
+    the leader has exited: under ``shell=True`` the leader is only the shell, and a shell
+    exits on SIGTERM while the ``cargo`` tree it spawned — which may ignore SIGTERM — keeps
+    running and keeps the capture pipe open. Waiting on the leader answers "did the shell
+    die", not "is the work over", so the second signal has to go out regardless.
+    """
+    # Resolve the group ONCE, while the leader is still alive. Re-reading it per signal
+    # would break exactly the case this exists for: SIGTERM kills the shell, `wait` reaps
+    # it, and `getpgid` then raises ProcessLookupError — so the SIGKILL would be aimed at
+    # a dead pid instead of the group, and the survivors that ignored SIGTERM would live.
+    # The child was started with `start_new_session`, so its pid IS the group id.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = proc.pid
+    for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass  # group already gone — nothing left to signal
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def run_with_heartbeat(
@@ -34,6 +71,7 @@ def run_with_heartbeat(
     tee_stderr: bool = False,
     stream_format: str = "claude-stream-json",
     interval: int = 15,
+    timeout: int | None = None,
     label: str = "",
     status: Callable[[], str] | None = None,
 ) -> tuple[int, str, bool]:
@@ -51,6 +89,16 @@ def run_with_heartbeat(
     exit with ``produced is False`` is the transient-infra signal (the child died
     at/near invocation — usage/rate limit, 5xx, auth — before any real output).
     ``input_text``, if given, is written to stdin.
+
+    ``timeout``, if given, is a HARD wall-clock bound in seconds. On expiry the child
+    is killed and :class:`subprocess.TimeoutExpired` is raised, so a hung command can
+    never hold a beat open indefinitely (issue #187 / eduralph/pdca-harness#368 — a
+    hung advisory gate once held one Check for 19 hours while this very heartbeat
+    printed ``… still working``). The child is started in its **own process session**
+    when a bound is set, and the whole group is signalled: under ``shell=True`` the
+    direct child is only a shell, so killing it alone would orphan the real work
+    (a ``cargo`` tree that keeps running and keeps the CPU). SIGTERM first so the
+    command can clean up, SIGKILL after a short grace.
 
     ``status``, if given, is called on every tick to append a live snapshot of the
     child's work (e.g. which artifacts exist yet, time since the last write) — so the
@@ -85,6 +133,11 @@ def run_with_heartbeat(
     proc = subprocess.Popen(
         cmd, cwd=cwd, shell=shell, env=env, text=True,
         stdin=stdin, stdout=stdout, stderr=stderr,
+        # Own session ONLY when a bound is set, so the kill can reach the whole tree.
+        # Unconditionally detaching would break the interactive leaves: a process in a
+        # different session has no controlling terminal, so a leaf that reads or writes
+        # the tty would take SIGTTIN/SIGTTOU instead of talking to the human.
+        start_new_session=timeout is not None,
     )
 
     chunks: list[str] = []
@@ -128,32 +181,59 @@ def run_with_heartbeat(
 
     suffix = f" — {label}" if label else ""
     start = time.monotonic()
-    while True:
-        try:
-            proc.wait(timeout=interval)
-            break
-        except subprocess.TimeoutExpired:
-            mins, secs = divmod(int(time.monotonic() - start), 60)
-            bits: list[str] = []
-            if stream_json and latest_tool["label"]:
-                bits.append(f"▸ {latest_tool['label']}")
-            if status is not None:
-                try:
-                    snap = status()
-                    if snap:
-                        bits.append(snap)
-                except Exception:  # a status probe must never break the run
-                    pass
-            extra = (" · " + " · ".join(bits)) if bits else ""
-            print(f"   … still working ({mins}m{secs:02d}s elapsed){suffix}{extra}",
-                  file=sys.stderr, flush=True)
+    try:
+        while True:
+            try:
+                # Wake at whichever comes first, the next tick or the deadline — waiting a
+                # full `interval` first would let the advertised HARD bound overrun by up
+                # to `interval` seconds (15 by default, and a caller may set it higher).
+                wait_for = interval
+                if timeout is not None:
+                    wait_for = max(0.1, min(interval, timeout - (time.monotonic() - start)))
+                proc.wait(timeout=wait_for)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - start
+                if timeout is not None and elapsed >= timeout:
+                    _kill_tree(proc)
+                    _close_streams(proc, readers)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                mins, secs = divmod(int(elapsed), 60)
+                bits: list[str] = []
+                if stream_json and latest_tool["label"]:
+                    bits.append(f"▸ {latest_tool['label']}")
+                if status is not None:
+                    try:
+                        snap = status()
+                        if snap:
+                            bits.append(snap)
+                    except Exception:  # a status probe must never break the run
+                        pass
+                extra = (" · " + " · ".join(bits)) if bits else ""
+                print(f"   … still working ({mins}m{secs:02d}s elapsed){suffix}{extra}",
+                      file=sys.stderr, flush=True)
+    except BaseException:
+        # Ctrl-C, or any caller-side abort. A BOUNDED child is in its OWN session, so the
+        # terminal's SIGINT never reached it: without this it outlives the driver that
+        # started it — the very orphaned-gate-tree failure the bound exists to prevent.
+        # An unbounded child shares the driver's group and already took the signal.
+        if timeout is not None:
+            _kill_tree(proc)
+            _close_streams(proc, readers)
+        raise
+    _close_streams(proc, readers)
+    output = "".join(chunks) if capture else ("".join(err_tail) if tee_err else "")
+    return proc.returncode, output, produced["session"]
+
+
+def _close_streams(proc: subprocess.Popen, readers: list[threading.Thread]) -> None:
+    """Join the drain threads and close the child's pipes — the one teardown both the
+    normal exit and the timeout/interrupt paths use, so no path leaks an open pipe."""
     for reader in readers:
         reader.join(timeout=5)
     for stream in (proc.stdout, proc.stderr):
         if stream is not None:
             stream.close()
-    output = "".join(chunks) if capture else ("".join(err_tail) if tee_err else "")
-    return proc.returncode, output, produced["session"]
 
 
 # ----------------------------------------------------------------------------

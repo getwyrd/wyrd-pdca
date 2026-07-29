@@ -62,6 +62,14 @@ def advance(d: Path, cfg: Config) -> None:
                 _say(f"→ {d.name}: Check — advisory reviewers ({len(cfg.advisory_leaves)})…")
                 leaves.run_advisory_leaves(d, cfg)
     elif s == state.CHECKED:
+        # Resume a Check leaf that NEVER RAN (issue #187). `check-gates.json` is the CHECKED
+        # marker (state.state), but the BUILT arm above writes it and only THEN runs the
+        # leaves — so a death in that window (Ctrl-C on a hung gate, OOM, a killed session)
+        # lands here with the gates recorded and no review. Without this, `assemble` would
+        # paper over the hole with the missing-review placeholder and the reviewer could
+        # never run again for this round: the marker that says "gates are done" also says
+        # "leaves are done", and there is no way back.
+        _resume_unrun_check_leaves(d, cfg, close)
         _say(f"→ {d.name}: assembling SUMMARY…")
         assemble.assemble_summary(d, cfg)  # pure code → SUMMARY.md §1–8
     elif s == state.ITERATE_DO:
@@ -77,6 +85,46 @@ def advance(d: Path, cfg: Config) -> None:
         _retire_cleared_deferrals(d)     # the human's ticks are their adjudication (#332)
         _archive_iteration(d, n, include_brief=True)  # brief archived too → UNPLANNED
     # UNPLANNED / AWAITING_SIGNOFF / COMPLETE / DISCONTINUED: nothing for the driver to do.
+
+
+def _resume_unrun_check_leaves(d: Path, cfg: Config, close: str = "") -> None:
+    """Run any Check leaf that never started, before SUMMARY freezes its absence (#187).
+
+    "Never ran" is not "ran and failed", and the bundle already records the difference:
+    a leaf that fails writes its stderr tail to ``<leaf>.error.log`` (#138), so an ABSENT
+    artifact with an ABSENT error log is the one case where nothing was ever attempted.
+    That is the only case resumed here — a leaf that genuinely failed keeps its recorded
+    failure and its §6 placeholder, and is never silently retried behind the human's back.
+
+    A close-disposition bundle has the same hole: its leaf-2 stand-in is the deterministic
+    ``_close_review_note``, written after ``run_close_gates``, so an interrupt between the
+    two loses the close confirmation exactly as it loses a real review.
+    """
+    if not (d / "check-review.md").exists() and not (d / "check-review.error.log").exists():
+        if close:
+            _say(f"→ {d.name}: Check — close-confirmation note never written, resuming…")
+            _close_review_note(d, close)
+        else:
+            _say(f"→ {d.name}: Check — advisory reviewer never ran, resuming"
+                 f"{_headless_note(cfg.reviewer)}…")
+            leaves.run_review(d, cfg)
+    # The advisory leaves are resumed as a PHASE, not per leaf. Selection is a policy
+    # decision `run_advisory_leaves` owns (`_select_advisory`): under
+    # `mode = "vendor-complement"` the configured list is a vendor POOL from which exactly
+    # one leaf runs, so a pool member that was deliberately NOT selected also has no
+    # artifact and no error log. Judging "unrun" per leaf would read those as interrupted
+    # and run a second, same-vendor reviewer — inventing a decorrelation lapse out of a
+    # correct selection. Any advisory artifact at all means the phase ran; only a phase
+    # that left nothing behind is resumed, and then with the full config so selection
+    # applies exactly as it would have.
+    if cfg.advisory_leaves and not _any_advisory_artifact(d):
+        _say(f"→ {d.name}: Check — advisory leaves never ran, resuming…")
+        leaves.run_advisory_leaves(d, cfg)
+
+
+def _any_advisory_artifact(d: Path) -> bool:
+    """True iff the advisory phase left ANY trace — a verdict, or a leaf's error log."""
+    return any(d.glob("check-advisory-*.md")) or any(d.glob("check-advisory-*.error.log"))
 
 
 def run_issue(d: Path, cfg: Config) -> str:
