@@ -38,10 +38,11 @@ from pdca_harness.config import Config
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "handoff-check"
 
-# §9 must carry the `- Outcome:` line `signoff.record` writes into: it REPLACES that line, so
-# without it the decision is silently dropped (PR #169 review round 2).
+# §9 must carry every line `signoff.record` writes into: it REPLACES lines, so each absent
+# one is a different silent loss — no `- Outcome:` drops the decision (PR #169 review
+# round 2), no `- By / date:` drops the attribution (issue #172).
 _SUMMARY = ("## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n"
-            "- Outcome:\n- Iteration delta (if iterating):\n")
+            "- Outcome:\n- By / date:\n- Iteration delta (if iterating):\n")
 
 
 def _load():
@@ -347,6 +348,34 @@ class Signoff(_Base):
         self.assertFalse(self._ok(results))
         self.assertTrue(any("§6 NEEDS-HUMAN is absent" in r.label for r in results), results)
 
+    def test_an_accept_without_a_by_date_line_fails(self) -> None:
+        """Issue #172. `signoff.record` replaces `- By / date:` unconditionally, and a
+        replace on an absent line is a silent no-op — so the outcome recorded while the
+        attribution vanished, and the bundle reached COMPLETE with a durable sign-off
+        nobody is named on (`publish` reads the contributor name off that line)."""
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- (none)\n\n## 9. Check sign-off\n\n"
+            "- Outcome:\n- Iteration delta (if iterating):\n", encoding="utf-8")
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("writable `by / date`" in r.label for r in results), results)
+
+    def test_a_summary_with_no_section9_heading_fails(self) -> None:
+        """Issue #172, the same shape as the §6 check: `signoff._section` returns the WHOLE
+        document when its heading is absent, so field lines surviving under any other
+        heading read as writable §9 fields — and `record`/`outcome_token` share that
+        fallback, so the flow could record an outcome and reach COMPLETE while the durable
+        summary had no Check sign-off section at all."""
+        (self.d / "SUMMARY.md").write_text(
+            "## 6. NEEDS-HUMAN\n\n- (none)\n\n## 8. Notes\n\n- Outcome:\n- By / date:\n"
+            "- Iteration delta (if iterating):\n", encoding="utf-8")
+        self._decision("accept\n")
+        results = hc.check_signoff(self.d, named=True)
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("§9 'Check sign-off' section is absent" in r.label
+                            for r in results), results)
+
     def test_a_missing_summary_fails_the_signoff(self) -> None:
         """PR #169 review round 2. `open_needs_human` and `outcome_token` both return
         "nothing" for an absent SUMMARY by their own defensive contract, so an accept sailed
@@ -409,7 +438,7 @@ class Signoff(_Base):
         self._decision("iterate-do\nthe cause was misread\n")
         (self.d / "SUMMARY.md").write_text(
             "## 6. NEEDS-HUMAN\n\n- [ ] C5 Causal adequacy — needs an ADR\n"
-            "\n## 9. Check sign-off\n\n- Outcome:\n"
+            "\n## 9. Check sign-off\n\n- Outcome:\n- By / date:\n"
             "- Iteration delta (if iterating):\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
@@ -417,7 +446,7 @@ class Signoff(_Base):
         self._decision("accept\n")
         (self.d / "SUMMARY.md").write_text(
             "## 6. NEEDS-HUMAN\n\n- [x] C5 Causal adequacy — adjudicated\n"
-            "\n## 9. Check sign-off\n\n- Outcome:\n"
+            "\n## 9. Check sign-off\n\n- Outcome:\n- By / date:\n"
             "- Iteration delta (if iterating):\n", encoding="utf-8")
         self.assertTrue(self._ok(hc.check_signoff(self.d, named=True)))
 
@@ -618,7 +647,25 @@ class Act(unittest.TestCase):
                   "- Spec template: <field added/clarified/removed>            (path)\n")
         results = self._check("cycles considered", committed="")
         self.assertFalse(self._ok(results))
-        self.assertTrue(any("untouched scaffold" in r.label for r in results), results)
+        self.assertTrue(any("scaffold placeholders" in r.label for r in results), results)
+
+    def test_a_partially_edited_scaffold_is_not_a_review(self) -> None:
+        """Issue #172. The check tested two sentinels — the TODO heading and the first
+        row — so an entry that removed exactly those two passed with `<rule …>`,
+        `<check …>`, `<agents/*.md …>` and `<specific issue>` untouched: a partially
+        edited scaffold counted as the substantive review the gate exists to require."""
+        self._log("# Act review — 2026-07-26 — cycles considered: 505, 509\n\n"
+                  "## What the cycles' records exposed\n- [C4] a recurring signal\n\n"
+                  "## Process deltas\n"
+                  "- Ruleset: <rule added/retired/relaxed/tightened>           (path:line)\n"
+                  "- Gates: <check added/promoted/moved>                       (path:line)\n"
+                  "- Agent role prompts: <agents/*.md / skill adjustment>      (path:line)\n\n"
+                  "## How effectiveness will be judged\n"
+                  "- The next Do phases should not recreate <specific issue>. "
+                  "Watch the next K cycles.\n")
+        results = self._check("cycles considered", committed="")
+        self.assertFalse(self._ok(results))
+        self.assertTrue(any("scaffold placeholders" in r.label for r in results), results)
 
     def test_an_absent_log_fails(self) -> None:
         self.assertFalse(self._ok(self._check("anything", committed="")))
