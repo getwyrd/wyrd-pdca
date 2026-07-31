@@ -1419,6 +1419,73 @@ class DeferredFindingsSurvive(_Base):
         self.assertEqual(autoiterate.deferred(d), [near[1]],
                          "the exactly-ticked entry retires; its near-twin stays")
 
+    def test_an_ANNOTATED_open_row_still_protects_its_entry(self) -> None:
+        """Issue #173. The round-6 exclusion compared open rows by EXACT text while the tick
+        matched fuzzily, so the guard was as strong as its weaker half: annotate a deferred
+        row without ticking it, tick a similar newly raised finding, and the fuzzy tick match
+        selected the ledger entry while the exact exclusion no longer recognised its edited
+        open row — retiring an objection the human never adjudicated."""
+        d = self._bundle("DEFER173", review=self._REVIEW)
+        parser = "C5 Causal adequacy — guards the symptom in the parser, not the cause"
+        renderer = "C5 Causal adequacy — guards the symptom in the renderer, not the cause"
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            json.dumps({"items": [parser]}), encoding="utf-8")
+        self.assertTrue(autoiterate._same_finding(parser, renderer),
+                        "fixture must be similar enough for the tick to reach the entry")
+        # The human annotates the deferred row WITHOUT ticking it, and ticks the similar
+        # NEW finding (which is not in the ledger at all).
+        (d / "SUMMARY.md").write_text(
+            f"## 6. NEEDS-HUMAN\n\n- [x] {renderer}\n"
+            f"- [ ] {parser} (owner: architecture)\n", encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(autoiterate.deferred(d), [parser],
+                         "a visibly unticked row protects its entry, edited or not")
+
+    def test_an_open_row_protects_under_every_edit_the_tick_match_tolerates(self) -> None:
+        """The #173 asymmetry itself, pinned: whatever edit `_same_finding` accepts when
+        matching a TICK must also be accepted when recognising an OPEN row — otherwise the
+        two matchers drift apart again and the weaker one reopens the hole. The open row
+        wins even against an exact tick: a visible unticked box is stronger evidence than
+        any match."""
+        LEDGER = "C5 Causal adequacy — guards the symptom, not the cause"
+        variants = [
+            ("C5 Causal adequacy — guards the symptom (owner: board), not the cause",
+             "annotated in the middle"),
+            ("C5 Causal adequacy — guards the symptom, not the cause (owner: board)",
+             "annotated at the end"),
+            (LEDGER, "untouched"),
+        ]
+        for n, (open_row, why) in enumerate(variants):
+            with self.subTest(why):
+                d = self._bundle(f"DEFER173B{n}", review=self._REVIEW)
+                (d / autoiterate.DEFERRED_FILE).write_text(
+                    json.dumps({"items": [LEDGER]}), encoding="utf-8")
+                (d / "SUMMARY.md").write_text(
+                    f"## 6. NEEDS-HUMAN\n\n- [x] {LEDGER}\n- [ ] {open_row}\n",
+                    encoding="utf-8")
+                autoiterate.retire_cleared(d, d / "SUMMARY.md")
+                self.assertEqual(autoiterate.deferred(d), [LEDGER], why)
+
+    def test_an_edited_open_row_matching_two_entries_protects_both(self) -> None:
+        """An EDITED open row is assigned fuzzily, so one that could name either of two
+        near-twin entries protects both — the round-4 doctrine applied to the exclusion:
+        when the evidence is ambiguous, decide for neither side; a finding that lingers is
+        merely visible. (A VERBATIM open row protects only its own entry — the test above
+        proves the exactly-ticked neighbour still drains.)"""
+        d = self._bundle("DEFER173C", review=self._REVIEW)
+        near = ["C5 Causal adequacy — guards the symptom in the parser, not the cause",
+                "C5 Causal adequacy — guards the symptom in the renderer, not the cause"]
+        annotated = near[1] + " (owner: board)"
+        (d / autoiterate.DEFERRED_FILE).write_text(
+            json.dumps({"items": near}), encoding="utf-8")
+        self.assertTrue(autoiterate._same_finding(near[0], annotated),
+                        "fixture must actually be ambiguous for this test to mean anything")
+        (d / "SUMMARY.md").write_text(
+            f"## 6. NEEDS-HUMAN\n\n- [x] {near[0]}\n- [ ] {annotated}\n", encoding="utf-8")
+        autoiterate.retire_cleared(d, d / "SUMMARY.md")
+        self.assertEqual(len(autoiterate.deferred(d)), 2,
+                         "an ambiguous open row must not let its neighbour retire")
+
     def test_an_UNambiguous_tick_still_retires(self) -> None:
         # The fail-closed rule must not swallow the ordinary case.
         d = self._bundle("DEFER14", review=self._REVIEW)
