@@ -59,6 +59,10 @@ def revalidate(cfg: Config, d: Path, date: str) -> dict:
             "old": old_res,
             "new": new_res,
             "changed": old_res != new_res,
+            # A re-gate that failed, then passed its once-only confirm (#371 upstream)
+            # would otherwise read as an unchanged clean pass — carry the flip so the
+            # stamp records that this confirmation leaned on a second sample.
+            "flaky": bool(n.get("flaky")) if n else False,
         })
 
     result = {
@@ -89,7 +93,8 @@ def render_md(result: dict) -> str:
              "", "| Check | Old | New | Δ | Gating |", "|---|---|---|---|---|"]
     for r in result["rows"]:
         delta = "→" if r["changed"] else ""
-        lines.append(f"| {r['check']} | {r['old'] or '—'} | {r['new'] or '—'} | "
+        new = (r["new"] or "—") + (" (flaky — passed on confirm)" if r.get("flaky") else "")
+        lines.append(f"| {r['check']} | {r['old'] or '—'} | {new} | "
                      f"{delta} | {'yes' if r['gating'] else 'no'} |")
     return "\n".join(lines) + "\n"
 

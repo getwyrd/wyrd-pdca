@@ -91,14 +91,22 @@ def run_with_heartbeat(
     ``input_text``, if given, is written to stdin.
 
     ``timeout``, if given, is a HARD wall-clock bound in seconds. On expiry the child
-    is killed and :class:`subprocess.TimeoutExpired` is raised, so a hung command can
-    never hold a beat open indefinitely (issue #187 / eduralph/pdca-harness#368 — a
-    hung advisory gate once held one Check for 19 hours while this very heartbeat
-    printed ``… still working``). The child is started in its **own process session**
-    when a bound is set, and the whole group is signalled: under ``shell=True`` the
-    direct child is only a shell, so killing it alone would orphan the real work
+    is killed and :class:`subprocess.TimeoutExpired` is raised — carrying the partial
+    capture as its ``output`` (#370), the only record of where a hung gate hung — so a
+    hung command can never hold a beat open indefinitely (issue #187 /
+    eduralph/pdca-harness#368 — a hung advisory gate once held one Check for 19 hours
+    while this very heartbeat printed ``… still working``).
+
+    Every **captured, streamed, or stderr-teed** child (and any bounded one) runs in
+    its **own process session** (POSIX), and the whole group is signalled on kill:
+    under ``shell=True``
+    the direct child is only a shell, so signalling it alone would orphan the real work
     (a ``cargo`` tree that keeps running and keeps the CPU). SIGTERM first so the
-    command can clean up, SIGKILL after a short grace.
+    command can clean up, SIGKILL after a short grace. On a NORMAL exit the group is
+    swept the same way (eduralph/pdca-harness#372): what the child spawned and left
+    behind would otherwise burn CPU for hours and hold ports/locks/fixtures into the
+    next cycle's gate run in the same lane. The interactive leaves (uncaptured,
+    unbounded) keep the terminal and are never sessionized or swept.
 
     ``status``, if given, is called on every tick to append a live snapshot of the
     child's work (e.g. which artifacts exist yet, time since the last write) — so the
@@ -130,14 +138,23 @@ def run_with_heartbeat(
         stdout, stderr = None, subprocess.PIPE  # stdout stays live; tee stderr only
     else:
         stdout, stderr = None, None
+    # Own session for every child that owes the harness a pipe (captured, streamed, or
+    # stderr-teed) or that carries a bound — so a kill or the normal-exit sweep can reach
+    # the whole tree (eduralph/pdca-harness#372: a straggler from a finished child once
+    # spun on a core for 21 hours, and a straggler still holding a port/lock when the
+    # NEXT cycle's gates run in the same lane is the transient-red class of #371). The
+    # tee-only child is included deliberately: a straggler inheriting its stderr pipe
+    # would otherwise hold the drain thread — and thereby this call — open past the
+    # child's own exit. The interactive leaves never come through here (leaves.py runs
+    # them with a bare subprocess.run), and a fully-inherited-stdio child stays in the
+    # driver's session, keeping its terminal. POSIX only: Windows has no setsid/killpg,
+    # so there the pre-#372 behaviour is unchanged.
+    sessionized = (os.name == "posix") and (
+        capture or stream_json or tee_stderr or timeout is not None)
     proc = subprocess.Popen(
         cmd, cwd=cwd, shell=shell, env=env, text=True,
         stdin=stdin, stdout=stdout, stderr=stderr,
-        # Own session ONLY when a bound is set, so the kill can reach the whole tree.
-        # Unconditionally detaching would break the interactive leaves: a process in a
-        # different session has no controlling terminal, so a leaf that reads or writes
-        # the tty would take SIGTTIN/SIGTTOU instead of talking to the human.
-        start_new_session=timeout is not None,
+        start_new_session=sessionized,
     )
 
     chunks: list[str] = []
@@ -197,7 +214,10 @@ def run_with_heartbeat(
                 if timeout is not None and elapsed >= timeout:
                     _kill_tree(proc)
                     _close_streams(proc, readers)
-                    raise subprocess.TimeoutExpired(cmd, timeout)
+                    # Carry the partial capture on the exception (#370): for a hung gate
+                    # it is the only record of where the hang was, and the exception type
+                    # has the field for exactly this.
+                    raise subprocess.TimeoutExpired(cmd, timeout, output="".join(chunks))
                 mins, secs = divmod(int(elapsed), 60)
                 bits: list[str] = []
                 if stream_json and latest_tool["label"]:
@@ -213,17 +233,59 @@ def run_with_heartbeat(
                 print(f"   … still working ({mins}m{secs:02d}s elapsed){suffix}{extra}",
                       file=sys.stderr, flush=True)
     except BaseException:
-        # Ctrl-C, or any caller-side abort. A BOUNDED child is in its OWN session, so the
-        # terminal's SIGINT never reached it: without this it outlives the driver that
-        # started it — the very orphaned-gate-tree failure the bound exists to prevent.
-        # An unbounded child shares the driver's group and already took the signal.
-        if timeout is not None:
+        # Ctrl-C, or any caller-side abort. A SESSIONIZED child is in its OWN session, so
+        # the terminal's SIGINT never reached it: without this it outlives the driver that
+        # started it — the very orphaned-gate-tree failure the sweep exists to prevent.
+        # A non-sessionized child shares the driver's group and already took the signal.
+        if sessionized:
             _kill_tree(proc)
             _close_streams(proc, readers)
         raise
+    if sessionized:
+        # The child EXITED — but what it spawned may not have (#372). Under shell=True the
+        # leader is only a shell; a backgrounded test or a server a test forgot to stop
+        # survives the wait() above and, left alone, burns CPU and holds ports/locks into
+        # the NEXT cycle's gate run in the same lane. Sweep the group BEFORE closing the
+        # streams, exactly as the timeout path kills before it closes: a straggler
+        # inheriting the capture pipe keeps the drain thread blocked past its join
+        # timeout, and closing a file another thread is reading waits on that reader —
+        # sweep-after-close deadlocks until the straggler dies of its own accord.
+        _reap_stragglers(proc.pid, label=label)
     _close_streams(proc, readers)
     output = "".join(chunks) if capture else ("".join(err_tail) if tee_err else "")
     return proc.returncode, output, produced["session"]
+
+
+def _reap_stragglers(pgid: int, *, label: str = "") -> None:
+    """Sweep survivors of a child that already exited — SIGTERM, a short grace, SIGKILL.
+
+    The child was sessionized, so its pid IS its group id and the group outlives it as a
+    stable handle on everything it spawned. A straggler here is not only a leak to clean
+    up but a *signal* (a test or leaf that leaves processes behind), so the sweep prints
+    one note instead of acting silently. No survivors — the overwhelmingly common case —
+    is one cheap probe and no output.
+    """
+    if not hasattr(os, "killpg"):  # non-POSIX — nothing was sessionized, nothing to sweep
+        return
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return  # nothing outlived the leader
+    suffix = f" — {label}" if label else ""
+    print(f"   · sweeping processes the finished command left behind{suffix}",
+          file=sys.stderr, flush=True)
+    for sig, grace in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 0.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.1)
 
 
 def _close_streams(proc: subprocess.Popen, readers: list[threading.Thread]) -> None:

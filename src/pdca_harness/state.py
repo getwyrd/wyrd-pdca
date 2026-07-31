@@ -59,6 +59,9 @@ DOWNSTREAM_OF_BRIEF = [
 DOWNSTREAM_GLOBS = (
     "check-advisory-*.md",
     "*.error.log",
+    # Each gate's full captured output (eduralph/pdca-harness#370) — the record behind the
+    # row's 120-char evidence line, and the only way a non-reproducing red can be diagnosed.
+    "gate-logs/*.log",
 )
 
 # Cycle evidence the archive deliberately does NOT move (issue #170) — the one place where
