@@ -1,6 +1,6 @@
 ---
 description: Signal this leaf is done — verify its artifact contract, capture carry-forward, end the session
-argument-hint: "[issue_id]  (omit to cover every bundle this session touched)"
+argument-hint: "<issue_id …>  (required for planner/signoff/publisher; act names --entry instead)"
 ---
 
 You are finishing an **interactive leaf** of the PDCA cycle. The driver is blocked on your
@@ -55,9 +55,9 @@ so the lint does not demand a tracker reference the downstream path explicitly p
 omitting.
 
 It is deterministic — file existence and set membership, reusing the driver's own predicates
-so it cannot disagree with the harness about what a valid artifact is. With an id it requires
-the artifacts to be present; with no id it scans and reports only *malformed* ones, because a
-planner legitimately briefs some issues and not others.
+so it cannot disagree with the harness about what a valid artifact is. Every named bundle
+must carry its leaf's artifacts, present and well-formed; there is no unnamed scan mode
+(the gate refuses one, see above).
 
 **On FAIL:** fix what is genuinely yours to fix and re-run. Some failures are not yours —
 `§9 Outcome is already set` means a decision the driver owns was authored by a leaf, and the
