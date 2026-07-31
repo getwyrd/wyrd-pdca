@@ -376,6 +376,23 @@ class Signoff(_Base):
         self.assertTrue(any("§9 'Check sign-off' section is absent" in r.label
                             for r in results), results)
 
+    def test_a_heading_only_the_gate_recognises_still_fails(self) -> None:
+        """PR #194 review (codex). `signoff._section` accepts only a case-sensitive line
+        starting with exactly `## ` — a demoted or re-cased heading sends `record`,
+        `outcome_token` and the field check through the whole-document fallback, which is
+        the precise bypass this gate closes. So the gate must mirror `_section`'s syntax,
+        not the tolerant `#+`/IGNORECASE form the §6 presence check can afford."""
+        for heading in ("### 9. Check sign-off", "## 9. check sign-off"):
+            with self.subTest(heading=heading):
+                (self.d / "SUMMARY.md").write_text(
+                    f"## 6. NEEDS-HUMAN\n\n- (none)\n\n{heading}\n\n- Outcome:\n"
+                    "- By / date:\n- Iteration delta (if iterating):\n", encoding="utf-8")
+                self._decision("accept\n")
+                results = hc.check_signoff(self.d, named=True)
+                self.assertFalse(self._ok(results), heading)
+                self.assertTrue(any("§9 'Check sign-off' section is absent" in r.label
+                                    for r in results), results)
+
     def test_a_missing_summary_fails_the_signoff(self) -> None:
         """PR #169 review round 2. `open_needs_human` and `outcome_token` both return
         "nothing" for an absent SUMMARY by their own defensive contract, so an accept sailed
@@ -666,6 +683,41 @@ class Act(unittest.TestCase):
         results = self._check("cycles considered", committed="")
         self.assertFalse(self._ok(results))
         self.assertTrue(any("scaffold placeholders" in r.label for r in results), results)
+
+    def test_a_review_may_quote_a_placeholder_in_prose(self) -> None:
+        """PR #194 review (codex). Act is exactly where changes to the scaffold itself get
+        proposed, so a completed entry may legitimately QUOTE a placeholder — "replace the
+        `<specific issue>` prompt with a required tracker reference" is a delta, not an
+        unfilled slot. The markers fire on a line that is still the scaffold's ROW, never on
+        the token appearing anywhere."""
+        self._log("# Act review — 2026-07-26 — cycles considered: 505, 509\n\n"
+                  "## What the cycles' records exposed\n- [C4] a recurring signal\n\n"
+                  "## Process deltas\n"
+                  "- Spec template: replace the <specific issue> prompt in the scaffold "
+                  "with a required tracker reference   (src/pdca_harness/act.py:287)\n"
+                  "- Ruleset: none warranted this round; the <rule "
+                  "added/retired/relaxed/tightened> slot stays as-is upstream\n\n"
+                  "## How effectiveness will be judged\n"
+                  "- The next Act entries carry tracker refs, not free text.\n")
+        self.assertTrue(self._ok(self._check("cycles considered", committed="")))
+
+    def test_a_collapsed_padding_scaffold_row_still_fails(self) -> None:
+        """The reason the markers are row REGEXES, not literal rows: an editor that collapses
+        the alignment padding — or a human who deletes the `(path:line)` stub but leaves the
+        placeholder — has not filled the slot in."""
+        for row, why in (
+            ("- Ruleset: <rule added/retired/relaxed/tightened> (path:line)",
+             "padding collapsed"),
+            ("- Gates: <check added/promoted/moved>", "location stub deleted"),
+        ):
+            with self.subTest(why=why):
+                self._log("# Act review — 2026-07-26 — cycles considered: 505\n\n"
+                          "## What the cycles' records exposed\n- [C4] a signal\n\n"
+                          f"## Process deltas\n{row}\n")
+                results = self._check("cycles considered", committed="")
+                self.assertFalse(self._ok(results), why)
+                self.assertTrue(any("scaffold placeholders" in r.label for r in results),
+                                results)
 
     def test_an_absent_log_fails(self) -> None:
         self.assertFalse(self._ok(self._check("anything", committed="")))
