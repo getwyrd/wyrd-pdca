@@ -32,6 +32,13 @@ def parse_fields(brief_path: Path) -> dict[str, str]:
     return fields
 
 
+# NOTE (v0.56.0 merge): upstream #336 shipped its own `whole_field`; the instance's
+# #174 implementation below is kept as the single copy — it passes upstream's whole
+# test_whole_field.py suite (relative indentation preserved, nested lists, ordered
+# lists) and additionally anchors headings at column 0, the guard for the indented
+# `#442`-in-prose corpus bug that truncated two committed briefs.
+
+
 def _is_placeholder(value: str) -> bool:
     """True if a value is still the template's unfilled ``<…>`` placeholder, so a
     consumer treats it as absent. Without this, a substring gate matches the placeholder
@@ -165,8 +172,15 @@ def is_placeholder(brief_path: Path) -> bool:
     Plan beat re-plans it instead of the planner being silently skipped (issue #113). The
     Slug — the first, always-filled field of any real brief — is the cheap, reliable
     sentinel: an authored slug is kebab-case, never an angle-bracket placeholder.
+
+    Read through :func:`whole_field`, not :func:`field` (#336/#334): a brief that writes
+    its Slug on the line BENEATH the label — a shape `brief.md.tpl` itself teaches and four
+    briefs in one measured corpus use — reads as *placeholder* under the line-based
+    accessor. That misreading is load-bearing beyond re-planning: `state()` consults the
+    tracker's terminal `resolved` marker for a placeholder brief, so a live, authored,
+    reopened bundle carrying a stale marker would be classified RESOLVED and abandoned.
     """
-    slug = field(brief_path, "slug").strip()
+    slug = whole_field(brief_path, "slug").strip()
     return not slug or slug.startswith("<")
 
 

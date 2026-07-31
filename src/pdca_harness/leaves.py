@@ -34,6 +34,8 @@ subprocess in the working dir; ``interactive`` leaves inherit the terminal.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +46,8 @@ import time
 from pathlib import Path
 
 from . import act as act_mod
+from . import rubric as rubric_mod
+from . import sizing, split
 from . import assemble
 from . import brief
 from . import families
@@ -51,6 +55,7 @@ from . import gates
 from . import guard
 from . import progress
 from . import sources
+from . import state
 from . import worktree
 from .config import Config, LeafConfig
 
@@ -158,28 +163,44 @@ def _mapped_argv(leaf: LeafConfig, profile: families.FamilyProfile,
     return extra
 
 
-# A single argv string is bounded by the OS (Linux ``MAX_ARG_STRLEN`` ≈ 128 KiB); an
-# oversized interactive *seed* — e.g. the Act cross-cycle index once enough cycles have
-# frozen — overflows it with "OSError: [Errno 7] Argument list too long" before the
-# child even execs. Keep a margin under the limit for the rest of argv + the environment.
-_SEED_ARG_BUDGET = 96 * 1024
+# A single argv string is bounded by the OS, and an oversized interactive SEED overflows it
+# with "OSError: [Errno 7] Argument list too long" before the child ever execs. Linux caps a
+# single argument at MAX_ARG_STRLEN (~128 KiB) — not total ARG_MAX; Windows caps the WHOLE
+# command line at 32,767 characters, which is why this is per-platform rather than one
+# "portable" number. A flat POSIX budget would leave the crash intact on a platform the
+# template supports (scripts/install.ps1, and the os.name == "nt" branches in act/worktree).
+_SEED_ARG_BUDGET = 24 * 1024 if os.name == "nt" else 96 * 1024
+
+#: Prefix for a spilled seed. Dot-prefixed and matched by the rendered `.gitignore`, so the
+#: file never shows up as untracked in the instance's tree — keep the two in step (a test
+#: asserts it).
+_SEED_SPILL_PREFIX = ".pdca-prompt-"
 
 
 def _seed_positional(prompt: str, workdir: Path) -> tuple[str, Path | None]:
-    """The interactive REPL seed positional, spilling an oversized prompt to a file.
+    """The interactive REPL seed, spilling an oversized prompt to a file (issue #313).
 
-    Interactive leaves inherit the TTY (they open a REPL), so the prompt can't ride
-    **stdin** the way a headless leaf's does — it goes as ``claude "<seed>"``. When that
-    seed would exceed the OS single-arg limit (issue: a large frozen-cycle Act index),
-    write it to a scratch file *inside* ``workdir`` — the REPL's cwd, so it reads it with
-    no out-of-tree permission prompt — and seed with a short pointer instead. Returns
-    ``(seed, spill|None)``; the caller unlinks ``spill`` once the session ends.
+    Interactive leaves inherit the TTY to open a REPL, so the prompt cannot ride **stdin**
+    the way a headless leaf's does — it goes as ``claude "<seed>"``. The Act leaf is what
+    trips the limit first: its prompt embeds the whole cross-cycle ACT INDEX, which grows
+    with every frozen cycle (observed at 151,653 bytes on a mature instance), so `pdca flow`
+    began dying the moment it auto-ran Act. Any interactive leaf can hit it — a large
+    planner or sign-off batch does the same.
+
+    Over budget, the prompt is written to a scratch file **inside ``workdir``** — the REPL's
+    cwd, so it reads it with no out-of-tree permission prompt — and the seed becomes a short
+    pointer. Under budget the prompt is passed inline, byte-for-byte as before.
+
+    Measured in BYTES, not characters: the OS limit is on the encoded argument, and a prompt
+    of mostly non-ASCII would otherwise pass a character-count check and still fail to exec.
+
+    Returns ``(seed, spill|None)``; the caller unlinks ``spill`` once the session ends.
     """
     if len(prompt.encode("utf-8")) <= _SEED_ARG_BUDGET:
         return prompt, None
     fh = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=workdir,
-        prefix=".pdca-prompt-", suffix=".md", delete=False)
+        prefix=_SEED_SPILL_PREFIX, suffix=".md", delete=False)
     with fh:
         fh.write(prompt)
     spill = Path(fh.name)
@@ -229,6 +250,9 @@ def _invoke(
     prompt = prompt_prefix + prompt
     run_env = {**os.environ, **env} if env else None
     if leaf.interactive:
+        # The seed may be spilled to a file when it would blow the OS single-argument
+        # limit (#313). `finally` so a non-zero exit or a raising spawn still cleans up;
+        # a SIGKILLed session can still orphan one, which is why the name is gitignored.
         seed, spill = _seed_positional(prompt, workdir)
         try:
             subprocess.run(argv + [seed], cwd=workdir, env=run_env)
@@ -348,10 +372,19 @@ def ensure_notes(cfg: Config, d: Path) -> None:
 def do_plan(d: Path, cfg: Config, csv: str | None = None) -> None:
     d.mkdir(parents=True, exist_ok=True)
     sources.seed(cfg, d)  # seed notes.json + sources/ from the configured providers (#65/#102)
+    # The seed above can be what FIRST writes notes.json — including a tracker item
+    # already settled in-issue (#302 review). Re-check AFTER seeding: a RESOLVED bundle
+    # is terminal, and invoking the planner would author a brief that overrides the
+    # marker, letting a settled ticket be built and published.
+    if state.state(d) == state.RESOLVED:
+        print(f"leaves: {d.name} — tracker item is resolved (notes.json `resolved`); "
+              "skipping Plan (terminal, #302)", file=sys.stderr)
+        return
     if cfg.planner.mode == "command":
         _invoke(cfg.planner, cfg.root, _plan_prompt(cfg, csv, d), cfg=cfg)
-        return
-    _stub_plan(d, cfg)
+    else:
+        _stub_plan(d, cfg)
+    run_plan_advisory(d, cfg)  # opt-in antagonistic review of the brief (#301); no-op unless configured
 
 
 def _plan_prompt(cfg: Config, csv: str | None, d: Path) -> str:
@@ -401,7 +434,23 @@ def _plan_prompt(cfg: Config, csv: str | None, d: Path) -> str:
         "restating it. Keep the parsed `- **Label:** value` field shape; resolve the repo + "
         "branch target per INTEGRATION §2; set `Difficulty` (the fix's blast-radius / "
         "cross-file reach, NOT edge-case density) so Do/review routing can key on it. "
-        "One bundle = one brief.md. Plan only."
+        "One bundle = one brief.md. Plan only.\n\n"
+        # The split belongs to THIS beat and no later one (#358): Do builds what it is
+        # given, and Check can only report that what it built is misshapen. Stated in the
+        # runtime prompt as well as agents/planner.md because the role file alone has
+        # twice proved insufficient — the prompt the model actually receives is built here.
+        "If this slice turns out to be several slices, SPLIT IT IN THIS BEAT — a split "
+        "produces briefs, and briefs are yours. Run `pdca split "
+        f"{issue_id}` to have the splitter draft a proposal, read it with the human, then "
+        f"`pdca split {issue_id} --accept`: that files one tracker issue per child as a "
+        "sub-issue of this one and materialises a bundle each. You do not leave the "
+        "session to file issues by hand. A CSV-DRIVEN batch run re-enumerates every "
+        "in-flight bundle from disk after the Plan beat, so it picks the children up and "
+        "schedules them into waves by itself — independent ones in parallel, dependent "
+        "ones stacked. EVERY OTHER SHAPE, including an explicit id list like `pdca flow "
+        "500 501`, drives exactly the ids it was given and never looks for new ones; "
+        "`--accept` prints the `pdca flow <child-ids>` command that drives them. Prefer "
+        "fewer, larger children: each costs a full cycle."
     )
 
 
@@ -433,8 +482,36 @@ def do_plan_batch(cfg: Config, csv: str | None = None, ids: list[str] | None = N
     :func:`ensure_notes`; the flow then drives exactly those ids (``flow.flow_ids``).
     """
     cfg.bundle_root.mkdir(parents=True, exist_ok=True)
+    # Snapshot the briefed set BY CONTENT HASH so the #301 plan-advisory pass covers
+    # exactly the bundles THIS session briefed or REWROTE (#301 review round 5 — a
+    # name-only snapshot skipped the review when a rerun session updated an existing
+    # brief; unchanged resumptions still skip). An unfilled template copy is NOT
+    # briefed (round 2 — the same placeholder semantics as state.state(), #113): the
+    # session replaces it with a real brief that must get its plan review.
+    briefed_before = {d.name: _brief_sha(d) for d in cfg.bundle_root.glob("issue_*")
+                      if (d / "brief.md").exists()
+                      and not brief.is_placeholder(d / "brief.md")}
     for iid in ids or []:
         sources.seed(cfg, cfg.bundle(iid))  # seed notes.json + sources/ per bundle (#65/#102)
+    # RESOLVED trackers are terminal and must not enter the Plan session (#302 review):
+    # an authored brief deliberately overrides the marker, so a batch planner briefing
+    # one would re-open a settled ticket for Do/Check. Ids are filtered up front (the
+    # seed just above may be what first resolved them); the CSV/default path — where the
+    # planner picks ids MID-session — is guarded after the session below.
+    if ids is not None:
+        kept = []
+        for iid in ids:
+            if state.state(cfg.bundle(iid)) == state.RESOLVED:
+                print(f"plan: issue_{iid} — tracker item is resolved; excluded from the "
+                      "Plan session (terminal, #302)", file=sys.stderr)
+            else:
+                kept.append(iid)
+        if not kept:
+            print("plan: every listed issue is resolved — nothing to brief", file=sys.stderr)
+            return
+        ids = kept
+    resolved_before = {b.name for b in cfg.bundle_root.glob("issue_*")
+                       if state.state(b) == state.RESOLVED}
     if cfg.planner.mode == "command":
         # On the CSV/default path the planner CHOOSES the ids mid-session, so the per-bundle
         # seed above never ran for them. Snapshot which bundles ALREADY HAD a brief so we can
@@ -445,8 +522,122 @@ def do_plan_batch(cfg: Config, csv: str | None = None, ids: list[str] | None = N
         _invoke(cfg.planner, cfg.root, _plan_batch_prompt(cfg, csv, ids), cfg=cfg)
         if ids is None:
             _warn_unseeded_briefs(cfg, before)
-        return
-    _stub_plan_batch(cfg, ids)
+    else:
+        _stub_plan_batch(cfg, ids)
+    # RESOLVED rejection runs BEFORE the plan-advisory pass: a brief set aside here no
+    # longer exists, so the advisory batch never reviews (or revises against) a brief
+    # the resolution guard is about to retract.
+    _reject_resolved_briefs(cfg, resolved_before)
+    # #301: one advisory pass over the freshly briefed OR rewritten bundles, then ONE
+    # revision session if any review found something. No-op unless
+    # [[leaves.plan_advisory]] is configured.
+    fresh = sorted(d for d in cfg.bundle_root.glob("issue_*")
+                   if (d / "brief.md").exists()
+                   and (d.name not in briefed_before
+                        or _brief_sha(d) != briefed_before[d.name]))
+    run_plan_advisory_batch(cfg, fresh)
+
+
+def _reject_resolved_briefs(cfg: Config, resolved_before: set[str]) -> None:
+    """Reject a brief the Plan session authored for a bundle that was RESOLVED going in
+    (#302 review). On the CSV/default path the planner picks ids MID-session, so the
+    up-front id filter cannot protect a resolved tracker; an authored brief would
+    override the marker and re-open the settled ticket for Do/Check. The brief is set
+    aside (not deleted — the planner's work stays inspectable), loudly, so the bundle
+    reads RESOLVED again before the drive set is built.
+
+    Revalidated first (#302 review round 6): the marker is a CACHE of the closure, and
+    on this path no up-front id filter ever checked the live tracker — the planner may
+    have briefed the item precisely BECAUSE the tracker reopened it. Discarding that
+    brief would lock the reopened issue out of every batch run until someone hand-edits
+    notes.json. Only the bundles the session actually briefed are checked (one tracker
+    call each), never the whole RESOLVED population."""
+    for name in sorted(resolved_before):
+        b = cfg.bundle_root / name
+        bp = b / "brief.md"
+        if bp.exists() and state.state(b) != state.RESOLVED:
+            if sources.tracker_issue_reopened(cfg, name.removeprefix("issue_")):
+                # DEFER, don't drive (#302 review round 10): this brief was authored
+                # while the closure-era notes.json was still in place — it never saw
+                # the reopen discussion, and keeping it would carry that stale
+                # context through Do/Check (and possibly publish) in this very run.
+                # Set THIS brief aside, clear the marker + set the notes aside, and
+                # the bundle reads UNPLANNED — the next Plan seeds the fresh thread
+                # and re-briefs with the reopen context in view.
+                # Brief FIRST, marker SECOND (#302 review round 15): clearing the
+                # marker while the stale brief could not be moved would leave the
+                # bundle reading PLANNED — straight into this run's drive set with
+                # the stale context the deferral exists to keep out.
+                aside = _brief_aside(bp, "brief.stale-reopen-context")
+                if aside is None:
+                    # The helper printed what happened; the marker was NOT touched,
+                    # so the bundle stays terminal (RESOLVED) — fail closed.
+                    continue
+                cleared = sources.clear_resolved_marker(b)  # closure-era notes aside
+                brief_note = ("the brief aside (" + aside.name + ")"
+                              if aside is not bp else "the brief removed")
+                if cleared:
+                    print(f"plan: {name} — the tracker issue is OPEN again, but this "
+                          f"session's brief was authored from the closure-era notes; "
+                          f"cleared the stale resolved marker, set the notes aside / "
+                          f"{brief_note}, and DEFERRED the bundle — the next Plan "
+                          "re-briefs it from the fresh thread", file=sys.stderr)
+                else:
+                    # #302 review round 11: never claim "cleared" over a failed
+                    # rename — the bundle honestly remains RESOLVED (the stale brief
+                    # is still set aside: it must not drive in any case).
+                    print(f"plan: {name} — the tracker issue is OPEN again, but the "
+                          f"closure-era notes could not be set aside; {brief_note} "
+                          "and the bundle remains RESOLVED — fix the bundle "
+                          "directory, then re-run", file=sys.stderr)
+                continue
+            aside = _brief_aside(bp, "brief.superseded-by-resolution")
+            if aside is None or aside is bp:
+                continue  # the helper printed what happened (or the DELETED line)
+            print(f"plan: {name} — the session briefed a RESOLVED tracker item; the brief "
+                  f"was set aside as {aside.name} (the issue was settled in the tracker; "
+                  "reopen it there to plan it again)", file=sys.stderr)
+
+
+def _brief_aside(bp: Path, stem: str) -> Path | None:
+    """Move ``bp`` out of the active brief slot, FAIL CLOSED (#302 review round 14).
+
+    A unique destination per rejection (#302 review round 3) keeps every set-aside
+    artifact inspectable. When the rename fails (locked file on Windows, an I/O
+    error) the brief is DELETED instead — losing the planner's inspectable copy
+    beats the alternative, where an authored brief survives the failed rejection,
+    shadows the still-present resolved marker as PLANNED on the next run, and drives
+    stale/settled work through Do/Check.
+
+    Returns the set-aside path on a successful rename; ``bp`` ITSELF when the
+    fallback deletion emptied the slot (#302 review round 16 — the slot IS empty, so
+    a reopen deferral may still proceed to clear the marker; renaming being
+    unavailable must not keep suppressing the reopened issue run after run); and
+    ``None`` only when the slot could NOT be emptied, after a loud
+    manual-intervention line. The helper prints what happened on every non-rename
+    path; contained per-bundle — a failure must not abort the batch Plan session's
+    remaining bundles."""
+    aside = bp.with_name(f"{stem}.md")
+    n = 2
+    while aside.exists():
+        aside = bp.with_name(f"{stem}-{n}.md")
+        n += 1
+    try:
+        bp.rename(aside)
+        return aside
+    except OSError:
+        try:
+            bp.unlink()
+            print(f"plan: {bp.parent.name} — could not set the brief aside (rename "
+                  f"failed); it was DELETED instead so it cannot drive settled/stale "
+                  "work", file=sys.stderr)
+            return bp  # slot emptied — the caller's deferral/rejection proceeds
+        except OSError as exc:
+            print(f"plan: {bp.parent.name} — could not set aside OR remove the "
+                  f"active brief ({exc}); MANUAL INTERVENTION required: the bundle "
+                  f"will read PLANNED over a resolved tracker item until {bp} is "
+                  "moved out of the way", file=sys.stderr)
+            return None
 
 
 def _warn_unseeded_briefs(cfg: Config, before: set[str]) -> None:
@@ -606,6 +797,378 @@ def _explicit_model_variant(d: Path, cfg: Config) -> dict | None:
     return None
 
 
+SIZING_FILE = "sizing.json"
+
+
+def _pointer_clause(d: Path, cfg: Config) -> str:
+    """What to tell the sizer about a pointer brief's planning artifact."""
+    artifact = brief.planning_artifact(d / "brief.md")
+    if not artifact:
+        return ""
+    resolved = _artifact_path(d, cfg, artifact)
+    if resolved is None:
+        # Say so rather than naming a path the leaf cannot open: a URL, or an artifact
+        # outside the tree. Sizing the pointer alone is then the honest answer, and the
+        # verdict is not cached because neither the model nor the digest saw the plan.
+        return (f" — the brief points at `{artifact}`, which is not readable from here, so "
+                "size what the brief itself states and say in `confidence` that the "
+                "authoritative plan was unavailable")
+    return (f" AND the planning artifact it points at ({resolved}) — for a pointer brief "
+            "THAT document is the plan, and sizing the pointer alone would score a "
+            "three-migration project as one small slice")
+
+
+def _sizer_prompt(d: Path, cfg: Config) -> str:
+    return (
+        "You are the SIZER. Read " + str(d / "brief.md")
+        + _pointer_clause(d, cfg)
+        + ". Answer ONE question: "
+        "how many INDEPENDENTLY SHIPPABLE outcomes does this brief describe? An outcome is "
+        "independently shippable if it could be its own PR — its own defect, its own success "
+        "criterion, its own test — without waiting on the others.\n\n"
+        "This is the judgment structural features cannot make. Do NOT re-estimate size from "
+        "word counts or file counts; the driver already has those. Size is not the question; "
+        "DECOMPOSABILITY is.\n\n"
+        "Write exactly one file, " + str(d / SIZING_FILE) + ", and nothing else:\n"
+        '{"band": "ok|watch|oversized", "independent_outcomes": ["…"], '
+        '"proposed_seams": ["…"], "confidence": "low|medium|high"}\n\n'
+        "band: `ok` = one outcome. `watch` = arguably two, or one with a large uncertain "
+        "surface. `oversized` = two or more that could each ship alone.\n"
+        "Propose seams; do NOT cut them — the split is authored in PLAN, by the human, "
+        "before Do dispatches."
+    )
+
+
+def _read_sizing(d: Path) -> dict | None:
+    """The sizer's verdict, or None if absent/unreadable/not an object.
+
+    Tolerant like every other bundle-file read: a malformed verdict must leave the
+    structural estimate exactly as it was, never crash the beat that consulted it.
+    """
+    p = d / SIZING_FILE
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _sizer_escalates(verdict: dict | None, spec: dict) -> bool:
+    """Whether ``spec`` fires against the first-pass verdict.
+
+    Matches on the leaf's own output — band and/or confidence — because that is the only
+    place the signal exists. An absent verdict never escalates: a leaf that failed to
+    answer is not evidence that a stronger one would.
+    """
+    if not verdict:
+        return False
+    bands = [str(b).lower() for b in spec.get("on_band", [])]
+    confs = [str(c).lower() for c in spec.get("on_confidence", [])]
+    band = str(verdict.get("band", "")).lower()
+    conf = str(verdict.get("confidence", "")).lower()
+    # OR across the declared conditions, and a spec declaring NEITHER never fires — an
+    # empty spec must not escalate every bundle, which is the failure a truthiness test
+    # would produce.
+    return (bool(bands) and band in bands) or (bool(confs) and conf in confs)
+
+
+def run_sizer(d: Path, cfg: Config) -> dict | None:
+    """Run the cheap-model size judgment over a brief, returning its verdict (#320).
+
+    Optional by construction: with no ``[leaves.sizer]`` in ``pdca.toml`` the leaf is a
+    stub and this writes nothing a model produced, so an instance taking a `copier update`
+    gains no model call it never asked for.
+
+    Escalation is over the leaf's OWN first pass — a `watch` or low-confidence answer is
+    exactly when a stronger model earns its cost, and no brief field predicts that. At most
+    one escalation runs: this is a corroborating signal, not a search.
+    """
+    bp = d / "brief.md"
+    if not bp.exists():
+        return None
+    if cfg.sizer.mode != "command":
+        return _stub_sizer(d)
+
+    # One paid verdict per BRIEF, not per beat. The policy is evaluated before Do and
+    # again before Check (#321), so a naive re-invoke doubles the cost of every cycle —
+    # four calls with an escalation — and lets the second nondeterministic answer overwrite
+    # the first. The verdict is a function of the brief, so it is stamped with the brief's
+    # digest and reused while that digest holds; an iterate that rewrites the brief changes
+    # it and earns a fresh pass. This also subsumes the stale-artifact problem the
+    # unconditional unlink was guarding: a verdict from a DIFFERENT brief never matches.
+    digest = _sizer_key(d, cfg, bp)
+    existing = _read_sizing(d)
+    if digest and existing is not None and existing.get("brief_sha") == digest:
+        return existing
+
+    verdict = _sizer_pass(cfg.sizer, d, cfg, "sizer")
+    for spec in cfg.sizer_escalation:
+        if _sizer_escalates(verdict, spec):
+            escalated = _sizer_pass(_leaf_from_spec(spec, cfg.sizer), d, cfg,
+                                    "sizer (escalated)")
+            if escalated is not None:
+                return _stamp(d, escalated, digest)
+            # An escalation that produced nothing must not discard the first pass: the
+            # cheap verdict is still the best evidence available. Restore it to DISK too —
+            # the escalation pass unlinks the artifact before running, so returning it only
+            # in memory would leave the bundle without the sizing record it did earn.
+            return _stamp(d, verdict, digest)
+    return _stamp(d, verdict, digest)
+
+
+def current_sizing(d: Path, cfg: Config) -> dict | None:
+    """The stored verdict IF it was given for the brief as it stands now — else None.
+
+    `_read_sizing` is the raw read and does not check the stamp. Every FREE reader — the
+    BUILT-time advisory, `pdca size` — must use this instead: `sizing.json` is not archived
+    by an iterate, so a bundle re-planned from `oversized` to a small single-outcome brief
+    still carries the old verdict on disk. Showing those seams, or folding that band into
+    a fresh estimate, states the opposite of the truth about the current brief.
+
+    A verdict whose inputs cannot be fingerprinted (an unfetchable planning artifact) was
+    never stamped, so it is not reusable either — the same safe direction `_sizer_key` takes.
+    """
+    verdict = _read_sizing(d)
+    bp = d / "brief.md"
+    if verdict is None or not bp.exists():
+        return None
+    key = _sizer_key(d, cfg, bp)
+    return verdict if key and verdict.get("brief_sha") == key else None
+
+
+def _sizer_key(d: Path, cfg: Config, bp: Path) -> str:
+    """The cache key for a sizing verdict, or "" when the inputs cannot be fingerprinted.
+
+    A POINTER brief is the reason this is not just the brief's digest: for those, the
+    planning artifact IS the plan and the sizer is told to read it, so hashing `brief.md`
+    alone would reuse an `ok` verdict after the artifact grew from one outcome to three —
+    suppressing exactly the advisory the pointer case exists to produce.
+
+    An artifact that cannot be read — a URL, or a path outside the tree — yields "" and the
+    verdict is NOT cached. Paying for a re-run is the safe direction when the alternative
+    is silently trusting a verdict whose input may have changed underneath it.
+    """
+    h = hashlib.sha256(bp.read_bytes())
+    # The CONFIGURATION is an input too. Adding a `[[leaves.sizer_escalation]]` that fires
+    # on low confidence, or pointing the leaf at a stronger model, must earn a fresh
+    # verdict — otherwise the cached answer from the weaker pass is returned and the
+    # escalation the operator just configured never runs.
+    h.update(repr([
+        (cfg.sizer.mode, cfg.sizer.family, tuple(cfg.sizer.argv), cfg.sizer.agent,
+         cfg.sizer.model, cfg.sizer.effort),
+        # ORDERED per-spec, not a flattened sorted set: `run_sizer` returns on the FIRST
+        # matching escalation, so reordering two rules changes which stronger model runs.
+        # Flattening gave both orders the same key, and the cached verdict from the rule
+        # that used to win was returned instead of running the one now promoted.
+        tuple(tuple(sorted((k, repr(v)) for k, v in spec.items()))
+              for spec in cfg.sizer_escalation),
+    ]).encode("utf-8"))
+    artifact = brief.planning_artifact(bp)
+    if not artifact:
+        return h.hexdigest()[:16]
+    resolved = _artifact_path(d, cfg, artifact)
+    if resolved is None:
+        return ""
+    try:
+        h.update(resolved.read_bytes())
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def _artifact_path(d: Path, cfg: Config, artifact: str) -> Path | None:
+    """The planning artifact as a path the LEAF can open, or None.
+
+    Resolved against the bundle first and then the target checkout, and returned ABSOLUTE
+    — the sizer runs with the bundle as its cwd, so handing it the brief's target-relative
+    string (`docs/adr/0042.md`) names a file it cannot find. The prompt and the cache key
+    both go through here, or the key hashes a document the model never read.
+
+    A URL, or a path that resolves nowhere, yields None: the leaf then sizes the brief
+    alone and the verdict is not cached, since neither the model nor the digest can see
+    what the pointer points at.
+
+    **CONTAINED to the bundle or the target checkout.** Absolute paths, `..` traversal and
+    symlink escapes are refused. `Path(root) / "/etc/passwd"` returns `/etc/passwd` — an
+    absolute join silently discards the root — so without this a brief declaring
+    `Planning artifact: /etc/passwd` would have the prompt instruct a command-mode sizer,
+    with `Read` pre-authorised, to open it.
+
+    The rubric loader already refuses the same shapes, and the argument is stronger here:
+    a rubric path comes from `pdca.toml`, which a human wrote, while a planning artifact
+    comes from `brief.md`, which a MODEL wrote.
+    """
+    if not artifact or Path(artifact).is_absolute():
+        return None
+    for root in (d, rubric_mod._target_root(d, cfg)):
+        if root is None:
+            continue
+        try:
+            base = Path(root).resolve()
+            candidate = (base / artifact).resolve()
+            candidate.relative_to(base)          # refuses `..` and symlink escapes
+            if candidate.is_file():
+                return candidate
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _stamp(d: Path, verdict: dict | None, digest: str) -> dict | None:
+    """Record which brief a verdict was given for, and (re)write it to the bundle.
+
+    Also restores the artifact after a failed escalation: `_sizer_pass` unlinks before each
+    run, so a fallback that returned the cheap verdict only in memory left the bundle with
+    no sizing record at all.
+    """
+    if verdict is None:
+        return None
+    stamped = {**verdict, "brief_sha": digest} if digest else dict(verdict)
+    try:
+        (d / SIZING_FILE).write_text(json.dumps(stamped, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # the stamp is a cache key, never a hard requirement
+    return stamped
+
+
+def _sizer_pass(leaf: LeafConfig, d: Path, cfg: Config, label: str) -> dict | None:
+    """One sizer invocation. Never raises, never reuses a previous verdict.
+
+    ADVISORY means advisory: a non-zero exit, a rate limit or a missing executable must
+    leave the structural estimate usable rather than abort the beat that consulted it —
+    an optional corroborating signal has no business taking the cycle down with it.
+
+    The artifact is unlinked FIRST so a pass that exits cleanly without writing cannot be
+    read as having produced the previous run's answer — most likely when an existing
+    bundle is switched from stub to command mode, where a stale `ok` would silently stand
+    in for a verdict the model never gave.
+    """
+    (d / SIZING_FILE).unlink(missing_ok=True)
+    try:
+        _invoke(leaf, d, _sizer_prompt(d, cfg), cfg=cfg, label=label)
+    except Exception as exc:  # noqa: BLE001 — an advisory leaf never aborts the beat
+        print(f"leaves: {label} did not run ({exc}) — continuing on the structural "
+              "estimate alone", file=sys.stderr)
+        return None
+    return _read_sizing(d)
+
+
+def _stub_sizer(d: Path) -> dict | None:
+    """Offline placeholder: a deterministic `ok` verdict so the suite stays green with no
+    model, and so `combine()` is exercised on the stub path exactly as on the real one."""
+    verdict = {"band": "ok", "independent_outcomes": [], "proposed_seams": [],
+               "confidence": "low", "stub": True}
+    (d / SIZING_FILE).write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+    return verdict
+
+
+def _split_prompt(d: Path, cfg: Config) -> str:
+    tpl = cfg.templates_dir / "split-proposal.md.tpl"
+    # READ the sizer's stored verdict, never re-invoke it: the leaf that judged this slice
+    # oversized already answered "how many independently shippable outcomes?" and proposed
+    # where they divide. Sizing the brief again here would pay a second model to rediscover
+    # what the first one wrote down — and the splitter is the one consumer that needs those
+    # seams most.
+    # `current_sizing`, not the raw read: after an iterate-plan the brief changes while
+    # `sizing.json` stays, and handing the splitter seams drawn from a replaced brief tells
+    # it the old decomposition describes the current one.
+    verdict = current_sizing(d, cfg) or {}
+    est = sizing.combine(sizing.estimate(d / "brief.md", cfg), verdict or None)
+    # LIST or nothing. The verdict is model output and the contract tolerates an untidy
+    # schema — but tolerant has to mean ignored, not iterated: `proposed_seams: 1` raised
+    # TypeError here, and `do_split` has already unlinked the previous proposal by then.
+    _out = verdict.get("independent_outcomes")
+    _seam = verdict.get("proposed_seams")
+    outcomes = [str(o) for o in _out] if isinstance(_out, list) else []
+    seams = [str(s_) for s_ in _seam] if isinstance(_seam, list) else []
+    prior = ""
+    if outcomes or seams:
+        prior = (
+            "\n\nThe sizer has already looked at this brief. Treat its answer as a "
+            "STARTING POINT, not a verdict to ratify — it saw only the brief, you may "
+            "disagree, and saying so with a reason is more useful than agreeing.\n"
+            + ("  outcomes it identified: " + "; ".join(outcomes) + "\n" if outcomes else "")
+            + ("  seams it proposed: " + "; ".join(seams) + "\n" if seams else ""))
+    return (
+        f"You are the SPLITTER. Read {d / 'brief.md'}. This slice has been judged too "
+        "large to build as one cycle. The driver sized it "
+        f"{est.band}: {'; '.join(est.reasons) or 'no structural signal'}.{prior}\n\n"
+        f"Fill {tpl} and write the result to {d / split.PROPOSAL} — exactly one file, "
+        "nothing else. Do NOT create bundles, branches or tracker items, and do NOT edit "
+        "brief.md. The split is authored in PLAN, by the human: they read your proposal "
+        "and run `pdca split <id> --accept`, which files the child issues and materialises "
+        "the briefs. You write prose; that command does the rest.\n\n"
+        "Each child must be independently shippable — its own defect, success criterion, "
+        "test and PR. Prefer fewer, larger children: each costs a full cycle, so a split "
+        "into six that could have been two is its own kind of oversizing.\n\n"
+        "The `Depends on:` / `Conflicts with:` fields BETWEEN children are the point. Get "
+        "them right and the scheduler needs no new code — independent children run in one "
+        "parallel wave, dependent ones stack. Keep the `<!-- pdca:child … -->` delimiters "
+        "exactly as the template writes them: a child body is a full draft brief and may "
+        "contain arbitrary headings and fenced code, so nothing that could appear inside a "
+        "child can mark its edge."
+    )
+
+
+def do_split(d: Path, cfg: Config) -> int:
+    """Run the splitter leaf over a briefed bundle (#322). Returns a process code."""
+    if not (d / "brief.md").exists():
+        print(f"split: {d.name} has no brief.md to split", file=sys.stderr)
+        return 1
+    # A frozen bundle is history. Writing a fresh proposal into a COMPLETE or DISCONTINUED
+    # record — and letting --accept overwrite its close marker and build notes — would
+    # rewrite an audit trail and spawn work nobody asked for.
+    st = state.state(d)
+    if st in (state.COMPLETE, state.DISCONTINUED, state.RESOLVED):
+        print(f"split: {d.name} is {st} — refusing to split a frozen bundle",
+              file=sys.stderr)
+        return 1
+    # Clear any previous proposal FIRST: `_invoke` ignores an interactive leaf's exit code,
+    # so a cancelled rerun would otherwise leave the old file in place and report success,
+    # and --accept would materialise a proposal for an earlier version of the brief.
+    (d / split.PROPOSAL).unlink(missing_ok=True)
+    if cfg.splitter.mode == "command":
+        _invoke(cfg.splitter, d, _split_prompt(d, cfg), cfg=cfg, label="splitter")
+    else:
+        _stub_split(d)
+    if not (d / split.PROPOSAL).exists():
+        print(f"split: the splitter produced no {split.PROPOSAL} in {d}", file=sys.stderr)
+        return 1
+    print(f"{d / split.PROPOSAL}")
+    return 0
+
+
+def _stub_split(d: Path) -> None:
+    """Offline placeholder: a two-child proposal, the second DEPENDING on the first.
+
+    Deliberately not two independent children: a stub whose output produced a single wave
+    would let the round-trip test pass without ever exercising the label→id rewrite, which
+    is the part of `--accept` most worth proving.
+    """
+    (d / split.PROPOSAL).write_text(
+        "<!-- pdca:split-proposal v1 -->\n"
+        f"# Split proposal — {d.name}\n\n## Wave sketch\n\n"
+        "child-2 stacks on child-1 (stub).\n\n"
+        "<!-- pdca:child child-1 -->\n"
+        "- **Slug:** stub-child-one\n"
+        "- **Defect / goal:** the first independently shippable outcome\n"
+        "- **Success criterion:** it ships alone\n"
+        "- **Test file:** tests/test_one.py\n"
+        "- **Difficulty:** low\n"
+        "<!-- pdca:end child-1 -->\n\n"
+        "<!-- pdca:child child-2 -->\n"
+        "- **Slug:** stub-child-two\n"
+        "- **Defect / goal:** the second, which builds on the first\n"
+        "- **Success criterion:** it ships after child-1\n"
+        "- **Test file:** tests/test_two.py\n"
+        "- **Difficulty:** low\n"
+        "- **Depends on:** child-1\n"
+        "<!-- pdca:end child-2 -->\n",
+        encoding="utf-8")
+
+
 def select_builder(d: Path, cfg: Config, n: int) -> LeafConfig:
     """Pick the Do builder backend for bundle ``d`` on attempt ``n`` (issues #134/#135/#167).
 
@@ -683,7 +1246,11 @@ def do_build(d: Path, cfg: Config) -> None:
     # log was already cleared above — so a post-mortem was back to terminal scrollback for the
     # one failure mode most likely to hit a whole wave (#286 review).
     try:
-        _do_build_command(d, cfg, builder, n)
+        # The lane lock (#296 review) spans ensure + the whole builder invocation, so an
+        # out-of-band gate read can never reconstruct the lane under the builder's feet
+        # (it fails closed "lane busy" instead). Blocking: Do waits out a transient gate.
+        with worktree.lane_lock(d, cfg, wait=True):
+            _do_build_command(d, cfg, builder, n)
     except Exception as exc:  # noqa: BLE001 — capture, then re-raise for the caller
         try:
             error_log.write_text(_format_leaf_attempt(exc, 1), encoding="utf-8")
@@ -738,7 +1305,7 @@ def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None
         env = guard.shim_env(cfg, env)
     # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
     _invoke(
-        builder, workdir, _build_prompt(d),
+        builder, workdir, _build_prompt(d, cfg, worktree_root=wt),
         label=f"Do {d.name}",
         status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
         stream_json=True,  # Tier 3: show the builder's live tool-use
@@ -746,7 +1313,22 @@ def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None
     )
 
 
-def _build_prompt(d: Path) -> str:
+def _build_prompt(d: Path, cfg: Config | None = None, *,
+                  worktree_root: Path | None = None) -> str:
+    # The target repo's standing rubric (#314), so the builder self-reviews against
+    # the same criteria the reviewer will apply — the asymmetry that costs a
+    # guaranteed round. "" when unconfigured, so the prompt is byte-identical.
+    # APPENDED, not prepended (#314 review): prefixing glued the rubric's last rule
+    # straight onto "You are the Do builder…" with no separator, merging the two
+    # instructions. The task prompt also reads better first — the rubric is a standing
+    # constraint on the work, not the framing for it.
+    # `worktree_root` is what `worktree.ensure` ACTUALLY returned — None when setup failed
+    # and `_do_build_command` fell back to running in place. Passing it explicitly is the
+    # only way the rubric lookup can tell "this lane is mine and live" from "this lane is
+    # mine and stale": a failed ensure() leaves the directory and its owner stamp behind,
+    # so an ownership check alone would still prefer a tree the builder is not editing.
+    rubric = (rubric_mod.for_builder(d, cfg, worktree_root=worktree_root)
+              if cfg is not None else "")
     return (
         f"You are the Do builder. Read {d}/brief.md. If $PDCA_WORKTREE is set, make ALL "
         "target-source edits there — it is an isolated git worktree off the target's base "
@@ -783,7 +1365,7 @@ def _build_prompt(d: Path) -> str:
         "runs the target's own hooks (formatter/linters), which no PDCA gate models, so a patch the target's "
         "commit hook would reject is not done even if every gate is green. Do NOT push, "
         "open, or mark any PR ready."
-    )
+    ) + rubric
 
 
 def _stub_build(d: Path, cfg: Config) -> None:
@@ -1186,6 +1768,44 @@ def _seed_sandbox_settings(cfg: Config, sandbox: Path,
     return True
 
 
+def _seed_plan_sandbox_settings(sandbox: Path, profile: families.FamilyProfile) -> bool:
+    """A MINIMAL fail-closed sandbox policy for the plan reviewer (#301 review round 8).
+
+    Withholding :func:`_seed_sandbox_settings` from plan reviews (round 6 — the Check
+    opt-ins must not extend to them) left the temp cwd with NO settings file at all,
+    and claude's ``sandbox.enabled`` defaults to FALSE — so a Bash-capable
+    plan-reviewer agent ran with no sandbox and the claimed "brief/notes/sources +
+    pinned target" boundary was prose, not policy. Seed the sandbox ON with NONE of
+    the Check grants: no ``excludedCommands``, no network keys —
+    ``allowUnsandboxedCommands: false`` (the retry escape hatch stays ignored) and
+    ``failIfUnavailable: true`` (a socat-less host REFUSES rather than running
+    unconfined under a claimed boundary, #289/#290).
+
+    Returns whether the seed landed, so the caller passes the confinement flag
+    (``--setting-sources project`` — dropping the operator's user scope, whose own
+    ``excludedCommands`` would otherwise union in monotonically, #288) exactly iff
+    the seeded file exists; on a failed write the flag is withheld and the leaf
+    keeps the operator's ambient sandbox (degrade the feature, never the boundary).
+    Families without a settings mechanism (codex: its default workspace-write
+    sandbox is its own, argv-configured) need no seed: False."""
+    if not profile.settings_scope_argv:
+        return False
+    try:
+        dest = sandbox / ".claude"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "settings.json").write_text(
+            json.dumps({"sandbox": {"enabled": True,
+                                    "allowUnsandboxedCommands": False,
+                                    "failIfUnavailable": True}}, indent=2),
+            encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"leaves: could not seed the plan-review sandbox into {sandbox} ({exc}); "
+              "the confinement flag is withheld — the leaf keeps the operator's ambient "
+              "sandbox", file=sys.stderr)
+        return False
+
+
 def _run_review_sandboxed(d: Path, cfg: Config) -> None:
     """Run the reviewer in a temp dir holding ONLY the reviewer inputs.
 
@@ -1232,7 +1852,7 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         # A transient (no-output) reviewer failure is retried with backoff before it
         # degrades to a §6 placeholder; the failed attempts' stderr lands in error_log.
         err = _invoke_leaf_resilient(
-            cfg.reviewer, sandbox, _REVIEW_PROMPT,
+            cfg.reviewer, sandbox, _REVIEW_PROMPT + rubric_mod.for_reviewer(d, cfg),
             error_log=error_log,
             label=f"Check review {d.name}",
             status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
@@ -1394,7 +2014,7 @@ def _advisory_applies(spec: dict, d: Path) -> bool:
     return _when_matches(spec.get("when"), d, default=True)
 
 
-def _advisory_prompt(spec: dict, leaf_id: str) -> str:
+def _advisory_prompt(spec: dict, leaf_id: str, rubric: str = "") -> str:
     role = spec.get("role") or "review the patch for correctness bugs and reuse / " \
         "simplification / efficiency cleanups"
     return (
@@ -1417,7 +2037,7 @@ def _advisory_prompt(spec: dict, leaf_id: str) -> str:
         "bullet still counts as '[human]', so an omission costs correctness nothing — it just "
         "spends a human on work a rebuild could have done. You are ADVISORY — you never gate; "
         "the human decides at sign-off. If you find nothing, say so explicitly."
-    )
+    ) + rubric
 
 
 def _resolved_builder_family(d: Path) -> str:
@@ -1528,7 +2148,8 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         out = sandbox / f"check-advisory-{leaf_id}.md"
         error_log = d / f"check-advisory-{leaf_id}.error.log"
         err = _invoke_leaf_resilient(
-            leaf, sandbox, _advisory_prompt(spec, leaf_id),
+            leaf, sandbox,
+            _advisory_prompt(spec, leaf_id, rubric_mod.for_reviewer(d, cfg)),
             error_log=error_log,
             label=f"Advisory {leaf_id} {d.name}",
             status=lambda: progress.bundle_activity(sandbox, (out.name,)),
@@ -1563,6 +2184,382 @@ def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
         + f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
         "re-run it or adjudicate by hand.\n",
         encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Plan-beat advisory reviewers (issue #301) — antagonists of the BRIEF, mirroring the
+# Check advisory machinery (#64/#200) at Plan: right after the planner writes brief.md,
+# each configured [[leaves.plan_advisory]] leaf reviews the PLAN (brief + notes +
+# sources — no patch, no gates), writes plan-advisory-<id>.md, the planner gets ONE
+# bounded revision pass over the findings, and a per-bundle BENEFIT record
+# (plan-advisory-benefit.json: brief hash before/after, revised?, finding count) captures
+# whether the review changed anything — the raw signal Act needs to judge whether plan
+# reviews pay off. Opt-in; an empty list leaves the Plan beat untouched.
+# ----------------------------------------------------------------------------
+PLAN_ADVISORY_INPUTS = ["brief.md", "notes.json"]  # + the sources/ dir, copied whole
+PLAN_ADVISORY_BENEFIT = "plan-advisory-benefit.json"
+
+
+def plan_advisory_artifact(d: Path, leaf_id: str) -> Path:
+    """The artifact a plan-advisory leaf writes. A distinct prefix from
+    ``check-advisory-*`` — the Check-side globs (assemble §5, archive) must not
+    pick these up as patch reviews."""
+    return d / f"plan-advisory-{leaf_id}.md"
+
+
+def _plan_advisory_prompt(spec: dict, leaf_id: str) -> str:
+    role = spec.get("role") or ("refute the brief: wrong root cause, untestable success "
+                                "criterion, hidden scope")
+    return (
+        f"You are an ADVISORY plan reviewer — an antagonist of the BRIEF, lens: {role}. "
+        "You have ONLY brief.md, notes.json and the sources/ dir here (no patch exists "
+        "yet); ground every claim about the code on the target source at $PDCA_TARGET, "
+        "never other checkouts. Attack the plan, not the prose: does the stated defect "
+        "match the tracker thread in notes.json/sources (wrong root-cause framing?); is "
+        "the success criterion something a gate or reviewer can actually verify, or "
+        "vibes; is the scope one logical fix or a hidden second change; do the repo + "
+        "branch target and any `Depends on` ids resolve (if dependency-state.json is "
+        "present it lists each declared prerequisite bundle's existence and state — "
+        "judge the declarations against it); did the brief ignore a "
+        "load-bearing comment in the thread. "
+        f"Write plan-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
+        "bullet prefixed '- NEEDS-HUMAN — ' with the evidence (a brief line, a thread "
+        "quote, a path:line). You are ADVISORY — you never gate, and you never edit "
+        "brief.md yourself. \"Could not fault the brief after a real attempt\" is an "
+        "acceptable strong answer — say so explicitly."
+    )
+
+
+def _plan_decorrelation_note(d: Path, msg: str) -> None:
+    """The plan-side twin of :func:`_decorrelation_note` (#200/#301)."""
+    plan_advisory_artifact(d, "decorrelation").write_text(
+        "# Plan advisory — decorrelation\n\n- NEEDS-HUMAN — " + msg + "\n", encoding="utf-8")
+
+
+def _select_plan_advisory(specs: list[dict], d: Path, cfg: Config) -> list[dict]:
+    """The #200 selection policy anchored on the PLANNER family (issue #301).
+
+    Pre-Do there is no builder telemetry, and the brief is the planner's artifact —
+    "reviewer ≠ author" therefore keys on ``cfg.planner.family`` (static config, no
+    telemetry needed). Unknown/empty planner family or no different-vendor leaf ⇒
+    same-vendor fallback + a decorrelation note, mirroring the Check-side contract."""
+    if cfg.plan_advisory_selection.get("mode") != "vendor-complement":
+        return specs
+    plan_advisory_artifact(d, "decorrelation").unlink(missing_ok=True)
+    if not specs:
+        return specs
+    planner_family = (cfg.planner.family or "").strip().lower()
+    if planner_family:
+        complement = next(
+            (s for s in specs
+             if (fam := s.get("family", "").strip().lower()) and fam != planner_family),
+            None)
+        if complement is not None:
+            return [complement]
+        reason = (f"the planner runs family '{planner_family}' and no configured "
+                  "plan-advisory declares a different (non-empty) family")
+    else:
+        reason = "the planner's family is not declared in [leaves.planner]"
+    chosen = specs[0]
+    _plan_decorrelation_note(
+        d, f"plan reviewer '{chosen.get('id') or 'plan-advisory'}' could not be "
+           f"decorrelated from the planner — {reason}; it ran same-vendor. Confirm the "
+           "review's independence by hand, or add a different-`family` "
+           "[[leaves.plan_advisory]] entry.")
+    return [chosen]
+
+
+def _brief_sha(d: Path) -> str:
+    """sha256 of brief.md's bytes ("" if absent) — the before/after benefit signal."""
+    bp = d / "brief.md"
+    return hashlib.sha256(bp.read_bytes()).hexdigest() if bp.is_file() else ""
+
+
+def _plan_findings(d: Path) -> int:
+    """SUBSTANTIVE findings across this bundle's plan-advisory artifacts.
+
+    Excluded: the decorrelation note (a selection lapse, not a brief finding) and any
+    NOT-COMPLETED placeholder — its NEEDS-HUMAN line reports infrastructure, not the
+    brief (#301 review round 3): counting it triggered a planner revision (and
+    ``findings: 1`` telemetry) over a missing CLI or transient outage. Placeholders
+    carry the machine-readable leaf-status marker (#278), the same signal §6 uses;
+    they still fold into §6 for the human, they just never drive the revision pass."""
+    count = 0
+    for p in sorted(d.glob("plan-advisory-*.md")):
+        if p.name == "plan-advisory-decorrelation.md":
+            continue
+        text = p.read_text(encoding="utf-8")
+        if assemble.leaf_status(text):
+            continue  # a placeholder, not a review
+        count += sum(1 for line in text.splitlines()
+                     if line.lstrip().startswith("- NEEDS-HUMAN"))
+    return count
+
+
+def _run_plan_advisory_leaves(d: Path, cfg: Config) -> list[str]:
+    """Run the applicable plan-advisory leaves for one briefed bundle; return the leaf
+    ids that ran. Artifacts only — the revision + benefit record are the caller's."""
+    applicable = [s for s in cfg.plan_advisory_leaves if _advisory_applies(s, d)]
+    ran: list[str] = []
+    for spec in _select_plan_advisory(applicable, d, cfg):
+        leaf_id = spec.get("id") or "plan-advisory"
+        leaf = LeafConfig(mode=spec.get("mode", "stub"), family=spec.get("family", ""),
+                          argv=list(spec.get("argv", [])), agent=spec.get("agent", ""),
+                          model=spec.get("model", ""), effort=spec.get("effort", ""))
+        if leaf.mode == "command":
+            _run_plan_advisory_sandboxed(d, cfg, leaf, spec, leaf_id)
+        else:
+            _stub_plan_advisory(d, spec, leaf_id)
+        ran.append(leaf_id)
+    return ran
+
+
+def _dependency_manifest(d: Path, cfg: Config) -> dict:
+    """``{dep id: {declared, exists, state}}`` for the brief's declared prerequisites
+    (#301 review round 5). The review sandbox holds only the plan inputs and
+    ``$PDCA_TARGET`` is the target repository — without this, the reviewer cannot
+    judge the ``Depends on`` / ``Depends on (merged)`` / ``Stacks on`` declarations it
+    is explicitly told to validate. ``find_bundle`` resolves archived copies too."""
+    bp = d / "brief.md"
+    out: dict[str, dict] = {}
+    for kind, ids in (("Depends on", brief.depends_on(bp)),
+                      ("Depends on (merged)", brief.depends_on_merged(bp)),
+                      ("Stacks on", brief.stacks_on(bp))):
+        for dep in ids:
+            b = cfg.find_bundle(dep)
+            out[dep] = {"declared": kind, "exists": b.is_dir(),
+                        "state": state.state(b) if b.is_dir() else None}
+    return out
+
+
+@contextlib.contextmanager
+def _plan_fallback_target(d: Path, cfg: Config):
+    """A DISPOSABLE grounding checkout when the brief's exact base cannot be
+    materialized (#301 review rounds 7/8): a temp DETACHED worktree at the resolved
+    primary's HEAD, removed after the review.
+
+    Never the lane worktree :func:`_reviewer_target` prefers (round 7) — pre-Do it
+    holds whatever its LAST user left there (another bundle's patch, or this
+    bundle's prior attempt after an iterate-to-Plan), and the antagonist would
+    fault the new brief against the wrong source. And never the primary checkout
+    itself (round 8): the family grounding flag is read/WRITE for codex
+    (``--add-dir``), so exposing the operator's working tree would let a reviewer
+    command mutate their uncommitted work despite the read-only contract. HEAD may
+    lag the brief's intended base — a loosely-grounded review still beats none
+    (advisory, never a gate). Unresolvable/non-git target or a failed add ⇒ ``None``
+    (the review grounds on the plan inputs alone)."""
+    from . import publish  # lazy: publish imports leaves, avoid an import cycle
+    try:
+        repo_spec, _base, _slug = publish._resolve_target(d)
+        primary = publish._checkout_path(cfg, repo_spec) if repo_spec else None
+    except Exception:  # noqa: BLE001 — grounding is best-effort, never fatal
+        primary = None
+    if primary is None or not (primary / ".git").exists():
+        yield None
+        return
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    pinned = Path(tmp) / "target"
+    if worktree._git(primary, "worktree", "add", "--detach", str(pinned), "HEAD") != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        yield None
+        return
+    try:
+        yield pinned
+    finally:
+        if worktree._git(primary, "worktree", "remove", "--force", str(pinned)) != 0:
+            shutil.rmtree(pinned, ignore_errors=True)
+            worktree._git(primary, "worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _pinned_plan_target(d: Path, cfg: Config):
+    """A read-only checkout PINNED to the brief's resolved base ref, for grounding the
+    plan review (#301 review round 2).
+
+    Pre-Do there is no per-cycle worktree the review may trust, so this materializes
+    a temp DETACHED worktree at the exact ``base_ref`` the brief resolves to (the
+    drift.py pattern), removed after the review. Unresolvable target / failed add ⇒
+    :func:`_plan_fallback_target` — a disposable detached tree at the primary's
+    HEAD, deliberately neither :func:`_reviewer_target`'s lane worktree (another
+    bundle's patched content, round 7) nor the writable primary checkout itself
+    (round 8). A loosely-grounded review still beats none — advisory, never a
+    gate."""
+    tgt = worktree._target(d, cfg)
+    if tgt is None:
+        with _plan_fallback_target(d, cfg) as fb:
+            yield fb
+        return
+    primary, base_ref = tgt
+    worktree._git(primary, "fetch", cfg.base_remote)  # best-effort refresh of the base
+    if base_ref.startswith("origin/") and cfg.base_remote != "origin":
+        # A stacked base lives on origin (#123): with base_remote = "upstream", fetching
+        # only it leaves origin/<parent-branch> stale/absent, the worktree add fails and
+        # the review silently grounds on the sibling checkout instead of the stacked
+        # base (#301 review round 4). Mirror worktree.ensure's dual fetch.
+        worktree._git(primary, "fetch", "origin")
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    pinned = Path(tmp) / "target"
+    if worktree._git(primary, "worktree", "add", "--detach", str(pinned), base_ref) != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        with _plan_fallback_target(d, cfg) as fb:
+            yield fb
+        return
+    try:
+        yield pinned
+    finally:
+        if worktree._git(primary, "worktree", "remove", "--force", str(pinned)) != 0:
+            shutil.rmtree(pinned, ignore_errors=True)
+            worktree._git(primary, "worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_plan_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict,
+                                 leaf_id: str) -> None:
+    """One plan-advisory leaf in a temp dir holding ONLY the plan inputs (the reviewer
+    independence sandbox, minus patch/gates), grounding on $PDCA_TARGET — a checkout
+    pinned to the brief's resolved base (#301 review round 2)."""
+    with tempfile.TemporaryDirectory(prefix="pdca-plan-advisory-") as tmp, \
+            _pinned_plan_target(d, cfg) as target:
+        sandbox = Path(tmp)
+        for name in PLAN_ADVISORY_INPUTS:
+            if (d / name).exists():
+                shutil.copy2(d / name, sandbox / name)
+        if (d / "sources").is_dir():
+            shutil.copytree(d / "sources", sandbox / "sources")
+        manifest = _dependency_manifest(d, cfg)
+        if manifest:
+            (sandbox / "dependency-state.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        profile = cfg.profile(leaf)
+        _seed_sandbox_agents(cfg, sandbox)
+        # DELIBERATELY no _seed_sandbox_settings / _sandbox_argv here (#301 review
+        # round 6): those carry the CHECK-leaf sandbox grants ([leaves.sandbox]
+        # network_access / unsandboxed_commands / seeded network keys) an operator
+        # opted into for Docker-backed gates and the reviewer's prior-art fetch. A
+        # plan review needs none of that — it reads the brief, notes/sources and the
+        # pinned read-only target — so the leaf gets a MINIMAL fail-closed sandbox
+        # instead (#301 review round 8): _seed_plan_sandbox_settings turns the vendor
+        # sandbox ON with none of those grants (claude's sandbox.enabled defaults
+        # FALSE, so seeding nothing left a Bash-capable reviewer unconfined), and the
+        # confinement flag rides exactly iff the seed landed (#290).
+        seeded = _seed_plan_sandbox_settings(sandbox, profile)
+        env = {"PDCA_TARGET": str(target)} if target else None
+        extra = ([profile.grounding_flag, str(target)]
+                 if target and profile.grounding_flag else [])
+        if seeded:
+            extra += list(profile.settings_scope_argv)
+        out = sandbox / f"plan-advisory-{leaf_id}.md"
+        error_log = d / f"plan-advisory-{leaf_id}.error.log"
+        err = _invoke_leaf_resilient(
+            leaf, sandbox, _plan_advisory_prompt(spec, leaf_id),
+            error_log=error_log,
+            label=f"Plan advisory {leaf_id} {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, (out.name,)),
+            stream_json=True, env=env, extra_argv=extra, cfg=cfg)
+        if err is not None:  # advisory must never crash Plan
+            _plan_advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
+                                       failure=_failure_class(err), error_log=error_log)
+            return
+        if out.exists():
+            shutil.copy2(out, plan_advisory_artifact(d, leaf_id))
+        else:
+            _plan_advisory_unavailable(d, leaf_id, "produced no artifact")
+
+
+def _stub_plan_advisory(d: Path, spec: dict, leaf_id: str) -> None:
+    role = spec.get("role") or "refute the brief (root cause, success criterion, scope)"
+    plan_advisory_artifact(d, leaf_id).write_text(
+        f"# Plan advisory — {leaf_id} (stub)\n\nLens: {role}.\n\n"
+        f"- NEEDS-HUMAN — plan-advisory lens is a stub here; a real `{leaf_id}` leaf "
+        "(family/argv in [[leaves.plan_advisory]]) reviews the brief and lists findings. "
+        "The human adjudicates at sign-off.\n",
+        encoding="utf-8")
+
+
+def _plan_advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
+                               failure: str = _FAIL_SUBSTANTIVE,
+                               error_log: Path | None = None) -> None:
+    print(f"leaves: {d.name} — plan advisory '{leaf_id}' unavailable ({reason})",
+          file=sys.stderr)
+    plan_advisory_artifact(d, leaf_id).write_text(
+        f"# Plan advisory — {leaf_id} — NOT COMPLETED\n\n"
+        + _unavailable_classification(failure, error_log)
+        + f"- NEEDS-HUMAN — plan-advisory leaf '{leaf_id}' did not produce findings "
+        f"({reason}); re-run it or adjudicate by hand.\n",
+        encoding="utf-8")
+
+
+def _plan_revision_prompt(cfg: Config, bundles: list[Path]) -> str:
+    per_bundle = "\n".join(
+        f"- {d}: findings in " + ", ".join(
+            p.name for p in sorted(d.glob("plan-advisory-*.md"))
+            if p.name != "plan-advisory-decorrelation.md")
+        for d in bundles)
+    return (
+        "You are the Plan leaf on a REVISION pass (issue #301) — do not re-plan from "
+        "scratch and do not implement. An antagonistic plan review raised findings "
+        "against the brief(s) below. For each bundle: read its plan-advisory-*.md, then "
+        "either revise brief.md in place to address a finding, or append a short "
+        "`Plan-review response:` line under the brief stating why the brief stands. "
+        "Keep the parsed `- **Label:** value` field shape. One pass, no new bundles.\n"
+        + per_bundle
+    )
+
+
+def run_plan_advisory_batch(cfg: Config, bundles: list[Path]) -> None:
+    """The Plan-beat advisory pass over freshly briefed bundles (issue #301).
+
+    Per bundle: run the selected plan-advisory leaves (artifacts). Then, if any bundle
+    has findings, ONE planner revision invocation covers them all (bounded by
+    construction — never a loop), and each reviewed bundle gets its benefit record.
+    No-op when nothing is configured or nothing is reviewable (a placeholder brief is
+    a template, not a plan — reviewing it would grade boilerplate)."""
+    if not cfg.plan_advisory_leaves:
+        return
+    reviewed = [d for d in bundles
+                if (d / "brief.md").exists() and not brief.is_placeholder(d / "brief.md")]
+    ran: dict[Path, list[str]] = {}
+    for d in reviewed:
+        # A rewritten brief (or a changed pool/`when` selection) must not inherit the
+        # PREVIOUS review's artifacts (#301 review round 6): stale findings would
+        # re-enter _plan_findings and §6 and could trigger a revision — or block
+        # sign-off — against a brief they never reviewed. Cleared BEFORE selection,
+        # so they vanish even when the new brief matches no leaf.
+        for stale in d.glob("plan-advisory-*"):
+            stale.unlink(missing_ok=True)
+        ids = _run_plan_advisory_leaves(d, cfg)
+        if ids:
+            ran[d] = ids
+    if not ran:
+        return
+    before = {d: _brief_sha(d) for d in ran}
+    with_findings = [d for d in ran if _plan_findings(d) > 0]
+    if with_findings and cfg.planner.mode == "command":
+        # Contained like the advisory leaves themselves (#301 review round 3): the
+        # revision is an OPT-IN advisory step, and a planner that exits non-zero here
+        # must not fail an otherwise completed Plan beat (or skip the benefit records
+        # below). The original briefs are untouched on failure → revised stays False.
+        try:
+            _invoke(cfg.planner, cfg.root, _plan_revision_prompt(cfg, with_findings), cfg=cfg)
+        except Exception as exc:  # noqa: BLE001 — advisory: never crash the Plan beat
+            print(f"leaves: plan-advisory revision pass failed ({type(exc).__name__}: "
+                  f"{exc}); briefs left as authored — findings stay open in §6",
+                  file=sys.stderr)
+    for d, ids in ran.items():
+        after = _brief_sha(d)
+        (d / PLAN_ADVISORY_BENEFIT).write_text(json.dumps({
+            "before_sha": before[d],
+            "after_sha": after,
+            "revised": after != before[d],
+            "findings": _plan_findings(d),
+            "leaves": ids,
+        }, indent=2) + "\n", encoding="utf-8")
+
+
+def run_plan_advisory(d: Path, cfg: Config) -> None:
+    """Single-bundle convenience over :func:`run_plan_advisory_batch`."""
+    run_plan_advisory_batch(cfg, [d])
 
 
 # ----------------------------------------------------------------------------
@@ -1664,17 +2661,58 @@ def signoff_rationale(d: Path) -> str:
 # Leaf 4 — Act (act, interactive): review frozen cycles, suggest deltas if sensible.
 # ----------------------------------------------------------------------------
 def run_act(cfg: Config, date: str) -> None:
-    if cfg.act.mode == "command":
-        _invoke(cfg.act, cfg.root, _act_prompt(cfg, date), cfg=cfg)
-    else:
-        _stub_act(cfg, date)
-    # Reset the cadence marker (issue #109) whenever the Act beat runs — even if a
-    # command-mode Act judged "no delta" and wrote no act-log entry, the review happened.
-    act_mod.mark_reviewed(cfg)
+    # Concurrent Act WRITERS serialize via the shared session lock (#299 review
+    # rounds 11/12): two flows completing at once both pass act_due before either
+    # advances the marker — and a manual `act log --append` takes the SAME lock —
+    # so the frontier union is never asked to undo duplicate act-log entries over
+    # one snapshot. The auto path WAITS for the active session (#299 review round
+    # 14) rather than skipping: a skip would leave this flow's newly frozen
+    # bundles without their promised automatic review until some unrelated later
+    # flow completed. The cadence re-check below then decides whether anything is
+    # left to review.
+    with act_mod.act_session(cfg, wait=True) as held:
+        if not held:  # only an unopenable lock file (never contention) lands here
+            print("leaves: cannot open the Act session lock — Act skipped this run; "
+                  "its cycles stay unreviewed for the next due Act", file=sys.stderr)
+            return
+        # Re-check the cadence UNDER the session lock: the other session may have
+        # just finished and advanced the frontier past our threshold — reviewing
+        # again would duplicate its entry over the same cycles.
+        if not act_mod.act_due(cfg):
+            print("leaves: Act no longer due — a concurrent session advanced the "
+                  "review frontier; skipped", file=sys.stderr)
+            return
+        # Snapshot the frozen set BEFORE the session (#299 review round 5): the
+        # review can only have covered what existed when it started — a bundle
+        # freezing mid-session must stay unreviewed, and re-globbing afterwards
+        # would push it past the frontier unseen. Fingerprints ride the SAME
+        # snapshot (#299 review round 17): a bundle recreated while the leaf runs
+        # must be attested by the hash the review read, not by post-session disk.
+        covered = act_mod.frozen_bundles(cfg)
+        snap_fps = {d.name: act_mod._fingerprint(d) for d in covered}
+        started = time.time()
+        if cfg.act.mode == "command":
+            _invoke(cfg.act, cfg.root, _act_prompt(cfg, date, bundles=covered), cfg=cfg)
+        else:
+            _stub_act(cfg, date, bundles=covered)
+
+        # Advance the review frontier (issues #109/#299) whenever the Act beat
+        # runs — even if a command-mode Act judged "no delta" and wrote no act-log
+        # entry, the review happened, over exactly the pre-session snapshot.
+        # delta_guard applies the mid-session delta protection INSIDE the marker's
+        # critical section (#299 review round 7 — a scan out here would race
+        # revalidate's unmark_reviewed); the stamp's `changed` verdict decides, so
+        # a confirming revalidation doesn't withhold.
+        act_mod.mark_reviewed(cfg, reviewed=covered, date=date, delta_guard=started,
+                              fingerprints=snap_fps)
 
 
-def _act_prompt(cfg: Config, date: str) -> str:
-    entries = act_mod.index(cfg)
+def _act_prompt(cfg: Config, date: str, bundles: list[Path] | None = None) -> str:
+    # `bundles` is run_act's pre-session snapshot (#299 review round 13): indexing
+    # here must describe EXACTLY the set the frontier will advance over — a bundle
+    # freezing between the snapshot and this call would otherwise be reviewed (and
+    # logged) now, left out of the frontier, and reviewed AGAIN next cadence.
+    entries = act_mod.index(cfg, bundles=bundles)
     act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
     recs = act_mod.recurrences(cfg, entries)
     index_md = act_mod.render_index(entries, act_mod.patterns(entries),
@@ -1689,8 +2727,9 @@ def _act_prompt(cfg: Config, date: str) -> str:
     )
 
 
-def _stub_act(cfg: Config, date: str) -> None:
-    entries = act_mod.index(cfg)
+def _stub_act(cfg: Config, date: str, bundles: list[Path] | None = None) -> None:
+    # Same snapshot rule as _act_prompt (#299 review round 13).
+    entries = act_mod.index(cfg, bundles=bundles)
     act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
     recs = act_mod.recurrences(cfg, entries)
     text = act_mod.scaffold_entry(entries, act_mod.patterns(entries), date=date, recs=recs)

@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import signoff
+from . import signoff, size_signal
 from .assemble import HUMAN, IMPL, NeedsHumanItem
 from .config import Config
 from .leaves import SIGNOFF_DECISION
@@ -110,7 +110,17 @@ def eligible(items: list[NeedsHumanItem]) -> bool:
     The STANDING `Validation` row has never counted either way (#293): the reviewer's prompt
     emits it on every cycle whatever it found, so it is a constant and a constant is not
     evidence about anything.
+
+    The ONE HUMAN item that does disqualify: the empirical size backstop (#324). It is
+    evidence that MORE REBUILDS ARE THE WRONG MOVE — findings on an oversized slice look
+    implementation-shaped every round, so rebuilding past it turns the backstop into an
+    accelerator for the exact failure it exists to stop. The KIND is the mechanism, not
+    the text: the same wording tagged IMPL counts as ordinary rebuild work, which is what
+    keeps this a deliberate override rather than a text-based veto (upstream pins both
+    directions in test_size_signal).
     """
+    if any(item.kind == HUMAN and size_signal.is_size_item(item.text) for item in items):
+        return False
     return any(item.kind == IMPL for item in items)
 
 

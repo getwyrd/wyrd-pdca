@@ -65,6 +65,100 @@ def _have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _footprint_counts(cfg: Config) -> tuple[int, int, int]:
+    """(lane, integration, orphaned-overflow) sibling-worktree counts (issue #297) — a
+    cheap glob-count, never a size walk. Targets come from :func:`sweep.target_checkouts`
+    so the common sibling-convention setup with NO ``[publisher.checkouts]`` entries is
+    still covered (#297 review — the counts were permanently 0 there), and only overflow
+    trees whose creating process is provably gone count as orphans (a live pid may be
+    another process's in-flight gate read)."""
+    from . import integrate, sweep, worktree  # lazy: doctor stays import-light
+    lanes = integs = ovfs = 0
+    for primary in sweep.target_checkouts(cfg):
+        sibs = [p for p in primary.parent.glob(primary.name + worktree.WT_SUFFIX + "*")
+                if p.is_dir()]
+        ovfs += len(worktree.orphan_overflow_dirs(primary))
+        lanes += sum(1 for p in sibs if worktree._OVF_SUFFIX not in p.name)
+        integs += sum(1 for p in primary.parent.glob(
+            primary.name + integrate.INTEG_INFIX + "*") if p.is_dir())
+    return lanes, integs, ovfs
+
+
+def _space_roots(cfg: Config, *, dev=lambda p: p.stat().st_dev) -> list[Path]:
+    """One representative path per DISTINCT filesystem the harness writes on (#297
+    review round 7): ``cfg.root`` plus each target checkout's PARENT directory. Lane,
+    integration and overflow trees are created as SIBLINGS of the checkout — under
+    ``checkout.parent`` — so when the checkout is itself a mount point, statting the
+    checkout would measure the mounted filesystem while the sibling worktrees fill
+    the parent's (#297 review round 9). Measuring the parent covers both: same
+    filesystem in the common case, the right one when they differ. Deduped by
+    ``st_dev``; an unstat-able path is kept so its row WARNs instead of vanishing.
+    ``dev`` is injected for tests — real mount points can't be fabricated in a unit
+    suite (the ``probe`` pattern from ``cli._suspend_inhibitor_argv``)."""
+    from . import sweep  # lazy: doctor stays import-light
+    roots: list[Path] = []
+    seen: set[int] = set()
+    for where in [cfg.root, *(p.parent for p in sweep.target_checkouts(cfg))]:
+        try:
+            d = dev(where)
+        except OSError:
+            roots.append(where)
+            continue
+        if d not in seen:
+            seen.add(d)
+            roots.append(where)
+    return roots
+
+
+def _quota_free_gb(where: Path, *, runner=subprocess.run) -> float | None:
+    """Best-effort per-USER quota headroom (GiB) on the filesystem holding ``where``,
+    or ``None`` when unknowable.
+
+    ``shutil.disk_usage`` reports filesystem-wide free blocks — but the motivating
+    #297 incident was ``EDQUOT``: a shared volume showing hundreds of free GiB while
+    THIS user could no longer write (#297 review round 12). Parse linuxquota's
+    ``quota -u -w --show-mntpoint --hide-device``: one row per quota'd filesystem
+    (``<mountpoint> <blocks> <soft> <hard> …``, 1 KiB block units); the row whose
+    mountpoint is the longest prefix of ``where`` supplies the headroom against its
+    hard (else soft) limit. No ``quota`` binary, no matching row, a limit of 0 (no
+    quota) or any exec/parse oddity ⇒ ``None`` — the fs-level number then stands and
+    the row says quotas were not probed. ``runner`` is injected for tests (real
+    quotas can't be fabricated in a unit suite)."""
+    if shutil.which("quota") is None:
+        return None
+    try:
+        proc = runner(["quota", "-u", "-w", "--show-mntpoint", "--hide-device"],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # quota exits NON-ZERO when a limit is exceeded — the output still carries the
+    # numbers, which is exactly the case this probe most needs to see.
+    try:
+        target = str(where.resolve())
+    except OSError:
+        return None
+    best: tuple[int, float] | None = None  # (mountpoint length, headroom GiB)
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4 or not parts[0].startswith("/"):
+            continue  # headers / device rows / continuation lines
+        mnt = parts[0]
+        try:
+            blocks = float(parts[1].rstrip("*"))  # '*' marks an exceeded soft limit
+            soft = float(parts[2])
+            hard = float(parts[3])
+        except ValueError:
+            continue
+        limit = hard if hard > 0 else soft
+        if limit <= 0:
+            continue  # no quota on this filesystem
+        if target == mnt or target.startswith(mnt.rstrip("/") + "/"):
+            headroom = max(0.0, limit - blocks) / (1024 ** 2)  # 1 KiB blocks → GiB
+            if best is None or len(mnt) > best[0]:
+                best = (len(mnt), headroom)
+    return best[1] if best else None
+
+
 # What Claude Code's Linux sandbox needs on PATH before it will actually engage. Missing any
 # of these, it does not fail — it disables the sandbox and runs unconfined (#289).
 # binary on PATH -> (what it is, the PACKAGE that provides it). The two differ for bubblewrap:
@@ -99,11 +193,21 @@ def _sandbox_expected(cfg: Config) -> bool:
 
     The operator's own ambient sandbox (their user-scope `~/.claude/settings.json`) is theirs,
     not the harness's claim, so it is not checked here.
+
+    Plan-advisory leaves count UNCONDITIONALLY (#301 review round 8): their runner seeds
+    a MINIMAL fail-closed sandbox (`_seed_plan_sandbox_settings` — enabled, no Check
+    grants) for every confinable family, with no `[leaves.sandbox]` exemption involved —
+    so a claude-family plan reviewer needs the dependencies even when no exemption is
+    configured (the seeded `failIfUnavailable` makes the leaf REFUSE without them).
     """
+    leaves_map = _command_leaves(cfg)
+    if any(cfg.profile(leaf).settings_scope_argv
+           for role, leaf in leaves_map.items() if role.startswith("plan-advisory:")):
+        return True
     if not getattr(cfg, "leaf_unsandboxed_commands", None):
         return False
     return any(cfg.profile(leaf).settings_scope_argv
-               for role, leaf in _command_leaves(cfg).items()
+               for role, leaf in leaves_map.items()
                if role == "reviewer" or role.startswith("advisory:"))
 
 
@@ -136,14 +240,28 @@ def _command_leaves(cfg: Config) -> dict[str, LeafConfig]:
     pass while the real Do attempt later dies on that missing CLI. Advisory leaves
     have no builder inheritance (their stored default mode is ``stub``)."""
     named = {"builder": cfg.builder, "reviewer": cfg.reviewer, "planner": cfg.planner,
-             "signoff": cfg.signoff, "publisher": cfg.publisher, "act": cfg.act}
+             "signoff": cfg.signoff, "publisher": cfg.publisher, "act": cfg.act,
+             # The sizer (#320) is a real command leaf the Plan beat spawns; omitting it
+             # let `--strict` pass while the advisory later died on a missing CLI.
+             "sizer": getattr(cfg, "sizer", LeafConfig()),
+             # `pdca split` spawns this like any other command leaf; omitting it let
+             # --strict pass while the split later died on a CLI nobody had installed.
+             "splitter": getattr(cfg, "splitter", LeafConfig())}
     out = {role: leaf for role, leaf in named.items()
            if leaf.mode == "command" and leaf.argv}
     # (kind, specs, base) — base is the leaf an omitted field inherits from (None ⇒
-    # no inheritance: advisory's own mode/argv/family).
+    # no inheritance: advisory's own mode/argv/family). Plan advisories (#301) are
+    # command leaves a real run spawns too — omitting them let --strict pass while the
+    # Plan beat later died on the missing CLI (#301 review).
     for kind, specs, base in (("advisory", cfg.advisory_leaves, None),
+                              ("plan-advisory", getattr(cfg, "plan_advisory_leaves", []), None),
                               ("variant", cfg.builder_variants, cfg.builder),
-                              ("escalation", cfg.builder_escalation, cfg.builder)):
+                              ("escalation", cfg.builder_escalation, cfg.builder),
+                              # Sizer escalations inherit from [leaves.sizer] the same way
+                              # builder escalations inherit from [leaves.builder], so a
+                              # spec naming a different binary must be resolved too.
+                              ("sizer-escalation", getattr(cfg, "sizer_escalation", []),
+                               getattr(cfg, "sizer", None))):
         for i, spec in enumerate(specs):
             mode = spec.get("mode") or (base.mode if base else "stub")
             argv = list(spec.get("argv") or (base.argv if base else []))
@@ -202,6 +320,37 @@ def registered_ids(cfg: Config) -> set[str]:
         for row in cfg.current_doctor_checks()
         if str(row.get("cmd") or "").strip()
     }
+
+
+def unregistered_dependencies(brief_path, cfg) -> list[str]:
+    """Brief-declared external dependencies with no registered ``[[doctor.checks]]`` row.
+
+    The principle (#263): when a change needs something a human must install or provide,
+    the system must REGISTER it — a row with a detect ``cmd`` and an install ``hint`` —
+    rather than let it surface mid-cycle as a cryptic build failure.
+
+    A pure function of ``brief.md`` + ``pdca.toml``, and **not a judgment call**: it is set
+    membership. That is what lets the Plan-exit policy block on it where the size advisory
+    can only warn (#333/#321).
+
+    :func:`registered_ids` owns what "registered" means — a row that would actually RUN
+    (it has a detect ``cmd``), read from ``pdca.toml`` as it stands NOW rather than from
+    the snapshot the run opened with, because Plan and Do both add rows mid-cycle (PR #269
+    review). That is also what makes the Plan-exit hold self-clearing: register the row and
+    the next beat proceeds, with no replan.
+
+    Lives here rather than in ``assemble`` (#333) so the Plan-exit check and the Check-time
+    backstop cannot drift apart; ``assemble`` imports this module already.
+    """
+    from . import brief as _brief  # local: brief has no dependency on doctor
+    registered = registered_ids(cfg)
+    return [
+        f"external dependency `{token}` is declared in the brief but has no matching "
+        f"[[doctor.checks]] row — register a detect cmd + install hint in pdca.toml, or "
+        f"annotate it `(no-check: …)` if nothing can detect it"
+        for token in _brief.external_dependency_tokens(brief_path)
+        if token.strip().lower() not in registered
+    ]
 
 
 def run(cfg: Config, *, strict: bool = False) -> int:
@@ -291,6 +440,45 @@ def run(cfg: Config, *, strict: bool = False) -> int:
                   f"sudo apt install {package} — without it the leaf sandbox silently does NOT "
                   "engage and the bounded exemption does not hold",
                   required=True)
+
+    print()
+    print("== workspace ==")
+    # Footprint preflight (issue #297): quota exhaustion mid-`cargo test` produces an
+    # arbitrary failing test name, so a gating red gets misattributed to the patch until a
+    # human traces it. Surface it HERE, before a run — statvfs is O(1); never `du` a
+    # multi-hundred-GB tree.
+    if cfg.doctor_min_free_gb > 0:
+        for where in _space_roots(cfg):
+            label = ("free disk space" if where == cfg.root
+                     else f"free disk space ({where.name})")
+            try:
+                fs_gb = shutil.disk_usage(where).free / (1024 ** 3)
+                quota_gb = _quota_free_gb(where)
+                # The EFFECTIVE headroom is the tighter of filesystem free and this
+                # user's quota (#297 review round 12): the motivating incident was
+                # EDQUOT on a shared volume that showed hundreds of fs-level GiB —
+                # disk_usage alone cannot see per-user quotas.
+                bound = quota_gb is not None and quota_gb < fs_gb
+                eff = quota_gb if bound else fs_gb
+                low = eff < cfg.doctor_min_free_gb
+                what = "user-quota headroom" if bound else "free"
+                caveat = ("" if quota_gb is not None or shutil.which("quota")
+                          else " (fs-level; per-user quotas not visible — install "
+                               "quota-tools to probe them)")
+                r.row(WARN if low else OK, label,
+                      f"{eff:.1f} GiB {what} < {cfg.doctor_min_free_gb:g} GiB "
+                      "threshold — gate runs will false-red on quota; run "
+                      "'pdca sweep' (or 'pdca sweep --remove')" if low
+                      else f"{eff:.1f} GiB {what}{caveat}")
+            except OSError as exc:
+                r.row(WARN, label, f"could not stat {where}: {exc}")
+    lanes_n, integs, ovfs = _footprint_counts(cfg)
+    if ovfs:
+        r.row(WARN, "harness worktree footprint",
+              f"{ovfs} orphaned overflow tree(s) (crash leftovers) — run 'pdca sweep'")
+    else:
+        r.row(OK, "harness worktree footprint",
+              f"{lanes_n} lane / {integs} integration worktree(s)")
 
     rows = _expand_checks(getattr(cfg, "doctor_checks", []), cfg.lanes)
     if rows:

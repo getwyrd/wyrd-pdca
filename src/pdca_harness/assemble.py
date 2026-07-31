@@ -8,12 +8,13 @@ mirrors ``templates/SUMMARY.md.tpl`` — keep the two in step if you edit either
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from pathlib import Path
 from typing import NamedTuple
 
-from . import brief, doctor
+from . import brief, doctor, size_signal
 from .config import Config
 from .gates import canonical_elements
 
@@ -166,6 +167,35 @@ def leaf_status(artifact_text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _one_line(value: str) -> str:
+    """A brief value flattened to one line, for a context that cannot hold a newline.
+
+    Only the SUMMARY title uses this: it is a Markdown `#` heading, so the two-space
+    continuation indent :func:`_item` applies would render as literal text rather than a
+    wrapped list item (#336).
+    """
+    return " ".join(value.split())
+
+
+def _item(value: str) -> str:
+    """A brief value rendered as the tail of a SUMMARY `- Label: …` bullet.
+
+    Continuations are indented two spaces so a multi-line value stays ONE Markdown list
+    item instead of terminating the list and dumping the remainder as body prose (#336).
+    """
+    lines = value.splitlines() or [""]
+    # A value whose FIRST line is itself a list item — ORDERED (`1.`, `2)`) as well as
+    # unordered — is a nested list under an empty
+    # label — the documented Scope/API shape. Rendering it inline gives
+    # `- Scope: - **API:** …` with the remaining bullets nested beneath, which flattens the
+    # first child into the label and changes the brief's meaning in SUMMARY. Put the whole
+    # block on its own lines instead, so the hierarchy the brief authored survives.
+    if re.match(r"^\s*(?:[-*+]|\d+[.)])\s", lines[0]):
+        return "\n" + "\n".join(f"  {line}" if line else "" for line in lines)
+    first, *rest = lines
+    return "\n".join([first] + [f"  {line}" if line else "" for line in rest])
+
+
 def _classify_finding(text: str, *, standing: bool = False,
                       tagged_impl: bool = False) -> NeedsHumanItem:
     """Classify one reviewer / advisory §6 item, stripping any `[impl]` marker.
@@ -264,6 +294,27 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
+    # Plan-advisory findings (#301 + review): folded into §6 individually, exactly like
+    # the Check advisories — including the decorrelation note and any NOT-COMPLETED
+    # placeholder, which no other summary path reads. Each finding stays visible until
+    # the human dispositions it at sign-off: a bundle-wide "was the brief revised?" bit
+    # cannot say WHICH findings the revision addressed, so it must never suppress them
+    # (one cosmetic edit would have hidden every remaining objection from C6). All
+    # HUMAN-kind by construction (the plan prompt emits no [impl] markers), so
+    # auto-iterate correctly declines (#264).
+    for ptext in [p.read_text(encoding="utf-8")
+                  for p in sorted(d.glob("plan-advisory-*.md"))]:
+        items += _items_from_artifact(ptext)
+    # The empirical size backstop (#324). HUMAN, never IMPL — and that tag is the whole
+    # mechanism: `autoiterate.eligible()` requires every item be IMPL or STANDING, so this
+    # DISQUALIFIES auto-iterate, which is what should happen to a bundle behaving
+    # oversized. Tagged IMPL it would instead count as a reason to rebuild, turning the
+    # backstop into an accelerator for the very failure it exists to stop.
+    # `current`, not `read`: the recorded file wins, but its ABSENCE must not read as
+    # "measured and small". A failed write would otherwise delete the backstop.
+    size_reasons = size_signal.oversize_reasons(size_signal.current(d, cfg), cfg)
+    if size_reasons:
+        items += [NeedsHumanItem(size_signal.needs_human_text(size_reasons), HUMAN)]
     # Across EVERY source, INCLUDING the ledger (PR #168 review round 6). Filtering deferred
     # entries against the current set first was the bug: a finding stored as HUMAN that a
     # later review re-raised as IMPL had its deferred copy suppressed by the text filter, so
@@ -335,30 +386,17 @@ def ensure_section6_item(summary_path: Path, text: str) -> bool:
         return False
     return True
 
-
-def _spec_line(label: str, brief_path: Path, *fields: str, default: str = "") -> str:
-    """One §1 spec bullet, carrying the field's WHOLE value (issue #174).
-
-    §1 is what the sign-off leaf and the HUMAN read to decide accept or iterate, and what the
-    C6 accept-guard gates on — so it has to show the spec, not its first line. It was built
-    from `brief.parse_fields`, which is line-based: 88 of 94 committed criteria reached
-    sign-off truncated, four rendered as nothing at all, and the worst showed 69 characters of
-    13,357, cut mid-clause. `brief.whole_field` reassembles the value; this re-indents its
-    continuation lines so a multi-line value stays one valid Markdown list item instead of
-    breaking the list.
-    """
-    value = brief.whole_field(brief_path, *fields, default=default)
-    lines = value.splitlines()
-    if len(lines) <= 1:
-        return f"- {label}: {value}"
-    # Multi-line: start the value on its own line and keep the brief's OWN relative
-    # indentation, so a criterion written as nested sub-bullets renders as nested sub-bullets
-    # rather than being flattened into one run-on paragraph. Two spaces minimum keeps every
-    # line inside this list item.
-    head, *rest = lines
-    body = [f"  {head.strip()}"] if head.strip() else []
-    body += [("  " + ln.rstrip()) if ln.strip() else "" for ln in rest]
-    return "\n".join([f"- {label}:", *body])
+def _plan_advisory_benefit(d: Path) -> dict | None:
+    """The bundle's plan-advisory benefit record (#301), or None if absent/unreadable —
+    the same tolerant contract as every other bundle-file read (testbed #3)."""
+    p = d / "plan-advisory-benefit.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def assemble_summary(d: Path, cfg: Config) -> None:
@@ -394,18 +432,23 @@ def assemble_summary(d: Path, cfg: Config) -> None:
     )
 
     issue = d.name.replace("issue_", "")
+    # §1-8 render the brief's spec fields for a human (and the C6 accept-guard) to judge
+    # against, so they must carry the WHOLE value — `parse_fields` is line-based and cut
+    # every wrapped field at its first line (#336). `fields` stays for everything that
+    # genuinely wants one line.
+    spec = functools.partial(brief.whole_field, d / "brief.md")
     out = "\n".join(
         [
-            f"# Result — issue {issue} / {fields.get('slug', fields.get('defect', '')[:40])}",
+            f"# Result — issue {issue} / {_one_line(spec('slug') or fields.get('defect', '')[:40])}",
             "",
             "## 1. Spec (from brief.md)              ← Check verifies against THIS",
-            _spec_line("Defect / goal", bp, "defect", "goal"),
-            _spec_line("Success criterion", bp, "success criterion"),
-            _spec_line("Repo + branch target", bp, "repo + branch target", "branch target"),
-            _spec_line("Scope (one logical fix) / out of scope", bp, "scope"),
+            f"- Defect / goal: {_item(spec('defect', 'goal'))}",
+            f"- Success criterion: {_item(spec('success criterion'))}",
+            f"- Repo + branch target: {_item(spec('repo + branch target', 'branch target'))}",
+            f"- Scope (one logical fix) / out of scope: {_item(spec('scope'))}",
             "",
             "## 2. Disposition claimed               ← sign-off confirms or overrides",
-            _spec_line("Outcome", bp, "disposition hint", default="Fixed"),
+            f"- Outcome: {_item(spec('disposition hint', default='Fixed'))}",
             "- Confidence: medium",
             "- Recommendation: (set by Do)",
             "",
@@ -441,11 +484,22 @@ def assemble_summary(d: Path, cfg: Config) -> None:
             "- By / date:",
             "",
             "## 10. Act candidates (hints for the next Act review)",
+            *_plan_advisory_act_lines(d),
             "- (empty is the common case)",
             "",
         ]
     )
     (d / "SUMMARY.md").write_text(out, encoding="utf-8")
+
+
+def _plan_advisory_act_lines(d: Path) -> list[str]:
+    """§10 line for the plan-advisory benefit record (#301): benefit telemetry is process
+    signal — exactly what Act reviews to judge whether plan reviews pay off over cycles."""
+    benefit = _plan_advisory_benefit(d)
+    if not benefit:
+        return []
+    return [f"- Plan advisory: {benefit.get('findings', 0)} finding(s); brief revised: "
+            f"{'yes' if benefit.get('revised') else 'no'} (plan-advisory-*.md)"]
 
 
 def _gate_lines(gates: dict, *, prefix: str) -> str:
@@ -672,31 +726,14 @@ def _declared_external_deps(build_notes_text: str) -> list[str]:
 
 
 def _unregistered_dependency_items(brief_path: Path, cfg: Config) -> list[str]:
-    """A brief-declared external dependency with no registered ``[[doctor.checks]]`` row (#263).
+    """The Check-time BACKSTOP for #263, delegating to the one implementation (#333).
 
-    The principle: when a change needs something a human must install or provide, the system
-    must REGISTER it — a doctor row with a detect ``cmd`` and an install ``hint`` — rather
-    than let it surface mid-cycle as a cryptic build failure. Registration has to be a
-    forcing function, so an unregistered declaration becomes a §6 item and the C6 guard
-    blocks accept until the row exists (or the human clears it as a false positive).
-
-    This cannot be the reviewer's job: its sandbox holds only ``REVIEWER_INPUTS``, so it
-    never sees ``pdca.toml`` and cannot know which rows are registered. Nor is it a judgment
-    call — it is set membership — so the driver decides it deterministically here.
-
-    :func:`doctor.registered_ids` owns what "registered" means: a row that would actually
-    RUN (it has a detect ``cmd``), read from ``pdca.toml`` as it stands **now** rather than
-    from the snapshot the run opened with — Plan and Do both add rows mid-cycle (PR #269
-    review).
+    #333 moved the primary check to Plan exit, before Do dispatches. This stays, and is
+    not redundant: ``pdca.toml`` can gain or lose rows mid-cycle, which is exactly why the
+    reconciliation reads the file as it stands now rather than from the run's opening
+    snapshot (PR #269 review). A row deleted after Plan passed is still caught here.
     """
-    registered = doctor.registered_ids(cfg)
-    return [
-        f"external dependency `{token}` is declared in the brief but has no matching "
-        f"[[doctor.checks]] row — register a detect cmd + install hint in pdca.toml, or "
-        f"annotate it `(no-check: …)` if nothing can detect it"
-        for token in brief.external_dependency_tokens(brief_path)
-        if token.strip().lower() not in registered
-    ]
+    return doctor.unregistered_dependencies(brief_path, cfg)
 
 
 def _needs_human_block(items: list[str]) -> str:

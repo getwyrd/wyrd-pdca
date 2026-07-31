@@ -19,13 +19,15 @@ rebuilds; ``iterate-plan`` re-opens Plan) and bounded so a cycle can't spin fore
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import sys
 import threading
 from pathlib import Path
 
 from . import (act, assemble, autoiterate, brief, driver, gates, integrate, lane, leaves,
-               merge, merged, preflight, publish, queue, signoff, state, waves)
+               merge, merged, preflight, publish, queue, signoff, size_signal, sources,
+               state, sweep, waves)
 from .config import Config
 
 
@@ -81,6 +83,52 @@ def _chunks(items: list, n: int):
 # Shared: the deterministic record/transition for one already-decided bundle, and
 # the single-issue "run the sign-off leaf then apply" convenience.
 # ----------------------------------------------------------------------------
+#: :func:`_apply_decision` outcome meaning "nothing was recorded, but the bundle was returned
+#: to a state a later beat can act on". Distinct from ``None`` (nothing to do — stop) and from
+#: ``"blocked"`` (C6 refused an accept — stop) precisely because the caller must NOT stop: the
+#: bundle is mid-repair, and breaking would strand it one beat short of a fresh SUMMARY.
+REASSEMBLE = "reassemble"
+
+
+def _quarantine_summary(d: Path, today: str) -> Path | None:
+    """Move a malformed ``SUMMARY.md`` aside so the bundle can reassemble; ``None`` on failure.
+
+    Renamed rather than deleted: it may carry §6 boxes the human ticked, and it is the
+    evidence about whichever leaf produced it. Date-stamped like ``revalidation-<date>.json``,
+    with a counter so a second incident on the same day cannot overwrite the first.
+    """
+    for n in range(1, 100):
+        suffix = "" if n == 1 else f"-{n}"
+        dest = d / f"SUMMARY.malformed-{today}{suffix}.md"
+        if dest.exists():
+            continue
+        try:
+            (d / "SUMMARY.md").rename(dest)
+        except OSError:
+            return None
+        return dest
+    return None
+
+
+def _repair_unsignable(d: Path, *, action: str, today: str, why: str) -> str | None:
+    """Move an unsignable ``SUMMARY.md`` aside and drop the stale decision; the caller's
+    return value.
+
+    Leaving the file in place would NOT re-drive: with SUMMARY.md present the bundle sits at
+    AWAITING_SIGNOFF, a HALTED state, so no beat reassembles it — the single-issue flow stops
+    and the batch sweep re-presents the same unusable summary every pass until the budget
+    runs out. Moving it aside drops the bundle to CHECKED, which the next beat rebuilds from
+    the check artifacts.
+    """
+    (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
+    kept = _quarantine_summary(d, today)
+    where = f"kept as {kept.name}" if kept else "could not be moved aside"
+    print(f"flow: {d.name} — decision '{action}' not recorded ({why}); unsignable "
+          f"SUMMARY.md {where}; bundle returned to {state.state(d)} to reassemble",
+          file=sys.stderr)
+    return REASSEMBLE if kept else None
+
+
 def _apply_decision(
     cfg: Config, d: Path, *, by: str, today: str, apply_now: bool
 ) -> str | None:
@@ -88,8 +136,9 @@ def _apply_decision(
 
     Reads the ``signoff-decision`` token a sign-off session (single or batch) left,
     records §9, and (if ``apply_now``) advances the transition. Returns the action
-    applied, ``None`` if no decision / unrecordable, or ``"blocked"`` if an accept was
-    refused because §6 NEEDS-HUMAN is still open. Pure deterministic code — no leaf.
+    applied, ``None`` if no decision / unrecordable, :data:`REASSEMBLE` if a malformed
+    SUMMARY was moved aside so a later beat can rebuild it, or ``"blocked"`` if an accept
+    was refused because §6 NEEDS-HUMAN is still open. Pure deterministic code — no leaf.
 
     ``apply_now`` advances the bundle immediately (single-issue ``flow``). The batch
     sweep passes ``apply_now=False`` so an ``iterate-do`` does NOT rebuild on the spot —
@@ -113,6 +162,16 @@ def _apply_decision(
               f"{state.state(d)}); skipping record, will re-drive", file=sys.stderr)
         (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
         return None
+    # BEFORE the C6 guard, deliberately. `open_needs_human` is the lenient side of
+    # `_section`, so on a summary with no §6 heading it scans the whole document and can
+    # return "blocked" for an accept — which would stop here and never reach the repair
+    # below, stranding the bundle exactly as an unrepaired malformed summary does (#330
+    # review). Whether the artifact can be written to at all is a property of the artifact,
+    # not of the decision, so it is settled first. C6 is not weakened: reassembly rebuilds §6
+    # from the review artifacts with every box unticked, so the guard fires on the next pass.
+    problem = signoff.unrecordable(d / "SUMMARY.md")
+    if problem:
+        return _repair_unsignable(d, action=action, today=today, why=problem)
     # Ledger integrity is checked HERE, not in `_maybe_auto_iterate` (PR #168 review round 8).
     # That was the wrong home for it: the function returns at its `not cfg.auto_iterate` guard,
     # and the batch sweep never calls it at all — so a bundle whose ledger broke after assembly
@@ -136,8 +195,16 @@ def _apply_decision(
     # folds it into the brief's carry-forward so the next iteration isn't blind.
     # §9's "Iteration delta" is a single line, so flatten a multi-line rationale.
     rationale = " ".join(leaves.signoff_rationale(d).split())
-    signoff.record(d / "SUMMARY.md", action=action, by=by or cfg.author or "unknown",
-                   date=today, delta=rationale)
+    try:
+        signoff.record(d / "SUMMARY.md", action=action, by=by or cfg.author or "unknown",
+                       date=today, delta=rationale)
+    except ValueError as exc:
+        # The `unrecordable` pre-check above catches the ordinary shapes; this stays as the
+        # backstop for the ones only the write can detect (a duplicated §9 body, where the
+        # substitution lands on the wrong copy). Contained HERE rather than left to
+        # `_isolate` because the single-issue flow has no `_isolate` around this call, and a
+        # traceback would abandon the run instead of reporting one bad bundle.
+        return _repair_unsignable(d, action=action, today=today, why=str(exc))
     (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
     # Apply now for single-issue flow; in the batch sweep apply an ``iterate-plan`` re-open
     # too — it only archives → UNPLANNED (no rebuild), so it can't interrupt the cheap-first
@@ -219,6 +286,17 @@ def _maybe_auto_iterate(
         _observe()
         return False
     if not autoiterate.eligible(items):
+        # Say WHY when it was the size backstop (#324). This rule fires at 2 rounds while
+        # `max_auto_iters` defaults to 3, so it deliberately stops the loop with a round
+        # still nominally available — and an operator who set that number and sees the
+        # loop halt early has to be able to read the reason, or their setting simply
+        # appears not to work. Every other decline is an ordinary HUMAN finding the human
+        # is about to read in §6 anyway.
+        for item in items:
+            if size_signal.is_size_item(item.text):
+                print(f"flow: {d.name} — not auto-iterating: {item.text}",
+                      file=sys.stderr)
+                break
         _observe()
         return False
     spent = autoiterate.count(d)
@@ -304,7 +382,14 @@ def flow(
         # (#264). The `for` bounds this, and so does the per-bundle auto budget.
         if _maybe_auto_iterate(cfg, d, by=by, today=today, apply_now=True):
             continue
-        if _signoff_and_apply(cfg, d, by=by, today=today) in (None, "blocked"):
+        applied = _signoff_and_apply(cfg, d, by=by, today=today)
+        if applied == REASSEMBLE:
+            # A malformed SUMMARY was moved aside; the bundle is back at CHECKED. Loop so
+            # this pass's `run_issue` rebuilds §1–8 and offers sign-off again, rather than
+            # stopping one beat short of a usable summary. Bounded by `max_iters` like every
+            # other retry here, and reassembly is deterministic code, so it cannot spin.
+            continue
+        if applied in (None, "blocked"):
             break
         if state.state(d) == state.COMPLETE:
             break
@@ -322,6 +407,7 @@ def flow(
         if rc:
             print(f"flow: issue_{issue_id} is COMPLETE but publish did not complete "
                   f"(rc {rc}) — NOT published; run `pdca publish {issue_id}`.", file=sys.stderr)
+    _sweep_quietly(cfg, [d])  # publish/freeze boundary — reclaim footprint (#297)
     if do_act:
         _maybe_run_act(cfg, today, any_complete=(final == state.COMPLETE))
     return final
@@ -448,12 +534,35 @@ def _run_beat_round_pooled(
     return progressed[0]
 
 
-def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str) -> None:
+def _sweep_quietly(cfg: Config, bundles: list[Path]) -> None:
+    """Reclaim the harness's worktree/build footprint at the end of a run (issue #297).
+
+    Runs only after every lane thread has joined (the callers sit past the drive loops),
+    so it never races a live Do. Best-effort by contract: a sweep failure must never
+    fail a run that already produced its results — one stderr summary, never a raise.
+    """
+    try:
+        lines = sweep.sweep(cfg, bundles)
+        if lines:
+            print(f"flow: footprint sweep — {len(lines)} action(s) "
+                  f"([driver].sweep_worktrees = {cfg.sweep_worktrees}):", file=sys.stderr)
+            for line in lines:
+                print(f"  {line}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — teardown must never fail the run
+        print(f"flow: footprint sweep failed ({type(exc).__name__}: {exc}); "
+              "run `pdca sweep` manually", file=sys.stderr)
+
+
+def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str,
+                    texts_prevalidated: bool = False) -> None:
     """Publish one COMPLETE bundle (Check's closing step), isolated so a single failure
-    can't abort the batch (testbed #3); a non-zero return is loud, never silent (#97)."""
+    can't abort the batch (testbed #3); a non-zero return is loud, never silent (#97).
+    ``texts_prevalidated`` (#295 review): the wave pre-pass already drafted + T4-gated
+    the texts, so publish runs mechanics-only (no second T4 run mid-wave)."""
     rc = _isolate(d, "publish", lambda: publish.publish(
         cfg, d.name.removeprefix("issue_"),
-        dry_run=cfg.publisher.mode == "stub", by=by, today=today, skip_if_no_target=True))
+        dry_run=cfg.publisher.mode == "stub", by=by, today=today, skip_if_no_target=True,
+        texts_prevalidated=texts_prevalidated))
     if rc not in (0, None):  # None ⇒ _isolate already logged an exception
         print(f"flow: {d.name} is COMPLETE but publish did not complete (rc {rc}) — NOT "
               f"published; run `pdca publish {d.name.removeprefix('issue_')}`.", file=sys.stderr)
@@ -531,9 +640,10 @@ def _audit_wave_overlap(wave: list[Path]) -> None:
                       f"conflict; review before merge.", file=sys.stderr)
 
 
-# Terminal: finished (COMPLETE) or deliberately abandoned (DISCONTINUED). A bundle left in
-# ANY other state when the driver stops driving it is work in flight — it will not be
-# published, and nothing else advances it this run.
+# Terminal: finished (COMPLETE), deliberately abandoned (DISCONTINUED), or settled in the
+# tracker outside a cycle (RESOLVED, #302). A bundle left in ANY other state when the driver
+# stops driving it is work in flight — it will not be published, and nothing else advances
+# it this run.
 _TERMINAL = (state.COMPLETE, state.DISCONTINUED, state.RESOLVED)
 
 
@@ -624,7 +734,7 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
             for d in chunk:
                 _isolate(d, "sign-off", lambda d=d: _apply_decision(
                     cfg, d, by=by, today=today, apply_now=False))
-        if all(state.state(d) in (state.COMPLETE, state.DISCONTINUED) for d in wave):
+        if all(state.state(d) in _TERMINAL for d in wave):
             return
     # Budget spent with work still in flight. An `iterate-do` recorded on the last allowed
     # pass defers its rebuild to "the next pass's build-all" — which never comes.
@@ -692,10 +802,41 @@ def _drive_and_act(
                     if state.state(d) == state.COMPLETE]
         _audit_wave_overlap(complete)
         if do_publish:
-            for d in complete:
-                if d.name not in published:
-                    _publish_bundle(cfg, d, by=by, today=today)
-                    published.add(d.name)
+            to_publish = [d for d in complete if d.name not in published]
+            # #295: draft ALL publishing texts (commit-msg.txt + pr-description.md) and
+            # gate them (T4) BEFORE any git/gh mechanics run, so text generation and
+            # mechanical publishing are two distinct phases — a mid-wave drafting/T4
+            # failure can no longer leave half the wave pushed. Isolated per bundle
+            # (testbed #3): one bundle's weak texts block only that bundle, never a
+            # sibling's accepted green work.
+            # Two sub-phases (#295 review round 2): every publisher leaf finishes BEFORE
+            # any T4 runs. The leaves execute from the shared project root, so a later
+            # bundle's leaf can touch an earlier bundle's artifacts — interleaving
+            # draft→T4 per bundle would let post-validation edits reach mechanics
+            # unvalidated. T4 over the final contents only.
+            drafted = {d.name: _isolate(d, "draft publish texts",
+                                        lambda d=d: publish.draft_texts(cfg, d,
+                                                                        run_t4=False))
+                       for d in to_publish}
+            # Validation-only (draft=False, #295 review round 4): a text missing HERE
+            # means a later leaf deleted it — re-drafting would invoke a publisher
+            # leaf mid-validation, reopening the mutation window; fail that bundle.
+            ready = {d.name: bool(drafted.get(d.name))
+                             and bool(_isolate(d, "validate publish texts (T4)",
+                                               lambda d=d: publish.draft_texts(
+                                                   cfg, d, draft=False)))
+                     for d in to_publish}
+            for d in to_publish:
+                if ready.get(d.name):
+                    # Mechanics-only: the pre-pass drafted AND T4-gated the texts — a
+                    # second T4 run here could transiently fail AFTER siblings pushed,
+                    # recreating the half-published wave (#295 review).
+                    _publish_bundle(cfg, d, by=by, today=today, texts_prevalidated=True)
+                else:
+                    print(f"flow: {d.name} — publish texts not ready (draft/T4 failed); "
+                          f"NOT published this run; fix and run `pdca publish "
+                          f"{d.name.removeprefix('issue_')}`.", file=sys.stderr)
+                published.add(d.name)
         accepted += complete
         # Carry this wave's accepted work to the NEXT wave's base (skipped on the final
         # wave, and by --no-publish). Default "stack": fold onto a run-scoped integration
@@ -710,25 +851,39 @@ def _drive_and_act(
                           file=sys.stderr)
                     break
             else:  # default: stack — fold onto a per-target integration branch
-                try:
-                    folded = integrate.fold(cfg, accepted, dry_run=dry)
-                except integrate.IntegrationError as exc:
-                    print(f"flow: wave {k} did not integrate ({exc}); STOPPING — later "
-                          f"waves not run.", file=sys.stderr)
-                    break
-                if folded and not dry:
-                    integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
-                    # Optional re-gate (#wave-model): validate EACH folded combination over
-                    # its integration tip before the next wave builds on it; any red ⇒ STOP.
-                    if cfg.regate_between_waves and any(
-                            wt is not None
-                            and gates.run_integration(cfg, wt).get("overall") == "fail"
-                            for _tgt, (_branch, wt) in folded.items()):
-                        print(f"flow: wave {k} integration re-gate FAILED — a combination is "
-                              f"red though each fix was green alone; STOPPING (later waves "
-                              f"not run).", file=sys.stderr)
+                # ONE lock scope covers fold AND re-gate (#297 review round 10): the
+                # locks stack keeps every target's integ lock held between the two,
+                # so no gap exists in which another flow's publish-boundary sweep
+                # could remove the tree — or another fold rewrite it — before the
+                # re-gate attests it.
+                stop_wave = False
+                with contextlib.ExitStack() as locks:
+                    try:
+                        folded = integrate.fold(cfg, accepted, dry_run=dry, locks=locks)
+                    except integrate.IntegrationError as exc:
+                        print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
+                              f"later waves not run.", file=sys.stderr)
                         break
+                    if folded and not dry:
+                        integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
+                        # Optional re-gate (#wave-model): validate EACH folded
+                        # combination over its integration tip before the next wave
+                        # builds on it; any red ⇒ STOP. hold_lock=False: the locks
+                        # stack already holds this tree's lock (re-acquiring would
+                        # deadlock on our own flock).
+                        if cfg.regate_between_waves and any(
+                                wt is not None
+                                and gates.run_integration(cfg, wt, hold_lock=False)
+                                        .get("overall") == "fail"
+                                for _tgt, (_branch, wt) in folded.items()):
+                            print(f"flow: wave {k} integration re-gate FAILED — a "
+                                  f"combination is red though each fix was green alone; "
+                                  f"STOPPING (later waves not run).", file=sys.stderr)
+                            stop_wave = True
+                if stop_wave:
+                    break
 
+    _sweep_quietly(cfg, bundles)  # publish/freeze boundary — reclaim footprint (#297)
     results = {d.name.replace("issue_", ""): state.state(d) for d in bundles}
     if do_act:
         _maybe_run_act(cfg, today,
@@ -762,9 +917,9 @@ def flow_batch(
 
     leaves.do_plan_batch(cfg, csv)
     # Resume set: every bundle with a brief that isn't finished. UNPLANNED (skipped /
-    # un-briefed), COMPLETE (done), DISCONTINUED (deliberately abandoned) and RESOLVED (a
-    # notes-only tracker resolved outside a cycle) are excluded, so a re-run is idempotent
-    # and a terminal bundle stays out of the sweep.
+    # un-briefed), COMPLETE (done), DISCONTINUED (deliberately abandoned) and RESOLVED
+    # (settled in the tracker, #302) are excluded, so a re-run is idempotent and a
+    # discontinued or resolved bundle stays out of the sweep.
     bundles = sorted(
         (cfg.bundle_root / name for name in _bundle_dirs(cfg)
          if state.state(cfg.bundle_root / name)
@@ -818,6 +973,22 @@ def flow_ids(
     """
     today = today or datetime.date.today().isoformat()
 
+    # A cached RESOLVED marker may be stale (#302 review round 5): revalidate the
+    # explicitly listed ids against the live tracker, exactly like the single-id CLI
+    # path — a REOPENED issue clears its marker (and sets the closure-era notes aside)
+    # BEFORE the plan-missing set is computed, so the bundle re-enters this very run
+    # instead of being skipped as terminal forever.
+    for iid in ids:
+        b = cfg.bundle(iid)
+        if (b.exists() and state.state(b) == state.RESOLVED
+                and sources.tracker_issue_reopened(cfg, iid)):
+            if sources.clear_resolved_marker(b):
+                print(f"flow: issue_{iid} — the tracker issue is OPEN again; cleared "
+                      "the resolved marker and planning it.", file=sys.stderr)
+            # else: clear_resolved_marker printed the failure (#302 review round 11);
+            # the bundle stays RESOLVED and the drive-set filter below skips it with
+            # its own terminal note — loud, never a silent "planned" claim.
+
     # Optional Plan pre-pass (#65): brief the UNPLANNED ids in one shared session, before
     # the drive set is filtered, so the un-briefed ones become drivable. A csv enables it too.
     if plan_missing or csv:
@@ -835,7 +1006,7 @@ def flow_ids(
         if not d.exists() or s == state.UNPLANNED:
             print(f"flow: {d.name} — no brief.md, skipped (brief it at Plan first)", file=sys.stderr)
             continue
-        if s in (state.COMPLETE, state.DISCONTINUED, state.RESOLVED):
+        if s in _TERMINAL:
             print(f"flow: {d.name} — already terminal ({s}), skipped", file=sys.stderr)
             continue
         bundles.append(d)

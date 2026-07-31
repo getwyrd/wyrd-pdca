@@ -28,6 +28,11 @@ DEFAULT_CLOSE_DISPOSITIONS = [
     # UPSTREAM = "not this repo's defect", EXTERNAL = "not a defect in scope at all".
     "upstream",
     "external",
+    # NB: "split" is deliberately NOT here. `close_class` SUBSTRING-matches every token, so
+    # a generic "split" would send `likely-fix — split parser failure`, `split-brain
+    # repro` and `not-split` down the close fast path, skipping builder and reviewer for
+    # ordinary fixes. An accepted split writes an explicit close MARKER, which
+    # `driver._close_class` honours outright — no hint token is needed for it (#323 review).
 ]
 
 
@@ -97,7 +102,19 @@ class Config:
     issue_id_example: str
     builder: LeafConfig
     reviewer: LeafConfig
+    # The target repo's standing review rubric ([project] in pdca.toml, #314). A path
+    # RELATIVE TO THE TARGET CHECKOUT, optionally narrowed to one Markdown section — the
+    # common shape is an "AGENTS.md" heading rather than a whole dedicated file. Unset =>
+    # every prompt is byte-identical to today.
+    rubric_file: str = ""
+    rubric_section: str = ""
     planner: LeafConfig = field(default_factory=LeafConfig)
+    #: The cheap-model size judgment (#320). Absent from pdca.toml => stub => never runs,
+    #: so an instance taking a `copier update` gains no model call it did not ask for.
+    sizer: LeafConfig = field(default_factory=LeafConfig)
+    #: The splitter (#322) — interactive, like the other human-in-the-loop leaves. Absent
+    #: from pdca.toml => stub => `pdca split` still works offline.
+    splitter: LeafConfig = field(default_factory=LeafConfig)
     signoff: LeafConfig = field(default_factory=LeafConfig)
     publisher: LeafConfig = field(default_factory=LeafConfig)
     act: LeafConfig = field(default_factory=LeafConfig)
@@ -161,6 +178,19 @@ class Config:
     # vice-versa with no per-brief edits — the cross-vendor decorrelation Check relies on
     # (INTEGRATION §4), made automatic. No different-vendor leaf ⇒ same-vendor fallback + §6.
     advisory_selection: dict = field(default_factory=dict)
+    # Plan-beat advisory reviewers (issue #301): an OPEN list mirroring [[leaves.advisory]]
+    # but reviewing the BRIEF right after Plan ([[leaves.plan_advisory]] in pdca.toml) —
+    # an antagonist of the plan, not the patch. Same spec shape ({id, role, family, mode,
+    # argv, agent, when?}); always advisory. A separate list, not a `beat` key on the
+    # Check list: the vendor-complement anchor differs (the PLANNER authored the brief;
+    # the builder authored the patch) and so does the input contract (brief/notes/sources,
+    # no patch/gates). Empty (default) ⇒ the Plan beat is unchanged.
+    plan_advisory_leaves: list[dict] = field(default_factory=list)
+    # Plan-advisory selection ([leaves.plan_advisory_selection], issue #301): same policy
+    # vocabulary as advisory_selection, anchored on the PLANNER family under
+    # ``mode = "vendor-complement"`` (pre-Do there is no builder telemetry, and the brief
+    # is the planner's artifact — reviewer ≠ author).
+    plan_advisory_selection: dict = field(default_factory=dict)
     # Commands a Check leaf may run OUTSIDE its sandbox ([leaves.sandbox]
     # unsandboxed_commands, issue #276). The reviewer/advisory leaves run under Claude Code's
     # sandbox, which denies the docker socket — so a Docker-backed conformance gate (a live
@@ -198,6 +228,11 @@ class Config:
     # an underpowered executor (e.g. min_iteration=2 → stronger, =3 → frontier). Empty ⇒
     # every attempt uses the default [leaves.builder].
     builder_escalation: list[dict] = field(default_factory=list)
+    # Sizer escalation ([[leaves.sizer_escalation]], #320). Triggers on the leaf's OWN
+    # first-pass verdict — runtime state, not a brief field — which is why it is an
+    # escalation rather than a variant: a `watch` or low-confidence answer is exactly when
+    # a stronger model is worth paying for, and no brief field predicts that.
+    sizer_escalation: list[dict] = field(default_factory=list)
     # Difficulty-routed builder variants (issue #134): an OPEN list of per-bundle Do
     # backends ([[leaves.builder_variant]] in pdca.toml), each {family, mode, argv, when}
     # where when = {field, substring} matches a brief field (e.g. difficulty=high), like a
@@ -303,6 +338,19 @@ class Config:
     # builds on it, so a combination that is red though each fix was green alone STOPs the
     # run. Off by default (needs the project's repo-scoped gates). [driver].regate_between_waves.
     regate_between_waves: bool = False
+    # Footprint sweep (issue #297): what the flow does with the harness's sibling
+    # worktrees once a run's waves complete (the publish/freeze boundary). "clean"
+    # (default) strips lane worktrees of build state but keeps the checkout warm, and
+    # removes integration/overflow trees outright; "remove" removes lane worktrees too;
+    # "off" never sweeps automatically (``pdca sweep`` still works). Left unbounded, the
+    # footprint (dominated by per-lane build dirs) has exhausted disk quotas and
+    # false-redded gating gates mid-run. ``[driver].sweep_worktrees``.
+    sweep_worktrees: str = "clean"
+    # Free-space preflight threshold in GiB for `pdca doctor`'s workspace row (issue
+    # #297): WARN when the filesystem under the project root has less free space, so
+    # quota exhaustion is a preflight warning instead of a mid-gate `os error 122`.
+    # 0 disables the row. ``[doctor].min_free_gb``.
+    doctor_min_free_gb: float = 10.0
     # Act cadence (issue #109): Act is a cross-cycle beat that only yields a real delta
     # once enough cycles have frozen to show a pattern, so ``flow`` auto-runs it only when
     # this many cycles have frozen SINCE the last Act review (counted across flow
@@ -324,6 +372,27 @@ class Config:
     # bundle as close / no-fix, so the driver skips the builder + reviewer leaves and
     # routes it straight to sign-off. ``[driver].close_dispositions`` in pdca.toml; the
     # built-in default covers the common tracker vocabulary.
+    # Structural size-estimate weights + cutoffs ([driver.sizing], issue #320). A raw
+    # table so an instance can retune against its OWN corpus without patching the engine —
+    # the whole point of #324's calibration loop. Empty => sizing.DEFAULT_* apply.
+    sizing: dict = field(default_factory=dict)
+    # Empirical Check-time backstop thresholds ([driver.size_signal], issue #324). Same
+    # shape and same reason as `sizing` above: an instance retunes against its own corpus.
+    # Empty => size_signal.DEFAULT_THRESHOLDS apply.
+    size_signal: dict = field(default_factory=dict)
+    # Pre-dispatch size advisory ([driver].size_guard, #321): "off" (default) | "warn".
+    # Default OFF, not "warn": a rendered default that emits output and consults a leaf
+    # would change behaviour for every instance taking a `copier update` — the property
+    # #342's update test asserts. An instance opts in.
+    size_guard: str = "off"
+    # Plan-exit reconciliation of brief-declared external dependencies
+    # ([driver].dependency_guard, #333): "hold" (default) | "warn" | "off".
+    #
+    # Defaults to HOLD, unlike size_guard, because the verdict is set membership rather
+    # than a heuristic — there is no false-positive class to trade against — and because
+    # it moves an EXISTING block earlier rather than adding one: the same condition
+    # already refuses `signoff --accept` through the C6 guard.
+    dependency_guard: str = "hold"
     close_dispositions: list[str] = field(
         default_factory=lambda: list(DEFAULT_CLOSE_DISPOSITIONS))
     # Family-profile overrides ([families.<name>] in pdca.toml): per-vendor CLI
@@ -489,6 +558,14 @@ class Config:
         # Advisory-selection policy (issue #200) — how the driver picks from that list.
         advisory_selection = dict(leaves.get("advisory_selection", {}))
 
+        # Plan-beat advisory leaves (issue #301) — [[leaves.plan_advisory]], mirroring the
+        # Check list; PDCA_LEAVES_MODE forces their mode too.
+        plan_advisory_leaves = [
+            {**spec, "mode": mode_override or spec.get("mode", "stub")}
+            for spec in leaves.get("plan_advisory", [])
+        ]
+        plan_advisory_selection = dict(leaves.get("plan_advisory_selection", {}))
+
         # Commands a Check leaf may run outside its sandbox (issue #276) — a harness-owned
         # exemption list, never the project's own settings.json `excludedCommands`.
         leaf_unsandboxed_commands = [
@@ -514,6 +591,10 @@ class Config:
         builder_escalation = [
             {**spec, "mode": mode_override or spec.get("mode", "")}
             for spec in leaves.get("builder_escalation", [])
+        ]
+        sizer_escalation = [
+            dict(spec) for spec in leaves.get("sizer_escalation", [])
+            if isinstance(spec, dict)
         ]
 
         # Difficulty-routed builder variants (issue #134) — per-bundle backends keyed on a
@@ -578,11 +659,26 @@ class Config:
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.
         scratch_dir = os.environ.get("PDCA_SCRATCH") or str(driver_cfg.get("scratch_dir", ""))
+        # Footprint sweep mode (issue #297). An unknown value falls back to "clean" with a
+        # note — the fail-safe direction is "still sweeps", never a silently-growing quota.
+        sweep_worktrees = str(driver_cfg.get("sweep_worktrees", "clean")).strip().lower()
+        if sweep_worktrees not in ("clean", "remove", "off"):
+            print(f"config: unknown [driver].sweep_worktrees '{sweep_worktrees}' — "
+                  "expected clean | remove | off; using 'clean'", file=sys.stderr)
+            sweep_worktrees = "clean"
+        try:  # free-space WARN threshold (issue #297); 0 disables the doctor row
+            doctor_min_free_gb = max(0.0, float(data.get("doctor", {}).get("min_free_gb", 10.0)))
+        except (TypeError, ValueError):
+            doctor_min_free_gb = 10.0
 
         # Close-disposition classes (issue #60): a configured list retunes the default
         # for an instance's tracker vocabulary; absent ⇒ the built-in default.
         close_dispositions = list(
             driver_cfg.get("close_dispositions", DEFAULT_CLOSE_DISPOSITIONS))
+        sizing = dict(driver_cfg.get("sizing", {}))
+        size_signal = dict(driver_cfg.get("size_signal", {}))
+        size_guard = str(driver_cfg.get("size_guard", "off"))
+        dependency_guard = str(driver_cfg.get("dependency_guard", "hold"))
 
         return cls(
             root=root,
@@ -590,6 +686,8 @@ class Config:
             process_dir=root / paths.get("process_dir", "process"),
             templates_dir=root / paths.get("templates_dir", "templates"),
             default_branch=data.get("project", {}).get("default_branch", "main"),
+            rubric_file=data.get("project", {}).get("rubric_file", ""),
+            rubric_section=data.get("project", {}).get("rubric_section", ""),
             tracker_system=tracker.get("system", ""),
             tracker_url=tracker.get("url", ""),
             issue_id_example=tracker.get("issue_id_example", ""),
@@ -620,7 +718,12 @@ class Config:
             leaf_unsandboxed_commands=leaf_unsandboxed_commands,
             leaf_network_access=leaf_network_access,
             advisory_selection=advisory_selection,
+            plan_advisory_leaves=plan_advisory_leaves,
+            plan_advisory_selection=plan_advisory_selection,
             builder_escalation=builder_escalation,
+            sizer=leaf("sizer"),
+            splitter=leaf("splitter"),
+            sizer_escalation=sizer_escalation,
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             gates_default_timeout_secs=gates_default_timeout_secs,
@@ -638,7 +741,13 @@ class Config:
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,
+            sweep_worktrees=sweep_worktrees,
+            doctor_min_free_gb=doctor_min_free_gb,
             close_dispositions=close_dispositions,
+            sizing=sizing,
+            size_signal=size_signal,
+            size_guard=size_guard,
+            dependency_guard=dependency_guard,
             families={k.strip().lower(): dict(v)
                       for k, v in data.get("families", {}).items()},
             doctor_checks=list(data.get("doctor", {}).get("checks", [])),
