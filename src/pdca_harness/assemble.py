@@ -257,6 +257,7 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
     # same missing mechanic — so it is HUMAN regardless of its (gate-kind) element.
     items += [NeedsHumanItem(t, HUMAN) for t in _unverifiable_items(gates_json)]
     items += _failed_gating_items(gates_json)
+    items += _flaky_gate_items(gates_json)
     build_notes = d / "build-notes.md"
     if build_notes.exists():
         items += [NeedsHumanItem(t, HUMAN)
@@ -487,6 +488,26 @@ def _failed_gating_items(gates: dict) -> list[NeedsHumanItem]:
         for r in gates["rows"]
         if r.get("gating") and r.get("result") == "fail"
     ]
+
+
+def _flaky_gate_items(gates: dict) -> list[NeedsHumanItem]:
+    """A gating gate that failed, then PASSED its once-only confirm re-run (#371 upstream)
+    → a §6 NEEDS-HUMAN item. The row records ``pass``, so nothing else would surface the
+    flip — and a flake swallowed silently is indistinguishable from a clean green, which
+    is how flaky substrate stays flaky. HUMAN, not IMPL: a rebuild cannot fix the
+    substrate the gate ran on, so auto-iterate defers the item to the human instead of
+    spending a round on it; the C6 accept-guard still makes the human acknowledge it."""
+    items: list[NeedsHumanItem] = []
+    for r in gates["rows"]:
+        if not r.get("flaky"):
+            continue
+        where = f" (full output: {r['log']})" if r.get("log") else ""
+        items.append(NeedsHumanItem(
+            f"{r['check']} flaked at Check — failed, then passed its once-only confirm "
+            f"re-run{where} — confirm the pass is trustworthy and note what interfered",
+            HUMAN,
+        ))
+    return items
 
 
 def _missing_review_text() -> str:

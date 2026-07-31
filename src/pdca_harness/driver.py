@@ -309,7 +309,10 @@ def _archive_iteration(d: Path, n: int, *, include_brief: bool) -> None:
     # attempt failed, which is the whole point of capturing it. Archive them with their attempt.
     # The patterns come from `state.DOWNSTREAM_GLOBS`, the same single source `is_resolved`
     # reads, so the archive set and the cycle-evidence set cannot drift apart.
-    names += [p.name for g in state.DOWNSTREAM_GLOBS for p in d.glob(g)]
+    # Relative paths, not bare names: a nested glob ("gate-logs/*.log", #370) must resolve
+    # back to its real location — `d / p.name` would look for the file at the top level.
+    # For the top-level patterns the two spellings are identical.
+    names += [str(p.relative_to(d)) for g in state.DOWNSTREAM_GLOBS for p in d.glob(g)]
     if include_brief:
         names.append("brief.md")
     if (d / "brief.md").exists():
@@ -320,5 +323,10 @@ def _archive_iteration(d: Path, n: int, *, include_brief: bool) -> None:
     for name in names:
         src = d / name
         if src.is_file():
-            arch.mkdir(parents=True, exist_ok=True)
-            src.rename(arch / Path(name).name)
+            # Preserve the relative layout, never flatten to the basename: the archived
+            # check-gates.json's `log` field says "gate-logs/<id>.log" (#370), so the file
+            # must live at iteration-vN/gate-logs/<id>.log for that reference to stay
+            # true — and flattening could let two artifacts with one basename collide.
+            dest = arch / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(dest)

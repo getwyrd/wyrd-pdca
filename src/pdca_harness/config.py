@@ -214,6 +214,11 @@ class Config:
     # is killed (whole process group) and recorded ``unverifiable``, never ``fail``: the
     # oracle gave no verdict, so it has none to hold against the fix.
     gates_default_timeout_secs: int = 0
+    # Confirm-once on a failed GATING row (eduralph/pdca-harness#371): re-run the command
+    # once and record both verdicts; a fail→pass flip passes flagged ``flaky`` and routes
+    # a §6 flake item to the human. On by default — one transient red must not park the
+    # bundle; ``confirm_gating_fail = false`` restores raw single-sample verdicts.
+    gates_confirm_fail: bool = True
     # Target-aware gate selection (docs 04). A check may carry ``target`` (a label or
     # list); it runs iff its labels are a SUBSET of the bundle's label set. The bundle is
     # classified from its brief on two axes: a PRIMARY one (``gate_target_match``: label →
@@ -441,6 +446,7 @@ class Config:
             gates_default_timeout_secs = max(0, int(gates.get("default_timeout_secs", 0)))
         except (TypeError, ValueError):
             gates_default_timeout_secs = 0
+        gates_confirm_fail = bool(gates.get("confirm_gating_fail", True))
         registry_consistency = dict(gates.get("registry_consistency", {}))
         install_extra_bootstrap = data.get("install", {}).get("extra_bootstrap", "")
         # `pdca try <id>` launch command (project-specific); "" ⇒ the command errors with a hint.
@@ -618,6 +624,7 @@ class Config:
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             gates_default_timeout_secs=gates_default_timeout_secs,
+            gates_confirm_fail=gates_confirm_fail,
             lanes=lanes,
             max_passes=max_passes,
             auto_iterate=auto_iterate,
