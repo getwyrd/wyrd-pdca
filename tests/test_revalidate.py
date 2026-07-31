@@ -157,5 +157,59 @@ class Revalidate(unittest.TestCase):
         self.assertIn("fail→pass", rendered)
 
 
+class FlakyRevalidation(unittest.TestCase):
+    """A frozen PASS re-confirmed only on the once-only confirm re-run (#371 upstream) is
+    a DELTA, not a silent confirmation — the stamp and the Act index must both say so."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = _stub_config(self.tmp)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_flaky_confirmed_pass_is_a_delta_not_a_silent_confirmation(self) -> None:
+        d = self.cfg.bundle("RVFLK")
+        d.mkdir(parents=True)
+        (d / "brief.md").write_text("- **Slug:** reval\n", encoding="utf-8")
+        (d / "patch.diff").write_text("--- a\n+++ b\n", encoding="utf-8")
+        self.cfg.gates_checks = [_PASS]
+        gates.run_gates(d, self.cfg)  # frozen: a clean pass
+        (d / "SUMMARY.md").write_text(
+            "## 9. Check sign-off\n- Outcome: accepted\n- By / date: t / 2026-06-04\n",
+            encoding="utf-8")
+        flag = self.tmp / "already-failed"
+        self.cfg.gates_checks = [{**_GATE, "cmd":
+                                  f"test -f {flag} || {{ touch {flag}; exit 1; }}; true"}]
+        res = revalidate.revalidate(self.cfg, d, "2026-07-31")
+        row = next(r for r in res["rows"] if r["rule_id"] == "C4")
+        self.assertEqual((row["old"], row["new"]), ("pass", "pass"))
+        self.assertTrue(row["flaky"])
+        # "pass → pass" hides that the confirmation leaned on a second sample: without
+        # `changed`, the stamp announces "no change — frozen record confirmed" and
+        # `deltas()` keeps the event out of the Act index entirely.
+        self.assertTrue(row["changed"],
+                        "a pass that needed a confirm re-run announced 'no change'")
+        self.assertFalse(res["regression"])  # a confirmed pass is still not a regression
+        self.assertTrue(any("flaky" in line for line in revalidate.deltas(d)),
+                        "the Act index misses the flaky confirmation")
+
+    def test_a_clean_confirmation_still_reads_as_no_change(self) -> None:
+        d = self.cfg.bundle("RVCLN")
+        d.mkdir(parents=True)
+        (d / "brief.md").write_text("- **Slug:** reval\n", encoding="utf-8")
+        (d / "patch.diff").write_text("--- a\n+++ b\n", encoding="utf-8")
+        self.cfg.gates_checks = [_PASS]
+        gates.run_gates(d, self.cfg)
+        (d / "SUMMARY.md").write_text(
+            "## 9. Check sign-off\n- Outcome: accepted\n- By / date: t / 2026-06-04\n",
+            encoding="utf-8")
+        res = revalidate.revalidate(self.cfg, d, "2026-07-31")
+        row = next(r for r in res["rows"] if r["rule_id"] == "C4")
+        self.assertFalse(row["flaky"])
+        self.assertFalse(row["changed"])
+        self.assertEqual(revalidate.deltas(d), [])
+
+
 if __name__ == "__main__":
     unittest.main()

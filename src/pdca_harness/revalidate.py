@@ -51,6 +51,12 @@ def revalidate(cfg: Config, d: Path, date: str) -> dict:
         ref = o or n
         old_res = o["result"] if o else None
         new_res = n["result"] if n else None
+        # A re-gate that failed, then passed its once-only confirm (#371 upstream) is NOT
+        # an unchanged clean pass: the frozen verdict was confirmed only on a second
+        # sample. Carry the flip on the row AND count it as a change, or the stamp would
+        # announce "no change — frozen record confirmed" and `deltas()` would keep the
+        # event out of the Act index — the flake buried in an otherwise unchanged row.
+        flaky = bool(n.get("flaky")) if n else False
         rows.append({
             "check": ref["check"],
             "element": ref.get("element", ""),
@@ -58,11 +64,8 @@ def revalidate(cfg: Config, d: Path, date: str) -> dict:
             "gating": (n or o).get("gating", False),
             "old": old_res,
             "new": new_res,
-            "changed": old_res != new_res,
-            # A re-gate that failed, then passed its once-only confirm (#371 upstream)
-            # would otherwise read as an unchanged clean pass — carry the flip so the
-            # stamp records that this confirmation leaned on a second sample.
-            "flaky": bool(n.get("flaky")) if n else False,
+            "changed": old_res != new_res or flaky,
+            "flaky": flaky,
         })
 
     result = {
@@ -112,7 +115,9 @@ def deltas(d: Path) -> list[str]:
             continue
         for r in res.get("rows", []):
             if r.get("changed"):
-                out.append(f"{r['check']} {r['old']}→{r['new']} ({res.get('date', '?')})")
+                flake = " (flaky — passed on confirm)" if r.get("flaky") else ""
+                out.append(f"{r['check']} {r['old']}→{r['new']}{flake} "
+                           f"({res.get('date', '?')})")
     return out
 
 
