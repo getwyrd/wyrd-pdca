@@ -414,6 +414,23 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     # ticked and retire the OTHER entry, while the deferred row sat unticked in plain sight.
     still_open = [_norm_line(line) for line in signoff.open_needs_human(summary_path)]
 
+    # The open row must be recognised by the SAME relation the tick is matched with
+    # (issue #173). Round 6 compared open rows by exact text while the tick matched fuzzily,
+    # so the guard was exactly as strong as its weaker half: a human who ANNOTATED an open
+    # row — `- [ ] …parser… (owner: architecture)` — and ticked a similar new finding had
+    # the annotated row slip the exclusion, and the never-adjudicated entry retired anyway.
+    # Assignment is EXACT-first, mirroring the tick match below: an open row that is
+    # verbatim some ledger entry protects THAT entry alone — so a still-open near-twin
+    # cannot shield its exactly-ticked neighbour (the round-5 drain stays drainable) —
+    # while an EDITED open row protects every entry it could name, failing closed on the
+    # same doctrine as round 4: a lingering finding is visible, a lost one is unrecoverable.
+    # (Upstream: eduralph/pdca-harness#335; this render carries the fix until that lands.)
+    protected: set[int] = set()
+    for o in still_open:
+        owned = [i for i, t in enumerate(ledger) if _norm_line(t) == o]
+        protected.update(owned if owned else
+                         [i for i, t in enumerate(ledger) if _same_finding(t, o)])
+
     retire: set[int] = set()
     for row in ticked:
         # EXACT first (PR #168 review round 5). The round-4 fail-closed rule counted an exact
@@ -424,7 +441,7 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
         exact = [i for i, t in enumerate(ledger) if _norm_line(t) == _norm_line(row)]
         hits = exact if exact else [i for i, t in enumerate(ledger)
                                     if _same_finding(t, row)]
-        if len(hits) == 1 and not any(_norm_line(ledger[hits[0]]) == o for o in still_open):
+        if len(hits) == 1 and hits[0] not in protected:
             retire.add(hits[0])
     kept = [t for i, t in enumerate(ledger) if i not in retire]
     if len(kept) != len(ledger):
