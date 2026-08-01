@@ -17,8 +17,9 @@ label set (subset = AND). The bundle is classified from its brief: a primary axi
 exits 0, fails on any other exit, and may instead declare itself **unverifiable**
 when it genuinely cannot run its mechanical check (issue #46): exit
 :data:`UNVERIFIABLE_RC` (77, the automake SKIP convention) **or** print a line
-containing :data:`UNVERIFIABLE_MARKER` (``PDCA-UNVERIFIABLE: <reason>``; the marker
-wins over the exit code, so a gate may exit 0 and still defer). When
+containing :data:`UNVERIFIABLE_MARKER` (``PDCA-UNVERIFIABLE: <reason>``) **while exiting
+0 or 77** — the marker lets a gate that did NOT fail defer to the human, and is ignored on
+any other exit code, because a gate that failed has failed whatever it printed (#329). When
 ``[[gates.checks]]`` is empty the driver falls back to all-PASS stub rows, so the
 offline vertical slice still runs.
 
@@ -32,6 +33,7 @@ where the C6 accept-guard forces the human to clear it before sign-off.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shlex
@@ -182,16 +184,34 @@ def run_working_tree(cfg: Config) -> dict:
     return _finalize(rows, name="working-tree", write_to=None)
 
 
-def run_integration(cfg: Config, worktree_path: Path) -> dict:
+def run_integration(cfg: Config, worktree_path: Path, *, hold_lock: bool = True) -> dict:
     """Run the repo-scoped gates against a wave integration worktree (#wave-model re-gate).
 
     Like :func:`run_working_tree`, but targeted at an explicit tree — the folded
     integration tip the *next* wave will build on. The gate commands run from it and see it
     as ``$PDCA_WORKTREE``, so a project's repo-scoped gate validates the *combination* of
     the waves so far: a result that is red though each fix was green alone means the
-    caller STOPs before building the next wave on it. Never writes a frozen record."""
-    rows = _run_checks(cfg, cwd=worktree_path, bundle=None, scopes=("repo",),
-                       worktree_override=worktree_path)
+    caller STOPs before building the next wave on it. Never writes a frozen record.
+
+    Runs under the tree's lifecycle lock (#297 review round 6): a concurrent
+    ``pdca sweep`` — or another flow's publish-boundary sweep — must not remove the
+    worktree mid-gate and invalidate this re-gate's result. ``hold_lock=False`` is
+    for a caller that ALREADY holds this tree's lock continuously across fold and
+    re-gate (the flow's ``locks`` stack, #297 review round 10) — re-acquiring here
+    would deadlock against our own held flock, and releasing between fold and
+    re-gate was exactly the gap another flow's sweep could remove the tree in."""
+    from . import integrate  # lazy: gates is imported by integrate's callers
+    with contextlib.ExitStack() as scope:
+        if hold_lock:
+            held = scope.enter_context(integrate.integ_lock(worktree_path))
+            if not held:
+                # Fail CLOSED (#297 review round 7): an unserialized re-gate could
+                # read a tree a concurrent fold is rewriting — it would attest nothing.
+                raise integrate.IntegrationError(
+                    f"could not take the integration lock next to {worktree_path.name} "
+                    f"— the re-gate cannot attest an unserialized tree")
+        rows = _run_checks(cfg, cwd=worktree_path, bundle=None, scopes=("repo",),
+                           worktree_override=worktree_path)
     return _finalize(rows, name="integration", write_to=None)
 
 
@@ -282,15 +302,31 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
     # tree — expose it as $PDCA_WORKTREE so a gate cmd targets it, not the host checkout.
     # ``worktree_override`` (the wave integration re-gate, #wave-model) points the
     # repo-scoped gates at an explicit tree (the folded integration tip) instead.
-    # Resolve the tree the gates read. `for_gate` (issue #226) returns the CACHED lane warm
-    # when this bundle owns it (the normal Do→Check path); when a DIFFERENT bundle owns it, it
-    # either spills to an ephemeral OVERFLOW tree (when `[driver].overflow` > 0) or heals the
-    # lane in place (`resync`, issue #224) so a stale orphan can't false-red this bundle. An
-    # overflow tree (`ovf_primary` not None) is torn down in the finally once the gates run.
+    # Resolve the tree the gates read. `for_gate` (issues #226/#296) RECONSTRUCTS the lane
+    # as base + patch.diff on every gating read — the lane is a warm checkout cache, never a
+    # trusted content cache — and, when a DIFFERENT bundle owns the lane, spills to an
+    # ephemeral OVERFLOW tree (when `[driver].overflow` > 0) instead. An overflow tree
+    # (`ovf_primary` not None) is torn down in the finally once the gates run. A tree that
+    # cannot be made to match patch.diff raises WorktreeError: fail CLOSED with a synthetic
+    # gating red — never run gates over mismatched content, never emit green for it (#296).
+    # The lane lock (#296 review) is entered via `hold` and kept for the WHOLE gate run,
+    # not just the reconstruction — so a concurrent reconstruction can't clean this run's
+    # outputs mid-command; released in the finally. A busy lane (an in-flight Do, another
+    # gate run) raises WorktreeError → the same fail-closed red as a mismatched tree.
+    hold = contextlib.ExitStack()
     if worktree_override is not None:
         wt, ovf_primary = worktree_override, None
     elif bundle is not None:
-        wt, ovf_primary = worktree.for_gate(bundle, cfg)
+        try:
+            wt, ovf_primary = worktree.for_gate(bundle, cfg, hold=hold)
+        except worktree.WorktreeError as exc:
+            hold.close()
+            print(f"gates: {exc} — failing closed, no gate was run", file=sys.stderr)
+            return _assemble_matrix([_row(
+                "C4 Verification (worktree mismatch)", "fail",
+                oracle="worktree reconstruction (base + patch.diff)",
+                rule_id="worktree-mismatch", path_line=str(exc).splitlines()[0][:160],
+                gating=True, element="C4")], stub=False)
     else:
         wt, ovf_primary = None, None
     configured: list[dict] = []
@@ -310,6 +346,7 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
     finally:
         if ovf_primary is not None and wt is not None:
             worktree.overflow_remove(ovf_primary, wt)
+        hold.close()
     # Overlay the configured gate results onto the complete 5/5/1 matrix.
     return _assemble_matrix(configured, stub=False)
 
@@ -537,13 +574,26 @@ def _write_gate_log(bundle: Path | None, chk: dict, *, cmd: str, cwd: Path,
 def _classify(rc: int, output: str) -> tuple[str, list[str]]:
     """Map a gate command's exit code + output to (result, evidence-lines).
 
-    ``unverifiable`` (issue #46) wins over the exit code: a gate may exit 0 and still
-    print the marker to defer to the human. The text after the marker is the reason;
-    otherwise the evidence is the command's last output line (as for pass/fail)."""
-    for line in output.splitlines():
-        if UNVERIFIABLE_MARKER in line:
-            reason = line.split(UNVERIFIABLE_MARKER, 1)[1].strip()
-            return "unverifiable", [reason or "gate declared itself unverifiable"]
+    ``unverifiable`` (issue #46) lets a gate that did NOT fail defer to the human: it may
+    exit 0 and still print the marker. The text after the marker is the reason; otherwise the
+    evidence is the command's last output line (as for pass/fail).
+
+    The marker is honoured only for an exit code that is not a failure — 0, or the dedicated
+    ``UNVERIFIABLE_RC``. A gate that exits non-zero FAILED, whatever its output happens to
+    contain, and saying otherwise masked real red (#329): the marker is a plain substring, so
+    a suite where one check deferred and a *different* test failed carried both the marker and
+    a non-zero exit, and the whole gate read ``unverifiable`` — which is not a gating failure,
+    so ``_finalize`` reported ``overall = "pass"``. Per bundle that still stops for a human
+    (``assemble._unverifiable_items`` → §6 → C6), but three consumers read ``overall`` with no
+    §6 in the path: the between-waves integration re-gate (``flow``) would not stop and later
+    waves would build on a red tip, ``revalidate`` would not count it as a PASS→FAIL
+    regression, and ``cli`` would exit 0. A gate with no possible verdict has its own channel;
+    it must use it rather than piggy-backing on a failure."""
+    if rc in (0, UNVERIFIABLE_RC):
+        for line in output.splitlines():
+            if UNVERIFIABLE_MARKER in line:
+                reason = line.split(UNVERIFIABLE_MARKER, 1)[1].strip()
+                return "unverifiable", [reason or "gate declared itself unverifiable"]
     last = output.strip().splitlines()[-1:] or [""]
     if rc == UNVERIFIABLE_RC:
         return "unverifiable", [last[0] or f"gate exited unverifiable (rc {UNVERIFIABLE_RC})"]

@@ -25,7 +25,7 @@ ITERATE_DO = "ITERATE_DO"  # sign-off chose iterate-to-Do
 ITERATE_PLAN = "ITERATE_PLAN"  # sign-off chose iterate-to-Plan
 COMPLETE = "COMPLETE"  # sign-off accepted — bundle frozen
 DISCONTINUED = "DISCONTINUED"  # sign-off chose discontinue — deliberately abandoned, no transition
-RESOLVED = "RESOLVED"  # a notes-only tracker whose issue was resolved OUTSIDE a cycle — terminal
+RESOLVED = "RESOLVED"  # briefless tracker bundle; notes.json records a terminal tracker resolution
 
 # States where the driver does nothing (human work, or done).
 HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
@@ -35,11 +35,13 @@ HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
 # symmetric stand-in for patch.diff — so the state machine reads it as "past Do".
 CLOSE_MARKER = "close-disposition"
 
-# Everything Do and Check write — i.e. everything downstream of brief.md. The single
-# source of truth (the driver archives exactly this set on iterate; re-exported as
-# ``driver.DOWNSTREAM_OF_BRIEF``). It lives HERE because "which files mean a cycle ran"
-# is a state question: `is_resolved` uses it to tell a real cycle from a notes-only
-# tracker. Includes the close marker (issue #60) so an iterate archives it too.
+# Everything Do and Check write, i.e. everything downstream of brief.md. Includes the
+# close marker (issue #60) so an iterate archives it too — reopening a close bundle to a
+# fix path then clears the marker and runs the real Do+Check band.
+#
+# Lives here rather than in `driver` (#334) because `is_resolved` must read it and
+# `driver` already imports this module — the other direction would be a cycle. `driver`
+# re-exports the name, so `driver.DOWNSTREAM_OF_BRIEF` still resolves.
 DOWNSTREAM_OF_BRIEF = [
     "patch.diff",
     "build-notes.md",
@@ -49,44 +51,53 @@ DOWNSTREAM_OF_BRIEF = [
     "check-gates.md",
     "check-review.md",
     "SUMMARY.md",
+    # The rubric snapshot (#314): a Do/Check-era artifact, so an iterate archives it and
+    # the rebuild takes a fresh one — a rubric that changed between attempts SHOULD apply
+    # to the next.
+    "rubric-snapshot.md",
+    # The empirical size measurement (#324). Same reasoning, plus a sharper one: it is
+    # measured FROM patch.diff, which this list archives. Left behind it would describe an
+    # attempt that is no longer there — and the archive of a rejected attempt would lack
+    # the very numbers that justified rejecting it. Not in CYCLE_EVIDENCE_ONLY: unlike the
+    # auto-iterate budget it does not accumulate, it is rewritten wholesale each Check.
+    "size-signal.json",
 ]
 
-# The rest of a cycle's output, by pattern: the advisory artifacts (#64) and each leaf's
-# captured error tail (#280). The iterate archive moves these alongside DOWNSTREAM_OF_BRIEF
-# (``driver._archive_iteration``), so they are cycle evidence by exactly the same argument —
-# and they live here for the same reason: enumerating the set twice is how the two lists drift
-# apart, which is the defect this guard exists to close.
+# Cycle artifacts matched by pattern rather than name. ONE definition, read by both
+# `_archive_iteration` (what an iterate moves) and `is_resolved` (what counts as evidence
+# a cycle ran), so those two answers cannot drift apart.
 DOWNSTREAM_GLOBS = (
     "check-advisory-*.md",
     "*.error.log",
-    # Each gate's full captured output (eduralph/pdca-harness#370) — the record behind the
-    # row's 120-char evidence line, and the only way a non-reproducing red can be diagnosed.
+    # Each gate's full captured output (eduralph/pdca-harness#370, instance #191) — the
+    # record behind the row's 120-char evidence line, and the only way a non-reproducing
+    # red can be diagnosed. Instance delta until #370 lands upstream.
     "gate-logs/*.log",
 )
 
-# Cycle evidence the archive deliberately does NOT move (issue #170) — the one place where
-# "what `_archive_iteration` moves" and "what `is_resolved` counts as evidence" must DIFFER.
+# Cycle evidence that must NOT be archived — the one set where "what the archive moves"
+# and "what proves a cycle ran" deliberately differ, so it is deliberately NOT read by
+# `_archive_iteration`.
 #
-# Both files ACCUMULATE across rebuilds, which is why they are kept out of the two lists
-# above, and both are unambiguous proof a cycle ran — a bundle cannot hold `auto-iterate.json`
-# without having auto-iterated. Counting them was simply missed when the evidence guard was
-# built (#150/#164): a bundle stripped to one of them plus a stray `resolved` notes.json read
-# RESOLVED, left the resume set, and had Plan skip it, abandoning a real iteration history
-# with nothing reported.
-#
-# Do NOT "tidy" this by folding these names into DOWNSTREAM_OF_BRIEF. The archive would then
-# move them, and each has a distinct failure if it does:
-#   auto-iterate.json       the round budget resets every iterate ⇒ auto-iterate never
-#                           terminates (`autoiterate.BUDGET_FILE`)
-#   deferred-findings.json  a deferred human finding vanishes into iteration-v<N>/ ⇒ exactly
-#                           the loss it exists to prevent (`autoiterate.DEFERRED_FILE`)
-#
-# The names are literals rather than imports because `autoiterate` imports `assemble`, which
-# would cycle back here. `test_state_resolved` pins them against those constants, so a rename
-# breaks the test rather than silently reopening the misclassification.
+# All three accumulate ACROSS rebuilds by design, and archiving any of them breaks the
+# feature that depends on the accumulation:
+#   auto-iterate.json       — the round budget; archive it and the count resets every
+#                             iterate, so auto-iterate never terminates
+#                             (`autoiterate.BUDGET_FILE`).
+#   deferred-findings.json  — a deferred human finding vanishes into iteration-v<N>/,
+#                             exactly the loss it exists to prevent (issue #170;
+#                             `autoiterate.DEFERRED_FILE`).
+#   loop-telemetry.json     — `leaves._record_loop_attempt`: "The file persists across
+#                             iterations (it is not archived), so it accumulates."
+# Yet a bundle cannot hold any of them without having run a cycle, so each is unambiguous
+# evidence. Folding them into DOWNSTREAM_OF_BRIEF instead would fix the misclassification
+# and break the accumulation, which is the worse bug. The names are literals rather than
+# imports because `autoiterate` imports `assemble`, which would cycle back here;
+# `test_state_resolved` pins them against those constants.
 CYCLE_EVIDENCE_ONLY = (
     "auto-iterate.json",
     "deferred-findings.json",
+    "loop-telemetry.json",
 )
 
 # §9 outcome token → bundle state. state owns the state names, so the mapping
@@ -101,53 +112,64 @@ _OUTCOME_TO_STATE = {
 
 
 def is_resolved(d: Path) -> bool:
-    """True iff this is a **notes-only tracker** (an open-question / research issue
-    logged as ``notes.json`` but never carried through a PDCA cycle) whose tracking issue
-    was **resolved outside the cycle**, recorded by a top-level ``resolved`` object in
-    ``notes.json`` (github state + close date + a note that the question was decided
-    in-issue).
-
-    Such a tracker has no result to sign off, so it can never reach COMPLETE/DISCONTINUED
-    through the normal transitions and would otherwise sit in the pending UNPLANNED list
-    forever. The ``resolved`` record makes it terminal ([`RESOLVED`]).
-
-    A bundle carrying **any** evidence a cycle ran — ``brief.md``, any artifact in
-    [`DOWNSTREAM_OF_BRIEF`] or matching [`DOWNSTREAM_GLOBS`], one of the accumulators in
-    [`CYCLE_EVIDENCE_ONLY`], or an ``iteration-v*`` archive — is NOT a tracker, so a stray
-    ``resolved`` key can never reclassify it (including a rejected cycle left briefless by
-    ``iterate-to-Plan``, which archives ``brief.md`` + everything downstream and must stay
-    UNPLANNED for its re-plan). A malformed / unreadable ``notes.json`` is "not resolved",
-    never a crash (every bundle file is possibly-absent/garbled, the defensive contract of
-    this module).
-    """
-    if (
-        (d / "brief.md").exists()
-        or any((d / f).exists() for f in DOWNSTREAM_OF_BRIEF)
-        or any(q.is_file() for g in DOWNSTREAM_GLOBS for q in d.glob(g))
-        # The accumulators the archive skips (#170) — evidence, but never moved.
-        or any((d / f).exists() for f in CYCLE_EVIDENCE_ONLY)
-        or any(d.glob("iteration-v*"))
-    ):
-        return False
-    p = d / "notes.json"
-    if not p.exists():
+    """Briefless-tracker terminal marker (issue #302): notes.json carries a top-level
+    dict ``resolved`` (e.g. ``{github_state, state_reason, closed_at, note}``) — the
+    question was settled in the tracker, outside a cycle. Defensive: absent /
+    unreadable / malformed notes.json, or a non-object ``resolved``, is False — never
+    a crash (testbed issue #3). Callers scope this to BRIEFLESS bundles only, so a
+    real cycle bundle is never reclassified by a stray key; note that a brief archived
+    by iterate-plan makes the bundle briefless again — a ``resolved`` written then
+    deliberately means "stop re-planning, the tracker settled it"."""
+    notes = d / "notes.json"
+    if not notes.exists():
         return False
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, ValueError):
+        data = json.loads(notes.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
         return False
-    # A top-level array / string / number / null is valid JSON but not a notes object —
-    # guard the type before `.get` so it can never raise (the "never a crash" contract).
-    return isinstance(data, dict) and isinstance(data.get("resolved"), dict)
+    if not (isinstance(data, dict) and isinstance(data.get("resolved"), dict)):
+        return False
+    # RESOLVED is terminal: the bundle leaves the resume set and `do_plan` returns early
+    # rather than briefing it (#302). So a marker arriving while a cycle is IN FLIGHT —
+    # a stale scrape, a tracker item closed as a duplicate, a human closing the ticket
+    # while the fix is being built — must not settle it. The docstring's "callers scope
+    # this to BRIEFLESS bundles" is not a guard the caller can honour: an iterate-to-Plan
+    # ARCHIVES brief.md, so a bundle mid-cycle with a full iteration history is briefless
+    # too. Decide it here, from evidence on disk (#334).
+    return not has_cycle_evidence(d)
+
+
+def has_cycle_evidence(d: Path) -> bool:
+    """True if anything in the bundle proves a cycle actually ran (issue #334).
+
+    Only a genuinely notes-only bundle can be RESOLVED. Every other artifact class means
+    work happened that a terminal marker would silently abandon — and the failure is
+    silent in the direction that costs most: the bundle drops out of the resume set and
+    Plan skips it, so a cycle with real iteration history ends with nothing reported.
+    """
+    bp = d / "brief.md"
+    if bp.exists() and not brief.is_placeholder(bp):
+        # An AUTHORED brief only. An unfilled template copy is "never authored" — the same
+        # standing as no brief at all — so the tracker's resolution still wins there
+        # (#302 review), which `test_placeholder_brief_does_not_unresolve_a_resolved_tracker`
+        # locks. Read via `whole_field`, so a Slug written beneath its label is recognised
+        # as authored rather than mistaken for a template (#336).
+        return True
+    if any((d / name).exists() for name in DOWNSTREAM_OF_BRIEF):
+        return True
+    if any((d / name).exists() for name in CYCLE_EVIDENCE_ONLY):
+        return True
+    if any(next(d.glob(pattern), None) for pattern in DOWNSTREAM_GLOBS):
+        return True
+    return next(d.glob("iteration-v*"), None) is not None
 
 
 def state(d: Path) -> str:
     """Return the bundle's state from the files present (docs 03 §state)."""
     bp = d / "brief.md"
     if not bp.exists():
-        # A briefless bundle is UNPLANNED — UNLESS it is a notes-only tracker whose issue
-        # was resolved outside a cycle: that is terminal, not pending work waiting on a
-        # Plan.
+        # No brief ever authored — pending Plan, unless the tracker itself settled the
+        # question (a notes-only bundle with a `resolved` record is terminal, #302).
         return RESOLVED if is_resolved(d) else UNPLANNED
     # Do is done when there's a patch — OR, on the close-disposition fast path, the
     # close marker that stands in for it (a close bundle never builds a patch.diff).
@@ -156,7 +178,13 @@ def state(d: Path) -> str:
         # placeholder) means the planner never authored it, so treat it as UNPLANNED and
         # let the Plan beat re-plan it instead of being skipped (issue #113). Scoped to
         # the pre-Do boundary so a real, progressed bundle is never reclassified.
-        return UNPLANNED if brief.is_placeholder(bp) else PLANNED
+        # A placeholder is "never authored" — the same standing as no brief at all — so
+        # the tracker's terminal `resolved` marker still wins there (#302 review): a
+        # resolved notes-only bundle that picked up a stray template copy must not
+        # reappear as pending. An AUTHORED brief keeps its normal PLANNED path.
+        if brief.is_placeholder(bp):
+            return RESOLVED if is_resolved(d) else UNPLANNED
+        return PLANNED
     if not (d / "check-gates.json").exists():
         return BUILT
     if not (d / "SUMMARY.md").exists():

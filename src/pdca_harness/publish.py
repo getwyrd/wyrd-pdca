@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import brief, leaves, progress, state
+from . import brief, gates, leaves, progress, state
 from .config import Config
 
 COMMIT_MSG = "commit-msg.txt"
@@ -40,6 +40,69 @@ PR_BODY = "pr-description.md"
 # Do worktree and stacked PR base off the prior waves' folded work (#wave-model); absent ⇒
 # build / open the PR off the target base.
 STACK_BASE_FILE = "stack-base"
+
+
+def _ensure_texts(cfg: Config, d: Path) -> bool:
+    """Draft the two contribution artifacts with the publisher leaf if absent (only-if-
+    missing, so re-runs never clobber an edited text); False when still missing after."""
+    if not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
+        print("publish: drafting contribution artifacts "
+              f"({COMMIT_MSG} / {PR_BODY})…", file=sys.stderr)
+        leaves.run_publish(d, cfg)
+    if not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
+        print(f"publish: {COMMIT_MSG} / {PR_BODY} still missing — aborting", file=sys.stderr)
+        return False
+    return True
+
+
+def draft_texts(cfg: Config, d: Path, *, run_t4: bool = True, draft: bool = True) -> bool:
+    """Pre-pass (issue #295): make bundle ``d`` text-ready for publishing — NO git/gh.
+
+    Drafts the two contribution artifacts (``commit-msg.txt`` / ``pr-description.md``)
+    if absent and runs the T4 contribution gate over them, so the flow can generate and
+    validate EVERY accepted bundle's publishing texts before any mechanical publishing
+    starts — a mid-wave drafting failure then blocks only its bundle, never leaves a
+    wave half-pushed.
+
+    ``run_t4=False`` is the flow's DRAFT-ONLY phase (#295 review round 2): publisher
+    leaves run from the shared project root, so a later bundle's leaf can touch an
+    earlier bundle's artifacts — validation is therefore a separate pass the flow runs
+    only after EVERY leaf has finished, so T4 always judges the final contents.
+
+    ``draft=False`` is the flow's VALIDATION-ONLY phase (#295 review round 4): a
+    missing artifact there means a later leaf DELETED it, and re-drafting would invoke
+    the publisher leaf again mid-validation — reopening the exact shared-root mutation
+    window the phase split closes (in a ≥3-bundle wave, the re-draft can mutate a
+    bundle T4 already passed). Validation fails on missing files instead.
+
+    Returns True when the phase succeeded — including the cases where there is
+    legitimately nothing to draft (not COMPLETE, a close/no-fix empty patch, no usable
+    target): :func:`publish`'s own guards re-decide and report those with their richer
+    messages. False = drafting or T4 failed: do not enter the mechanics loop. (The
+    ``--no-issue``/pending-id mode stays exclusive to :func:`publish` — the flow
+    never publishes pending-id, so this T4 run never sets ``$PDCA_PENDING_ID``.)
+    """
+    if state.state(d) != state.COMPLETE:
+        return True
+    patch = d / "patch.diff"
+    if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
+        return True                                  # close/no-fix: nothing to contribute
+    repo_spec, base, _slug = _resolve_target(d)
+    if not repo_spec or not base:
+        return True                                  # non-contributing cycle
+    if draft:
+        if not _ensure_texts(cfg, d):
+            return False
+    elif not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
+        print(f"publish: {COMMIT_MSG} / {PR_BODY} missing at validation for {d.name} — "
+              "a later draft removed them? NOT re-drafting mid-validation; the bundle "
+              "is not ready.", file=sys.stderr)
+        return False
+    if run_t4 and not _t4_passes(cfg, d):
+        print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY} for "
+              f"{d.name} — fix them and retry", file=sys.stderr)
+        return False
+    return True
 
 
 def publish(
@@ -52,6 +115,7 @@ def publish(
     today: str | None = None,
     skip_if_no_target: bool = False,
     pending_id: bool = False,
+    texts_prevalidated: bool = False,
 ) -> int:
     """Contribute an accepted bundle's fix as a draft PR. Return a process code.
 
@@ -67,6 +131,13 @@ def publish(
     bundle is recorded ``id_pending`` so the human adds the real id and re-gates T4
     before marking the PR ready. The publisher leaf omits the trailer (no invented id)
     in this case.
+
+    ``texts_prevalidated`` (set by the flow, #295 review): the caller already ran
+    :func:`draft_texts` — drafting AND the T4 gate — over this bundle, so this call is
+    mechanics-only. Skipping the second T4 run matters beyond cost: a transient or
+    stateful T4 command that passed the pre-pass but failed here would recreate the
+    half-published wave the pre-pass exists to prevent. Direct ``pdca publish`` never
+    sets it, keeping the lazy draft+gate path self-contained.
     """
     d = cfg.bundle(issue_id)
     today = today or datetime.date.today().isoformat()
@@ -105,29 +176,33 @@ def publish(
         print(msg, file=sys.stderr)
         return 1
 
-    # Artifacts the T4 gate needs — write them with the publisher leaf if absent.
-    if not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
-        print("publish: drafting contribution artifacts "
-              f"({COMMIT_MSG} / {PR_BODY})…", file=sys.stderr)
-        leaves.run_publish(d, cfg)
-    if not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
-        print(f"publish: {COMMIT_MSG} / {PR_BODY} still missing — aborting", file=sys.stderr)
-        return 1
+    # Artifacts the T4 gate needs — write them with the publisher leaf if absent, then
+    # gate them. Skipped wholesale when the flow's pre-pass already drafted AND gated
+    # (texts_prevalidated, #295 review) — re-running a transient/stateful T4 here could
+    # fail mid-wave AFTER siblings pushed, recreating the half-published state the
+    # pre-pass exists to prevent. The lazy path keeps direct `pdca publish`
+    # self-contained, and is idempotent — only-if-missing.
+    if not texts_prevalidated:
+        if not _ensure_texts(cfg, d):
+            return 1
 
-    # T4 contribution gate — the artifacts MUST pass before anything is pushed.
-    #
-    # pending_id (--no-issue) is passed INTO the gate rather than applied to its verdict
-    # (PR #184 review). It used to relax any nonzero T4 to a warning, on the premise that
-    # the one thing legitimately missing in this mode is the not-yet-assigned tracker id —
-    # but the gate was never told which mode it ran in, so the relaxation covered the whole
-    # checker: `contribcheck` KEEPS the `**User impact:**` opener requirement under
-    # --no-issue, and a malformed PR body was waved through as "pending id" too. Told the
-    # mode, the gate drops exactly the trailer requirement and nothing else, so what is
-    # left to fail is a real defect — and a real defect blocks the push in either mode.
-    if not _t4_passes(cfg, d, pending_id=pending_id):
-        mode = " (--no-issue: the tracker id is NOT what it wants)" if pending_id else ""
-        print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY}{mode} — "
-              "fix them and retry", file=sys.stderr)
+        # T4 contribution gate — the artifacts MUST pass before anything is pushed.
+        # pending_id (--no-issue) is passed INTO the gate rather than applied to its
+        # verdict (PR #184 review): it used to relax any nonzero T4 to a warning, but the
+        # gate was never told which mode it ran in, so the relaxation covered the whole
+        # checker — a malformed PR body was waved through as "pending id" too. Told the
+        # mode, the gate drops exactly the trailer requirement and nothing else, so what
+        # is left to fail is a real defect — and a real defect blocks in either mode.
+        if not _t4_passes(cfg, d, pending_id=pending_id):
+            mode = " (--no-issue: the tracker id is NOT what it wants)" if pending_id else ""
+            print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY}{mode} — "
+                  "fix them and retry", file=sys.stderr)
+            return 1
+    elif not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
+        # Defensive: prevalidated promises the texts exist; a vanished artifact means
+        # the promise no longer holds — refuse rather than push without a commit message.
+        print(f"publish: {COMMIT_MSG} / {PR_BODY} missing despite prevalidation — "
+              "aborting", file=sys.stderr)
         return 1
 
     # Stack mode (issue #54): the brief names an existing PR's head branch — contribute a
@@ -549,41 +624,60 @@ def _fork_owner(repo: Path, remote: str = "origin") -> str:
     return m.group(1) if m else ""
 
 
+def publish_gates(cfg: Config) -> list[dict]:
+    """The T4 rows publish is responsible for running (issue #339).
+
+    The tier alone used to select them, so registering ANY T4-tier check for Check
+    silently made publish re-run it before every push. In one instance that check was a
+    batched 3x model review of the whole ``patch.diff``: ~6 minutes, re-paid on every
+    publish attempt and every retry — and the push and ``gh pr create`` sit downstream of
+    it, so retries happen.
+
+    Duplicated cost is the smaller half. **Publish re-samples a nondeterministic reviewer
+    after the human has signed off**: a bundle green at Check can be refused at publish
+    over a finding that did not exist when §9 was recorded. Observed in both directions on
+    one bundle — two findings each seen by only 1 of 3 passes, and a re-run of the
+    identical command minutes later reporting none. That is not re-checking a decision
+    against a fixed oracle; it is drawing a fresh sample from a distribution, after the
+    decision, with the branch push gated on the result.
+
+    What the slot is actually for (this module's own docstring): checks whose subject is
+    the contribution artifacts publish just drafted — ``commit-msg.txt`` /
+    ``pr-description.md`` — which do not exist at Check time, so Check cannot have
+    validated them.
+
+    **The default is keyed on `scope`, not a flat True.** A bundle-scoped T4 row is about
+    the bundle's own artifacts, so it defaults to running here — which keeps the shipped
+    ``T4-contribution`` row gating publish, unchanged, including for an instance taking a
+    ``copier update``. A repo-scoped row cannot be about artifacts publish just drafted, so
+    it defaults off; a flat ``True`` would preserve the original defect for exactly those
+    rows, and worse, publish's environment carries only ``$PDCA_BUNDLE`` (no
+    ``$PDCA_WORKTREE``, which the Check runner exports), so a repo-scoped row depending on
+    it passes Check and then falsely blocks the push.
+
+    An explicit ``at_publish`` always wins, in both directions.
+
+    Not modelled here, and worth knowing: a check cannot yet be publish-ONLY. ``_applies``
+    knows only ``scope``/``target``, so a row whose subject is ``pr-description.md`` still
+    runs at Check — where ``pdca contribcheck`` is deliberately default-open (no
+    ``pr-description.md`` yet => pass), which is what lets one registration serve both
+    phases. A real ``phase`` property would express it directly; that is the larger change
+    #339 records for later.
+    """
+    return [c for c in cfg.gates_checks
+            if c.get("tier") == "T4"
+            and c.get("at_publish", c.get("scope", "repo") == "bundle")]
+
+
 def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
-    """Run the configured T4-tier gates that apply at publish. None → nothing to
+    """Run every configured T4-tier gate over the bundle. No T4 gate → nothing to
     enforce (True). Keeps publish decoupled from any one project's checker.
 
-    **What belongs here.** Publish's T4 step exists for the checks whose subject is the
-    contribution artifacts it just drafted — ``commit-msg.txt`` / ``pr-description.md``,
-    which do not exist at Check time, so Check *cannot* have validated them
-    (``pdca contribcheck`` is the shipped one). It selects on the tier and nothing else,
-    which makes the tier string load-bearing in a way no config says out loud: register a
-    whole-diff review at T4 for Check, and publish silently inherits it and re-runs it at
-    push time — minutes of model spend Check already paid, and a *fresh sample* of a
-    nondeterministic reviewer, so a bundle green at Check can be refused at publish over a
-    finding that did not exist when the human signed it off (issue #183).
-
-    ``at_publish = false`` on a check opts it out of this step while leaving it fully in
-    force at Check. Absent, it defaults True — unchanged behaviour for every other check.
-
     ``pending_id`` (``--no-issue``) is exported to every gate as ``$PDCA_PENDING_ID=1``
-    beside ``$PDCA_BUNDLE`` — the caller's mode, declared to the checker that has to act
-    on it, rather than a blanket amnesty applied to its exit code afterwards. The shipped
-    checker reads it as ``contribcheck --no-issue``: no tracker-id requirement, every
-    other contribution check unchanged. Set or unset, the variable the gate sees is the
-    one this flag says it should: an inherited value is scrubbed, not honoured.
-
-    Output stays captured — a failing gate's evidence is reported in one place below —
-    so the gate is silent for as long as it runs, and a T4 gate is routinely a
-    model-backed review measured in minutes, not seconds. Captured *and* silent reads
-    as a hang, and an operator who kills it loses the whole run (issue #181): on a
-    bundle whose contribution artifacts already exist this is the FIRST thing publish
-    does after the guards, so the terminal goes quiet immediately. Announce each gate
-    and tick a heartbeat through :mod:`pdca_harness.progress` — the single place that
-    pattern lives, already used by the Check-time gates (``gates.py``) and the leaves.
-    """
-    t4 = [c for c in cfg.gates_checks
-          if c.get("tier") == "T4" and c.get("at_publish", True)]
+    beside ``$PDCA_BUNDLE`` — the caller's mode, declared to the checker that has to
+    act on it, rather than a blanket amnesty applied to its exit code afterwards
+    (PR #184 review; the shipped checker reads it as ``contribcheck --no-issue``)."""
+    t4 = publish_gates(cfg)
     if not t4:
         return True
     # PDCA_PENDING_ID is DERIVED from the flag, never inherited (PR #184 review r2). An
@@ -600,19 +694,42 @@ def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
     if pending_id:
         env["PDCA_PENDING_ID"] = "1"
     for chk in t4:
+        # Resolve `subcmd` through the SAME helper Check uses (#338). Reading the raw
+        # `cmd` ran the empty string for a delegated row — and `subprocess.run("")` exits
+        # 0, so a gate an instance believed it had registered passed vacuously at publish
+        # while working correctly at Check.
+        cmd, cmd_error = gates._delegated_cmd(chk, cfg.gates_runner)
+        # The instance's label shape (pinned by test_publish_slice): the human-facing
+        # `label` wins, then the id, then the raw cmd — and it reaches the heartbeat
+        # UNPREFIXED, because the announce line below already says "T4 gate".
         label = chk.get("label") or chk.get("id") or chk.get("cmd", "")
+        if cmd_error:
+            print(f"publish: T4 gate '{label}' is misconfigured — {cmd_error}",
+                  file=sys.stderr)
+            return False
+        # Announce BEFORE the run (issue #181): a T4 gate is routinely a model-backed
+        # review measured in minutes, and on a bundle whose contribution texts already
+        # exist this is the FIRST thing publish does — captured AND silent reads as a
+        # hang, and an operator who kills it loses the whole run.
         print(f"  · T4 gate {label} (a gate can take minutes; a heartbeat follows)…",
               file=sys.stderr, flush=True)
-        # No `status` probe here, deliberately. `bundle_activity` reports the newest
-        # write in the bundle — the right signal for a Do leaf or a Check gate, which
-        # are producing artifacts as they run. A T4 gate is not: it reads patch.diff
-        # and writes its report (if any) once, at the end. The bundle's newest write is
-        # whatever Check left hours ago, so the probe would tick `⚠ no writes 180m` —
-        # a stall warning, on the very run whose point is to show it is NOT stalled.
-        rc, output, _ = progress.run_with_heartbeat(
-            chk.get("cmd", ""), cwd=cfg.root, shell=True, env=env, capture=True,
-            label=label,
-        )
+        # Heartbeat, not a bare captured run (#338): a T4 gate can be minutes of complete
+        # silence — 6m25s measured for three parallel model review passes over a 300 KB
+        # patch.diff.
+        #
+        # Deliberately NO `status=progress.bundle_activity`: that probe reports the newest
+        # write in the bundle, which suits a Do leaf or an artifact-producing Check gate. A
+        # T4 gate reads patch.diff and writes its report once, at the end, so the newest
+        # write is whatever Check left hours earlier and every tick would render
+        # "no writes 180m" — a stall warning on the very run proving it is not stalled.
+        try:
+            rc, output, _ = progress.run_with_heartbeat(
+                cmd, cwd=cfg.root, shell=True, env=env, capture=True,
+                label=label,
+            )
+        except Exception as exc:  # command not found, etc. — a failing gate, surfaced
+            print(f"publish: T4 gate '{label}' could not run — {exc}", file=sys.stderr)
+            return False
         if rc != 0:
             print(output.strip(), file=sys.stderr)
             return False

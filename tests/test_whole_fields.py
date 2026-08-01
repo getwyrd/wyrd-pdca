@@ -114,7 +114,14 @@ class WholeField(unittest.TestCase):
 
 
 class SpecRendering(unittest.TestCase):
-    """What §1 actually emits — the artifact the human reads."""
+    """What §1 actually emits — the artifact the human reads.
+
+    v0.56.0 merge: exercised through the LIVE composition `- label: _item(whole_field(…))`
+    (upstream #336's rendering, which replaced the instance's `_spec_line`). The properties
+    pinned here are renderer-independent — a value must stay one list item with its
+    structure intact — and the instance-corpus SIBLING regression stays pinned. (The old
+    renderer's every-multiline-value-on-its-own-line shape was cosmetic and is gone; the
+    inline-first-line shape `_item` emits is equally valid Markdown.)"""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -125,18 +132,13 @@ class SpecRendering(unittest.TestCase):
 
     def _line(self, text: str, label: str, *fields: str, default: str = "") -> str:
         self.bp.write_text(text, encoding="utf-8")
-        return assemble._spec_line(label, self.bp, *fields, default=default)
+        value = brief.whole_field(self.bp, *fields, default=default)
+        return f"- {label}: {assemble._item(value)}"
 
     def test_a_single_line_value_stays_inline(self) -> None:
         out = self._line("- **Success criterion:** it works\n", "Success criterion",
                          "success criterion")
         self.assertEqual(out, "- Success criterion: it works")
-
-    def test_a_multiline_value_starts_on_its_own_line(self) -> None:
-        out = self._line("- **Success criterion:** first\n  second\n", "Success criterion",
-                         "success criterion")
-        self.assertEqual(out.splitlines()[0], "- Success criterion:")
-        self.assertIn("second", out)
 
     def test_every_continuation_stays_inside_the_list_item(self) -> None:
         # A line at column 0 would break out of the list and render as body text.

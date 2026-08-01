@@ -15,11 +15,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import (act, brief, doctor, drift, driver, flow, gates, manual_test, merged, publish,
-               queue, registry, revalidate, revert, signoff, state, waves, worktree)
+from . import (act, brief, cleanup, doctor, drift, driver, flow, gates, leaves, manual_test,
+               merged, publish, queue, registry, revalidate, revert, signoff, sizing, sources,
+               split, state, sweep, waves, worktree)
 # `_parse_opt_in` is config's strict boolean (#132: anything unrecognized fails CLOSED,
 # with a warning). Underscored but package-internal, and the one place these semantics are
 # written down — a second spelling of "is this env var true" is how PR #184 r3 happened.
@@ -239,6 +241,21 @@ def main(argv: list[str] | None = None) -> int:
     p_flow.add_argument("--auto-iterate", action="store_true", help="rebuild without stopping while Check finds implementation-level work; findings needing a human are DEFERRED into the bundle and re-enter \u00a76 at handover, not shown before it. Bounded by [driver].soft_auto_iters / max_auto_iters, never auto-accepts (#264/#332; overrides [driver].auto_iterate / PDCA_AUTO_ITERATE)")
     p_flow.add_argument("--no-inhibit", action="store_true", help="don't hold a suspend inhibitor for the run (also PDCA_NO_INHIBIT=1) — for CI/containers where it's unavailable or unwanted (#244)")
 
+    p_size = sub.add_parser("size",
+                            help="print the a-priori slice-size estimate for one bundle or the queue (#320)")
+    p_size.add_argument("issue_ids", nargs="*", help="ids to size; none => every briefed bundle")
+
+    p_split = sub.add_parser("split",
+                             help="propose a split for an oversized slice, then materialize it (#322/#323)")
+    p_split.add_argument("issue_id")
+    p_split.add_argument("--accept", action="store_true",
+                         help="materialize the proposal's children; files their tracker "
+                              "issues too unless --ids says they already exist")
+    p_split.add_argument("--ids", default="",
+                         help="comma-separated tracker ids, one per child, IN PROPOSAL "
+                              "ORDER. Omit to have the child issues filed for you, each as "
+                              "a sub-issue of the parent")
+
     p_status = sub.add_parser("status", help="list bundle states (cheap-first queue)")
     p_status.add_argument("issue_id", nargs="?")
 
@@ -292,20 +309,102 @@ def main(argv: list[str] | None = None) -> int:
     p_drift.add_argument("--no-fetch", action="store_true",
                          help="skip `git fetch` (check against already-fetched base refs)")
 
-    # Act tooling as one command group (#89): `act index` / `act log`.
-    p_act = sub.add_parser("act", help="cross-cycle Act tooling (index / log)")
+    # Act tooling as one command group (#89): `act index` / `act log` / `act resolve`.
+    # The help text is the operator's contract for the OUT-OF-TURN review path (#298):
+    # every load-bearing fact an operator needs to run an Act review outside the flow's
+    # cadence lives here, not only in module docstrings. RawDescription keeps the
+    # epilog's command sequence lines intact; no literal `%` (argparse %-substitution),
+    # and `%(prog)s` renders the per-instance command name (#73).
+    p_act = sub.add_parser(
+        "act", help="cross-cycle Act tooling (index / log / resolve)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Manual, out-of-turn Act review across frozen (COMPLETE) cycles.\n"
+            "These commands carry no cadence gate — [driver].act_cadence throttles only\n"
+            "the flow's auto-run Act — so run them whenever a review is worth doing.\n"
+            "Needs at least one frozen COMPLETE bundle (otherwise `log` exits 1)."),
+        epilog=(
+            "typical out-of-turn review:\n"
+            "  %(prog)s index                      survey frozen cycles + recurring signals\n"
+            "  %(prog)s log --date <ISO>           preview the scaffolded entry (prints only)\n"
+            "  %(prog)s log --date <ISO> --append  record it; also stamps process/.act-reviewed,\n"
+            "                                      so the flow's next auto-Act won't re-cover\n"
+            "                                      these cycles\n"
+            "  %(prog)s resolve <signal>           mark an applied process delta (act-ledger.json)\n"
+            "index/log default to the cycles frozen since the last review (the frontier\n"
+            "recorded in .act-reviewed) — --all or --since widens to the full history;\n"
+            "the scaffold's Process-deltas section is deliberately TODO — choosing the deltas\n"
+            "is Act's irreducible human work"))
     act_sub = p_act.add_subparsers(dest="act_cmd", required=True)
-    p_actidx = act_sub.add_parser("index", help="read-only index of frozen cycles + recurring signals")
-    p_actidx.add_argument("--since", help="only cycles signed off on/after this ISO date")
-    p_actlog = act_sub.add_parser("log", help="scaffold a dated act-log entry (deltas left to the human)")
-    p_actlog.add_argument("--since", help="only consider cycles signed off on/after this ISO date")
+    p_actidx = act_sub.add_parser(
+        "index", help="read-only index of frozen cycles + recurring signals",
+        description="Read-only index of frozen (COMPLETE) cycles, their §6/§7/§10 extracts "
+                    "and recurring signals. No cadence gate; writes nothing. Defaults to "
+                    "the cycles frozen since the last review (#299).")
+    p_actidx.add_argument("--since", help="only cycles signed off on/after this ISO date "
+                                          "(implies the full frozen history as base scope)")
+    p_actidx.add_argument("--all", action="store_true",
+                          help="cover every frozen cycle, not just those unreviewed since "
+                               "the last Act")
+    p_actlog = act_sub.add_parser(
+        "log", help="scaffold a dated act-log entry (deltas left to the human)",
+        description="Scaffold a dated act-log entry over the frozen (COMPLETE) cycles "
+                    "(exits 1 when none exist). The Process-deltas section is left TODO "
+                    "deliberately — choosing the deltas is Act's irreducible human work. "
+                    "Without --append the entry is only printed (a safe preview). "
+                    "Defaults to the cycles frozen since the last review (#299).")
+    p_actlog.add_argument("--since", help="only consider cycles signed off on/after this ISO "
+                                          "date (implies the full frozen history as base scope)")
+    p_actlog.add_argument("--all", action="store_true",
+                          help="cover every frozen cycle, not just those unreviewed since "
+                               "the last Act")
     p_actlog.add_argument("--date", required=True, help="review date (ISO; Act is out-of-band so pass it)")
-    p_actlog.add_argument("--append", action="store_true", help="append to process/act-log.md (default: print)")
-    p_actres = act_sub.add_parser("resolve",
-                                  help="mark a tracked recurring signal as a delta you applied (#149)")
+    p_actlog.add_argument("--append", action="store_true",
+                          help="append to process/act-log.md AND advance the review frontier in "
+                               "process/.act-reviewed — a manual Act review resets the flow's "
+                               "cadence too, so the next auto-Act won't re-cover these cycles "
+                               "(default: print only)")
+    p_actres = act_sub.add_parser(
+        "resolve",
+        help="mark a tracked recurring signal as a delta you applied (#149)",
+        description="Mark a tracked recurring signal as a process delta you applied. The "
+                    "record lands in process/act-ledger.json; a later Act flags the signal "
+                    "as an ineffective delta if it recurs after the applied date (#149).")
     p_actres.add_argument("signal", help="substring of the recurring signal to mark applied")
     p_actres.add_argument("--location", default="", help="where the delta landed (path:line / rule)")
     p_actres.add_argument("--date", help="applied date (ISO; default today)")
+
+    # Tracker reconciliation (issue #300): bundles and the issue tracker drift out of
+    # sync; cleanup reports the discrepancies (dry-run default) and --apply acts.
+    p_cleanup = sub.add_parser(
+        "cleanup",
+        help="reconcile bundle state with the issue tracker (dry-run; --apply acts; #300)",
+        description="Match each bundle's state against its tracker issue: a closed issue "
+                    "resolves its notes-only tracker bundle (RESOLVED, #302) or "
+                    "discontinues one awaiting sign-off; a COMPLETE/DISCONTINUED bundle "
+                    "whose issue is still open gets it commented and closed; a merged PR "
+                    "on an unaccepted bundle is reported (never auto-accepted — the C6 "
+                    "verdict stays human). Dry-run by default; --apply executes.")
+    p_cleanup.add_argument("issue_ids", nargs="*",
+                           help="bundle ids to reconcile (default: every issue_* bundle)")
+    p_cleanup.add_argument("--apply", action="store_true",
+                           help="execute the planned actions (default: report only)")
+    p_cleanup.add_argument("--repo", default="",
+                           help="GitHub repo of the tracker issues (OWNER/REPO; default: "
+                                "the [[plan.source]] github provider's repo, or gh's default)")
+    p_cleanup.add_argument("--by", default="", help="§9 attribution for discontinue records")
+
+    # Footprint reclaim (issue #297): the on-demand counterpart of the flow's end-of-run
+    # sweep. Distinct from tracker cleanup — this touches only harness-named sibling
+    # worktrees of target checkouts, never bundles.
+    p_sweep = sub.add_parser("sweep",
+                             help="reclaim harness worktree/build footprint (lane, "
+                                  "integration, overflow trees; #297)")
+    p_sweep.add_argument("--remove", action="store_true",
+                         help="remove lane worktrees entirely (default: clean their build "
+                              "state, keep the checkouts warm)")
+    p_sweep.add_argument("--dry-run", action="store_true",
+                         help="report what would be reclaimed without touching anything")
 
     p_signoff = sub.add_parser("signoff", help="record the human Check sign-off (§9)")
     p_signoff.add_argument("issue_id")
@@ -408,8 +507,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "publish":
         return publish.publish(cfg, args.issue_id, dry_run=args.dry_run,
                                open_pr=not args.no_pr, by=args.by, pending_id=args.no_issue)
+    if args.cmd == "cleanup":
+        return cleanup.run(cfg, args.issue_ids, apply=args.apply, repo=args.repo, by=args.by)
     if args.cmd == "doctor":
         return doctor.run(cfg, strict=args.strict)
+    if args.cmd == "size":
+        return _size(cfg, args.issue_ids)
+    if args.cmd == "split":
+        return _split(cfg, args)
+    if args.cmd == "sweep":
+        # Explicit mode so the manual command works even under sweep_worktrees = "off".
+        lines = sweep.sweep(cfg, mode="remove" if args.remove else "clean",
+                            dry_run=args.dry_run)
+        for line in lines:
+            print(line)
+        if not lines:
+            print("sweep: nothing to reclaim (no harness worktrees found)")
+        return 0
     if args.cmd == "revert":
         return revert.revert(cfg, args.issue_id, dry_run=args.dry_run, by=args.by)
     return 2
@@ -447,6 +561,13 @@ def _run(cfg: Config, issue_id: str) -> int:
         return 1
     final = driver.run_issue(d, cfg)
     print(f"{final}\t{d}")
+    if driver.held(final):
+        # Non-zero, or automation reads a bundle blocked before Do as a completed run. The
+        # reasons were already printed by the driver; this is the exit code that carries
+        # them to a caller that never sees stderr.
+        print(f"run: {d.name} is held at {final} — resolve the item(s) above and re-run",
+              file=sys.stderr)
+        return 1
     if final == state.AWAITING_SIGNOFF:
         open_items = signoff.open_needs_human(d / "SUMMARY.md")
         if open_items:
@@ -508,13 +629,33 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
             print(f"  already complete — nothing to run. To redo it: rm -rf {d}", file=sys.stderr)
             return 0
         if d.exists() and state.state(d) == state.RESOLVED:
-            # A notes-only tracker whose issue was resolved outside a cycle is terminal —
-            # there is nothing to run, and it is a SUCCESS, not a failure (the multi-id
-            # sweep already skips it; #150).
-            print(f"{state.RESOLVED}\t{d}", file=sys.stderr)
-            print("  resolved tracker (issue settled outside a cycle) — nothing to run.",
-                  file=sys.stderr)
-            return 0
+            # A settled tracker item is a successful no-op, like COMPLETE (#302 review
+            # round 3): the multi-id path skips it and exits 0 — automation must not
+            # read this terminal state as a failed flow on the single-id path either.
+            # But the marker is a CACHE (#302 review round 4): the tracker can have
+            # REOPENED the issue since it was written, and the seed never refreshes an
+            # existing notes.json — so revalidate against the live tracker first, and
+            # a reopened issue clears the marker and proceeds to a real flow.
+            if sources.tracker_issue_reopened(cfg, iid):
+                if not sources.clear_resolved_marker(d):
+                    # clear_resolved_marker printed the why (#302 review round 11):
+                    # claiming "planning it" over a still-resolved bundle would
+                    # silently suppress the reopened work — fail loudly instead.
+                    return 1
+                print(f"flow: issue_{iid} — the tracker issue is OPEN again; cleared "
+                      "the resolved marker and planning it.", file=sys.stderr)
+            else:
+                print(f"{state.RESOLVED}\t{d}", file=sys.stderr)
+                # The manual remediation names the WHOLE file (#302 review round 15):
+                # deleting only the `resolved` key would leave the closure-era
+                # notes.json in place, and ensure_notes refuses to re-fetch while it
+                # exists — Plan would brief from the pre-reopen thread.
+                print("  tracker item resolved outside a cycle — nothing to run. Reopen "
+                      "it in the tracker (a reachable GitHub tracker is then picked up "
+                      "here automatically; otherwise rename notes.json away — e.g. to "
+                      "notes.superseded-by-reopen.json — so the next Plan re-fetches "
+                      "the fresh thread) to plan it again.", file=sys.stderr)
+                return 0
         if not d.exists():
             d.mkdir(parents=True)
         final = flow.flow(cfg, iid, csv=args.from_csv,
@@ -523,6 +664,9 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
         if final == state.AWAITING_SIGNOFF:
             for it in signoff.open_needs_human(d / "SUMMARY.md"):
                 print(f"    {it}")
+        # RESOLVED counts as success too: the flow can DISCOVER the resolution mid-run
+        # (the Plan seed fetches notes that carry the terminal marker, #302) — a settled
+        # ticket correctly skipped is not a failed cycle.
         return 0 if final in (state.COMPLETE, state.AWAITING_SIGNOFF, state.RESOLVED) else 1
 
     # Several ids: batch — auto-plan unbriefed, drive concurrently, cheap-first sign-off.
@@ -536,15 +680,185 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _report_batch(results: dict[str, str]) -> int:
-    """Print a batch result map and return a process code (0 iff all COMPLETE)."""
+    """Print a batch result map and return a process code (0 iff every bundle reached
+    a SUCCESSFUL terminal — COMPLETE, or RESOLVED (#302 review round 11): a tracker
+    item settled outside the cycle is a successful no-op on the batch path exactly as
+    it is on the single-id path; automation must not read it as a failed flow."""
     if not results:
         print("flow: nothing to drive — no in-flight briefs among the ids.", file=sys.stderr)
         return 0
     for iid, st in sorted(results.items()):
         print(f"{st}\t{iid}")
-    done = sum(1 for s in results.values() if s == state.COMPLETE)
-    print(f"flow: {done}/{len(results)} complete")
+    done = sum(1 for s in results.values() if s in (state.COMPLETE, state.RESOLVED))
+    resolved = sum(1 for s in results.values() if s == state.RESOLVED)
+    tail = f" ({resolved} resolved in the tracker)" if resolved else ""
+    print(f"flow: {done}/{len(results)} complete{tail}")
     return 0 if done == len(results) else 1
+
+
+def _prog() -> str:
+    """The command name this instance actually installs — rendered projects namespace it
+    (`pdca-gramps`), so hard-coding `pdca` prints guidance that is not executable there."""
+    name = Path(sys.argv[0] or "").name
+    # `-`, `-c`, `__main__.py` and the like are not command names an operator can retype.
+    return name if name and name.isidentifier() or name.startswith("pdca") else "pdca"
+
+
+def _split(cfg: Config, args) -> int:
+    """`pdca split <id>` drafts a proposal; `--accept` materializes it.
+
+    Two verbs in one because they are two halves of one decision and the second is
+    meaningless without the first: the human reads the proposal, then accepts it.
+
+    Every PR needs its own issue, and child slices are no exception. Without `--ids` this
+    now FILES those issues — one per child, each a real sub-issue of the parent (#358).
+    #323 left that to the human to keep the tracker the source of truth; inside an
+    interactive Plan session that objection is much weaker (the human is present and
+    approving) and the friction is real — leave the session, file N issues by hand, come
+    back with the numbers. `--ids` stays for a human who has already filed them, and is
+    REQUIRED for a tracker this cannot reach.
+    """
+    d = cfg.bundle(args.issue_id)
+    if not args.accept:
+        return leaves.do_split(d, cfg)
+
+    # Normalise `#601` -> `601`. The configured issue_id_example is `#123` and the brief
+    # parser strips the prefix from dependency lists, so `--ids '#601,#602'` is the natural
+    # thing to type — but it would create `issue_#601` while `compute_waves` looked for
+    # `issue_601`, and the printed follow-up command would be truncated by the shell at `#`.
+    # Normalise the two shapes an operator naturally types. `#601` comes from
+    # issue_id_example; `issue_601` comes from copying a bundle directory name. Both are
+    # the same tracker id, and `brief._id_list` already strips either when reading a
+    # dependency — so leaving them raw creates `issue_issue_601` while the rewritten
+    # `Depends on` resolves to `601`, and `pdca flow` aborts on an unresolved dependency
+    # AFTER the parent has been marked split.
+    ids = []
+    for token in args.ids.split(","):
+        token = token.strip().lstrip("#").strip()
+        if token.startswith("issue_"):
+            token = token[len("issue_"):]
+        if token:
+            ids.append(token)
+    filed = False
+    if not ids:
+        # No ids given: file one issue per child, parented to this bundle's issue. Reading
+        # the proposal here rather than inside `accept` so a malformed one is refused
+        # BEFORE anything is filed — a tracker issue cannot be rolled back, and creating
+        # three of them for a proposal that then fails to parse is the worst order.
+        try:
+            children = split.parse((d / split.PROPOSAL).read_text(encoding="utf-8"))
+            # Every reason acceptance would fail that does not need the ids — run BEFORE a
+            # single issue is filed. Without it, a second `--accept` filed a whole second
+            # set of real sub-issues and only then discovered the parent was already
+            # split; a cyclic proposal filed its children before `validate` refused them.
+            # Tracker issues cannot be withdrawn, so the order is the whole guarantee.
+            split.preflight(d, children, cfg)
+        except OSError:
+            print(f"split: {d.name} has no {split.PROPOSAL} — run "
+                  f"`{_prog()} split {args.issue_id}` first", file=sys.stderr)
+            return 1
+        except split.SplitError as exc:
+            print(f"split: {exc}", file=sys.stderr)
+            return 1
+        try:
+            ids = split.file_children(d, children, cfg, prog=_prog())
+        except split.TrackerUnavailable as exc:
+            # Never a silent skip: name the reason AND the way forward. A split that
+            # filed nothing and materialised nothing would otherwise look like a no-op.
+            print(f"split: {exc}. File one issue per child yourself and pass them in "
+                  f"proposal order:\n  {_prog()} split {args.issue_id} --accept --ids "
+                  + ",".join(f"<id-{n}>" for n in range(1, len(children) + 1)),
+                  file=sys.stderr)
+            return 1
+        except split.SplitError as exc:
+            print(f"split: {exc}", file=sys.stderr)
+            return 1
+        filed = True
+        try:
+            print(f"filed {len(ids)} child issue(s): "
+                  + ", ".join("#" + i for i in ids), file=sys.stderr)
+        except OSError:
+            # A closed or full stderr must not abort the run HERE: the issues exist, and
+            # stopping between filing and accepting is the one state with no artifact
+            # naming them. Carry on; the failure paths below re-print the numbers.
+            pass
+    try:
+        created = split.accept(d, ids, cfg)
+    except split.SplitError as exc:
+        print(f"split: {exc}", file=sys.stderr)
+        if filed:
+            # The issues are real and cannot be withdrawn. Say so explicitly and give the
+            # command that resumes against them, or they are orphaned with nothing on
+            # screen naming them — the one failure this feature must not have.
+            print("split: the child issues were already filed and CANNOT be rolled back: "
+                  + ", ".join("#" + i for i in ids) + ".", file=sys.stderr)
+            if "already marked" in str(exc):
+                # `preflight` passed and `accept` then found the parent terminal, so
+                # ANOTHER acceptance won the race between them. Printing the ordinary
+                # retry here would be a false instruction: it cannot succeed against an
+                # already-split parent, and following it would file a third set.
+                print("split: the parent was marked split by another run while these were "
+                      "being filed, so its children already exist. Do NOT re-run --accept: "
+                      "close the issues above as duplicates, or reopen the parent if this "
+                      "run's split is the one you want.", file=sys.stderr)
+            else:
+                print("Fix the problem above, then re-run against them:\n"
+                      f"  {_prog()} split {args.issue_id} --accept --ids {','.join(ids)}",
+                      file=sys.stderr)
+        return 1
+    for child in created:
+        print(child)
+    print(f"{d.name} marked split; run `{_prog()} flow {' '.join(ids)}` to drive the "
+          "children", file=sys.stderr)
+    return 0
+
+
+def _size(cfg: Config, issue_ids: list[str]) -> int:
+    """Read-only: the structural size estimate and WHY, for one bundle or the queue.
+
+    Read-only on purpose — it decides nothing and writes nothing, so it can be run against
+    a live queue at any time. The reasons matter more than the band: "3 conflicts declared"
+    and "predicts a large patch" call for different responses, and a bare band hides which
+    fired (#320).
+    """
+    if issue_ids:
+        bundles = []
+        for i in issue_ids:
+            d = cfg.bundle(i)
+            # An explicit id that names nothing must be REPORTED, not sized: the estimator
+            # fail-opens to `ok` by design (a detector that crashes Plan is worse than one
+            # that abstains), so a typo would otherwise print a confident `ok` and exit 0.
+            if not (d / "brief.md").is_file():
+                print(f"size: {d.name} has no brief.md — nothing to size", file=sys.stderr)
+                return 1
+            bundles.append(d)
+    else:
+        bundles = sorted(b for b in cfg.bundle_root.glob("issue_*")
+                         if b.is_dir() and (b / "brief.md").exists()) \
+            if cfg.bundle_root.exists() else []
+    if not bundles:
+        print("(no briefed bundles to size)")
+        return 0
+    for d in bundles:
+        # Fold in a STORED sizer verdict — read, never invoked: `pdca size` is documented
+        # read-only and must stay safe to run against a live queue. Without this the one
+        # deliberate way to ask "how big is this?" showed only the structural bands and
+        # never the decomposability answer the instance had already paid a model for.
+        est = sizing.combine(sizing.estimate(d / "brief.md", cfg), leaves.current_sizing(d, cfg))
+        print(f"{est.band}\t{d.name}\tscore={est.score} "
+              f"churn={est.churn_band} patch={est.patch_band}"
+              + (f" sizer={est.model_band}" if est.model_band else ""))
+        for reason in est.reasons:
+            print(f"    - {reason}")
+        stored = leaves.current_sizing(d, cfg) or {}
+        # LIST or nothing. The verdict is model output and the contract is deliberately
+        # tolerant of an untidy schema — but tolerant has to mean "ignored", not "iterated":
+        # `proposed_seams: 1` crashed this command, and a string printed one "seam" per
+        # character.
+        seams = stored.get("proposed_seams")
+        for seam in seams if isinstance(seams, list) else []:
+            print(f"    seam: {seam}")
+    return 0
 
 
 def _status(cfg: Config, issue_id: str | None) -> int:
@@ -560,6 +874,17 @@ def _status(cfg: Config, issue_id: str | None) -> int:
     rows.sort(key=lambda r: (_STATE_ORDER.index(r[0]) if r[0] in _STATE_ORDER else 99, r[1].name))
     for s, d in rows:
         flag = ""
+        # Oversize marker (#320/#321): visible in the queue without running anything,
+        # since the estimate is a pure read of the brief.
+        # Computed first, APPENDED below — the sign-off annotation used to overwrite it,
+        # hiding the marker precisely at the queue's human touch point.
+        # Same combination `pdca size` uses. Structure alone would omit the marker in the
+        # one case the sizer exists for — a brief structure scores `ok`/`watch` that the
+        # model finds decomposable — so the two commands would disagree at the sign-off
+        # queue, which is where a human is actually looking.
+        oversized = (d / "brief.md").exists() and sizing.combine(
+            sizing.estimate(d / "brief.md", cfg),
+            leaves.current_sizing(d, cfg)).band == sizing.OVERSIZED
         if s == state.AWAITING_SIGNOFF:
             n = len(signoff.open_needs_human(d / "SUMMARY.md"))
             flag = "  [cheap: confirm]" if n == 0 else f"  [{n} NEEDS-HUMAN]"
@@ -568,6 +893,8 @@ def _status(cfg: Config, issue_id: str | None) -> int:
         blocked = _blocked_by(cfg, d) if s != state.COMPLETE else []
         if blocked:
             flag += f"  [blocked-by: {', '.join(blocked)}]"
+        if oversized:
+            flag += "  [oversized]"
         print(f"{s:18}{d.name}{flag}")
     return 0
 
@@ -577,11 +904,29 @@ def _waves(cfg: Config, ids: list[str]) -> int:
     (#wave-model). With no ids, schedules every in-flight briefed bundle. An unschedulable
     graph (cycle / unresolved dep) is reported, not run."""
     if ids:
-        bundles = [cfg.bundle(i) for i in ids if (cfg.bundle(i) / "brief.md").exists()]
+        # The explicit-id branch applies the SAME terminal filter as the no-id scan
+        # (#302 review rounds 3/9): `pdca flow <id>` skips a terminal bundle, so the
+        # preview must agree instead of reporting settled work as a runnable wave.
+        bundles = []
+        for i in ids:
+            d = cfg.bundle(i)
+            if not (d / "brief.md").exists():
+                continue
+            s = state.state(d)
+            if s in (state.COMPLETE, state.DISCONTINUED, state.RESOLVED):
+                print(f"waves: {d.name} — already terminal ({s}), excluded",
+                      file=sys.stderr)
+                continue
+            bundles.append(d)
     elif cfg.bundle_root.exists():
+        # RESOLVED is terminal too (#302 review round 2, mirrored round 8): a resolved
+        # bundle with a stray placeholder brief has brief.md on disk, so the file test
+        # alone would schedule settled work — filter on the terminal set, not just
+        # COMPLETE/DISCONTINUED; the preview must match the flow's drive set.
         bundles = sorted((d for d in cfg.bundle_root.glob("issue_*")
                           if d.is_dir() and (d / "brief.md").exists()
-                          and state.state(d) not in (state.COMPLETE, state.DISCONTINUED)),
+                          and state.state(d) not in (state.COMPLETE, state.DISCONTINUED,
+                                                     state.RESOLVED)),
                          key=lambda p: p.name)
     else:
         bundles = []
@@ -835,11 +1180,50 @@ def _act(cfg: Config, args: argparse.Namespace) -> int:
     return 2
 
 
+def _act_scope(cfg: Config, args: argparse.Namespace) -> tuple[list, list, bool]:
+    """``(scoped_entries, all_entries, full)`` for an act command (#299).
+
+    Default scope = the unreviewed frozen set (resume from the frontier); ``--all``
+    or ``--since`` widens to every frozen cycle (``--since`` then date-filters).
+    Patterns / ledger registration / recurrence detection always run over
+    ``all_entries`` — a signal seen once before the frontier and once after must
+    still count as recurring, so narrowing the narrative scope must never narrow
+    the signal history.
+
+    Both scopes derive from ONE frozen snapshot (#299 review round 3): a bundle
+    freezing between two globs would enter the scoped set (and be marked reviewed on
+    --append) while missing from the signal history — its recurring signals never
+    registered yet its cycles pushed past the frontier.
+
+    ``all_entries`` is NEVER date-filtered (#299 review round 7): ``--since``
+    narrows only the narrative scope — a signal seen once before the requested date
+    and once after must still register as recurring under ``--since --append``.
+    """
+    frozen = act.frozen_bundles(cfg)
+    all_entries = act.index(cfg, bundles=frozen)          # full signal history, always
+    if args.all or args.since:
+        scoped = ([e for e in all_entries if e.date and e.date >= args.since]
+                  if args.since else all_entries)
+        return scoped, all_entries, True
+    if not act.has_frontier(cfg):
+        # A legacy count marker records no names — cover the full history once,
+        # loudly; the first --append then records a real frontier (#299 review r3).
+        if frozen:
+            print("act: legacy count marker (no frontier recorded) — covering the "
+                  "full frozen history; `--append` records the frontier", file=sys.stderr)
+        return all_entries, all_entries, False
+    unreviewed = set(act.unreviewed_bundles(cfg, frozen=frozen))
+    return [e for e in all_entries if e.bundle in unreviewed], all_entries, False
+
+
 def _act_index(cfg: Config, args: argparse.Namespace) -> int:
-    """Print the read-only Act bundle index across frozen cycles."""
-    entries = act.index(cfg, since=args.since)
-    print(act.render_index(entries, act.patterns(entries),
-                           act.load_ledger(cfg), act.recurrences(cfg, entries)))
+    """Print the read-only Act bundle index (default: unreviewed cycles only, #299)."""
+    entries, all_entries, full = _act_scope(cfg, args)
+    if not full:
+        print(f"act index: {len(entries)} unreviewed of {len(all_entries)} frozen "
+              "cycle(s) (--all for the full index)", file=sys.stderr)
+    print(act.render_index(entries, act.patterns(all_entries),
+                           act.load_ledger(cfg), act.recurrences(cfg, all_entries)))
     return 0
 
 
@@ -848,21 +1232,82 @@ def _act_log(cfg: Config, args: argparse.Namespace) -> int:
 
     The scaffold pre-fills the considered bundles and recurring signals; the
     Process-deltas section is left TODO because choosing them is Act's
-    irreducible human work.
+    irreducible human work. Default scope resumes from the review frontier (#299);
+    --append advances the frontier past the covered cycles.
     """
-    entries = act.index(cfg, since=args.since)
-    if not entries:
+    started = time.time()  # before the scaffold's index is built (#299 review round 6)
+    entries, all_entries, full = _act_scope(cfg, args)
+    if not all_entries:
         print("no frozen cycles to review (need COMPLETE bundles)", file=sys.stderr)
         return 1
-    act.register_signals(cfg, entries, args.date)  # track recurring signals (#149)
-    text = act.scaffold_entry(entries, act.patterns(entries), date=args.date,
-                              recs=act.recurrences(cfg, entries))
+    if not entries:
+        print(f"no unreviewed frozen cycles ({len(all_entries)} frozen, all covered by "
+              "the last Act) — use --all or --since to re-review", file=sys.stderr)
+        return 1
+    text = act.scaffold_entry(entries, act.patterns(all_entries), date=args.date,
+                              recs=act.recurrences(cfg, all_entries))
     if args.append:
+        # Recording is the ONLY writing path (#298 review): the ledger registration
+        # (#149) rides --append with the entry, so a plain `act log` stays the safe,
+        # read-only preview the help promises — over the FULL signal history (#299).
+        # Log first, frontier second: a crash between the two re-reviews the cycles
+        # next time — never silently skips them. The marker write itself is atomic.
+        # The whole write rides the SHARED Act session lock (#299 review round 12):
+        # a manual append overlapping a flow's auto-Act would otherwise log-and-mark
+        # the very snapshot the automatic leaf is still reviewing, and the leaf
+        # would then append a duplicate entry the frontier union cannot undo.
+        with act.act_session(cfg) as held:
+            if not held:
+                print("act: another Act session is running (a flow's auto-Act or a "
+                      "concurrent append) — retry when it finishes", file=sys.stderr)
+                return 1
+            return _act_log_append(cfg, args, entries, all_entries, text, full,
+                                   started)
+    print(text)
+    return 0
+
+
+def _act_log_append(cfg: Config, args: argparse.Namespace, entries, all_entries,
+                    text: str, full: bool, started: float) -> int:
+    """The writing half of ``act log --append`` — runs INSIDE the Act session lock."""
+    act.register_signals(cfg, all_entries, args.date)  # track recurring signals (#149)
+    if full:
+        # Explicit --all/--since re-review: duplicating coverage is the point.
+        # delta_guard still applies the in-session delta protection (#299 r6/7),
+        # and the entries' EXTRACTION-time fingerprints ride along (#299 review
+        # round 18) — a bundle recreated between the scaffold and this write must
+        # not have its new generation attested by a post-append hash.
         log = act.append_entry(cfg, text)
-        act.mark_reviewed(cfg)  # a manual Act review resets the flow cadence too (#109)
-        print(f"appended entry to {log}")
+        withheld = act.mark_reviewed(
+            cfg, reviewed=[e.bundle for e in entries], date=args.date,
+            delta_guard=started,
+            fingerprints={e.bundle.name: e.fingerprint
+                          for e in entries if e.fingerprint})
     else:
-        print(text)
+        # Default frontier scope: re-check + append + advance under ONE marker
+        # critical section (#299 review round 10) — two overlapping appends must
+        # not both log the same cycles; the loser re-scopes to what is STILL
+        # unreviewed (re-rendering the entry) or records nothing at all.
+        log, kept, withheld = act.append_reviewed(
+            cfg, entries,
+            lambda kept: act.scaffold_entry(kept, act.patterns(all_entries),
+                                            date=args.date,
+                                            recs=act.recurrences(cfg, all_entries)),
+            date=args.date, delta_guard=started)
+        if log is None:
+            print("act: a concurrent Act covered these cycles while this entry "
+                  "was prepared — nothing left to record (rerun to preview the "
+                  "new scope)", file=sys.stderr)
+            return 1
+        if len(kept) < len(entries):
+            print(f"act: {len(entries) - len(kept)} cycle(s) were covered by a "
+                  f"concurrent Act — logged the remaining {len(kept)}",
+                  file=sys.stderr)
+    if withheld:
+        print(f"act: {len(withheld)} cycle(s) got a revalidation delta while "
+              "this entry was written — left unreviewed for the next Act",
+              file=sys.stderr)
+    print(f"appended entry to {log}")
     return 0
 
 
@@ -871,8 +1316,12 @@ def _act_resolve(cfg: Config, args: argparse.Namespace) -> int:
     date = args.date or datetime.date.today().isoformat()
     raw = act.resolve(cfg, args.signal, args.location, date)
     if raw is None:
+        # The registration path is --append (a plain `act log` is a read-only preview,
+        # #298 review) — the recovery hint must name the WRITING invocation, or the
+        # operator follows it and the next resolve fails identically.
         print(f"act resolve: no open ledger signal matching '{args.signal}' — run "
-              f"`pdca act log` to register recurring signals first", file=sys.stderr)
+              f"`pdca act log --date <ISO> --append` to register recurring signals first",
+              file=sys.stderr)
         return 1
     print(f"marked applied ({date}): {raw}")
     return 0
@@ -901,11 +1350,27 @@ def _signoff(cfg: Config, args: argparse.Namespace) -> int:
         action = "discontinue"
 
     date = datetime.date.today().isoformat()
-    signoff.record(summary, action=action, by=args.by or "unknown", date=date, delta=args.delta)
+    try:
+        signoff.record(summary, action=action, by=args.by or "unknown", date=date,
+                       delta=args.delta)
+    except ValueError as exc:
+        # A SUMMARY with no §9 is refused rather than written to (#327). Same answer as the
+        # absent-SUMMARY check above — report and exit non-zero — because this is a direct
+        # CLI boundary with nothing to contain a traceback.
+        print(f"cannot sign off — {exc}", file=sys.stderr)
+        return 1
 
     # Apply the transition: accept freezes; iterate clears and re-runs the body.
     final = driver.run_issue(d, cfg)
     print(f"{final}\t{d}")
+    if driver.held(final):
+        # Same contract as `pdca run` (#351 review): an iterate that archives the attempt,
+        # returns to PLANNED and is then held before Do has NOT rebuilt anything, and
+        # exiting 0 would tell automation the sign-off decision was carried out.
+        print(f"signoff: {d.name} is held at {final} — the transition was recorded but the "
+              "rebuild did not run; resolve the item(s) above and re-run",
+              file=sys.stderr)
+        return 1
 
     # Accept → publish by default, like `flow`'s closing step (#97): a standalone
     # `signoff --accept` otherwise left bundles COMPLETE-but-unpublished with no signal.
