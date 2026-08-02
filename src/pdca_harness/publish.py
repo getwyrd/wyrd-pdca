@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import brief, gates, leaves, progress, state
+from . import brief, gates, leaves, progress, scratch, state
 from .config import Config
 
 COMMIT_MSG = "commit-msg.txt"
@@ -342,6 +342,15 @@ def publish(
     if stack_branch:
         record["stacks_on"] = brief.stacks_on(d / "brief.md")
     (d / "publish.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    # The bundle is published — its temporary data is done (#200). `flow` sweeps at this same
+    # boundary, but the piecemeal path (`pdca run` → `pdca signoff --accept` → `pdca publish`)
+    # never calls sweep() at all, so without this a hand-driven cycle freezes and contributes
+    # while its multi-gigabyte scratch stays forever: exactly the unbounded footprint the
+    # change exists to stop, for the workflow that is fully supported (#207 review). Reached
+    # only on a REAL publish — `dry_run` returns above, before this record is written.
+    for line in scratch.reclaim(cfg, [d]):
+        print(f"  {line}")
 
     # A requested-but-failed PR is a partial run, not a success — the branch is
     # pushed but the cycle isn't done. Exit non-zero so `flow` doesn't read the
@@ -689,7 +698,11 @@ def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
     # not an input. (`$PDCA_BUNDLE` below is overwritten unconditionally for the same
     # reason.) A human re-gating a pending-id bundle by hand still has `contribcheck
     # --no-issue`, and Check-time gates still honour a deliberate export.
-    env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    # This bundle's scratch (#200; #207 review). An `at_publish` T4 row shells out to cargo /
+    # make / a model-backed review exactly as a Check-time gate does, but reaches them through
+    # here rather than `gates._run_checks` — so without this its temp trees land under the
+    # scratch ROOT and the bundle sweep cannot see them.
+    env = {**os.environ, **scratch.env_for(cfg, d), "PDCA_BUNDLE": str(d)}
     env.pop("PDCA_PENDING_ID", None)
     if pending_id:
         env["PDCA_PENDING_ID"] = "1"

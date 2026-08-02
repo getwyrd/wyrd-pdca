@@ -2758,7 +2758,12 @@ def run_publish(d: Path, cfg: Config) -> None:
         # / `merge` itself, which is the human's Check sign-off, not the model's (best-effort;
         # a no-op for claude, whose native hook already enforces this).
         profile = families.resolve(cfg.publisher.family, cfg.families)
-        env = None if profile.native_guard else guard.shim_env(cfg, None)
+        # Seed with this bundle's scratch BEFORE the shim is built (#200; #207 review): the
+        # shim dir comes from `mkdtemp(dir=env["TMPDIR"])`, so passing None here would put one
+        # `pdca-guard-*` per publisher invocation directly under the scratch ROOT, where the
+        # bundle sweep — which only knows about `issue_<id>` dirs — can never reclaim it.
+        scratch_env = scratch.env_for(cfg, d)
+        env = scratch_env or None if profile.native_guard else guard.shim_env(cfg, scratch_env)
         _invoke(cfg.publisher, cfg.root, _publish_prompt(d, cfg), env=env, cfg=cfg)
         return
     _stub_publish(d, cfg)

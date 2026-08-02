@@ -193,17 +193,24 @@ class BundleScratch(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         saved = os.environ.pop("PDCA_SCRATCH", None)
-        if saved is not None:
-            self.addCleanup(os.environ.__setitem__, "PDCA_SCRATCH", saved)
-        (self.tmp / "pdca.toml").write_text(
+        self.addCleanup(lambda: os.environ.__setitem__("PDCA_SCRATCH", saved)
+                        if saved is not None else os.environ.pop("PDCA_SCRATCH", None))
+        self.cfg = self._cfg(self.tmp)
+        self.scratch_root = self.tmp / "scratch"
+        self.scratch_root.mkdir()
+        # What `cli._export_scratch` does at CLI entry — and the ONLY thing scratch.root()
+        # reads, so that a root the CLI rejected stays rejected (see the P1 test below).
+        os.environ["PDCA_SCRATCH"] = str(self.scratch_root)
+
+    def _cfg(self, root: Path) -> Config:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "pdca.toml").write_text(
             '[project]\ndefault_branch = "main"\n'
             '[leaves.builder]\nmode = "stub"\n'
             '[leaves.reviewer]\nmode = "stub"\n',
             encoding="utf-8",
         )
-        self.cfg = Config.load(self.tmp)
-        self.cfg.scratch_dir = str(self.tmp / "scratch")
-        (self.tmp / "scratch").mkdir()
+        return Config.load(root)
 
     def _bundle(self, name: str = "issue_651") -> Path:
         d = self.cfg.bundle_root / name
@@ -223,10 +230,39 @@ class BundleScratch(unittest.TestCase):
         self.assertEqual(Path(ea["PDCA_SCRATCH"]).name, "issue_651")
 
     def test_unset_scratch_dir_is_byte_for_byte_the_old_behaviour(self) -> None:
+        os.environ.pop("PDCA_SCRATCH", None)
         self.cfg.scratch_dir = ""
         self.assertIsNone(scratch.for_bundle(self.cfg, self._bundle()))
         self.assertEqual(scratch.env_for(self.cfg, self._bundle()), {})
         self.assertEqual(scratch.reclaim(self.cfg, [self._bundle()]), [])
+
+    def test_a_rejected_root_is_not_resurrected_from_the_config(self) -> None:
+        # `_export_scratch` POPS $PDCA_SCRATCH when the configured dir is unusable, so the run
+        # falls back to the default temp location. Reading cfg.scratch_dir as a fallback would
+        # hand every leaf and gate the directory the CLI just rejected and warned about — the
+        # P1 from the #207 review.
+        os.environ.pop("PDCA_SCRATCH", None)
+        self.cfg.scratch_dir = "/definitely/not/usable"
+        self.assertIsNone(scratch.root(self.cfg))
+        self.assertEqual(scratch.env_for(self.cfg, self._bundle()), {})
+
+    def test_two_projects_sharing_a_root_do_not_collide(self) -> None:
+        # scratch_dir is machine-wide (/var/tmp/pdca ships as the value) while issue_<id> is
+        # unique only within one project. Without the project segment, two projects' issue_651
+        # share a directory: one inherits the other's build trees, then deletes them.
+        other = self._cfg(self.tmp / "other-project")
+        d = self._bundle("issue_651")
+        mine = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        (other.bundle_root / "issue_651").mkdir(parents=True)
+        theirs = Path(scratch.env_for(other, other.bundle_root / "issue_651")["PDCA_SCRATCH"])
+        self.assertNotEqual(mine, theirs)
+        self.assertEqual(mine.name, theirs.name)          # same bundle name…
+        self.assertNotEqual(mine.parent, theirs.parent)   # …different project slice
+        # And our sweep must not see, let alone reclaim, the other project's dir.
+        scratch._stamp(theirs).write_text("999999\n", encoding="utf-8")
+        self.assertNotIn(theirs, scratch.orphans(self.cfg))
+        scratch.reclaim(self.cfg, [d])
+        self.assertTrue(theirs.is_dir())
 
     # --- the deadline ------------------------------------------------------------
     def test_reclaimed_at_the_boundary(self) -> None:
@@ -275,6 +311,54 @@ class BundleScratch(unittest.TestCase):
         lines = scratch.reclaim(self.cfg, [d])
         self.assertTrue(p.is_dir())
         self.assertTrue(any("still alive" in ln for ln in lines), lines)
+
+    def test_a_second_live_owner_blocks_reclaim(self) -> None:
+        # Two processes on one bundle share the directory. A single overwritten pid would let
+        # whichever stamped last delete it at its own boundary while the other still has a
+        # leaf or gate using it as $TMPDIR — so the stamp is a LIST (#207 review).
+        d = self._bundle("issue_996")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).write_text(f"{os.getppid()}\n{os.getpid()}\n", encoding="utf-8")
+        lines = scratch.reclaim(self.cfg, [d])
+        self.assertTrue(p.is_dir(), "reclaimed while another live process still owned it")
+        self.assertTrue(any("still alive" in ln for ln in lines), lines)
+        self.assertEqual(scratch.orphans(self.cfg), [])
+
+    def test_claiming_prunes_dead_owners_but_keeps_live_ones(self) -> None:
+        d = self._bundle("issue_995")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).write_text(f"999999999\n{os.getppid()}\n", encoding="utf-8")
+        scratch.for_bundle(self.cfg, d)                       # re-claim
+        owners = scratch._owners(p)
+        self.assertIn(os.getpid(), owners)
+        self.assertIn(os.getppid(), owners)                   # live: kept
+        self.assertNotIn(999999999, owners)                   # dead: pruned
+
+    def test_an_out_of_range_pid_is_unclassifiable_not_a_crash(self) -> None:
+        # os.kill raises OverflowError — not an OSError, so worktree._pid_alive does not catch
+        # it — on an integer outside pid_t. A corrupt sidecar must not take `pdca sweep` down.
+        d = self._bundle("issue_994")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).write_text("9" * 40 + "\n", encoding="utf-8")
+        self.assertIsNone(scratch._owners(p))
+        self.assertEqual(scratch.orphans(self.cfg), [])       # no crash, and left alone
+        self.assertEqual(sweep.sweep(self.cfg, []), [])
+
+    def test_a_failed_removal_keeps_the_stamp_discoverable(self) -> None:
+        # ignore_errors hides a transient permission/mount failure. Dropping the sidecar anyway
+        # would leave a potentially huge tree that neither orphans() nor `pdca sweep` can ever
+        # see again — the permanent residue this module exists to stop.
+        if os.geteuid() == 0:
+            self.skipTest("mode bits don't bind root")
+        d = self._bundle("issue_993")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        (p / "sub").mkdir()
+        p.chmod(0o555)                                        # rmtree of `sub` will fail
+        self.addCleanup(p.chmod, 0o755)
+        lines = scratch.reclaim(self.cfg, [d])
+        self.assertTrue(p.is_dir())
+        self.assertTrue(scratch._stamp(p).exists(), "stamp dropped — the tree is now invisible")
+        self.assertTrue(any("could not remove" in ln for ln in lines), lines)
 
     def test_missing_stamp_is_never_licence_to_delete(self) -> None:
         # An unstamped dir proves nothing (an older run, or a leaf that wiped the sidecar).
