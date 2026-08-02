@@ -1,0 +1,15 @@
+Reviewing issue #635: add backward-compatible segmented chunk maps, staged publication, and shared resolution across every consumer as the >10 GiB multipart precursor.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief settles the wire identity, structural failures, bounded resolver behavior, consumer inventory, publication seam, scope exclusions, and required external tools sufficiently to make acceptance objective. |
+| C2 Reproduction (red pre-fix) | PASS | An isolated base-plus-binding-test run executed all eight cases and all eight failed behaviorally on the segmented JSON shape, including the live-GC loss oracle at `crates/custodian/tests/segmented_map_consumers.rs:449`. |
+| C3 Change | PASS | The patch stays within the precursor scope: it introduces the discriminated map and staged committer while routing maintenance through the shared entry at `crates/custodian/src/resolve.rs:34`, without adding a multipart producer. |
+| C4 Verification (red→green) | PASS | The same eight-test target moved from 0/8 to 8/8 in isolated builds, and a fresh full `cargo xtask ci` passed including the seeded retirement/publication/repoint DSTs at `crates/dst/tests/custodian.rs:1980`. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Rebuild must enforce the 100 KB limit on each caller-supplied flip value: a direct probe was accepted with a 102,401-byte value because `flip_batch` checks only aggregate batch bytes at `crates/core/src/metadata.rs:2494`. |
+| T1 Structure | PASS | The production dependency direction remains coherent: custodian consumers share one wrapper and the core resolver owns metadata semantics (`crates/custodian/src/resolve.rs:1`, `crates/core/src/metadata.rs:1863`). |
+| T2 Shape | PASS | Legacy arrays serialize unchanged while segmented objects are type-discriminated, and malformed tables are rejected during construction/decode (`crates/core/src/metadata.rs:683`, `crates/core/src/metadata.rs:849`). |
+| T3 Runtime | NEEDS-HUMAN | Maintainers must accept precursor-only runtime coverage — #636's real `Completing@E` caller was not present or exercised, so publication evidence uses a test-supplied caller contribution at the seam described by `crates/core/src/metadata.rs:2180`. |
+| T4 Contribution | NEEDS-HUMAN | A human must triage the eight reported blockers because `scripts/review-branch --bundle` and its truncated result artifact are unavailable here; affected-path merged-history and closed/rejected-work checks found no competing segmented-map implementation. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Rebuild must extend the envelope oracle to adversarial caller contributions — the current test asserts the per-value ceiling only on its small default fixture at `crates/core/src/metadata.rs:3789`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Maintainers must decide whether to freeze this durable format and publication API before #636 supplies its first production caller, because that choice fixes the integration contract exposed at `crates/core/src/metadata.rs:2173`. |

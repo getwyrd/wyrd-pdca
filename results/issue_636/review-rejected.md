@@ -1,0 +1,29 @@
+# Recorded-rejected review findings — issue 636
+
+Format (the gate's own): `<file:line> | <CLASS> | <MATCH> | <reason>`.
+Everything else in `review-batch.md` was **fixed**; only the rows below are rejected with reason.
+
+**Iteration 4 (round 3's 21 findings): 19 fixed, 2 rejected** — the two `crates/core/src/write.rs`
+rows, which are one finding seen twice (once as BUG, once as CONVENTION) and are the *third*
+appearance of the timeout-in-the-fan-out class this brief's *Prior-art check* forbids re-earning.
+The rows are at the bottom of this file. Everything else in round 3's `review-batch.md` was fixed;
+`build-notes.md` §2 tables what each was and §4 records the negation that proves each fix is bound
+by an assertion.
+
+**Iteration 3 (round 2's 38 findings): nothing rejected — all 38 are fixed.** They dedupe to 21
+distinct defects, each one real; `build-notes.md` §2 tables what each actually was, and §4 records
+the negation run that proves the fix is bound by a test. The two rows below are iteration 1's and
+are kept for the record: neither finding recurred in round 2's run.
+
+Line numbers on the two rows below are the ones the batched review reported against
+`iteration-v1/patch.diff`.
+
+crates/core/src/write.rs:841 | CONVENTION | Fragment fan-out awaits external D-server writes without a timeout | Already recorded-rejected for this slice in `results/issue_508/review-rejected.md` and carried into this brief's *Prior-art check*: "a second timeout inside `core`'s fan-out (the `ChunkStore` seam owns it)" must not be re-earned. The bound is the seam's: `PlacementChunkStore::put_fragment_at` is the D-server client, and its implementation (`crates/chunkstore-grpc`) is where a deadline belongs — a second timer here would double-bound the same await with two unrelated budgets and make the effective deadline whichever process was configured most tightly. It is also **not this diff's pattern**: the pre-existing `write::write_fragments` (`crates/core/src/write.rs:231-262`) fans out through the identical `try_join_all`, so the finding is about the seam's contract, not about the staged path. #638 (this slice's declared dependency) ships the server-enforced fragment-write deadline that makes `W_write` real at both ends.
+
+crates/core/src/multipart.rs:3778 | CONVENTION | accepts missing, mismatched, or wrong-length staging metadata | **Half fixed, half rejected, and the split is 0016's own.** The *structural* half is fixed: an owned `sidx:` entry whose `owner` is absent or foreign, or whose `staged` placement is absent, is now `RecordError::OwnedEntryMalformed` rather than a row the walk deletes after marking nothing (`crates/core/src/multipart.rs`, `reclaim_owned`). The *placement-length* half is rejected: 0016 settles it explicitly against a strict check here (`0016:416-432`) — "a `sidx:` with a length-mismatched `staged` placement **decodes**", the fleet **quarantines** it (`ReferenceSet.malformed`, `gc.rs:160-170`'s malformed-placement skip), and "a reclaimer that refused would strand the very bytes it exists to evidence". `AGENTS.md:146-149` names placement length as *the* example of a contextual check, and the liberal `StagedPlacement::fragments` identity fallback marks every position the fragment could occupy, so the evidence is complete even for a short vector. Making it strict here would convert a quarantinable record into a permanent leak.
+
+Round 3's two rows (line numbers as reported against `iteration-v3/patch.diff`):
+
+crates/core/src/write.rs:849 | BUG | so a queued write can land after teardown removes its sidx protection and the orphan grace expires | **The named hazard is real and the proposed fix does not close it; the fix that does is #638's, this brief's declared dependency.** A timeout inside `core`'s fan-out bounds only how long *this process waits* — it cannot stop a request already accepted by a D server from landing, so the late fragment the finding describes still lands, exactly as late, with a timeout as without. What makes a late write impossible is a **server-enforced** deadline on the fragment write, which is what #638 ships and what `0016:1551-1576` requires before decision 5's late-fragment bound is real; the brief says so in *Ordering note* ("without it `W_write` is a caller-side timeout only and decision 5's late-fragment bound is not real"). Meanwhile the *protection* half is already handled by design and is asserted here: `reclaim_owned` orphan-marks the chunk's **full planned placement** — every position the fragment could occupy — before deleting the entry that names it (`crates/core/src/multipart.rs`, `reclaim_owned`; `0016:1547-1550`), so a fragment landing after teardown lands on a position an `orphan:` record already covers. What remains unbounded without #638 is the *grace* elapsing before the late write lands, and no code in `crates/core` can bound that. Adding a caller-side timer would make the diff look like it answered the finding while leaving the hazard untouched — the worse of the two outcomes.
+
+crates/core/src/write.rs:851 | CONVENTION | Fragment writes await unbounded external `PlacementChunkStore` operations | Same finding, seen a second time and already recorded-rejected for this slice at iteration 1 (`crates/core/src/write.rs:841`, above) and before that in `results/issue_508/review-rejected.md`; the brief's *Prior-art check* names "a second timeout inside `core`'s fan-out (the `ChunkStore` seam owns it)" as a rejection that must not be re-earned. The bound belongs to `PlacementChunkStore::put_fragment_at`'s implementation (`crates/chunkstore-grpc`), where one deadline governs the RPC; a second timer here would double-bound the same await with two unrelated budgets. It is also not this diff's pattern — the pre-existing `write::write_fragments` (`crates/core/src/write.rs:231-262`) fans out through the identical `try_join_all`.
