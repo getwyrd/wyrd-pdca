@@ -137,12 +137,35 @@ check "brief base=integration branch -> origin/<branch> (#91)" \
   "origin/feat/m4-production-metadata-backend" \
   "$(PDCA_BUNDLE="$TMP/b_m4" "$RV" --print-base)"
 
-# the _clean_ref quirk publish uses: a backticked branch in trailing prose wins over the
-# plain token — run-verify MUST match publish so both cut from the SAME base.
+# Parity with publish._clean_ref, ANCHORED (#204). A backtick span wins only at the START of
+# the field; one in trailing prose is a parenthetical about a DIFFERENT branch and must not
+# hijack the base. This assertion used to pin the opposite, in the name of the very parity it
+# was breaking: _clean_ref was anchored upstream (#235/#262) and this twin never followed, so
+# publish opened the PR against main while C4-verify validated against feat/x-slice.
 mkbrief "$TMP/b_paren" '- **Repo + branch target:** getwyrd/wyrd @ main (feature branch `feat/x-slice`)'
-check "backtick span wins (matches publish._clean_ref) -> origin/feat/x-slice" \
-  "origin/feat/x-slice" \
+check "trailing backtick span does NOT hijack the base (#204) -> origin/main" \
+  "origin/main" \
   "$(PDCA_BUNDLE="$TMP/b_paren" "$RV" --print-base)"
+
+# The shape a planner actually writes — a verified-at-Plan note. Pre-#204 this yielded
+# `origin/origin/main`, a ref that resolves to nothing.
+mkbrief "$TMP/b_verified" '- **Repo + branch target:** getwyrd/wyrd @ main   (verified at Plan: `origin/main` = `9120f7a`)'
+check "verified-at-Plan note does not double the remote (#204) -> origin/main" \
+  "origin/main" \
+  "$(PDCA_BUNDLE="$TMP/b_verified" "$RV" --print-base)"
+
+# The other direction still holds: an anchored span IS the ref (already covered by b_m4
+# above; this pins the short form the issue tabulates).
+mkbrief "$TMP/b_anchored" '- **Repo + branch target:** getwyrd/wyrd @ `feat/x`'
+check "anchored backtick span is the base (#204) -> origin/feat/x" \
+  "origin/feat/x" \
+  "$(PDCA_BUNDLE="$TMP/b_anchored" "$RV" --print-base)"
+
+# Trailing sentence punctuation is stripped repeatedly, as _clean_ref's .rstrip(",.;:") does.
+mkbrief "$TMP/b_punct" '- **Repo + branch target:** getwyrd/wyrd @ main.'
+check "trailing punctuation stripped (matches _clean_ref) -> origin/main" \
+  "origin/main" \
+  "$(PDCA_BUNDLE="$TMP/b_punct" "$RV" --print-base)"
 
 mkbrief "$TMP/b_none" $'- **Kind:** bug\n- **Slug:** something'
 check "no branch target field -> origin/main default" \
