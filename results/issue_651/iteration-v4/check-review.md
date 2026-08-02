@@ -1,0 +1,15 @@
+Review of issue #651: route repair, evacuation, restore, backfill, and drain-status maintenance through segmented-map resolution with per-object containment and ceiling-safe repoints.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The four acceptance decisions, containment invariant, red discriminator, external tools, and scope boundary are explicit and independently testable (`crates/custodian/tests/segmented_map_repair.rs:417`). |
+| C2 Reproduction (red pre-fix) | PASS | The #650 base compiled the added discriminator and failed all 11 tests on assertions, while the patch passes the same 11 tests (`crates/custodian/tests/segmented_map_repair.rs:420`). |
+| C3 Change | FAIL | Plan must split or explicitly re-budget approximately 2,488 nonblank/noncomment additions against the stated ≤~1,500 allowance—the 1,609-line discriminator shows the unpruned test bulk, so this cycle violated its STOP condition (`crates/custodian/tests/segmented_map_repair.rs:1609`). |
+| C4 Verification (red→green) | PASS | Independent red→green, exact `cargo xtask ci`, typos, docs render, deny, conformance, statics, and 50-seed DST all pass; the recorded apply failure used an integration ref missing prerequisite #650 and is an ordering caveat, not a patch defect (`crates/dst/tests/custodian.rs:1994`). |
+| C5 Causal adequacy | PASS | The change removes blind inline-map reads through one per-pass resolved index and exact-home CAS rather than probing around the symptom; all 142 in-diff mutants were caught or unviable (`crates/custodian/src/resolve.rs:76`). |
+| T1 Structure | PASS | Thirteen touched files stay within the 15-file limit, and the shared maintenance walk centralizes cross-pass containment without a new dependency seam (`crates/custodian/src/resolve.rs:57`). |
+| T2 Shape | PASS | Typed root generations and chunk homes retain exact stored bytes and make flat/segment CAS targets explicit, preventing blind rewrites and re-encoding-dependent conflicts (`crates/core/src/metadata.rs:2816`). |
+| T3 Runtime | PASS | Real pass entry points exercise restore survival, repair, evacuation, ceiling refusal, backfill continuation, O(N) resolution counting, and supersede races under the fully green CI/DST run (`crates/custodian/tests/segmented_map_repair.rs:1114`). |
+| T4 Contribution | NEEDS-HUMAN | Human must adjudicate the batch review's eight opaque blockers because `scripts/review-branch` and its report are absent; affected-path PR inventory independently confirms #647 closed-unmerged and #402/#555 merged, but definition of done requires recorded dispositions (`AGENTS.md:206`). |
+| T5 Judgment | PASS | Unreadable, refused, and ambiguous work is non-certifying while healthy objects continue, matching the fail-closed maintenance rubric without re-raising tracked #653 (`crates/custodian/src/reconstruction.rs:337`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether assertion-red seam tests plus the 50-seed DST are sufficient production fitness evidence for destructive repair/evacuation paths—live Tier-1 disk-fault and Tier-2 kill/reconstruct topology was not exercised. |
