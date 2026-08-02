@@ -246,7 +246,15 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
   three members).
 - **Ready-mark gate:** PRs open as **draft**; the human re-reads and marks ready. The
   builder/publisher leaves never `gh pr ready` / `gh pr merge` (mechanically blocked by
-  `builder_guard.py`).
+  `builder_guard.py`). **Scope under `wave_mode = "merge"`** (2026-08-02, see §2 "Wave
+  sequencing"): this gate holds unchanged for the model leaves and for every FINAL-wave PR;
+  for a **non-final** wave of a dependent batch, the deterministic driver (not a leaf)
+  readies and merges the wave's PRs at the wave boundary — the human's fresh-eyes read for
+  those happens at per-bundle sign-off (before publish), not on the open PR. That trade is
+  deliberate; its guardrail is host-side: keep `main`'s **required status checks** covering
+  the real gates (`rust`, `gate`, `dco` — as of 2026-08-02 only `docs-check` /
+  `require-issue` / `docs-immutability` are required, which would NOT stop a red auto-merge;
+  tighten before the first merge-mode batch).
 - **External-contribution flow:** standard GitHub PR against `main`, gated by
   `require-issue` / `dco` / `cargo xtask ci`.
 - **MAINTAINERS file:** `../wyrd/docs/governance/GOVERNANCE.md` is the authority (roles +

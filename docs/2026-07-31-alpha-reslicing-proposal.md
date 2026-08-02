@@ -6,6 +6,11 @@
 **Filed 2026-07-31** as getwyrd/wyrd issues (parents stay open as seam trackers):
 635.1–635.6 → **#648 #649 #650 #651 #652 #653** · 636.1–636.7 → **#654 #655 #656 #657 #658 #659 #660** · 637.1–637.5 → **#661 #662 #663 #664 #665** · 508.1–508.6 → **#666 #667 #668 #669 #670 #671**.
 
+> **2026-08-02:** `wave_mode` changed `"stack"` → `"merge"` mid-batch. The base-discipline
+> and sequencing rules below were written for `"stack"` and two of them no longer apply as
+> written — see the **Addendum** at the end of this document before writing or running any
+> remaining slice brief.
+
 ## Budget and rules (manual guardrails until pdca-harness 0.56)
 
 Derived from this instance's own convergence data (report §3: <100 KB patches converge in 2–3 rounds; ≥250 KB take 6–18 or die):
@@ -89,3 +94,39 @@ Waves hold at most **two builder bundles** (the driver's `lanes = 2`); `publish 
 Independent 0.1-Alpha items (#511 bucket ops, #512 conformance harness, #560 lease renewal, #585 docker env, #596 gitlink) are already inside the budget individually and fill Lane B from wave 9 on (or any earlier idle lane); #512 runs after 508.5 to exercise multipart end-to-end.
 
 ~24 slices instead of 5 looks like more process, but the arithmetic from the report favors it decisively. The five big slices consumed **37 builder rounds** (634: 6, 635: 18, 636: 4, 638: 9, 637: 0) for one merged PR, one PR closed unmerged, one discontinuation, one accepted-but-unpublished patch and one unstarted brief — and because the escalation ladder pins every round after the first to the top builder tier, ~29 of those 37 rounds ran at maximum cost over up-to-1 MB diffs. At the historical small-slice median of 2 rounds, ~24 slices ≈ 48 *converging* rounds, most of them first-attempt-tier, on ~20× smaller review units — each of which the review, mutation and adversary machinery can actually cover, and each of which the maintainer can review in one sitting instead of confronting another 19,000-line PR.
+
+---
+
+## Addendum (2026-08-02) — running the remainder of this batch under `wave_mode = "merge"`
+
+`wave_mode` switched `"stack"` → `"merge"` (getwyrd/wyrd-pdca#198) after the stale-stacked-PR
+incident on #648–#650's PRs (wyrd #675/#676: the fold-rebuilt `pdca-integration/main` left
+open stacked PRs DCO-red and CONFLICTING). Under `"merge"` the driver merges each
+**non-final** wave's PRs into the real base before the next wave builds. Three of this
+plan's rules change with it:
+
+- **Base discipline, restated for `"merge"`:** every remaining brief names **`main`** as its
+  "Repo + branch target" base — never the previous slice's branch, and never a `Stacks on:`
+  declaration. The dependency is carried by wave ORDER (the predecessor is genuinely merged
+  into `main` before the dependent builds), not by branch wiring. A brief that still names a
+  predecessor's `fix/*` branch would (a) build against a branch that stops advancing after
+  its PR merges, and (b) open — and in merge mode, MERGE — its PR into that branch instead
+  of `main`, silently leaving the slice out of the release base. **Audit the already-written
+  briefs for unstarted slices (651+) for this before the next run.**
+- **Atomic merge pairs:** "merged bottom-up by the maintainer" no longer holds the pairs
+  together — the driver merges every completed non-final wave at its boundary. The two
+  affected constraints:
+  - *Same-wave pairs* still hold: both members merge back-to-back at one wave boundary.
+  - *Chained pairs* — **635.6→636.5 (#653 "never merged without #658") and #625→#633
+    ("merge as one unit")** — cannot: the consumer builds on the merged producer, so the
+    producer lands on `main` a full build-cycle earlier. Either **fold each chained pair
+    into a single bundle** (accepting the budget overrun; the committer + first caller as
+    one brief) or **pull the pair out of the driver** and run it as a hand-stacked pair of
+    PRs the maintainer merges together. Decide per pair at its Plan pass; the driver has no
+    per-bundle mode override.
+- **Merge gating:** `gh pr merge` fails closed only on *required* checks, and wyrd `main`
+  currently requires only `docs-check` / `require-issue` / `docs-immutability` — **not
+  `rust`/`gate`**. Harness-side C4-ci runs the same `cargo xtask ci` before accept, but the
+  host-only gates (CodeQL, dco) would not block an auto-merge. Before the first merge-mode
+  batch, add `rust` and `gate` (and `dco`) to `main`'s required status checks so a non-final
+  wave can never merge red.
