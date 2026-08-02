@@ -59,6 +59,18 @@
   instruction — a brief naming that branch today names a ref that no longer exists, and
   `C4-verify` would warn and fall back to `origin/main`. Add another integration branch here
   when a future milestone needs the same.
+- **Wave sequencing is `wave_mode = "merge"`** (changed from `"stack"`, 2026-08-02): for a
+  dependent multi-issue batch, the driver `gh pr merge`s each **non-final** wave's PRs into
+  the real base (`main`) before the next wave builds; the final wave's PRs stay the human's
+  to merge. `"stack"` folded waves onto the run-scoped `pdca-integration/<base>` branch and
+  opened stacked PRs against it — but that branch is force-rebuilt on every fold, so any
+  stacked PR still open at the next fold went stale: its old `pdca-integrate:*` commits fell
+  out of the base's ancestry (wyrd's `dco` gate red on harness commits) and a later
+  overlapping bundle turned it CONFLICTING against its own already-folded content (wyrd
+  #675/#676, 2026-08-01, batch 648–650). Under `"merge"` no rebuilt-each-run branch ever
+  serves as a PR base. This is distinct from the M4 pattern above: a *milestone's* durable
+  `feat/*` integration branch remains the right shape for a planned PR sequence; `"merge"`
+  governs the driver's own wave stacking within one batch run.
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).
   `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:
@@ -74,8 +86,11 @@
   `pdca-integration/<base>` branch that **no brief names**, and a bundle-scoped gate is never
   told about it — so a wave≥1 dependent is still verified against `origin/<brief base>`.
   That is a different problem from #91 and is tracked upstream as
-  **eduralph/pdca-harness#273**; it is live here (`wave_mode = "stack"`), and the
-  `$WYRD_VERIFY_BASE` slot above is what a fix would feed.
+  **eduralph/pdca-harness#273**; the `$WYRD_VERIFY_BASE` slot above is what a fix would
+  feed. **Mooted here since `wave_mode = "merge"`** (2026-08-02, see "Wave sequencing"
+  above): a wave≥1 bundle now builds on a genuinely merged `origin/<brief base>`, so the
+  ref C4-verify resolves IS the base the PR opens against. The gap stays live upstream for
+  `"stack"`-mode instances.
 - **Override convention:** a maintainer's explicit base-branch request on the PR wins
   (per `GOVERNANCE.md` decision-making); otherwise `main`.
 - **Cross-version cherry-pick rules:** none today (single line). If back-porting starts,
@@ -231,7 +246,15 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
   three members).
 - **Ready-mark gate:** PRs open as **draft**; the human re-reads and marks ready. The
   builder/publisher leaves never `gh pr ready` / `gh pr merge` (mechanically blocked by
-  `builder_guard.py`).
+  `builder_guard.py`). **Scope under `wave_mode = "merge"`** (2026-08-02, see §2 "Wave
+  sequencing"): this gate holds unchanged for the model leaves and for every FINAL-wave PR;
+  for a **non-final** wave of a dependent batch, the deterministic driver (not a leaf)
+  readies and merges the wave's PRs at the wave boundary — the human's fresh-eyes read for
+  those happens at per-bundle sign-off (before publish), not on the open PR. That trade is
+  deliberate; its guardrail is host-side: keep `main`'s **required status checks** covering
+  the real gates (`rust`, `gate`, `dco` — as of 2026-08-02 only `docs-check` /
+  `require-issue` / `docs-immutability` are required, which would NOT stop a red auto-merge;
+  tighten before the first merge-mode batch).
 - **External-contribution flow:** standard GitHub PR against `main`, gated by
   `require-issue` / `dco` / `cargo xtask ci`.
 - **MAINTAINERS file:** `../wyrd/docs/governance/GOVERNANCE.md` is the authority (roles +
