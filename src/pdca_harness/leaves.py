@@ -47,7 +47,7 @@ from pathlib import Path
 
 from . import act as act_mod
 from . import rubric as rubric_mod
-from . import sizing, split
+from . import scratch, sizing, split
 from . import assemble
 from . import brief
 from . import families
@@ -352,7 +352,7 @@ def ensure_notes(cfg: Config, d: Path) -> None:
     d.mkdir(parents=True, exist_ok=True)
     issue_id = d.name.removeprefix("issue_")
     cmd = cfg.notes_cmd.format(id=issue_id)
-    env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    env = {**os.environ, **scratch.env_for(cfg, d), "PDCA_BUNDLE": str(d)}
     try:
         rc, _, _ = progress.run_with_heartbeat(
             cmd, cwd=cfg.root, shell=True, env=env, capture=True,
@@ -1283,7 +1283,7 @@ def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None
         # (The profile is the SELECTED builder's, so an escalated/variant claude
         # backend gets this too.)
         extra = [profile.grounding_flag, str(wt)] if profile.grounding_flag else None
-        workdir, env = cfg.root, {"PDCA_WORKTREE": str(wt)}
+        workdir, env = cfg.root, {**scratch.env_for(cfg, d), "PDCA_WORKTREE": str(wt)}
     elif wt:
         # Other command builders (codex, a local agentic CLI) have no cwd-walking agent
         # machinery, so CONFINE them by running *in* the worktree (cwd): otherwise the
@@ -1295,10 +1295,11 @@ def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None
         # granted with its grounding flag. So grant the bundle dir as an extra writable
         # root (#230); a family with no grounding flag (generic) is unsandboxed and reaches
         # it anyway. cwd stays the worktree, so #136 still confines source edits.
-        workdir, env = wt, {"PDCA_WORKTREE": str(wt)}
+        workdir, env = wt, {**scratch.env_for(cfg, d), "PDCA_WORKTREE": str(wt)}
         extra = [profile.grounding_flag, str(d)] if profile.grounding_flag else None
     else:
-        workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
+        # best-effort: edit in place, as before — but still scope this bundle's scratch.
+        workdir, env, extra = cfg.root, (scratch.env_for(cfg, d) or None), None
     if not profile.native_guard:
         # A family without its own PreToolUse STOP hook gets the driver's `gh`
         # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
@@ -1813,7 +1814,11 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
     reviewer's cwd containing no build-notes.md, the builder's framing cannot
     leak in even though the model has a Read tool. check-review.md is copied back.
     """
-    with tempfile.TemporaryDirectory(prefix="pdca-review-") as tmp:
+    # Inside this bundle's scratch (#200), not the process-wide root: the sandbox is already
+    # auto-deleted on exit, but a leaf that dies hard leaves it behind, and under the bundle
+    # dir that leftover is reclaimed at publish/freeze like everything else.
+    with tempfile.TemporaryDirectory(prefix="pdca-review-",
+                                     dir=scratch.for_bundle(cfg, d)) as tmp:
         sandbox = Path(tmp)
         for name in REVIEWER_INPUTS:
             src = d / name
@@ -1832,7 +1837,8 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         # via the family's grounding flag (claude: --add-dir). Independence holds — the
         # target is the upstream source, not build-notes.md.
         target = _reviewer_target(d, cfg)
-        env = {"PDCA_TARGET": str(target)} if target else None
+        env = {**scratch.env_for(cfg, d),
+               **({"PDCA_TARGET": str(target)} if target else {})} or None
         # STOP discipline for a NETWORKED reviewer (#135 / PR #136 review). With
         # [leaves.sandbox] network_access open, an authenticated host `gh` is reachable
         # from inside the leaf, and `gh pr ready` / `merge` / `review --approve` are the
@@ -2124,7 +2130,8 @@ def run_advisory_leaves(d: Path, cfg: Config) -> None:
 def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, leaf_id: str) -> None:
     """Run one advisory leaf in a temp dir holding ONLY the reviewer inputs (the same
     independence sandbox as the main reviewer), grounding on $PDCA_TARGET (#75)."""
-    with tempfile.TemporaryDirectory(prefix="pdca-advisory-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="pdca-advisory-",
+                                     dir=scratch.for_bundle(cfg, d)) as tmp:
         sandbox = Path(tmp)
         for name in REVIEWER_INPUTS:
             if (d / name).exists():
@@ -2138,7 +2145,8 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         # earn an automated red→green at Check.
         seeded = _seed_sandbox_settings(cfg, sandbox, profile)
         target = _reviewer_target(d, cfg)
-        env = {"PDCA_TARGET": str(target)} if target else None
+        env = {**scratch.env_for(cfg, d),
+               **({"PDCA_TARGET": str(target)} if target else {})} or None
         # Unconditional for every sandboxed advisory family: see _run_review_sandboxed —
         # the claude hook is builder/publisher frontmatter only, so it is absent here too.
         env = guard.shim_env(cfg, env)
@@ -2357,7 +2365,7 @@ def _plan_fallback_target(d: Path, cfg: Config):
     if primary is None or not (primary / ".git").exists():
         yield None
         return
-    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-", dir=scratch.for_bundle(cfg, d))
     pinned = Path(tmp) / "target"
     if worktree._git(primary, "worktree", "add", "--detach", str(pinned), "HEAD") != 0:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -2398,7 +2406,7 @@ def _pinned_plan_target(d: Path, cfg: Config):
         # the review silently grounds on the sibling checkout instead of the stacked
         # base (#301 review round 4). Mirror worktree.ensure's dual fetch.
         worktree._git(primary, "fetch", "origin")
-    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-", dir=scratch.for_bundle(cfg, d))
     pinned = Path(tmp) / "target"
     if worktree._git(primary, "worktree", "add", "--detach", str(pinned), base_ref) != 0:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -2419,7 +2427,8 @@ def _run_plan_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: d
     """One plan-advisory leaf in a temp dir holding ONLY the plan inputs (the reviewer
     independence sandbox, minus patch/gates), grounding on $PDCA_TARGET — a checkout
     pinned to the brief's resolved base (#301 review round 2)."""
-    with tempfile.TemporaryDirectory(prefix="pdca-plan-advisory-") as tmp, \
+    with tempfile.TemporaryDirectory(prefix="pdca-plan-advisory-",
+                                     dir=scratch.for_bundle(cfg, d)) as tmp, \
             _pinned_plan_target(d, cfg) as target:
         sandbox = Path(tmp)
         for name in PLAN_ADVISORY_INPUTS:
@@ -2444,7 +2453,8 @@ def _run_plan_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: d
         # FALSE, so seeding nothing left a Bash-capable reviewer unconfined), and the
         # confinement flag rides exactly iff the seed landed (#290).
         seeded = _seed_plan_sandbox_settings(sandbox, profile)
-        env = {"PDCA_TARGET": str(target)} if target else None
+        env = {**scratch.env_for(cfg, d),
+               **({"PDCA_TARGET": str(target)} if target else {})} or None
         extra = ([profile.grounding_flag, str(target)]
                  if target and profile.grounding_flag else [])
         if seeded:
@@ -2748,7 +2758,12 @@ def run_publish(d: Path, cfg: Config) -> None:
         # / `merge` itself, which is the human's Check sign-off, not the model's (best-effort;
         # a no-op for claude, whose native hook already enforces this).
         profile = families.resolve(cfg.publisher.family, cfg.families)
-        env = None if profile.native_guard else guard.shim_env(cfg, None)
+        # Seed with this bundle's scratch BEFORE the shim is built (#200; #207 review): the
+        # shim dir comes from `mkdtemp(dir=env["TMPDIR"])`, so passing None here would put one
+        # `pdca-guard-*` per publisher invocation directly under the scratch ROOT, where the
+        # bundle sweep — which only knows about `issue_<id>` dirs — can never reclaim it.
+        scratch_env = scratch.env_for(cfg, d)
+        env = scratch_env or None if profile.native_guard else guard.shim_env(cfg, scratch_env)
         _invoke(cfg.publisher, cfg.root, _publish_prompt(d, cfg), env=env, cfg=cfg)
         return
     _stub_publish(d, cfg)

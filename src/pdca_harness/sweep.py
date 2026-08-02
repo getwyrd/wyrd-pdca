@@ -1,4 +1,4 @@
-"""Reclaim the harness's own worktree/build footprint (issue #297).
+"""Reclaim the harness's own footprint — worktrees (issue #297) and leaf scratch (#200).
 
 The isolation model leaves durable siblings next to every target checkout: per-lane
 Do/Check worktrees (``<name>.pdca-wt[-l<slot>]``, reset-and-reused but never removed),
@@ -20,10 +20,19 @@ after a run's waves complete, when nothing reuses the trees) and on demand via
 * ``"remove"`` — lane worktrees are removed too (Do/``pdca try`` recreate on demand).
 * ``"off"`` — the flow never sweeps; ``pdca sweep`` still works (explicit mode).
 
+The second footprint is **leaf scratch** under ``[driver].scratch_dir`` (#200). It arrived
+with #134, after this module was written, and was never registered here — so nothing
+reclaimed it, and the root reached 96 GB / 3,930 stale dirs before the page cache it
+generated got a 3d 19h run OOM-killed. :mod:`~pdca_harness.scratch` scopes it per bundle so
+there is something to reclaim; ``sweep()`` reclaims it at the same publish/freeze boundary,
+**unconditionally** — see the note at that call, it is deliberately not under
+``sweep_worktrees``.
+
 Best-effort throughout: teardown must never fail a run (the ``overflow_remove``
 contract). Only harness-named siblings of target checkouts are touched — never the
 primary checkout, never bundle artifacts. Must not run while a flow is mid-Do on the
-same lanes (the flow's own call sites run after all lane threads join).
+same lanes (the flow's own call sites run after all lane threads join); for scratch, a dir
+stamped with another LIVE pid is left alone, so a concurrent flow is safe regardless.
 """
 
 from __future__ import annotations
@@ -35,7 +44,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import integrate, worktree
+from . import integrate, scratch, worktree
 from .config import Config
 
 MODES = ("clean", "remove", "off")
@@ -201,12 +210,20 @@ def sweep(cfg: Config, bundles: list[Path] | None = None, *,
     (teardown must not fail a run); sizes are deliberately not computed (no ``du``
     over a 200 GB tree).
     """
+    lines: list[str] = []
+    # Leaf scratch (#200) is reclaimed UNCONDITIONALLY — before the ``"off"`` return, and
+    # not gated on ``sweep_worktrees``. That knob expresses a footprint preference about
+    # WORKTREES: "off" keeps lane checkouts warm at a cost the operator has accepted. "a
+    # bundle's temporary data is gone once it is ready to publish" is not a preference of
+    # that kind — it is the property that keeps the scratch root from growing without bound,
+    # which is what took an entire run down on 2026-08-02. An operator tuning worktree reuse
+    # must not silently switch it off.
+    lines += scratch.reclaim(cfg, bundles, dry_run=dry_run)
     mode = mode or cfg.sweep_worktrees
     if mode not in MODES:  # defensive: config.load already normalizes
         mode = "clean"
     if mode == "off":
-        return []
-    lines: list[str] = []
+        return lines
     verb = "would " if dry_run else ""
     for primary in target_checkouts(cfg, bundles):
         try:

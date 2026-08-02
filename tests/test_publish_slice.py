@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from pdca_harness import cli, flow, gates, leaves, publish, signoff, state
+from pdca_harness import cli, flow, gates, leaves, publish, scratch, signoff, state
 from pdca_harness.config import Config, LeafConfig
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
@@ -256,10 +256,21 @@ class PublishSlice(unittest.TestCase):
             "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n"
             "@@ -1 +1,2 @@\n base\n+fix line\n", encoding="utf-8")
 
+        # #200: a real publish is the bundle's deadline for temporary data. `flow` sweeps at
+        # this boundary, but the piecemeal path (`pdca run` → `signoff --accept` → `publish`)
+        # never calls sweep() at all, so publish has to reclaim it itself (#207 review).
+        os.environ["PDCA_SCRATCH"] = str(self.tmp / "scratch")
+        self.addCleanup(os.environ.pop, "PDCA_SCRATCH", None)
+        bundle_scratch = scratch.for_bundle(self.cfg, d)
+        (bundle_scratch / "cargo-target-ci").mkdir()
+
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(buf):
             rc = publish.publish(self.cfg, "DIRTY", open_pr=False, by="T", today="2026-06-05")
         self.assertEqual(rc, 0, buf.getvalue())
+        self.assertFalse(bundle_scratch.exists(),
+                         "publish left the bundle's scratch behind — the non-flow workflow "
+                         "keeps exactly the unbounded footprint #200 removes")
         # The operator's dirty edits are restored — edit-in-place survives publish.
         self.assertEqual((repo / "file.txt").read_text(encoding="utf-8"), "base\nbuilder edit\n")
         self.assertTrue((repo / "untracked.txt").exists())
