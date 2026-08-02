@@ -1,6 +1,7 @@
-"""[driver].scratch_dir — throwaway heavy leaf work is redirected off tmpfs /tmp (#134).
+"""[driver].scratch_dir — throwaway heavy leaf work is redirected off tmpfs /tmp (#134),
+and is bundle-scoped so it can be reclaimed at the publish/freeze boundary (#200).
 
-Three promises:
+Four promises:
   * config: `[driver].scratch_dir` parses; `PDCA_SCRATCH` overrides for one run;
     unset ⇒ "" (the knob fails open to the status quo).
   * CLI entry: `_export_scratch` creates the dir and exports BOTH `PDCA_SCRATCH` and
@@ -9,6 +10,9 @@ Three promises:
   * agent definitions: the four heavy-checkout leaves (builder, reviewer, adversary,
     code-review) carry the scratch discipline — `$TMPDIR` only helps tools that respect
     it; a model writing a literal `/tmp/wyrd-adv` needs the standing instruction.
+  * lifetime (#200): each bundle gets its OWN subdir, and it is gone once that bundle is
+    ready to publish. Reuse below that line (the auto-iterate rounds) is preserved; a
+    crashed run's leftovers are reclaimed by pid stamp, never by a wall clock.
 
 Offline: pure config/env, no leaves. Run from root:
     PYTHONPATH=src python -m unittest discover -s tests
@@ -24,7 +28,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from pdca_harness import cli
+from pdca_harness import cli, scratch, sweep
 from pdca_harness.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,6 +181,120 @@ class ScratchDiscipline(unittest.TestCase):
                 # `"$PDCA_SCRATCH/..."` with the variable unset expands to a
                 # filesystem-root `/pdca-...` path (PR #137 review).
                 self.assertIn("${PDCA_SCRATCH:-${TMPDIR:-/tmp}}", body)
+
+
+class BundleScratch(unittest.TestCase):
+    """#200 — the scratch root gets an owner: one subdir per bundle, reclaimed at the
+    publish/freeze boundary. Before this, every bundle's throwaway work landed in one flat
+    directory that nothing emptied (96 GB / 3,930 stale dirs, and the page cache it
+    generated OOM-killed a 3d 19h run)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        saved = os.environ.pop("PDCA_SCRATCH", None)
+        if saved is not None:
+            self.addCleanup(os.environ.__setitem__, "PDCA_SCRATCH", saved)
+        (self.tmp / "pdca.toml").write_text(
+            '[project]\ndefault_branch = "main"\n'
+            '[leaves.builder]\nmode = "stub"\n'
+            '[leaves.reviewer]\nmode = "stub"\n',
+            encoding="utf-8",
+        )
+        self.cfg = Config.load(self.tmp)
+        self.cfg.scratch_dir = str(self.tmp / "scratch")
+        (self.tmp / "scratch").mkdir()
+
+    def _bundle(self, name: str = "issue_651") -> Path:
+        d = self.cfg.bundle_root / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # --- scoping -----------------------------------------------------------------
+    def test_each_bundle_gets_its_own_dir_and_env(self) -> None:
+        a, b = self._bundle("issue_651"), self._bundle("issue_652")
+        ea, eb = scratch.env_for(self.cfg, a), scratch.env_for(self.cfg, b)
+        self.assertNotEqual(ea["PDCA_SCRATCH"], eb["PDCA_SCRATCH"])
+        # BOTH variables move together: $PDCA_SCRATCH is what the role prompts name, and
+        # $TMPDIR is what catches everyone who never heard of it (cargo's .tmp* dirs).
+        for e in (ea, eb):
+            self.assertEqual(e["PDCA_SCRATCH"], e["TMPDIR"])
+            self.assertTrue(Path(e["PDCA_SCRATCH"]).is_dir())
+        self.assertEqual(Path(ea["PDCA_SCRATCH"]).name, "issue_651")
+
+    def test_unset_scratch_dir_is_byte_for_byte_the_old_behaviour(self) -> None:
+        self.cfg.scratch_dir = ""
+        self.assertIsNone(scratch.for_bundle(self.cfg, self._bundle()))
+        self.assertEqual(scratch.env_for(self.cfg, self._bundle()), {})
+        self.assertEqual(scratch.reclaim(self.cfg, [self._bundle()]), [])
+
+    # --- the deadline ------------------------------------------------------------
+    def test_reclaimed_at_the_boundary(self) -> None:
+        d = self._bundle()
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        (p / "cargo-target-ci").mkdir()          # the 19 GB tree, in miniature
+        (p / ".tmpABC").mkdir()                  # cargo's own, carrying no bundle identity
+        lines = scratch.reclaim(self.cfg, [d])
+        self.assertFalse(p.exists())
+        self.assertFalse(scratch._stamp(p).exists())
+        self.assertTrue(any("issue_651" in ln for ln in lines), lines)
+
+    def test_survives_iteration_so_a_rebuild_stays_warm(self) -> None:
+        # The #422 property: reuse BELOW the publish line is untouched. Re-resolving the
+        # bundle's scratch (as each Do→Check round does) must not wipe the build tree.
+        d = self._bundle()
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        (p / "cargo-target-ci").mkdir()
+        again = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        self.assertEqual(p, again)
+        self.assertTrue((p / "cargo-target-ci").is_dir())
+
+    def test_dry_run_reports_without_removing(self) -> None:
+        d = self._bundle()
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        lines = scratch.reclaim(self.cfg, [d], dry_run=True)
+        self.assertTrue(p.is_dir())
+        self.assertTrue(any("would" in ln for ln in lines), lines)
+
+    # --- the crash backstop ------------------------------------------------------
+    def test_orphan_with_a_dead_owner_is_reclaimed(self) -> None:
+        d = self._bundle("issue_999")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).write_text("999999999\n", encoding="utf-8")   # provably not a pid
+        self.assertEqual(scratch.orphans(self.cfg), [p])
+        scratch.reclaim(self.cfg, [])          # no bundles named — orphan pass alone
+        self.assertFalse(p.exists())
+
+    def test_live_owner_is_left_alone(self) -> None:
+        # A dir stamped with another LIVE pid may be a concurrent flow's $TMPDIR; removing
+        # it would fail that run's gates. Same rule as worktree.orphan_overflow_dirs.
+        d = self._bundle("issue_998")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).write_text(f"{os.getppid()}\n", encoding="utf-8")
+        self.assertEqual(scratch.orphans(self.cfg), [])
+        lines = scratch.reclaim(self.cfg, [d])
+        self.assertTrue(p.is_dir())
+        self.assertTrue(any("still alive" in ln for ln in lines), lines)
+
+    def test_missing_stamp_is_never_licence_to_delete(self) -> None:
+        # An unstamped dir proves nothing (an older run, or a leaf that wiped the sidecar).
+        # Never reclaim what cannot be classified.
+        d = self._bundle("issue_997")
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        scratch._stamp(p).unlink()
+        self.assertEqual(scratch.orphans(self.cfg), [])
+        self.assertTrue(p.is_dir())
+
+    # --- wiring ------------------------------------------------------------------
+    def test_sweep_reclaims_scratch_even_when_worktree_sweeping_is_off(self) -> None:
+        # sweep_worktrees expresses a preference about WORKTREES. "a bundle's temp data is
+        # gone once it is ready to publish" is policy, and must not switch off with it.
+        d = self._bundle()
+        p = Path(scratch.env_for(self.cfg, d)["PDCA_SCRATCH"])
+        self.cfg.sweep_worktrees = "off"
+        lines = sweep.sweep(self.cfg, [d])
+        self.assertFalse(p.exists())
+        self.assertTrue(any("leaf scratch" in ln for ln in lines), lines)
 
 
 if __name__ == "__main__":

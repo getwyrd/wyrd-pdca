@@ -41,13 +41,17 @@ def shim_env(cfg: Config, env: dict | None) -> dict:
     """``env`` with a guarded ``gh`` first on ``PATH`` (see module docstring).
 
     Returns a copy; the input mapping is never mutated. The shim directory is a
-    per-invocation tempdir (mode 0700 via mkdtemp) left to the OS tmp reaper."""
+    per-invocation tempdir (mode 0700 via mkdtemp), created inside the caller's ``$TMPDIR``
+    — which for a leaf is its bundle's scratch dir, so the sweep reclaims it at
+    publish/freeze (#200). It used to be left "to the OS tmp reaper": true of ``/tmp``,
+    false of the disk-backed ``[driver].scratch_dir``, where no reaper exists and these
+    accumulated one per invocation."""
     out = dict(env or {})
     guard_py = cfg.root / ".claude" / "hooks" / "builder_guard.py"
     real_gh = shutil.which("gh")
     if not guard_py.is_file() or not real_gh:
         return out
-    shim_dir = Path(tempfile.mkdtemp(prefix="pdca-guard-"))
+    shim_dir = Path(tempfile.mkdtemp(prefix="pdca-guard-", dir=out.get("TMPDIR") or None))
     shim = shim_dir / "gh"
     shim.write_text(
         _SHIM.format(python=sys.executable, guard=guard_py, gh=real_gh),
