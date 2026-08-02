@@ -1,0 +1,15 @@
+Task under review: make repair, restore, backfill, rebalance, and drain-status passes safely resolve segmented chunk maps while bounding reconstruction reads and refusing oversize repoints.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | Acceptance is decidable across restore protection, segmented repair/evacuation, deliberate backfill refusal, and counted O(N) resolution evidence (`crates/custodian/tests/segmented_map_repair.rs:15`). |
+| C2 Reproduction (red pre-fix) | PASS | The retained discriminator compiled on the issue-650 base and all 8 tests failed on assertions, including the stranded-fragment verdict at `crates/custodian/tests/segmented_map_repair.rs:313`. |
+| C3 Change | NEEDS-HUMAN | Human must choose a split or grant a budget exception — the patch has 2,184 rough nonblank/noncomment additions against the brief's approximately 1,500-line ceiling, including the 1,069-line discriminator (`crates/custodian/tests/segmented_map_repair.rs:1`). |
+| C4 Verification (red→green) | PASS | The same 8 tests turned green, and independent typos, docs render, fmt, clippy, build, workspace tests, three dependency-wall checks, conformance, statics, and 50-seed DST reruns passed (`crates/dst/tests/custodian.rs:2049`). |
+| C5 Causal adequacy | PASS | The evidence binds both formerly weak causes: the fixture proves a legal-to-oversize transition and the store double asserts exactly N segment reads (`crates/custodian/tests/segmented_map_repair.rs:623`, `crates/custodian/tests/segmented_map_repair.rs:859`); 96 rerun mutants left no survivors. |
+| T1 Structure | PASS | Resolver-with-homes and exact-record repoint logic are centralized at the metadata boundary and consumed by both moving passes (`crates/core/src/metadata.rs:2671`). |
+| T2 Shape | PASS | Segmented moves CAS both the carrying segment's exact bytes and the resolved root, preserving the generation boundary without new dependency or format surface (`crates/core/src/metadata.rs:2977`). |
+| T3 Runtime | PASS | In-memory pass tests and the seeded repoint-versus-supersede simulation exercised successful, conflicting, refused, and reclaimable-copy outcomes (`crates/dst/tests/custodian.rs:1715`). |
+| T4 Contribution | NEEDS-HUMAN | Human must adjudicate the 14 recorded batch-review blockers — `scripts/review-branch` and its raw report are unavailable here, although affected-path checks independently confirmed #647 as closed-unmerged and #402/#555 as merged prior art. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Rebuild must make a refused evacuation non-certifying — `Aborted` is discarded at `crates/custodian/src/rebalance.rs:149`, so the test reports `Satisfied` while the placement remains on the draining server (`crates/custodian/tests/segmented_map_repair.rs:663`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether the operator experience for a permanently refused drain is acceptable — data remains safe, but the current reconciliation signal can claim convergence instead of exposing the blocked evacuation (`crates/custodian/src/rebalance.rs:482`). |
