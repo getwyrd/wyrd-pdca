@@ -159,21 +159,37 @@ _pkg_from_added_cargo() {
 }
 
 # The base branch named in the bundle's brief "Repo + branch target: <repo> @ <base>"
-# field, or "" if absent. Mirrors publish._clean_ref EXACTLY (a markdown backtick span
-# wins over the first token) so C4-verify resolves the SAME base publish cuts the PR from
-# — a stacked milestone slice's integration branch, not a hardcoded main (#91). Pure brief
-# parse; ALWAYS returns 0 so `set -e`/pipefail never aborts a bare `$(_brief_base)` (#88).
+# field, or "" if absent. Mirrors publish._clean_ref EXACTLY so C4-verify resolves the SAME
+# base publish cuts the PR from — a stacked milestone slice's integration branch, not a
+# hardcoded main (#91). Pure brief parse; ALWAYS returns 0 so `set -e`/pipefail never aborts
+# a bare `$(_brief_base)` (#88).
+#
+# The backtick span wins ONLY when it is the START of the field, never anywhere in it
+# (#204, mirroring the upstream #235/#262 anchoring of _clean_ref). `main (feature branch
+# `feat/x-slice`)` names the base **main**: the span is a parenthetical aside about a
+# DIFFERENT branch. This twin kept the pre-#235 rule for a while and inverted the parity it
+# exists to maintain — publish opened the PR against main while C4-verify validated against
+# feat/x-slice, and the shape a planner actually writes (`main (verified at Plan:
+# `origin/main` = `9120f7a`)`) yielded `origin/origin/main`, a ref resolving to nothing.
 _brief_base() {
   local bp="${BUNDLE:-}/brief.md" line raw tok
   { [ -n "${BUNDLE:-}" ] && [ -f "$bp" ]; } || return 0
   line="$(grep -iE 'repo \+ branch' "$bp" | head -1 || true)"
   raw="${line#*@}"; [ "$raw" = "$line" ] && return 0     # no '@' → no base named
-  if [[ "$raw" == *'`'*'`'* ]]; then                     # backtick code span wins
-    tok="${raw#*\`}"; tok="${tok%%\`*}"
-  else
-    raw="${raw#"${raw%%[![:space:]]*}"}"; tok="${raw%%[[:space:]]*}"   # else first token
+  raw="${raw#"${raw%%[![:space:]]*}"}"                   # lstrip, as _clean_ref's .strip()
+  tok=""
+  if [[ "$raw" == '`'*'`'* ]]; then                      # ANCHORED span: `<ref>`…
+    tok="${raw#\`}"; tok="${tok%%\`*}"
   fi
-  tok="${tok#\`}"; tok="${tok%\`}"; tok="${tok%%[,.;:]}"
+  # Empty span (an adjacent `` pair) matches no ref: _clean_ref's `[^`]+` needs content,
+  # so it falls through to the first token. Keep the twin agreeing on that edge too.
+  [ -n "$tok" ] || tok="${raw%%[[:space:]]*}"
+  # token.strip("`").rstrip(",.;:") — both strip REPEATEDLY, so loop rather than trim once.
+  while [ -n "$tok" ] && [ "${tok#\`}" != "$tok" ]; do tok="${tok#\`}"; done
+  while [ -n "$tok" ] && [ "${tok%\`}" != "$tok" ]; do tok="${tok%\`}"; done
+  while [ -n "$tok" ]; do
+    case "$tok" in *[,.\;:]) tok="${tok%?}";; *) break;; esac
+  done
   printf '%s' "$tok"
 }
 
