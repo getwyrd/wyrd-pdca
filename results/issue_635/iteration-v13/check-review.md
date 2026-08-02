@@ -1,0 +1,15 @@
+Review of the segmented inode chunk-map implementation, including staged publication, shared consumer resolution, containment behavior, and large-object accounting.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The contract is specific enough to decide compatibility, publication, containment, and accounting outcomes without an unresolved scope choice (`docs/design/architecture/08-crosscutting-concepts.md:83`). |
+| C2 Reproduction (red pre-fix) | PASS | The clean target base compiled the binding suite and failed all 9 cases, establishing the pre-fix behavior the acceptance decision depends on (`crates/custodian/tests/segmented_map_consumers.rs:589`). |
+| C3 Change | PASS | The authorized boundary remains one core resolver with a narrow custodian adapter and current architecture documentation, so no unplanned dependency or manifest change needs Plan re-entry (`crates/core/src/metadata.rs:2946`). |
+| C4 Verification (red→green) | PASS | The same binding suite changed from 0/9 on the clean base to 9/9 on the target, and a clean-environment `cargo xtask ci` rerun passed every native validator and seeded DST check (`crates/custodian/tests/segmented_map_consumers.rs:589`). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | The rebuild must require exact current root/table identity, because an independent probe changed the table while retaining its group and the group-only retry check returned stale chunks instead of failing closed (`crates/core/src/metadata.rs:2907`). |
+| T1 Structure | PASS | Ownership stays in core while custodian consumers share a small adapter, preserving the dependency direction and a single resolution policy (`crates/custodian/src/resolve.rs:76`). |
+| T2 Shape | PASS | Flat wire identity and segmented decode invariants are explicit at the serialization boundary, so malformed persisted shape is rejected before runtime use (`crates/core/src/metadata.rs:1382`). |
+| T3 Runtime | NEEDS-HUMAN | The maintainer must accept landing a dormant segmented committer before issue #636 and its extra root read per committed object per maintenance pass, because production reach and operational cost are intentionally deferred (`crates/custodian/src/resolve.rs:39`). |
+| T4 Contribution | NEEDS-HUMAN | A human must settle the four recorded batch-review items and closed/rejected prior-art status, because the prescribed `scripts/review-branch` wrapper is absent and its red contribution result cannot be independently adjudicated. |
+| T5 Judgment | NEEDS-HUMAN [impl] | The rebuild must add assertions that kill independently reproduced boundary survivors, because mutable GC error guards and raw-recovery branches can change without failing the current suite (`crates/custodian/src/gc.rs:307`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | The maintainer must decide whether synthetic raw-record, redb, and DST evidence is fit for release before issue #636 supplies a real production publisher caller, because the staged committer is not yet exercised by deployed topology (`crates/core/src/metadata.rs:3395`). |

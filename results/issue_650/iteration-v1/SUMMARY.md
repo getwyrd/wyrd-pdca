@@ -1,0 +1,126 @@
+# Result — issue 650 / gc-scrub-through-resolver-fail-closed-containment
+
+## 1. Spec (from brief.md)              ← Check verifies against THIS
+- Defect / goal:
+  Two defects in the **reference set** GC and scrub both gate on.
+  1. **It cannot see a segmented object's chunks.** `referenced_fragments` builds the protected
+     set from each committed record's inline chunk list (`crates/custodian/src/gc.rs:251` on
+     `origin/main`), so a segmented object's fragments are simply **absent from it** — and GC's
+     safety gate (`gc.rs:159`; the loop's load-bearing invariant, whose violation is named
+     *silent corruption*, at `gc.rs:22-25`) would pass them to `delete_fragment`. Scrub reads the
+     same set (`scrub.rs:43`,`:75`) and would never verify them while still reporting the store
+     clean.
+  2. **An incomplete reference set still certifies — the finding still open at #647's close.** In
+     the closed PR `ReferenceSet::protects` short-circuits `true` while the set is incomplete
+     (correct for *reclamation*, and why nothing is deleted), but `gc_step` then audits **every**
+     otherwise-unprotected fleet fragment as `skip reason="referenced"` and still returns
+     `Reconciled::Satisfied` — it reports the store converged while holding a set it knows is
+     partial. Scrub's twin **was** fixed in #647 (it returns `Blocked` for the identical
+     condition); the GC side was not. Two passes reading one set answer differently about the
+     same store.
+- Success criterion:
+  The added test target `crates/custodian/tests/segmented_map_consumers.rs`
+  passes and binds the issue's acceptance, driven through the real fenced control point
+  `wyrd_custodian::reconcile_step` (base-visible):
+  1. **A segmented object's fragments survive GC + scrub, asserted positively.** After a GC pass
+     **past the grace window** and a scrub pass over an object seeded as raw `seg:` records + a
+     segmented root, every fragment it owns is still present on every D server that held it, **and**
+     a drain of a server holding one answers `ReconciliationStatus::Pending` — the positive
+     observable, because "GC deleted nothing" also passes when GC did nothing at all.
+  2. **With one unresolvable inode, GC and scrub never certify and reclaim nothing.** Both steps
+     return `Ok(_)` and **not** `Reconciled::Satisfied`, and nothing of that object is reclaimed;
+     the blocker is attributed on the audit seam naming the object. (The positive
+     `Reconciled::Blocked` match ships in the appended `crates/custodian/tests/{gc,scrub}.rs`
+     legs, which `C4-ci` runs — see *Test file* for why the discriminator asserts the
+     base-expressible half.)
+  3. **One damaged object does not end the walk** — with that object present the reference build
+     still completes over the rest of the store, a healthy object's fragments are still protected
+     and still verified. A store-access fault (not one object's fault) still propagates.
+- Repo + branch target:
+  getwyrd/wyrd @ main   (resolved and verified at Plan:
+  `git ls-remote --heads origin main` → `9120f7a`, matching the sandbox's `origin/main`)
+- Scope (one logical fix) / out of scope:
+  route the **reference build** through the resolver and make **certification** honest
+  in both passes that read it. `crates/custodian/src/gc.rs` — the reference build resolves a
+  committed map through #649's resolver by bounded `seg:` ranges; `ReferenceSet` carries the
+  objects it could **not** resolve; `gc_step`'s outcome reflects that incompleteness instead of
+  reporting convergence. `crates/custodian/src/scrub.rs` — inherits the same set and the same
+  outcome rule; the two passes' answers must be identical for identical input.
+  `crates/custodian/src/reconciliation.rs` — the outcome type gains the "cannot certify" answer
+  and the rule for combining outcomes across loops. Plus their existing test files and the added
+  fixture. **Caller-first:** every production symbol introduced here has a caller **in this
+  slice** — the incompleteness field is read by `protects` and by both steps' outcome; this slice
+  lands no behaviour flip and no producer of segmented maps. **Out of scope:** restore,
+  reconstruction, backfill, rebalance and `desired_state` (#651) — do not route them here even
+  though they will share this fixture; the record-ceiling helpers and `repoint_chunk` (#651); the
+  chunk-id floor (#652); the committer (#653); any new/edited ADR / spec / proposal; any
+  conformance-vector change.
+
+## 2. Disposition claimed               ← sign-off confirms or overrides
+- Outcome: likely-fix
+- Confidence: medium
+- Recommendation: (set by Do)
+
+## 3. Correctness (Check — chain)
+- C1 Spec: none — brief.md
+- C2 Reproduction (red pre-fix): none — (no gate configured)
+- C3 Change: none — patch.diff
+- C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance): fail — xtask: `cargo deny check` failed with exit status: 1
+- C4 per-fix red->green: this patch's test red pre-fix, green post-fix: pass — run-verify.sh: PASS — red without the fix, green with it.
+- C5 surviving mutants on the bundle diff (cargo mutants --in-diff): pass — 14 mutants tested in 14s: 5 caught, 9 unviable
+
+## 4. Conformance (Check — stack)
+- T1 Structure: none — (no gate configured)
+- T2 Shape: none — (no gate configured)
+- T3 Runtime: none — (no gate configured)
+- T4 batched multi-pass rubric review (3x codex, union, triaged): fail — review-branch: 19 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/development/wyrd/wyrd-pdca/results/issue
+- T4 contribution artifacts complete (user-impact opener + tracker id in both): pass — scripts/pdca contribcheck
+- T5 Judgment: none — reviewer + human sign-off
+- T5 judgment: → see §5.
+
+## 5. Advisory review (artifact-only, decorrelated)
+Reviewer ran without build-notes.md. Summary:
+
+Reviewing issue #650: make GC and scrub resolve segmented chunk maps, fail closed on incomplete reference sets, and report non-certification without ending healthy-object processing.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance choice is specific and internally consistent: both maintenance consumers must share resolver-backed references and surface a non-certifying outcome, matching the target contract at `docs/design/architecture/06-runtime-view.md:29`. |
+| C2 Reproduction (red pre-fix) | PASS | The issue-649 base compiled and ran the added target, with three behavioral failures rather than a compile/zero-test red at `crates/custodian/tests/segmented_map_consumers.rs:358`; the genuine-store-fault control at `crates/custodian/tests/segmented_map_consumers.rs:613` remained green. |
+| C3 Change | PASS | The scoped-change decision is satisfied: resolver/error classification is centralized in the shared reference build at `crates/custodian/src/gc.rs:308` and outcome aggregation at `crates/custodian/src/reconciliation.rs:45`, with no dependency or unrelated-consumer change. |
+| C4 Verification (red→green) | NEEDS-HUMAN | Handling of the inherited advisory is owed — red→green plus typos, docs render, fmt, clippy, build, workspace tests, conformance, statics, mutants, and DST passed, but a scratch-local real `cargo deny` remains red for RUSTSEC-2026-0221 against unchanged `event-listener` 5.4.1 at `Cargo.lock:1204`, so the required whole gate is not green. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Rebuild must cover structurally unreadable committed roots — a direct test of a segment-count-mismatched committed inode returned `Err` at the unconditional decode propagation in `crates/custodian/src/gc.rs:314`, ending the walk instead of the per-object containment promised at `crates/custodian/src/gc.rs:294`. |
+| T1 Structure | PASS | Six touched files and 909 additions stay below the stated file/semantic budgets, while one `ReferenceSet` owns the safety rule at `crates/custodian/src/gc.rs:251` and one combiner owns cross-loop precedence at `crates/custodian/src/reconciliation.rs:54`. |
+| T2 Shape | PASS | The dependency-shape decision is satisfied: production remains over the `MetadataStore`/`ChunkStore` seams at `crates/custodian/src/gc.rs:308` and the living architecture is current at `docs/design/architecture/06-runtime-view.md:29`, with no new crate or dependency. |
+| T3 Runtime | PASS | For the implemented resolver-error paths, the real fenced control point reclaims genuine garbage, preserves segmented fragments, reports a drain pending, and continues through healthy objects at `crates/custodian/tests/segmented_map_consumers.rs:357`, `crates/custodian/tests/segmented_map_consumers.rs:379`, and `crates/custodian/tests/segmented_map_consumers.rs:567`; full custodian and DST runs also passed. |
+| T4 Contribution | NEEDS-HUMAN | Contribution-review disposition is owed — affected-file history independently covered merged and closed/unmerged work and found #647 as the sole unmerged prior art, but `scripts/review-branch` and `scripts/pdca contribcheck` are absent from the artifact-only inputs, so the reported 19 findings and contribution PASS cannot be independently reproduced. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Rebuild must bind operator attribution — criterion 2 asserts only outcomes and byte survival at `crates/custodian/tests/segmented_map_consumers.rs:468` and `crates/custodian/tests/segmented_map_consumers.rs:498`, while inode naming is supported only by code-read at `crates/custodian/src/gc.rs:458` and `crates/custodian/src/scrub.rs:224`, so an audit regression would pass. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether the operator-facing recovery flow is fit — in staging remove one live `seg:` record, run GC and scrub, confirm both name the inode and refuse certification, restore it, rerun, and confirm certification; aggregate `Blocked` at `crates/custodian/src/reconciliation.rs:42` alone does not identify the repair target. |
+
+
+## 6. NEEDS-HUMAN — items the human must clear before sign-off
+- [ ] C4 Verification (red→green) — Handling of the inherited advisory is owed — red→green plus typos, docs render, fmt, clippy, build, workspace tests, conformance, statics, mutants, and DST passed, but a scratch-local real `cargo deny` remains red for RUSTSEC-2026-0221 against unchanged `event-listener` 5.4.1 at `Cargo.lock:1204`, so the required whole gate is not green.
+- [ ] C5 Causal adequacy — Rebuild must cover structurally unreadable committed roots — a direct test of a segment-count-mismatched committed inode returned `Err` at the unconditional decode propagation in `crates/custodian/src/gc.rs:314`, ending the walk instead of the per-object containment promised at `crates/custodian/src/gc.rs:294`.
+- [ ] T4 Contribution — Contribution-review disposition is owed — affected-file history independently covered merged and closed/unmerged work and found #647 as the sole unmerged prior art, but `scripts/review-branch` and `scripts/pdca contribcheck` are absent from the artifact-only inputs, so the reported 19 findings and contribution PASS cannot be independently reproduced.
+- [ ] T5 Judgment — Rebuild must bind operator attribution — criterion 2 asserts only outcomes and byte survival at `crates/custodian/tests/segmented_map_consumers.rs:468` and `crates/custodian/tests/segmented_map_consumers.rs:498`, while inode naming is supported only by code-read at `crates/custodian/src/gc.rs:458` and `crates/custodian/src/scrub.rs:224`, so an audit regression would pass.
+- [ ] Validation — fitness-to-purpose — Human must decide whether the operator-facing recovery flow is fit — in staging remove one live `seg:` record, run GC and scrub, confirm both name the inode and refuse certification, restore it, rerun, and confirm certification; aggregate `Blocked` at `crates/custodian/src/reconciliation.rs:42` alone does not identify the repair target.
+- [ ] C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) FAILED (gating) — xtask: `cargo deny check` failed with exit status: 1
+- [ ] T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 19 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/development/wyrd/wyrd-pdca/results/issue
+
+## 7. Proven / not proven
+- Proven by which oracle: gates overall = fail (stub oracles).
+- Unproven / needs manual run: anything flagged in §6.
+
+## 8. Ready-to-ship attachments
+- patch.diff
+- tracker-comment.md     (ALWAYS, every tracker item)
+- build-notes.md         (builder rationale — for the human, not the reviewer)
+
+## 9. Check sign-off                     ← human completes Check here
+- Disposition confirmed / overridden:
+- Outcome: iterated-to-Do
+- Iteration delta (if iterating): Auto-iterate (round 1): rebuilding for the implementation-level findings — C4 Verification (red→green) — Handling of the inherited advisory is owed — red→green plus typos, docs render, fmt, clippy, build, workspace tests, conformance, statics, mutants, and DST passed, but a scratch-local real `cargo deny` remains red for RUSTSEC-2026-0221 against unchanged `event-listener` 5.4.1 at `Cargo.lock:1204`, so the required whole gate is not green.; C5 Causal adequacy — Rebuild must cover structurally unreadable committed roots — a direct test of a segment-count-mismatched committed inode returned `Err` at the unconditional decode propagation in `crates/custodian/src/gc.rs:314`, ending the walk instead of the per-object containment promised at `crates/custodian/src/gc.rs:294`.; T4 Contribution — Contribution-review disposition is owed — affected-file history independently covered merged and closed/unmerged work and found #647 as the sole unmerged prior art, but `scripts/review-branch` and `scripts/pdca contribcheck` are absent from the artifact-only inputs, so the reported 19 findings and contribution PASS cannot be independently reproduced.; T5 Judgment — Rebuild must bind operator attribution — criterion 2 asserts only outcomes and byte survival at `crates/custodian/tests/segmented_map_consumers.rs:468` and `crates/custodian/tests/segmented_map_consumers.rs:498`, while inode naming is supported only by code-read at `crates/custodian/src/gc.rs:458` and `crates/custodian/src/scrub.rs:224`, so an audit regression would pass.; C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) FAILED (gating) — xtask: `cargo deny check` failed with exit status: 1; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 19 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/development/wyrd/wyrd-pdca/results/issue.
+- By / date: auto-iterate / 2026-07-31
+
+## 10. Act candidates (hints for the next Act review)
+- (empty is the common case)

@@ -1,0 +1,15 @@
+Review of issue #635: add the persistent segmented chunk-map shape, staged publisher, and shared resolution path for all chunk-map consumers.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The acceptance boundary is explicit and testable: preserve legacy array bytes, reject malformed segmented shapes at decode, and resolve every consumer (`crates/core/src/metadata.rs:990`). |
+| C2 Reproduction (red pre-fix) | PASS | The binding regression is causal: on the exact base its nine tests all failed assertions, while the patch makes all nine pass (`crates/custodian/tests/segmented_map_consumers.rs:510`). |
+| C3 Change | PASS | The change stays inside the declared data/docs/test slice and centralizes maintenance resolution without expanding into the multipart protocol or session model (`crates/custodian/src/resolve.rs:53`). |
+| C4 Verification (red→green) | PASS | Independent red→green was 9 failures→9 passes; CI constituents, conformance, statics, DST, and cargo-deny all passed after moving cargo-deny's read-only advisory-cache lock into scratch (`crates/custodian/tests/segmented_map_consumers.rs:510`). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | The rebuild must authenticate every trusted durable segment, not only `resume_from - 1`: a same-length earlier-ID change committed a mixed old/new map because segment boundaries stayed unchanged (`crates/core/src/metadata.rs:2997`). |
+| T1 Structure | PASS | One core resolver owns flat/segmented semantics and the custodian adapter preserves live-generation identity, avoiding consumer-specific interpretation (`crates/core/src/metadata.rs:2198`). |
+| T2 Shape | PASS | The persisted shape preserves legacy-array identity and validates count, order, and contiguous spans during decode, protecting bytewise CAS compatibility (`crates/core/src/metadata.rs:976`). |
+| T3 Runtime | NEEDS-HUMAN | The maintainer must accept landing a `Completing`-less precursor committer before #636 supplies the real session fence — this determines whether an otherwise unreachable persistence API should ship now (`crates/core/src/metadata.rs:2540`). |
+| T4 Contribution | NEEDS-HUMAN | A human must inspect and triage the reported six batch-review items — the target lacks `scripts/review-branch` and its output is unavailable, so their novelty and validity cannot be independently settled; affected-path prior art was mechanically clear. |
+| T5 Judgment | NEEDS-HUMAN [impl] | The rebuild must add allocator-boundary coverage: all three independently rerun survivors replace the `< 2^64` comparator, so the tests do not protect the ID-space boundary whose failure can undercount or misclassify persisted IDs (`crates/core/src/metadata.rs:3473`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | The maintainer must decide whether this fixed on-disk encoding and precursor API are fit for the >10 GiB roadmap before #636 creates segmented maps — the choice locks durable compatibility for later writers (`docs/design/architecture/08-crosscutting-concepts.md:83`). |
