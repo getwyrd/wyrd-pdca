@@ -45,7 +45,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-from . import brief, lane, progress, state, worktree
+from . import brief, lane, progress, scratch, state, worktree
 from .config import Config
 
 # A gate that cannot RUN its mechanical check (vs. running and failing) declares so:
@@ -342,7 +342,13 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
                                        worktree_path=wt,
                                        default_timeout_secs=cfg.gates_default_timeout_secs,
                                        confirm_fail=cfg.gates_confirm_fail,
-                                       persist_logs=persist_logs))
+                                       persist_logs=persist_logs,
+                                       # This bundle's scratch (#200). Resolved HERE, where
+                                       # cfg is in scope: _run_one deliberately takes no
+                                       # Config, and a gate shells out to cargo/make, whose
+                                       # own temp files must land in the bundle's dir too.
+                                       scratch_env=(scratch.env_for(cfg, bundle)
+                                                    if bundle is not None else {})))
     finally:
         if ovf_primary is not None and wt is not None:
             worktree.overflow_remove(ovf_primary, wt)
@@ -396,7 +402,8 @@ def _timeout_for(chk: dict, default_secs: int) -> int | None:
 
 def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
              worktree_path: Path | None = None, default_timeout_secs: int = 0,
-             confirm_fail: bool = True, persist_logs: bool = True) -> dict:
+             confirm_fail: bool = True, persist_logs: bool = True,
+             scratch_env: dict | None = None) -> dict:
     cmd, cmd_error = _delegated_cmd(chk, runner)
     gating = bool(chk.get("gating", True))
     label = f"{chk.get('id', '')}: {chk.get('label', '')}".strip(": ")
@@ -411,7 +418,8 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
             "fail", oracle=chk.get("subcmd", "") or cmd, rule_id=chk.get("id", ""),
             path_line=cmd_error[:120], gating=gating, element=chk.get("tier", ""),
         )
-    env = {"PDCA_BUNDLE": str(bundle)} if bundle is not None else None
+    env = ({**(scratch_env or {}), "PDCA_BUNDLE": str(bundle)}
+           if bundle is not None else (dict(scratch_env) if scratch_env else None))
     # Worktree isolation (issue #94): the tree Do edited; a gate cmd targets $PDCA_WORKTREE.
     if worktree_path is not None:
         env = {**(env or {}), "PDCA_WORKTREE": str(worktree_path)}
