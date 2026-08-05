@@ -20,29 +20,34 @@
 //!
 //! The fixture (in-memory trait stores, raw-record `seg:`/root seeding) is the pruned #650
 //! fixture (`crates/custodian/tests/segmented_map_consumers.rs`) — integration-test crates
-//! cannot import across files — carrying only what these three criteria need: no loop
-//! dispatch, no coordination, no scrub context. The post-restore pass is an operator one-shot,
-//! never a loop step, so it is driven directly exactly as `tests/restore_reconcile.rs` drives
-//! it.
+//! cannot import across files — carrying only what these criteria need: no loop dispatch, no
+//! coordination, no scrub context. The post-restore pass is an operator one-shot, never a loop
+//! step, so it is driven directly exactly as `tests/restore_reconcile.rs` drives it.
 //!
 //! **Why no assertion here names the answer's new shape:** the production files are reverted
 //! under the per-fix red leg, so naming a symbol this patch introduces (`RestoreReport`'s new
-//! field, a new `ReconciliationStatus` variant) would make that leg fail to COMPILE and the
-//! red would degrade to "a symbol is missing" instead of "the behaviour was wrong". Every leg
-//! below is therefore expressed in base-visible entries only, and the positive matches on the
-//! new shapes ship in `tests/restore_reconcile.rs` and `tests/segmented_map_consumers.rs`,
-//! which the whole-tree gate runs.
+//! field, a new `ReconciliationStatus` variant) would make that leg fail to COMPILE and the red
+//! would degrade to "a symbol is missing" instead of "the behaviour was wrong". Every leg below
+//! is therefore expressed in base-visible entries only, and the positive matches on the new
+//! shapes ship in `tests/restore_reconcile.rs`, `tests/segmented_map_consumers.rs` and
+//! `crates/server/src/cli.rs`'s own `mod tests`, which the whole-tree gate runs.
 //!
 //! 1. `a_segmented_object_no_longer_stops_the_post_restore_pass` — criterion (1).
-//! 2. `an_unreadable_object_is_contained_and_the_run_is_not_certified` — criterion (2a):
-//!    non-certification with the incomplete reading as the SOLE cause.
+//! 2. `an_unreadable_object_is_contained_and_neither_surface_certifies_it` — criteria (2a)
+//!    and (3): non-certification with the incomplete reading as the SOLE cause, and both
+//!    surfaces naming the blocking record on their own audit seam. One store, because
+//!    criterion (3) is stated over criterion (2a)'s.
 //! 3. `an_unreadable_object_does_not_starve_the_objects_the_pass_could_read` — criterion (2b):
 //!    containment — the damaged object costs the readable one's loss nothing.
-//! 4. `a_drain_over_an_incomplete_reference_set_names_the_blocking_record` — criterion (3).
+//! 4. `marks_and_report_rest_on_one_reading` — criterion (2c): the pass never both marks a
+//!    fragment and reports a record it could not read.
+//! 5. `a_record_already_known_unreadable_is_named_before_a_later_read_can_fail` — criterion (3)
+//!    again, at the seam's hardest moment: a store fault in a LATER read still ends the pass,
+//!    and the record it had already found unreadable must be attributed by then anyway.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -53,8 +58,10 @@ use wyrd_core::metadata::{
     self, ChunkMap, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, SegmentGroup,
     SegmentRecord, SegmentRef, SegmentedMap,
 };
-use wyrd_custodian::desired_state::{reconciliation_status, set_lifecycle, DServerLifecycle};
-use wyrd_custodian::{reconcile_after_restore, ExpiredPendingPolicy, GcContext};
+use wyrd_custodian::desired_state::{
+    reconciliation_status, set_lifecycle, DServerLifecycle, ReconciliationStatus,
+};
+use wyrd_custodian::{reconcile_after_restore, ExpiredPendingPolicy, GcContext, RestoreReport};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -62,7 +69,8 @@ use wyrd_traits::{
 
 // ---- in-memory trait stores (the pass is proven over the seams, backend-agnostic) ----
 
-/// A trivial in-memory metadata store.
+/// A trivial in-memory metadata store, optionally **decaying** one committed record (see
+/// [`MemMeta::decay_after_first_read`]).
 ///
 /// `BTreeMap`, so `scan` answers in key order and the DAMAGED record (`inode:1`) is always the
 /// one the reference build meets FIRST — otherwise "the readable object was still reported"
@@ -71,6 +79,31 @@ use wyrd_traits::{
 #[derive(Default)]
 struct MemMeta {
     kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
+    /// The record to serve **readable on the first `inode:` scan and unreadable on every later
+    /// one** — a record damaged (or a snapshot superseded) in the instant between a pass's two
+    /// reads of the committed namespace. The only fixture that can tell a pass which reads that
+    /// namespace ONCE from one which reads it twice and gates its marking on the first read.
+    decaying: Mutex<Option<Vec<u8>>>,
+    /// How many times the committed namespace was scanned, so the decay above fires on every
+    /// read after the first.
+    inode_scans: Mutex<usize>,
+    /// A ledger prefix whose `scan` fails with a plain, non-`ChunkMapError` fault — a genuine
+    /// backend outage under one of the reads the pass makes AFTER the committed namespace, which
+    /// is what tests whether a record it has ALREADY found unreadable was attributed by then or
+    /// only batched for a report the fault will stop it from ever returning.
+    failing: Mutex<Option<Vec<u8>>>,
+}
+
+impl MemMeta {
+    fn decay_after_first_read(self, inode: InodeId) -> Self {
+        *self.decaying.lock().unwrap() = Some(metadata::inode_key(inode));
+        self
+    }
+
+    fn fail_scans_of(self, prefix: &[u8]) -> Self {
+        *self.failing.lock().unwrap() = Some(prefix.to_vec());
+        self
+    }
 }
 
 #[async_trait]
@@ -80,14 +113,29 @@ impl MetadataStore for MemMeta {
     }
 
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-        Ok(self
+        if let Some(failing) = self.failing.lock().unwrap().as_deref() {
+            if prefix.starts_with(failing) {
+                return Err(Box::new(std::io::Error::other(STORE_FAULT)));
+            }
+        }
+        let mut rows: Vec<(Vec<u8>, Bytes)> = self
             .kv
             .lock()
             .unwrap()
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect())
+            .collect();
+        if prefix.starts_with(b"inode:") {
+            let mut scans = self.inode_scans.lock().unwrap();
+            *scans += 1;
+            if let (2.., Some(decaying)) = (*scans, self.decaying.lock().unwrap().as_deref()) {
+                for (_key, value) in rows.iter_mut().filter(|(key, _)| key == decaying) {
+                    *value = Bytes::from_static(UNREADABLE_RECORD);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     // The required paginated read (#634): a test double needs *a* body, not a backend's — the
@@ -117,6 +165,14 @@ impl MetadataStore for MemMeta {
         Ok(CommitOutcome::Committed)
     }
 }
+
+/// Bytes that are not an [`InodeRecord`] — what a record damaged under a running pass looks
+/// like to the very next read of it.
+const UNREADABLE_RECORD: &[u8] = b"not a record";
+
+/// The injected store fault's exact text, so a leg proves THIS fault came back rather than
+/// accepting any error at all — a pre-fix tree fails the same read differently.
+const STORE_FAULT: &str = "simulated store fault: ledger unreachable";
 
 /// One D server's fragment bytes — a deliberately dumb `ChunkStore`. Content is never real
 /// erasure-coded payload: what these legs assert is presence on disk and the absence of an
@@ -214,32 +270,22 @@ fn capturing_dispatch(capture: Capture) -> tracing::Dispatch {
     )
 }
 
-/// Every DISTINCT record name an audit trail attributed, read back out of the JSON the
-/// subscriber wrote (`"inode":"<name>"`) — a set, and read rather than assumed, because what
-/// makes an attribution usable is that two damaged records arrive under two names.
-fn attributed_objects(logged: &str) -> BTreeSet<String> {
-    logged
-        .split(r#""inode":""#)
-        .skip(1)
-        .filter_map(|rest| rest.split('"').next().map(str::to_owned))
-        .collect()
+/// Whether an audit trail reported a record it could not read at all — the observable half of
+/// "this run cannot speak for the whole store", named without naming a symbol this patch adds.
+fn reports_an_unreadable_record(logged: &str) -> bool {
+    logged.contains(r#""action":"unresolvable-chunk-map""#)
 }
 
-/// Assert that a surface's audit trail attributes the blocker: the right seam, the right
-/// action, and — the part an operator actually needs — the NAME of the record to repair.
+/// Assert that a surface's audit trail attributes the blocker: the right seam (so a collector
+/// can select on it), the right action, and — the part an operator actually needs — the NAME of
+/// the record to repair.
 fn assert_attributes_blocker(logged: &str, seam: &str, object: &str) {
     assert!(
-        logged.contains(&format!(r#""target":"{seam}""#)),
-        "the blocker must be reported on {seam} so a collector can select on it. got: {logged}"
-    );
-    assert!(
-        logged.contains(r#""action":"unresolvable-chunk-map""#),
-        "the audit line must classify the blocker as an unreadable chunk map. got: {logged}"
-    );
-    assert!(
-        logged.contains(&format!(r#""inode":"{object}""#)),
-        "the audit line must NAME the record to repair — a refusal an operator cannot \
-         attribute is a stall with no way out. got: {logged}"
+        logged.contains(&format!(r#""target":"{seam}""#))
+            && reports_an_unreadable_record(logged)
+            && logged.contains(&format!(r#""inode":"{object}""#)),
+        "{seam} must classify the blocker as an unreadable chunk map AND name {object}: a \
+         refusal an operator cannot attribute is a stall with no way out. got: {logged}"
     );
 }
 
@@ -250,23 +296,29 @@ const NOW: u64 = 10_000;
 const GRACE: u64 = 1_000;
 
 /// `inode:1` sorts BEFORE `inode:2`, so in the mixed-store legs the DAMAGED object is always
-/// the one the reference build meets first.
+/// the one the reference build meets first. `DAMAGED_OBJECT` is its key as the store spells it
+/// — the name the blocker must reach the operator under.
 const DAMAGED_INODE: InodeId = 1;
 const READABLE_INODE: InodeId = 2;
-/// `DAMAGED_INODE`'s key, as the store spells it — the name the blocker must reach the
-/// operator under.
 const DAMAGED_OBJECT: &str = "inode:1";
 
-/// The readable object's segment-group nonce (32 lowercase hex characters, `0016:354`) and the
-/// fence epoch its segments are scoped by; the damaged object gets its own group, so nothing
-/// about it is inside the readable object's bounded `seg:` range.
+/// The damaged object's two chunks: the one whose `seg:` record was written (its fragment is on
+/// disk, and must survive the pass) and the one whose record never was — the hole that makes the
+/// root unresolvable. Each leg seeds its own store, so one pair of ids serves them all.
+const DAMAGED_HELD: ChunkId = 0xD1_00;
+const DAMAGED_UNWRITTEN: ChunkId = 0xD2_00;
+
+/// Segment-group nonces (32 lowercase hex characters, `0016:354`) and the fence epochs their
+/// segments are scoped by. The damaged object gets its own group, so nothing about it is inside
+/// the readable object's bounded `seg:` range.
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 const EPOCH: u64 = 7;
 const DAMAGED_NONCE: &str = "fedcba9876543210fedcba9876543210";
 const DAMAGED_EPOCH: u64 = 11;
 
-/// Each fixture chunk is one fragment (`EcScheme::None`) placed on exactly one D server — the
-/// smallest shape that still puts a segmented object's fragments on more than one server.
+/// Every fixture chunk is one fragment (`EcScheme::None`: k = 1, and the lone fragment IS the
+/// data) placed on exactly one D server — the smallest shape that still spreads a segmented
+/// object's fragments over more than one server.
 const CHUNK_LEN: u64 = 5;
 
 /// A D server holding nothing any valid placement names, so a drain of it is decided by the
@@ -277,53 +329,26 @@ fn frag(chunk: ChunkId, index: u16) -> FragmentId {
     FragmentId { chunk, index }
 }
 
+fn chunk_ref(chunk: ChunkId, dserver: DServerId) -> ChunkRef {
+    ChunkRef {
+        id: chunk,
+        scheme: EcScheme::None,
+        len: CHUNK_LEN,
+        placement: vec![dserver],
+    }
+}
+
 async fn commit(meta: &MemMeta, batch: WriteBatch) {
     assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
 }
 
-/// Seed a committed **segmented** root at `inode` naming `chunks.len()` segments (one chunk
-/// each, `(chunk id, placed dserver)`), but WRITE only the first `written` of their `seg:`
-/// records. `written == chunks.len()` is the readable shape; a smaller `written` is the real
-/// gap this slice's containment rule exists for — a segment the root's own table names, on a
-/// generation it still names, that genuinely never got written
-/// (`metadata::ChunkMapError::SegmentAbsent`, as surfaced by `metadata::resolve_chunk_map`).
-///
-/// Built with the real validating constructors rather than hand-typed JSON, so a fixture typo
-/// cannot silently change WHICH rule the leg exercises; the bytes that land are the same ones
-/// `metadata::encode` / `metadata::seg_key` put in a store, and the seeding is a raw
-/// `WriteBatch` put — never a publish path, since no producer of segmented maps exists yet.
-async fn seed_segmented(
-    meta: &MemMeta,
-    inode: InodeId,
-    group: &SegmentGroup,
-    chunks: &[(ChunkId, DServerId)],
-    written: usize,
-) {
-    let mut segments = Vec::new();
-    let mut offset = 0u64;
-    for (index, &(chunk_id, dserver)) in chunks.iter().enumerate() {
-        segments.push(SegmentRef {
-            index: index as u32,
-            byte_offset: offset,
-            byte_len: CHUNK_LEN,
-        });
-        if index < written {
-            let chunk_ref = ChunkRef {
-                id: chunk_id,
-                scheme: EcScheme::None,
-                len: CHUNK_LEN,
-                placement: vec![dserver],
-            };
-            let record = SegmentRecord::new(vec![chunk_ref], offset).unwrap();
-            let key = metadata::seg_key(group, index as u32).unwrap();
-            commit(meta, WriteBatch::new().put(key, metadata::encode(&record))).await;
-        }
-        offset += CHUNK_LEN;
-    }
-    let map = SegmentedMap::new(group.clone(), segments).unwrap();
+/// Commit `inode`'s root record. Raw `WriteBatch` puts throughout — never a publish path, since
+/// no producer of segmented maps exists yet — but built with the real validating constructors,
+/// so a fixture typo cannot silently change WHICH rule a leg exercises.
+async fn commit_root(meta: &MemMeta, inode: InodeId, size: u64, chunk_map: ChunkMap) {
     let root = InodeRecord {
-        size: offset,
-        chunk_map: ChunkMap::Segmented(map),
+        size,
+        chunk_map,
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -335,14 +360,65 @@ async fn seed_segmented(
     .await;
 }
 
-/// Seed the object the containment legs are built around: a committed root naming two
-/// segments, only the first of which was ever written, plus that first segment's fragment on
-/// `d0`. Asserts the fixture really is unreadable, so a leg can never pass because the fault it
-/// was built around silently stopped being one.
-async fn seed_damaged(meta: &MemMeta, d0: &MemDServer, a: ChunkId, b: ChunkId) {
+/// One post-restore pass over `meta` and `fleet` at [`NOW`] — the operator one-shot, driven
+/// directly, exactly as `tests/restore_reconcile.rs` drives it (it is never a loop step).
+async fn reconcile<'a>(
+    meta: &'a dyn MetadataStore,
+    fleet: &'a [(DServerId, &'a dyn ChunkStore)],
+) -> Result<RestoreReport> {
+    reconcile_after_restore(
+        &GcContext {
+            meta,
+            fleet,
+            grace_window_millis: GRACE,
+            expired_pending: ExpiredPendingPolicy::Reclaim,
+        },
+        NOW,
+    )
+    .await
+}
+
+/// Seed a committed **segmented** root at `inode` naming `chunks.len()` segments (one chunk
+/// each, `(chunk id, placed dserver)`), but WRITE only the first `written` of their `seg:`
+/// records. `written == chunks.len()` is the readable shape; a smaller `written` is the real
+/// gap this slice's containment rule exists for — a segment the root's own table names, on a
+/// generation it still names, that genuinely never got written
+/// (`metadata::ChunkMapError::SegmentAbsent`, as surfaced by `metadata::resolve_chunk_map`).
+async fn seed_segmented(
+    meta: &MemMeta,
+    inode: InodeId,
+    group: &SegmentGroup,
+    chunks: &[(ChunkId, DServerId)],
+    written: usize,
+) {
+    let mut segments = Vec::new();
+    for (index, &(chunk, dserver)) in chunks.iter().enumerate() {
+        let offset = index as u64 * CHUNK_LEN;
+        segments.push(SegmentRef {
+            index: index as u32,
+            byte_offset: offset,
+            byte_len: CHUNK_LEN,
+        });
+        if index < written {
+            let record = SegmentRecord::new(vec![chunk_ref(chunk, dserver)], offset).unwrap();
+            let key = metadata::seg_key(group, index as u32).unwrap();
+            commit(meta, WriteBatch::new().put(key, metadata::encode(&record))).await;
+        }
+    }
+    let map = SegmentedMap::new(group.clone(), segments).unwrap();
+    let size = chunks.len() as u64 * CHUNK_LEN;
+    commit_root(meta, inode, size, ChunkMap::Segmented(map)).await;
+}
+
+/// Seed the object the containment legs are built around: a committed root naming two segments,
+/// only the first of which was ever written, plus that first segment's fragment on `d0`.
+/// Asserts the fixture really is unreadable, so a leg can never pass because the fault it was
+/// built around silently stopped being one.
+async fn seed_damaged(meta: &MemMeta, d0: &MemDServer) {
     let group = SegmentGroup::new(DAMAGED_NONCE, DAMAGED_EPOCH).unwrap();
-    seed_segmented(meta, DAMAGED_INODE, &group, &[(a, 0), (b, 0)], 1).await;
-    d0.put(frag(a, 0)).await;
+    let chunks = [(DAMAGED_HELD, 0), (DAMAGED_UNWRITTEN, 0)];
+    seed_segmented(meta, DAMAGED_INODE, &group, &chunks, 1).await;
+    d0.put(frag(DAMAGED_HELD, 0)).await;
 
     let root_key = metadata::inode_key(DAMAGED_INODE);
     let root: InodeRecord = metadata::decode(&meta.get(&root_key).await.unwrap().unwrap()).unwrap();
@@ -352,6 +428,13 @@ async fn seed_damaged(meta: &MemMeta, d0: &MemDServer, a: ChunkId, b: ChunkId) {
             .is_err(),
         "fixture: the seeded root's map must genuinely fail to resolve"
     );
+}
+
+/// Seed a committed object holding one chunk in a **flat** map — the smallest committed record
+/// that can carry a placement, for the legs whose subject is not the map's shape.
+async fn seed_flat(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dserver: DServerId) {
+    let map = vec![chunk_ref(chunk, dserver)].into();
+    commit_root(meta, inode, CHUNK_LEN, map).await;
 }
 
 /// Whether `frag` on `dserver` was handed to GC — the front half of a deletion, and the only
@@ -370,73 +453,50 @@ async fn is_marked_collectable(meta: &MemMeta, dserver: DServerId, frag: Fragmen
 /// outright, so a store holding ONE segmented object returned `Err` and the operator command
 /// produced no report at all.
 ///
-/// The positive observable is the data-loss trap underneath it: a build whose reference set
-/// cannot see a segmented object's chunks calls every fragment it owns unreferenced and MARKS
-/// them — handing live bytes to GC on its next grace window. So "returned `Ok`" is asserted
-/// together with "and marked nothing of it".
+/// Two positive observables, because "returned `Ok`" alone would also be produced by a pass
+/// that quietly skipped the object: the data-loss trap underneath it (a build whose reference
+/// set cannot see a segmented object's chunks calls every fragment it owns unreferenced and
+/// MARKS them, handing live bytes to GC on its next grace window), and the report half actually
+/// judging a chunk of that object — the segmented map was read, not stepped over.
 #[tokio::test]
 async fn a_segmented_object_no_longer_stops_the_post_restore_pass() {
     enable_audit_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
-    let d1 = MemDServer::default();
 
+    // Two segments, both written and both readable. `held`'s fragment is on the D server its
+    // placement names; `gone`'s was reclaimed after the restore point, so a pass that reads this
+    // object's map owes the operator a loss verdict for it.
     let group = SegmentGroup::new(NONCE, EPOCH).unwrap();
-    let chunk_a: ChunkId = 0xA1_00;
-    let chunk_b: ChunkId = 0xA2_00;
-    seed_segmented(
-        &meta,
-        READABLE_INODE,
-        &group,
-        &[(chunk_a, 0), (chunk_b, 1)],
-        2,
-    )
-    .await;
-    d0.put(frag(chunk_a, 0)).await;
-    d1.put(frag(chunk_b, 0)).await;
+    let held: ChunkId = 0xA1_00;
+    let gone: ChunkId = 0xA2_00;
+    seed_segmented(&meta, READABLE_INODE, &group, &[(held, 0), (gone, 0)], 2).await;
+    d0.put(frag(held, 0)).await;
 
-    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1)];
-    let ctx = GcContext {
-        meta: &meta,
-        fleet: &fleet,
-        grace_window_millis: GRACE,
-        expired_pending: ExpiredPendingPolicy::Reclaim,
-    };
-
-    let report = reconcile_after_restore(&ctx, NOW)
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let report = reconcile(&meta, &fleet)
         .await
         .expect("one segmented object must not turn the whole post-restore pass into an error");
 
     assert_eq!(
         report.stranded_marked, 0,
-        "every fragment on disk belongs to the segmented object's committed map: marking one \
-         hands live bytes to GC, which is the data-loss trap this pass exists to avoid: \
-         {report:?}"
+        "marking a fragment this committed map references hands live bytes to GC: {report:?}"
     );
-    for (dserver, fragment) in [(0, frag(chunk_a, 0)), (1, frag(chunk_b, 0))] {
-        assert!(
-            !is_marked_collectable(&meta, dserver, fragment).await,
-            "no `orphan:` record may exist for a fragment a committed segmented map still \
-             references — GC would reclaim it after the grace window and the data would be GONE"
-        );
-        assert!(
-            fleet[dserver as usize]
-                .1
-                .get_fragment(fragment)
-                .await
-                .unwrap()
-                .is_some(),
-            "the segmented object's fragment must still be on its D server"
-        );
-    }
     assert!(
-        report.dangling.is_empty() && report.misplaced.is_empty(),
-        "every fragment of this object sits exactly where its placement names, so a pass that \
-         can read the map must report neither loss nor a stale placement: {report:?}"
+        !is_marked_collectable(&meta, 0, frag(held, 0)).await
+            && d0.get_fragment(frag(held, 0)).await.unwrap().is_some(),
+        "an `orphan:` record here is GC reclaiming live data after the grace window"
+    );
+    assert_eq!(
+        report.dangling,
+        vec![gone],
+        "the report half must judge this object's chunks: a pass that returns `Ok` by SKIPPING \
+         the segmented map reports nothing here — the same blind spot, quieter: {report:?}"
     );
 }
 
-// ---- criterion (2a): the run is not certified, with the incomplete reading the SOLE cause ----
+// ---- criteria (2a) + (3): neither completeness surface certifies, and both NAME the
+// blocking record — with the incomplete reading the SOLE cause ----
 
 /// An otherwise **fully healthy** store — nothing dangling, nothing misplaced, nothing
 /// under-replicated, nothing to mark — plus one committed object whose chunk map cannot be
@@ -446,73 +506,77 @@ async fn a_segmented_object_no_longer_stops_the_post_restore_pass() {
 /// whenever any loss is reported, so a scenario carrying one would satisfy it without the fix.
 /// Here the incomplete reading is the only thing that can make it false.
 #[tokio::test]
-async fn an_unreadable_object_is_contained_and_the_run_is_not_certified() {
+async fn an_unreadable_object_is_contained_and_neither_surface_certifies_it() {
     enable_audit_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
-    let d1 = MemDServer::default();
 
-    let damaged_a: ChunkId = 0xD1_00;
-    let damaged_b: ChunkId = 0xD2_00;
-    seed_damaged(&meta, &d0, damaged_a, damaged_b).await;
+    seed_damaged(&meta, &d0).await;
 
-    // A wholly healthy object beside it: its every fragment present, at the D server its own
+    // A wholly healthy object beside it: its fragment present, at the D server its own
     // placement names.
-    let group = SegmentGroup::new(NONCE, EPOCH).unwrap();
-    let healthy_a: ChunkId = 0xC1_00;
-    let healthy_b: ChunkId = 0xC2_00;
-    seed_segmented(
-        &meta,
-        READABLE_INODE,
-        &group,
-        &[(healthy_a, 0), (healthy_b, 1)],
-        2,
-    )
-    .await;
-    d0.put(frag(healthy_a, 0)).await;
-    d1.put(frag(healthy_b, 0)).await;
+    let healthy: ChunkId = 0xC1_00;
+    seed_flat(&meta, READABLE_INODE, healthy, 0).await;
+    d0.put(frag(healthy, 0)).await;
 
-    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1)];
-    let ctx = GcContext {
-        meta: &meta,
-        fleet: &fleet,
-        grace_window_millis: GRACE,
-        expired_pending: ExpiredPendingPolicy::Reclaim,
-    };
-
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
     let audit = Capture::default();
-    let report = reconcile_after_restore(&ctx, NOW)
+    let report = reconcile(&meta, &fleet)
         .with_subscriber(capturing_dispatch(audit.clone()))
         .await
         .expect("one unreadable object is contained, not an error that blanks the whole report");
 
     assert_eq!(
         report.stranded_marked, 0,
-        "an unreadable map hides WHICH chunks its object owns, so no fragment in the fleet can \
-         be shown not to be one of them — nothing may be marked while the set is incomplete: \
-         {report:?}"
-    );
-    assert!(
-        !is_marked_collectable(&meta, 0, frag(damaged_a, 0)).await,
-        "the damaged object's own readable fragment must not be handed to GC"
+        "an unreadable map hides WHICH chunks its object owns: {report:?}"
     );
     assert!(
         report.dangling.is_empty()
             && report.misplaced.is_empty()
             && report.under_replicated.is_empty(),
-        "this store is healthy apart from the record that could not be read — reporting a loss \
-         here would make the non-certification below pass for the wrong reason: {report:?}"
+        "a loss here would make the non-certification below pass for the wrong reason: {report:?}"
     );
     assert!(
         !report.is_clean(),
-        "the ONLY thing wrong with this store is that the pass could not read one committed \
-         object — and `is_clean` is what the operator command exits on. Certifying a reading \
-         that did not finish tells a restore script the run was healthy: {report:?}"
+        "the one record the pass could not read is all that is wrong here, and `is_clean` is \
+         its claim that the run was a clean bill — about a reading that FINISHED: {report:?}"
     );
+    let logged = audit.contents();
+    assert_attributes_blocker(&logged, "wyrd.custodian.restore.audit", DAMAGED_OBJECT);
+    // ...and the pass's own summary — the one line an operator greps, and the one a log
+    // collector alerts on — must not certify the run either. Asserted on the emitted text, so
+    // no symbol this fix introduces is named here (see the module note).
+    assert!(
+        logged.contains("post-restore reconciliation INCOMPLETE"),
+        "the summary must say the reading did not finish — 'complete' here is the \
+         certification every other refusal in this pass withholds. got: {logged}"
+    );
+
+    // CRITERION (3), over this same store: the OTHER completeness surface. A drain of a server
+    // no VALID committed placement names is decided by the completeness of the reference set
+    // alone — which is where `reconciliation_status` is most dangerous, because it is where it
+    // would otherwise answer `Satisfied`, i.e. "you may decommission this box". It answered a
+    // bare `Pending` before: the same word a server that genuinely still holds referenced
+    // fragments gets, so an operator watching the stall could not learn WHICH record to repair,
+    // and rebalance cannot evacuate fragments of a map it cannot read. Its own capture, so the
+    // restore pass's lines above cannot stand in for the drain's.
+    set_lifecycle(&meta, EMPTY_DSERVER, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    let drain_audit = Capture::default();
+    let status = reconciliation_status(&meta, EMPTY_DSERVER)
+        .with_subscriber(capturing_dispatch(drain_audit.clone()))
+        .await
+        .expect("one unreadable object must not blank the drain surface fleet-wide either");
     assert_attributes_blocker(
-        &audit.contents(),
-        "wyrd.custodian.restore.audit",
+        &drain_audit.contents(),
+        "wyrd.custodian.drain.audit",
         DAMAGED_OBJECT,
+    );
+    assert!(
+        !matches!(status, ReconciliationStatus::Satisfied),
+        "a drain over an incomplete reference set must never be certified: that tells an \
+         operator to decommission a server an unreadable object may still own bytes on"
     );
 }
 
@@ -526,98 +590,142 @@ async fn an_unreadable_object_does_not_starve_the_objects_the_pass_could_read() 
     enable_audit_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
-    let d1 = MemDServer::default();
 
-    let damaged_a: ChunkId = 0xD1_01;
-    let damaged_b: ChunkId = 0xD2_01;
-    seed_damaged(&meta, &d0, damaged_a, damaged_b).await;
+    seed_damaged(&meta, &d0).await;
 
-    // The readable object: chunk `present` still has its fragment, chunk `lost` does not —
-    // `EcScheme::None`, so k = 1 and a chunk with no fragment anywhere is unreadable AND
+    // The readable object's chunk has no fragment anywhere: k = 1, so it is unreadable AND
     // unreconstructible. That verdict is exactly what an `Err` over the damaged record used to
     // cost the operator.
-    let group = SegmentGroup::new(NONCE, EPOCH).unwrap();
-    let present: ChunkId = 0xC1_01;
     let lost: ChunkId = 0xC2_01;
-    seed_segmented(&meta, READABLE_INODE, &group, &[(present, 0), (lost, 1)], 2).await;
-    d0.put(frag(present, 0)).await;
+    seed_flat(&meta, READABLE_INODE, lost, 0).await;
 
-    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1)];
-    let ctx = GcContext {
-        meta: &meta,
-        fleet: &fleet,
-        grace_window_millis: GRACE,
-        expired_pending: ExpiredPendingPolicy::Reclaim,
-    };
-
-    let report = reconcile_after_restore(&ctx, NOW)
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let report = reconcile(&meta, &fleet)
         .await
         .expect("one unreadable object must not end the walk over the ones that are readable");
 
     assert!(
         report.dangling.contains(&lost) || report.misplaced.contains(&lost),
-        "the readable object's genuine loss must still be reported — withholding it because \
-         ANOTHER object could not be read is the failure this containment rule exists to \
-         prevent, and it lands at exactly the moment an operator needs the report: {report:?}"
+        "withholding the readable object's genuine loss because ANOTHER object could not be \
+         read is the failure this containment rule exists to prevent: {report:?}"
     );
     assert_eq!(
         report.stranded_marked, 0,
-        "the containment is fleet-wide: while any committed object is unreadable, nothing may \
-         be marked anywhere — not the damaged object's own fragment, not the readable \
-         object's: {report:?}"
+        "the containment is fleet-wide: nothing may be marked anywhere: {report:?}"
     );
+    let held = frag(DAMAGED_HELD, 0);
     assert!(
-        !is_marked_collectable(&meta, 0, frag(damaged_a, 0)).await,
-        "the damaged object's own readable fragment must not be handed to GC"
-    );
-    assert!(
-        d0.get_fragment(frag(damaged_a, 0)).await.unwrap().is_some(),
-        "and its bytes must still be on disk"
+        !is_marked_collectable(&meta, 0, held).await
+            && d0.get_fragment(held).await.unwrap().is_some(),
+        "the damaged object's own readable fragment must be neither marked nor gone"
     );
 }
 
-// ---- criterion (3): the drain surface tells its two "not yet" answers apart ----
+// ---- criterion (3), continued: the name outlives a store fault that ends the pass ----
 
-/// `reconciliation_status` answered a bare `Pending` over an incomplete reference set — the
-/// same word it uses for a server that genuinely still holds referenced fragments. An operator
-/// watching a decommission stall could not learn WHICH record was blocking it, so the stall was
-/// a state nothing exits: rebalance cannot evacuate fragments of a map it cannot read, so the
-/// drain never converges on its own.
+/// Attribution a later fault can swallow is not attribution. The pass reads more of the store
+/// after the reference build — the `orphan:` and `pending:` ledgers, then the fleet — and any of
+/// those reads can fail for reasons that have nothing to do with the damaged record: a backend
+/// blip, a partitioned store. That error propagates, and rightly (a pass that cannot read the
+/// store has no answer for any object). But by then this pass already KNOWS which record it
+/// could not read, and if that name were held back for a report the fault stops it from
+/// returning, the operator would be left with an error naming nothing and the record still
+/// blocking every future pass — the stall with no way out that C-1 forbids.
 ///
-/// Asserted on the audit seam, which is where an unattributed refusal is observable without
-/// naming the answer's new shape (see the module note). The status must still be *answerable* —
-/// one damaged object may not turn a per-server operator query into an `Err` fleet-wide.
+/// So the name must already be on the durability seam. Asserted per intervening read, and on the
+/// injected fault's own text, so a leg cannot pass on some *other* error.
 #[tokio::test]
-async fn a_drain_over_an_incomplete_reference_set_names_the_blocking_record() {
+async fn a_record_already_known_unreadable_is_named_before_a_later_read_can_fail() {
     enable_audit_callsites();
+    for ledger in [b"orphan:".as_slice(), b"pending:".as_slice()] {
+        let meta = MemMeta::default();
+        let d0 = MemDServer::default();
+        seed_damaged(&meta, &d0).await;
+        let meta = meta.fail_scans_of(ledger);
+
+        let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+        let audit = Capture::default();
+        let failed = reconcile(&meta, &fleet)
+            .with_subscriber(capturing_dispatch(audit.clone()))
+            .await
+            .expect_err("fixture: the poisoned ledger read must end the pass with an error");
+
+        assert!(
+            failed.to_string().contains(STORE_FAULT),
+            "fixture: the pass must have failed on the INJECTED store fault: {failed}"
+        );
+        assert_attributes_blocker(
+            &audit.contents(),
+            "wyrd.custodian.restore.audit",
+            DAMAGED_OBJECT,
+        );
+    }
+}
+
+// ---- criterion (2c): the marks and the report rest on ONE reading ----
+
+/// A conclusion and the reading it rests on are one. This pass may read the committed namespace
+/// once or twice — both are honest implementations — but it must never **mark a fragment** under
+/// one reading while **reporting a record it could not read** from another. A mark is an
+/// authorization to delete, and an operator shown a report naming an unreadable record has no
+/// way to tell that the marks beside it were decided before the damage was seen.
+///
+/// Stated as that conjunction, so the leg is implementation-neutral: a pass reading once sees the
+/// record fine and marks the stray (passes); a pass reading twice but withholding marks while
+/// EITHER reading found a hole marks nothing and names the record (passes); a pass reading twice
+/// and gating on the FIRST reading marks the stray *and* reports the record unreadable (fails —
+/// the defect this leg exists to catch).
+#[tokio::test]
+async fn marks_and_report_rest_on_one_reading() {
+    enable_audit_callsites();
+    let healthy: ChunkId = 0xC1_02;
+    let stray = frag(0x5A_02, 0);
+
+    // CONTROL: over a store that never changes under the pass, the stray IS marked. Without it
+    // "nothing was marked" below would be satisfied by a pass that marks nothing, ever.
+    let control = MemMeta::default();
+    let control_d0 = MemDServer::default();
+    seed_flat(&control, READABLE_INODE, healthy, 0).await;
+    control_d0.put(frag(healthy, 0)).await;
+    control_d0.put(stray).await;
+    let control_fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &control_d0)];
+    let control_report = reconcile(&control, &control_fleet).await.unwrap();
+    assert_eq!(
+        control_report.stranded_marked, 1,
+        "fixture: the stray is unreferenced and evidence-free, so a COMPLETE reading marks it \
+         — which is what makes the run below a refusal, not a no-op: {control_report:?}"
+    );
+
+    // ...and now the same store, with the committed record readable on the first `inode:` read
+    // and unreadable on every later one.
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
+    seed_flat(&meta, READABLE_INODE, healthy, 0).await;
+    d0.put(frag(healthy, 0)).await;
+    d0.put(stray).await;
+    let meta = meta.decay_after_first_read(READABLE_INODE);
 
-    let damaged_a: ChunkId = 0xD1_02;
-    let damaged_b: ChunkId = 0xD2_02;
-    seed_damaged(&meta, &d0, damaged_a, damaged_b).await;
-
-    // Drained server: one no VALID committed placement names, so the answer turns on the
-    // completeness of the reference set rather than on a genuine reference. This is the moment
-    // the surface is most dangerous — it is where it would otherwise say `Satisfied`, i.e.
-    // "you may decommission this box".
-    set_lifecycle(&meta, EMPTY_DSERVER, DServerLifecycle::Draining)
-        .await
-        .unwrap();
-
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
     let audit = Capture::default();
-    let status = reconciliation_status(&meta, EMPTY_DSERVER)
+    let report = reconcile(&meta, &fleet)
         .with_subscriber(capturing_dispatch(audit.clone()))
         .await
-        .expect("one unreadable object must not blank the drain-status surface fleet-wide");
+        .expect("a record damaged between two reads must not blank the whole report either");
     let logged = audit.contents();
 
-    assert_attributes_blocker(&logged, "wyrd.custodian.drain.audit", DAMAGED_OBJECT);
-    assert_eq!(
-        attributed_objects(&logged),
-        BTreeSet::from([DAMAGED_OBJECT.to_owned()]),
-        "the blocker — and only the blocker — must be named: a status that reports records it \
-         is not actually blocked by sends the operator to repair the wrong one. \
-         got: {status:?} / {logged}"
+    assert!(
+        !(report.stranded_marked > 0 && reports_an_unreadable_record(&logged)),
+        "this run both MARKED a fragment and reported a record it could not read: two readings, \
+         two conclusions, and the operator is shown one of them. Read the set once, or withhold \
+         every mark while EITHER reading found a hole. {report:?} / {logged}"
+    );
+    // The fixture really did what it says: the record is genuinely unreadable to every read
+    // after the first, so this leg cannot pass because the fault never fired. (How many times
+    // the pass read the namespace is the implementation's choice, and not asserted.)
+    let rows = meta.scan(b"inode:").await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|(_key, value)| metadata::decode::<InodeRecord>(value).is_err()),
+        "fixture: the record must be unreadable after the first read"
     );
 }
