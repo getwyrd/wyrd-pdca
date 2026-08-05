@@ -1,204 +1,254 @@
-# build-notes.md — issue 651 (re-scoped slice 4a of 7)
+# Build notes — issue 651, iteration 14 (Do)
 
-`restore-and-desired-state-contained-and-attributed`, built against **`origin/main` @ `d50f0ca`**
-in `$PDCA_WORKTREE` (`/home/eddie/development/wyrd/wyrd.pdca-wt-l0`). Every `path:line` below is
-that tree **after** the patch unless it says "base".
+> Withheld from the reviewer by the driver; written for the human at sign-off.
 
----
+## What this round is
 
-## 1. What the patch does, in one line per surface
+A **narrow delta on the v13 tree**, not a rebuild. `iteration-v13/patch.diff` was applied to the
+worktree at `origin/main` (`d50f0ca`) and edited. v13's gates were all green — C4-ci pass,
+C4-verify red→green 5/5, C5 38 mutants with no survivor, C5 causal adequacy and T1 PASS — and the
+only failing gate was **T4 batch review, 2 blocking findings**, both the same TEST-GAP:
 
-| Surface | Before (base) | After |
+> `crates/custodian/src/restore.rs:296` / `:585` — *the new concurrent two-scan marking path can
+> authorize GC-visible orphan marks but has only Tokio/in-memory interleaving tests, violating the
+> requirement that new destructive or concurrent paths include seeded Tier-0 DST coverage.*
+
+The iteration-13 carry-forward directs exactly one piece of work: **add that DST leg**, exercising
+"the interleaving the Tokio doubles only approximate", pinning "the brief's own one-reading rule".
+It also directs **not** to chase the advisory reviewer's CLI findings (record-reject them) and
+**not** to reintroduce the dropped ambiguity rule. That is what this round did, and nothing else:
+the production semantics of v13 are unchanged, line for line.
+
+## The delta, in three parts
+
+### 1. The seeded Tier-0 DST leg — property 11 (`crates/dst/tests/custodian.rs:1727-2145`)
+
+Two campaign tests, both declared through `dst_campaign_test!` (so the ADR-0035 determinism
+barrier is unbypassable) and both swept over 50 seeds by `cargo xtask dst` inside `cargo xtask ci`:
+
+- **`restore_two_readings_never_license_a_mark`** (`custodian.rs:2217-2221`) — the seed picks *which*
+  disagreement a genuinely concurrent writer causes and *where* it lands.
+- **`restore_two_readings_cover_the_divergence_window`** (`custodian.rs:2223-2227`) — walks the whole
+  landing span in one run and asserts the window this property exists for is genuinely **reached**.
+- The first is also replayed over the eight committed `REGRESSION_SEEDS`
+  (`custodian.rs:2260`), so a bug-finding seed becomes permanent (ADR-0009).
+
+**Why it is not another Tokio double with a nicer name.** The per-slice tests in
+`crates/custodian/tests` drive the two-scan race through a metadata double that publishes at a
+**hard-coded seam** — the instant the first `inode:` scan is answered
+(`restore_reconcile.rs:44/58/89-95`). They pin the *decision*, but the test chooses the schedule. The
+DST leg changes three things that matter:
+
+- The store is the DST tier's **second `MetadataStore` implementation**, the simulated-TiKV model
+  (`crates/dst/tests/support/mod.rs`), whose every read and commit spans a real madsim await
+  boundary (`network_hop`). An in-memory `MemMeta` never yields, which is *why* a Tokio double can
+  only approximate the race — there is no schedule for the scheduler to pick.
+- The writer is a real concurrent task (`madsim::task::spawn`, `custodian.rs:1947`) whose landing
+  point comes from the run seed, so 50 seeds sweep the window and ties at the same virtual instant
+  are resolved by the seed, not by the fixture.
+- The assertions are conditioned on **what the pass's own readings returned**, observed at the
+  store seam by a recording tap (`RecordingMeta`, `custodian.rs:1779`), never on the fixture's
+  intended timing. That is what makes them implementation-neutral in the brief's (2c) sense: a pass
+  that read the namespace **once** satisfies every one of them, and the coverage leg's divergence
+  clause is explicitly skipped when `readings <= 1` (`custodian.rs:2137`) rather than punishing the
+  better implementation.
+
+The six invariants asserted on every seed and every landing point (`custodian.rs:1974-2083`):
+
+| # | Invariant | Why it is the C-1 one |
 |---|---|---|
-| `reconcile_after_restore` report half | re-read `inode:` itself and `?`d out on `ChunkMap::Segmented` (`restore.rs:390`, `:403-405` on base) — one segmented or undecodable record ⇒ **whole pass `Err`, no report** | reads the **same `ReferenceSet`** the mark gate uses (`restore.rs:366`, `:444`); the objects it could not read are named in `RestoreReport::unresolvable` (`restore.rs:157`) and `is_clean()` is false (`restore.rs:171`) |
-| `reconciliation_status` | bare `Pending` over an incomplete set (`desired_state.rs:188-190` on base) | `PendingUnresolvable { objects }` (`desired_state.rs:118`, `:231`) + the blocker named on `wyrd.custodian.drain.audit` (`desired_state.rs:258`) |
-| `wyrd custodian --reconcile-after-restore` | prints "…complete", exits 0 unless dangling/misplaced (`cli.rs:1196-1236` on base) | prints `INCOMPLETE` + a NEEDS-HUMAN block naming the records (`cli.rs:1215`, `:1248`), and **exits non-zero** on them (`cli.rs:1281`) |
+| 1 | the pass returns `Ok` | one damaged record may not blank the report for every object the pass could read |
+| 2 | never both `stranded_marked > 0` and a record it could not read | the brief's (2c) conjunction — two readings, two conclusions |
+| 3 | a fragment **either** reading protects is never marked | the late commit's only copy, else GC takes it after the grace window |
+| 4 | either reading's hole withholds every mark, and the record is **named** | attribution, or the stall is a state nothing exits |
+| 5 | the readable object's fragment is never marked, on any schedule | — |
+| 6 | a reading that **finished** marks the genuine stray; one that did not, marks it after the named record is repaired | the positive observable, in both directions |
 
-Also: the pass's own audit summary no longer says "complete" over a partial reading
-(`restore.rs:613-630`), and the runbook's "two bills" list is now three
-(`docs/design/architecture/m4-first-deployment-blueprint.md:599`, `:609-616`).
+(6) is why "nothing was marked" can never pass vacuously: on a complete reading the pass **must**
+mark the stray, and on an incomplete one the leg repairs the record the run named, re-runs the same
+pass over the same store, and requires the withheld mark to appear (`custodian.rs:2059-2083`).
 
----
+### 2. Two pointer comments in `restore.rs` (docs only, no semantics)
 
-## 2. The one real design decision: where the report half gets its chunks
+At the two sites the finding is filed against: the one-reading rule in `reconcile_after_restore`'s
+docs (`crates/custodian/src/restore.rs:245-249`) and `committed_chunks`'s docs (`:610-614`) now
+name the DST property that pins them. This is the cheap defence against the same finding being
+re-filed from a site that gives the reviewer no way to see the coverage. `cargo fmt` clean; the
+semantic-line count of `restore.rs` is unchanged (110 in both v13 and this patch — comments are not
+counted, and nothing else moved).
 
-The base's `committed_chunks` did a **second walk of `inode:`**. Three options were on the table.
+### 3. Bundle hygiene — `review-rejected.md`
 
-**(A) Feed the report half from the `ReferenceSet` the mark gate already built. ← CHOSEN.**
-`gc::ReferenceSet` (base, `gc.rs:265-295`) already carries everything the report needs:
-`schemes` is *exactly* the validly-placed committed chunks (with their `EcScheme`, hence `k`),
-and `placed` is *exactly* their `(dserver, fragment)` pairs — both filled in the one `Ok(frags)`
-branch of `gc.rs:427-442`. So `committed_chunks` becomes a **pure regroup** of that set
-(`restore.rs:444-482`), no store access at all:
+- The `restore.rs` rows were re-filed at this patch's line numbers (the gate binds a rejection to
+  `file:line` + CLASS + MATCH, so a 12-line doc insertion above them reads as an unsuppressed
+  finding): `277→283`, `287→293`, `288→294`, `293→299`, `604→616`, `613→625`, `632→644`,
+  `815→827`. `desired_state.rs` rows are unmoved.
+- Added section (iv): the advisory reviewer's round-13 CLI findings (the `dangling` / `misplaced`
+  paragraphs printing a count and "See the audit log for each chunk id"), **declined** — the text
+  is verbatim on the base (`git show origin/main:crates/server/src/cli.rs` `:1213-1215`,
+  `:1221-1226`) and widening it is the report-schema churn `brief.md` § Scope declines. This is the
+  iteration-13 carry-forward's own instruction ("Record-reject these rather than rebuilding the CLI
+  output shape"), executed.
 
-* it inherits the resolver for free, so a **segmented** object's chunks are judged (criterion 1);
-* it inherits the containment for free, so an **unreadable** object contributes nothing and is
-  named rather than raised (criterion 2);
-* the two halves become *structurally incapable* of disagreeing about which chunks exist — the
-  base could report as dangling precisely the object whose fragments the mark gate was
-  protecting;
-* it **removes** a full `inode:` scan per pass (fewer store round-trips, and the second copy of
-  every record's bytes is no longer materialised). Net memory and IO go **down**, which matters
-  because two of iteration-5's seven blockers were memory-blowup risks in a walk.
+## The ninth file — flagged, not smuggled
 
-**(B) Keep the second walk, but resolve it through `metadata::resolve_chunk_map` with its own
-containment.** Rejected on cost *and* on correctness. Cost, concretely: the contain-and-continue
-block in `gc.rs:365-416` is **22 non-comment, non-blank lines** (scan → `decode` match → `resolve_chunk_map`
-match → `downcast::<ChunkMapError>` → `unresolvable.insert`); reproducing it here is those 22
-lines **on top of** the 40-line second walk it would keep, plus a second
-`BTreeMap<Vec<u8>, String>` and a second `meta.scan(b"inode:")` per pass. (A) instead replaces
-that 40-line walk with a 26-line pure regroup (`restore.rs:444-482`, base `restore.rs:390-432`)
-and adds no store read at all — a **36-line** swing between the two options, all of it duplicated
-logic. Correctness: two independent walks of a *live*
-store can disagree, and the brief's Scope forbids it outright — "this slice adds **no**
-custodian-level walk and no `crate::resolve` module".
+`brief.md` § Budget names eight files and says *"A ninth file means the shape is wrong: STOP and
+hand back."* This patch touches **nine**: the eight, plus `crates/dst/tests/custodian.rs`.
 
-**(C) The v5 salvage shape (`iteration-v5/patch.diff:2956-3136`) verbatim** — `resolve::homed_objects` /
-`protected_fragments` / `MaintenanceWalk`. Rejected because that module is **#681's** and does
-not exist on this base: pulling it in re-creates the resolving namespace walk inside this slice
-(`iteration-v5/patch.diff:2717-2955` ships `crates/custodian/src/resolve.rs` as **234 added lines**, before any callsite) and
-takes the patch straight past the 700-line budget. The brief names this as "the single most
-likely way this bundle fails again". What was salvaged is the **shape** — the
-`PendingUnresolvable { objects }` variant, the `unresolvable: Vec<String>` report field, the
-`is_clean` clause, the emitter's prose — with every callsite re-pointed to
-`gc::referenced_fragments` / `gc::ReferenceSet` / `gc::object_name`.
+I did not stop, and the reason is that two instructions conflict and the later, bundle-specific one
+is explicit. The iteration-13 carry-forward (the human's, after the brief) says: *"Add seeded Tier-0
+DST coverage for that path… Note the brief currently states 'No DST leg' under External
+dependencies. That line is now stale against the shipped design… Adding the DST leg is the correct
+resolution… Expect the DST leg to add test bytes; that is not overage in the sense the backstop
+means."* A seeded Tier-0 custodian property has exactly one home in this repo — the campaign file
+that owns the seed sweep and the `REGRESSION_SEEDS` replay — and a **new** file there would be a
+ninth file too, without the seed-regression replay. So the ninth file is unavoidable given the
+directed work; the only choice was where.
 
-### Consequences of (A) worth the reviewer's eye
+**What it costs, measured** (crude counter: added lines that are non-blank and non-comment):
 
-* **Verdict order changed** from store-scan order to **chunk-id order** (`BTreeMap`,
-  `restore.rs:448`). Deterministic where it was not; every existing assertion in
-  `restore_reconcile.rs` compares single-element vectors, so nothing depended on the old order.
-* **A chunk id committed by two different objects is now judged once, not twice.** `placed` is a
-  set. No caller depends on duplicate entries in `dangling` / `misplaced`, and a duplicate id is
-  a corruption case in either reading. Flagged here because it is the only behavioural difference
-  I could find that is not the fix itself.
-* `expected.get_mut(&frag.chunk)` (`restore.rs:468`) cannot miss — `placed` and `schemes` are
-  filled together — and the miss branch is the fail-safe direction anyway (leave the chunk out of
-  the *report*; it stays fully protected from marking regardless). Comment says so at the line,
-  because "silent skip" is a rubric defect class and I did not want it read as one.
-
-## 3. Smaller decisions
-
-* **Ranking in `reconciliation_status`.** `PendingUnresolvable` is checked exactly where the base
-  checked `unresolvable` — *after* the genuine-reference test, *before* the malformed one
-  (`desired_state.rs:224`). Deliberate and commented (`desired_state.rs:218-223`): while valid
-  placements still name the server the drain is honestly converging and rebalance is moving them,
-  so "wait" is true and actionable; this answer takes over at the moment that wait would
-  otherwise become unbounded. It also mirrors `PendingMalformed`'s position, so the surface has
-  one ranking rule rather than two.
-* **A new audit seam, `wyrd.custodian.drain.audit`** (`desired_state.rs:261`) — the drain surface
-  had no emitter at all. Same `action = "unresolvable-chunk-map"` and `inode = <name>` fields as
-  `gc::emit_unresolvable` / `scrub::emit_unscrubbable`, so one collector query selects all three.
-  Its counter counts **observations** (one per blocking record per status read), documented at
-  the emitter because a status read is an operator's poll, not a pass.
-* **CLI names the blockers inline, capped at 10** (`cli.rs:106`, `:1262`). A chunk id is opaque
-  and belongs in the log; an `inode:` key is the thing an operator repairs. The cap keeps a store
-  with a large damaged range from burying the NEEDS-HUMAN block; every record is on the audit seam
-  regardless.
-* **`emit_summary` no longer says "complete"** over a partial reading (`restore.rs:627`). The
-  invariant is "a pass never reports a conclusion it could not reach"; that line is the one place
-  an operator greps for the word.
-* **`ReconciliationStatus::Pending`'s doc shrank** (`desired_state.rs:85-88`): #650 had widened it
-  to cover the incomplete-set case, which now has its own variant.
-
-## 4. Files touched (8 of 8 budget, 614 of 700 added semantic lines)
-
-```
- 22  crates/custodian/src/desired_state.rs        63  crates/custodian/src/restore.rs
- 36  crates/server/src/cli.rs                    418  crates/custodian/tests/segmented_map_restore.rs  (NEW)
- 52  crates/custodian/tests/restore_reconcile.rs  13  crates/custodian/tests/segmented_map_consumers.rs
-  1  docs/.../06-runtime-view.md                   9  docs/.../m4-first-deployment-blueprint.md
-```
-
-Production is **121** lines against the brief's ~130 estimate; the discriminator's own fixture is
-the bulk, as the brief predicted. Two files need explaining:
-
-* **`segmented_map_consumers.rs` (#650's file) had to change.** Two of its legs assert the drain
-  status over an unreadable record, and this slice changes that answer — leaving them would leave
-  `C4-ci` red. They now pin `PendingUnresolvable { objects }` positively (`:722-733`, `:1100-1112`),
-  which is also the "positive match on the new shape in an existing gated file" the brief asks
-  for. The second one is a bonus: its three pairwise-distinct-but-lossily-colliding keys now prove
-  the **answer** carries injective names, not just the audit line. Its module note is corrected
-  (`:5-17`) since it claimed #651 would not need to touch it.
-* **`m4-first-deployment-blueprint.md`** is not in the brief's Docs-currency line, but it is the
-  operator runbook for the exact command whose exit code changed, and it enumerated "two very
-  different bills". An operator meeting a third exit-1 reason with no procedure is a stale-doc
-  defect; the addition is 9 lines in the existing style.
-
-`crates/custodian/tests/rebalance.rs` was **not** touched: its 15 `ReconciliationStatus` sites are
-all `assert_eq!` comparisons, not exhaustive matches, so the new variant does not break them —
-which also keeps the #681 conflict surface the brief warned about at zero.
-
-## 5. Forced self-refutation (the three questions)
-
-**(a) Genuine red?** — **Yes, mechanically.** `./engine/scripts/run-verify.sh` (the project's own
-per-fix gate) reverts `restore.rs`, `desired_state.rs`, `cli.rs` and every modified test file,
-keeps the added discriminator, and runs `cargo test -p wyrd-custodian --test segmented_map_restore`:
-
-```
-0 passed; 4 failed        →  run-verify.sh: PASS — red without the fix, green with it.
-  a_segmented_object_no_longer_stops_the_post_restore_pass
-      panicked: … : SegmentedMapUnsupported { operation: "restore::committed_chunks" }
-  an_unreadable_object_is_contained_and_the_run_is_not_certified          (same, at the `expect`)
-  an_unreadable_object_does_not_starve_the_objects_the_pass_could_read    (same, at the `expect`)
-  a_drain_over_an_incomplete_reference_set_names_the_blocking_record
-      panicked: the blocker must be reported on wyrd.custodian.drain.audit … got: <empty>
-```
-
-All four are **assertion** reds on base-visible symbols — the file names no symbol this patch
-introduces, so the reverted tree still compiles and the red is behavioural, not "a symbol is
-missing". `--classify` returns exactly one `ADDED_TEST`, as the brief's dry-run predicted.
-
-Because three of those four die at the `expect` (the base cannot get far enough to be judged), I
-also ran a **mutation check** so the certification assertion is not riding on that panic. With
-only `&& self.unresolvable.is_empty()` deleted from `is_clean()` (`restore.rs:171`) and everything
-else intact:
-
-```
-segmented_map_restore : an_unreadable_object_is_contained_and_the_run_is_not_certified  FAILED
-restore_reconcile     : an_unreadable_committed_record_is_named_and_stops_the_run_…     FAILED
-(3 + 14 others still pass)
-```
-
-so the non-certification clause of criterion (2a) binds on its own. File restored and re-run green
-afterwards.
-
-**(b) Production path?** — **Yes.** Every leg calls the real
-`wyrd_custodian::reconcile_after_restore` / `wyrd_custodian::desired_state::reconciliation_status`
-over in-memory `MetadataStore` / `ChunkStore` **trait implementations** — the seam the loops are
-built on (ADR-0010), the same doubles `restore_reconcile.rs` and `segmented_map_consumers.rs` use.
-No copy, no mock of the behaviour under test, no re-implementation: the fixture supplies *storage*,
-production supplies every decision. The audit assertions read JSON the **production** `tracing`
-callsites emitted through a capturing subscriber.
-
-**(c) Fixture includes the fault?** — **Yes, and it is asserted to be a real fault.**
-`seed_damaged` (`segmented_map_restore.rs:342-361`) seeds a committed root naming two segments and
-writes only the first, then asserts `metadata::resolve_chunk_map(...).is_err()` on the seeded
-bytes — so a leg can never pass because the fault it was built around silently stopped being one.
-The damaged object is `inode:1` and the store double is a `BTreeMap`, so the walk meets the
-**damaged record first**: "the readable object was still reported" cannot pass by the readable
-object simply having been handled earlier. Nothing is curated out — the damaged object's own
-readable fragment stays on `d0` and is asserted still present and still unmarked, and criterion
-(2b)'s readable object carries a *genuine* loss that must still be named.
-
-## 6. Gates run here
-
-| What | Command (project's own runner) | Result |
+| | v13 | this patch |
 |---|---|---|
-| Whole Wyrd gate | `./engine/xtask.sh ci` (fmt, clippy `-D warnings`, build, test incl. DST, deny, conformance, **typos**, docs render) | `xtask ci: all checks passed` (exit 0) |
-| Per-fix red→green | `PDCA_BUNDLE=… ./engine/scripts/run-verify.sh` | `PASS — red without the fix, green with it` |
-| Commit-hook readiness | `cargo fmt --all` clean; `typos` clean (it caught one word — "Pendings" in a test section header — now reworded) | ✓ |
+| production (`restore.rs`, `desired_state.rs`, `cli.rs`) | 308 | **308 — unchanged** |
+| tests | 640 | 932 |
+| total | 948 | 1240 |
+| files | 8 | 9 |
+| patch bytes | 121 KB | 145 KB |
 
-`typos` and `docs-renderer` (the brief's two external dependencies) are **both installed on this
-host**, so the prose gates actually ran rather than warn-and-skipping. No NEEDS-HUMAN external
-dependency to declare.
+The whole +292 is the DST property and its fixture. Production semantics did not move by one line
+this round.
 
-## 7. What I deliberately did NOT do
+## Alternatives I rejected, with their cost
 
-* No `crate::resolve`, no custodian-level namespace walk, no `repoint_chunk`, no record ceilings,
-  no reconstruction / backfill / rebalance change — #681 / #682, per Scope.
-* No DST leg (brief: none in this slice), no conformance-vector change, no ADR/spec/proposal edit.
-* No change to `crates/server/src/custodian.rs`: it passes the `RestoreReport` straight through and
-  the new field reaches the CLI without it.
-* Did **not** re-rank `PendingUnresolvable` above the genuine-reference `Pending` (see §3) — that
-  would have changed an answer the base already gives correctly, for no operator benefit.
+**(a) A new DST file, `crates/dst/tests/restore_two_readings.rs`.** Same ninth-file count, and it
+would have to re-declare the fixture the campaign file already owns: `MemDServer` (31 lines),
+`servers()`/`fleet_of` (9), the `#[path = "support/mod.rs"]` include, plus its own
+`dst_campaign_test!` wiring — ~45 duplicated lines — and it would sit **outside**
+`committed_regression_seeds_stay_green`, so a bug-finding seed would not be replayable through the
+campaign's own regression mechanism. Rejected on both counts, not on taste.
+
+**(b) A hand-rolled paced double over `MemMeta`** (add `madsim::time::sleep` to a copy of the
+in-memory store, ~25 lines) instead of `SimTikvMetadataStore`. Cheaper by roughly the 12 forwarding
+lines of `RecordingMeta`'s trait impl, and **worse**: the rubric's test-fidelity rule is *"DST/sim
+models mirror the production adapter's error and seam semantics"*, and the repo already has the
+sanctioned model with a commit that awaits mid-flight, pessimistic prewrite locks and the blind-batch
+`Err` rule. Inventing a third store to get an await boundary is how a sim model drifts from the
+adapter it stands in for. `RecordingMeta` therefore adds **no** semantics — it forwards every call
+and records one thing (each `inode:` scan's answer).
+
+**(c) Asserting "nothing is ever marked" outright.** Two lines shorter than the conditioned form,
+and it fails the single-reading implementation the brief calls *"the better one"* (§ Success
+criterion 2c), and it fails legitimately whenever the writer lands after both readings. Rejected
+by the brief, not by preference.
+
+**(d) Driving the DST leg through `reconcile_step`** like properties 1–10. `reconcile_after_restore`
+is not a loop step — it is an operator one-shot the CLI calls directly
+(`crates/server/src/cli.rs`'s `restore_verdict` path), and `reconcile_step` has no restore arm. The
+leg drives the production entry point; there is no fenced control point to route through.
+
+## Refuting my own test (the three forced questions)
+
+**(a) Genuine red?** Yes — three separate reverts, each re-run, each restored afterwards:
+
+| revert | leg | result |
+|---|---|---|
+| drop `appeared.protects(..)` from the mark gate (v13's fix, `restore.rs:364`) | **through the project runner** `./engine/xtask.sh dst` | both new legs **FAILED**: *"reading(s) [1] of THIS pass returned the record that places FragmentId { chunk: 25874, index: 0 }, and the pass marked that fragment collectable anyway"* (at landings 0 ms and 2 ms) |
+| drop `attribute_unresolvable(&committed.unresolvable, ..)` (v12's union-of-holes, `restore.rs:300`) | `cargo test -p wyrd-dst --test custodian` under `--cfg madsim` | both **FAILED**: *"reading(s) [1] met a record this pass could not read, and it marked 2 fragment(s) anyway … RestoreReport { stranded_marked: 2, …, unresolvable: [] }"* — note the report itself said nothing was unresolvable, so an assertion phrased only over the report would have missed it; the recording tap is what gives it teeth |
+| whole `restore.rs` reverted to `origin/main` | — | **compile error** (`no field `unresolvable` on type `RestoreReport`), as expected and by design: the DST leg is CI-gated coverage, not the discriminator, so it may name symbols this patch introduces. The assertion-red-on-base constraint belongs to `crates/custodian/tests/segmented_map_restore.rs`, which C4-verify re-proved this round (below) |
+
+And the discriminator itself, through the project's own gate:
+`PDCA_BUNDLE=… ./engine/scripts/run-verify.sh` → **`PASS — red without the fix, green with it`**
+(5/5 legs red on the base with `SegmentedMapUnsupported { operation: "restore::committed_chunks" }`
+and a decode error).
+
+**(b) Production path?** Yes. The DST leg calls `wyrd_custodian::reconcile_after_restore` — the
+same function `wyrd custodian --reconcile-after-restore` calls — over a real `GcContext`, a real
+fleet of `ChunkStore`s and the repo's own simulated-TiKV `MetadataStore`. Nothing about the pass is
+re-implemented in the test; `RecordingMeta` forwards every trait call and adds no behaviour. The
+marks are read back as the `orphan:` records the production code writes
+(`metadata::orphan_key`, the same function `restore.rs` marks with), not as a report field.
+
+**(c) Fixture includes the fault?** Yes, and the coverage leg **proves** it rather than asserting
+it. The probe run (temporary, removed) classified every landing point:
+
+```
+readings=2
+divergent=[(LateCommit,0),(LateCommit,1),(LateCommit,2),(Damage,0),(Damage,1),(Damage,2)]
+past=[(LateCommit,3..6),(Damage,3..6)]
+```
+
+i.e. at landings 0–2 ms the writer genuinely lands **between** the pass's two readings — the exact
+schedule the finding is about — and at 3–6 ms it lands past the pass. The permanent form of that
+check is `restore_two_readings_cover_the_divergence_window` (`custodian.rs:2111-2145`), which reds
+if a future change moves the readings so the span no longer covers the window: the failure mode is
+"the window is no longer reached, re-tune", never a silent vacuum. The nemesis is really injected
+(the writer's own commit is asserted to have landed, `custodian.rs:1958`), the damaged record
+really stops decoding (the pass names it, invariant 4), and the marks asserted absent are asserted
+present in the same run under invariant 6.
+
+## Gates run here (the project's own runners, not hand-rolled)
+
+- `./engine/xtask.sh dst` (the DST tier: clippy on `wyrd-dst` under `--cfg madsim`, then 50 seeds)
+  → **green**; 14 campaign tests including the two new ones.
+- `PDCA_BUNDLE=… ./engine/scripts/run-verify.sh` (C4-verify) → **`PASS — red without the fix, green
+  with it`**. Classification re-checked with `--classify`: exactly one
+  `ADDED_TEST crates/custodian/tests/segmented_map_restore.rs` (plus `CRATE crates/custodian`,
+  `CRATE crates/dst`, `CRATE crates/server`), so the invocation is still
+  `cargo test -p wyrd-custodian --test segmented_map_restore` and the new DST file — a *modified*
+  test file — changes neither leg.
+- `./engine/xtask.sh ci` (C4-ci, the whole gate) → **exit 0**, `xtask ci: all checks passed`. The
+  prose gates really ran on this host (`typos`, `lint_docs: OK`, `render_site: link audit OK`), so
+  this is CI parity rather than the warn-skip path.
+- `cargo fmt --all --check` → clean, so the target's commit hooks have nothing to reject.
+
+## Anything a reviewer might raise that I decided rather than missed
+
+- **The leg does not cover "the writer landed before the first reading."** Unreachable by
+  construction: the writer's own commit spans two network hops while the pass's first reading is
+  one, so the earliest possible landing is after it. That regime is just "the object was already
+  committed", which the per-slice tests and property 4 already own. The coverage leg therefore
+  requires the *divergent* and *past-the-pass* schedules, and does not claim the third.
+- **`RESTORE_NEMESIS_SPAN = 6` is a tuned constant.** Documented at the constant with the hop
+  arithmetic it comes from, and the coverage leg fails loudly if the tuning goes stale.
+- **The leg asserts on `orphan:` records, not on deletions.** Restore deletes nothing; the mark is
+  the authorization. GC's own reclamation of a marked fragment is property 4's subject, and
+  property 10's for the incomplete-set case.
+- **`Interleaving` is returned but only the coverage leg reads it.** Deliberate: it is the seam
+  that lets the coverage claim be *checked* rather than asserted in prose.
+
+## Self-review against the target's standing rubric (`AGENTS.md` § Review rubric & protocol)
+
+Read before emitting the patch, applied to it as the last step. Only the delta is re-examined here;
+the v13 body was self-reviewed against the same rubric in `iteration-v13/build-notes.md`.
+
+- **One clock per correctness lifecycle** — the DST leg reads no clock. It uses
+  `madsim::time::sleep` (virtual time, the simulator's) for the writer's landing point and passes a
+  fixed logical `now = 10_000` to the pass, the caller's own stamp. No `SystemTime::now`, so
+  `clippy.toml`'s disallowed-method gate has nothing to review.
+- **Narrow trait seams / dependency direction (ADR-0010)** — the leg lives in `crates/dst/tests`,
+  adds no dependency to any production crate, and touches `wyrd-custodian` only through its public
+  API (`reconcile_after_restore`, `GcContext`, `RestoreReport`).
+- **Metadata validation boundaries (ADR-0045)** — the damaged record is bytes that fail *decode*,
+  and the pass surfaces it as an error contained per record; nothing is identity-filled.
+- **No DST-reachable shared mutable global state (ADR-0035)** — `RecordingMeta` is instance state
+  only (a `Mutex` field, no `static`), and both new tests are declared through `dst_campaign_test!`
+  so the barrier is installed. `cargo xtask ci`'s statics gate passed.
+- **`#![forbid(unsafe_code)]`** — no new crate root; `custodian.rs` already carries it.
+- **Docs currency** — no port/API/RPC/CLI-flag/persisted-field change in this delta (the v13 patch's
+  are documented in both living architecture docs). The two `restore.rs` doc insertions point at
+  the new coverage.
+- **Absent or unsupported entries** — the leg's whole subject: an unreadable record is named,
+  nothing is silently skipped, and the assertions read the `orphan:` records themselves rather than
+  a count.
+- **Await discipline** — the delta adds no production await. The test's awaits are the simulator's.
+- **Test fidelity — the rule this round exists to satisfy** — the new concurrent path now lands
+  with seeded Tier-0 DST coverage, driven over the sanctioned simulated-TiKV model rather than a
+  bespoke double, and the coverage leg proves the interleaving is reached.
+- **Reviewer protocol** — both round-13 findings are **fixed** (not silenced); the advisory CLI
+  findings are declined with a recorded reason and a scope citation in `review-rejected.md`.
+
+## Scratch hygiene
+
+Three throwaway files under `$PDCA_SCRATCH` (`pdca-builder-651-restore.rs.keep`,
+`pdca-builder-651-restore-final.rs`, `pdca-builder-651-ci.log`) — the revert backups and the CI log.
+Removed at the end of the round; nothing was written to `/tmp`.

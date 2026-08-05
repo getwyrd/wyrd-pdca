@@ -34,6 +34,11 @@
 #     defect the exit code cannot evidence. Either leg reporting 0 tests is reported as what it
 #     is. (#104 removes the dominant cause — a cfg gate — but a test can still vanish behind an
 #     unset feature, an #[ignore], or a filter that matches nothing.)
+#   * The RED leg failed WITHOUT running a test (Act 2026-08-02). A compile error exits
+#     non-zero exactly as a failing assertion does, so "cargo failed" is not evidence of a
+#     red; a discriminator that calls production API the patch ADDS cannot build once that
+#     production change is reverted. This used to fall through to PASS — the gate meant to
+#     prove the fix is real accepting a bundle whose test never built. See _red_verdict.
 #   * Non-production (manifest) classification (issue #165, v0.43.0) is N/A for Wyrd: that
 #     branch is for repos whose patch must touch a non-behavioral manifest the test can't move
 #     (e.g. po/POTFILES.{in,skip}). Wyrd is a pure-Rust workspace with no such manifests.
@@ -146,6 +151,39 @@ _tests_ran() { # <cargo-test-output> -> total tests executed across every target
     | sed -nE 's/^test result:.*[[:space:]]([0-9]+) passed;[[:space:]]([0-9]+) failed;.*/\1 \2/p' \
     | awk '{ t += $1 + $2 } END { print t + 0 }'
 }
+
+# --- the RED leg's verdict, from cargo's status AND what actually ran (Act 2026-08-02) ---
+# The RED leg reverts production, keeps the added test, and expects a failing assertion.
+# Cargo's exit status alone cannot say that happened, in EITHER direction:
+#
+#   rc  tests  verdict        why
+#   --  -----  -----------    -------------------------------------------------------------
+#   0     0    UNVERIFIABLE   empty target: exits 0 having asserted nothing (#114)
+#   0    >0    FAIL           tests ran and passed without the fix — no red, real defect
+#  !=0    0    UNVERIFIABLE   NOTHING RAN. A compile error exits non-zero exactly as a
+#                             failing assertion does, and the test that never built proves
+#                             nothing. This is the case that used to fall through to PASS.
+#  !=0   >0    PASS           a test ran and failed without the fix — the genuine red
+#
+# The `!=0 / 0` cell is the one this function exists for. Before it, the RED leg's only
+# question was "did cargo fail?", so a bundle whose discriminator did not COMPILE against
+# the reverted base was recorded as proof that its test catches the bug — an evidence gate
+# failing toward *accept*, in the direction that loses the proof rather than the data.
+# It was reachable in practice: a test that calls net-new production API cannot build once
+# that API is reverted, which is a routine shape here (the `GREEN_ONLY` escape covers only
+# a net-new CRATE, not a net-new symbol in an existing one). Three briefs in the 2026-07-25
+# multipart batch carried a paragraph telling Do to out-think it; two had a real instance
+# caught by cross-vendor plan review. Queued by that review as PROPOSED
+# (`process/act-log.md`, getwyrd/wyrd-pdca#178) and applied at the 2026-08-02 Act pass.
+#
+# UNVERIFIABLE is exit 77 at the call sites — a §6 NEEDS-HUMAN, never a patch defect: the
+# leg gave no verdict, so it has none to hold against the fix either way.
+_red_verdict() { # <cargo-exit-status> <tests-ran> -> PASS | FAIL | UNVERIFIABLE
+  local rc="$1" ran="$2"
+  [ "$ran" -eq 0 ] && { printf 'UNVERIFIABLE'; return 0; }
+  [ "$rc" -eq 0 ] && { printf 'FAIL'; return 0; }
+  printf 'PASS'
+}
 # The cargo package name from the patch's ADDED `<crate>/Cargo.toml` (a net-new crate the
 # patch introduces — there is no pre-patch Cargo.toml to read). Pure patch parsing, "" if
 # none — the fallback _pkg_name uses when a test's crate isn't in the worktree yet (#88).
@@ -240,6 +278,14 @@ fi
 # worktree, no cargo — for engine/tests.
 if [ "${1:-}" = "--tests-ran" ]; then
   _tests_ran "$(cat "${2:?--tests-ran needs a file of cargo test output}")"
+  exit 0
+fi
+
+# --red-verdict <rc> <tests-ran>: the RED leg's verdict for that pair, as the leg itself
+# computes it. No worktree, no cargo — for engine/tests (Act 2026-08-02).
+if [ "${1:-}" = "--red-verdict" ]; then
+  _red_verdict "${2:?--red-verdict needs a cargo exit status}" "${3:?--red-verdict needs a tests-ran count}"
+  echo
   exit 0
 fi
 
@@ -429,22 +475,36 @@ for f in "${ALL[@]}"; do
   fi
 done
 echo "run-verify.sh: RED — cargo test ${TEST_ARGS[*]} (production reverted, test kept)" >&2
-if run_test; then
-  # cargo exited 0 — but that means "the test passes without the fix" ONLY if a test actually
-  # ran. A zero-test target exits 0 too, and calling that "the test does not catch the bug"
-  # accuses a correct bundle of a defect the exit code cannot evidence (#114).
-  if [ "$TESTS_RAN" -eq 0 ]; then
-    echo "run-verify.sh: UNVERIFIABLE — with production reverted the target ran 0 tests, so no RED" >&2
-    echo "               could be established. This is NOT 'the test passes without the fix' — the" >&2
-    echo "               test never ran. It is compiled out: a cfg the gate does not set (#104), a" >&2
-    echo "               feature it does not enable, every test #[ignore]d, or a filter matching" >&2
-    echo "               nothing." >&2
+RED_RC=0
+run_test || RED_RC=$?
+case "$(_red_verdict "$RED_RC" "$TESTS_RAN")" in
+  UNVERIFIABLE)
+    # Neither direction is claimable: nothing executed. Which of the two ways it got here
+    # matters to the human, so name it (cargo's status is the only thing that tells them
+    # apart) — but both are exit 77, a §6 item, never a verdict on the patch.
+    if [ "$RED_RC" -eq 0 ]; then
+      echo "run-verify.sh: UNVERIFIABLE — with production reverted the target ran 0 tests, so no RED" >&2
+      echo "               could be established. This is NOT 'the test passes without the fix' — the" >&2
+      echo "               test never ran. It is compiled out: a cfg the gate does not set (#104), a" >&2
+      echo "               feature it does not enable, every test #[ignore]d, or a filter matching" >&2
+      echo "               nothing." >&2
+    else
+      echo "run-verify.sh: UNVERIFIABLE — the RED leg's cargo run failed (status $RED_RC) WITHOUT" >&2
+      echo "               running a test, so no RED was established. This is NOT 'red without the" >&2
+      echo "               fix' — the discriminator never executed. The usual cause is that it does" >&2
+      echo "               not COMPILE against the reverted base: it calls production API this patch" >&2
+      echo "               adds, so reverting the fix removes the symbol it needs. Split the test so" >&2
+      echo "               it exercises the behaviour through pre-existing API, or record at sign-off" >&2
+      echo "               why this slice has no isolable red (the cargo output is above)." >&2
+    fi
     exit 77
-  fi
-  echo "run-verify.sh: FAIL — the test PASSES without the fix ($TESTS_RAN test(s) ran), so it does" >&2
-  echo "               not catch the bug (no red)." >&2
-  exit 1
-fi
+    ;;
+  FAIL)
+    echo "run-verify.sh: FAIL — the test PASSES without the fix ($TESTS_RAN test(s) ran), so it does" >&2
+    echo "               not catch the bug (no red)." >&2
+    exit 1
+    ;;
+esac
 
-echo "run-verify.sh: PASS — red without the fix, green with it." >&2
+echo "run-verify.sh: PASS — red without the fix, green with it ($TESTS_RAN test(s) ran red)." >&2
 exit 0

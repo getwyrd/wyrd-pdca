@@ -1,14 +1,5 @@
 # Batched review — 3 passes, union of findings
 
-- [ ] `crates/core/src/metadata.rs:2121` **BUG** (seen by 1 pass): An undecodable `inode:18446744073709551615` now yields `u64::MAX`, so `recover` seeds that saturated floor and the next `alloc_inode` panics on `id + 1` in checked builds or wraps the allocator to reserved inode 0 in release builds.
-- [ ] `crates/core/src/metadata.rs:2055` **BUG** (seen by 1 pass): Paging bounds only the row count because `MetadataStore` imposes no value-size ceiling, so corrupted Redb inode values larger than `MAX_VALUE_BYTES` can still make recovery allocate an arbitrarily large page and exhaust memory.
-- [ ] `crates/core/src/metadata.rs:2073` **BUG** (seen by 1 pass): `RECOVERY_PAGE` bounds rows rather than bytes, and `MetadataStore` imposes no value-size limit, so Redb/TiKV can materialize 64 arbitrarily large damaged values and OOM startup despite the claimed bounded recovery.
-- [ ] `crates/core/src/metadata.rs:2121` **BUG** (seen by 1 pass): An undecodable `inode:u64::MAX` now seeds the allocator to `u64::MAX`, so the next allocation overflows at `id + 1`, defeating the promised damage containment.
-- [ ] `crates/server/tests/gateway_recover_totality.rs:275` **TEST-GAP** (seen by 1 pass): The size test creates only one inode, so it never crosses `RECOVERY_PAGE` or verifies that recovery includes a high-water mark found on a later page.
-- [ ] `crates/server/tests/gateway_recover_totality.rs:249` **TEST-GAP** (seen by 1 pass): The size-totality test contains only one inode row, so it never exercises the continuation cursor or verifies that an inode beyond the 64-row first page contributes to the recovered floor.
-- [ ] `crates/server/tests/gateway_recover_totality.rs:183` **TEST-GAP** (seen by 1 pass): The assertion checks only the damaged key, so moving the warning off the required `wyrd.metadata.audit` target would still pass.
-- [ ] `crates/server/tests/gateway_recover_totality.rs:249` **TEST-GAP** (seen by 1 pass): The size-totality test stores only one inode, so it never exercises cursor continuation or verifies that the maximum inode can be recovered from a later page.
-- [ ] `crates/core/src/metadata.rs:2120` **CONVENTION** (seen by 1 pass): A malformed `inode:` key whose value decodes successfully is silently skipped without an error or audit repair obligation, violating the repository rule for unsupported entries.
-- [ ] `crates/core/src/metadata.rs:2127` **CONVENTION** (seen by 1 pass): Making allocator recovery continue past unsupported or malformed chunk maps leaves the living architecture’s explicit requirement that id recovery return a typed error for such maps stale, violating the repository’s architecture-currency rule.
+No untriaged findings survive (all either absent, noise-dropped, or recorded-rejected).
 
 Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale — not re-reviewed to silence. The gate blocks while any finding here is unchecked.
