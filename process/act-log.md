@@ -29,6 +29,171 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-08-02 — cycles considered: issue_115, issue_503, issue_504, issue_505, issue_507, issue_509, issue_510, issue_575, issue_576, issue_577, issue_634, issue_635, issue_638, issue_648, issue_649, issue_650, issue_651, issue_652
+
+> Eighteen bundles frozen since the last frozen-bundle review (2026-07-16); the 07-18
+> addendum took one publish-time signal out of issue_505 and the 07-21 entry was an
+> external-review churn analysis, not a bundle sweep. This review also **discharges the
+> 2026-07-25 Act queue**, which recorded its delta as PROPOSED and explicitly deferred
+> application to "the next Act review". **issue_115** (ACCEPTED, §6 both cleared, §10 empty)
+> is read here for the first time and exposes nothing — the long-carried "two bundles have
+> never had an Act review" note retires with it; issue_153 was discontinued and never froze a
+> bundle, so it stays outside the index. No contribution disposition is re-decided.
+
+## What the cycles' records exposed
+
+- **The queued gate defect was still live, and it is an instance of a class we already
+  named.** `engine/scripts/run-verify.sh` decided the RED leg from cargo's exit status alone.
+  The zero-test guard (#114) sat only on the branch where cargo exits **0**, so a non-zero
+  exit — *the shape a compile error takes* — skipped it and fell through to an unconditional
+  `PASS — red without the fix`. A bundle whose discriminator never built was recorded as proof
+  that its test catches the bug. It is reachable rather than theoretical: the leg reverts every
+  patch-touched production file, so a test calling production API the patch *adds* cannot
+  compile, and the `GREEN_ONLY` escape covers only a net-new **crate**, not a net-new symbol.
+  This is exactly the `enforcement-reach` class the 2026-07-21 churn analysis discovered and
+  left delta-owed (§"New class discovered post-rubric", 2026-07-22): *a guard whose actual
+  coverage is narrower than its claimed scope, so a violation passes it silently.* We logged
+  the class from wyrd's guards and then carried the same shape in our own.
+- **The advisory reviewer escalates a T4 row it can never discharge — 8 of 8 bundles.** 634,
+  635, 638, 648, 649, 650, 651, 652 each carry a T4 NEEDS-HUMAN saying `scripts/review-branch
+  --bundle` / `scripts/pdca contribcheck` and their artifacts "are absent from the permitted
+  inputs". Both commands live at the **instance root**; the reviewer works from `$PDCA_TARGET`.
+  `agents/reviewer.md:37-44` tells it to treat any gate it cannot reproduce as provisional —
+  a rule written for *target-toolchain* gaps (harness#236 ask 4) that misfires on rows whose
+  command is ours. Nothing is lost if such rows stop escalating: a **failing** gating row
+  already reaches §6 on its own line (issue_651 carries both the gate's `FAILED (gating) — 1
+  blocking` and the reviewer's provisional note), and the half the reviewer *can* do — the
+  affected-path prior-art check — it performed every cycle.
+- **A stale host CLI was charged to two patches, and then to a slice's size.** `cargo-deny`
+  0.20.0 moved `--config` into the root; this host still had 0.19.9, and `xtask`'s dependency
+  wall uses the root form. Gating C4-ci went red on **issue_651 and issue_652** with
+  "unexpected argument '--config' found" — a message naming a flag, not a stale tool. 651 lost
+  a Do round to it; 652 carried it into §6 as an undischarged external dependency.
+- **The size backstop then inherited that contamination.** issue_652 is **66 KB / 4 files** —
+  inside both the calibrated thresholds and this instance's own ≤1,500-line budget
+  (`docs/2026-07-31-alpha-reslicing-proposal.md:18`) — and fired on the *rounds* rule alone
+  (`size-signal.json`: `rounds: 3`), recommending `iterate-plan`. At least one of those rounds
+  was the cargo-deny fault. Two firings (651, 652), two human overrides, both correct. The rule
+  is right; its input counts rounds nobody spent on the slice.
+- **A recurring C4 class resolved itself, and the resolution is only visible by reading the
+  findings.** 409, 503, 505, 507, 509, 510, 575, 577 all escalated "aggregate `cargo xtask ci`
+  not independently reproduced — `cargo deny check` could not acquire the read-only
+  `~/.cargo/advisory-dbs/db.lock`". By issue_652 the reviewer had solved it itself: *"full
+  `cargo xtask ci` also passed with the real `cargo-deny` database made writable in reviewer
+  scratch"*. Reviewer practice, not machinery — and per eduralph/pdca-harness#429 the absence
+  of the signal since is **not** what establishes that; the 652 basis line is.
+- **Advisory-leaf infrastructure failed twice more, in two different ways.** 634's adversary
+  leaf exited non-zero and produced no artifact; 652 reached §6 with *no advisory review at
+  all* — the reviewer leaf was OOM-killed with both lanes after 3d 19h. Both were dispositioned
+  as infra, correctly, but an empty verdict is still indistinguishable from "found nothing"
+  (harness#278, open since 07-10).
+
+## Process deltas
+
+- **Gates — the RED leg's non-zero path is guarded (the 07-25 queued delta, now applied).**
+  A pure `_red_verdict()` decides all four cells from cargo's status **and** what ran
+  (`engine/scripts/run-verify.sh:181`), the RED leg routes through it (`:478-507`), and the
+  `≠0 status / 0 tests` cell now reports **UNVERIFIABLE (exit 77 → §6 NEEDS-HUMAN)** with a
+  message naming the usual cause, instead of PASS. A `--red-verdict` test hook (`:284`) makes
+  the matrix unit-pinnable with no worktree and no cargo; six cases pin it, including that any
+  non-zero status behaves identically (`engine/tests/test_run_verify.sh:261-282`). The PASS
+  line now also states the count that made it a red (`:509`). Header verdict list updated
+  (`:36-41`). Suite green.
+  *Known cost, accepted:* a slice whose RED leg genuinely cannot compile now raises a §6 item
+  instead of passing silently — visible rather than free.
+  *Known drift:* this script is template-rendered, so the local edit must be reconciled by
+  `copier update` until the upstream fix lands (filed below) — the same drift shape
+  harness#422 records for this instance's `[driver].scratch_dir` patch.
+- **Doctor — the dependency wall's own tooling is preflighted, by CLI *shape*.**
+  `pdca.toml:730-741` adds `cargo-deny` and `cargo-machete` rows; the cargo-deny row probes
+  `cargo deny --config /nonexistent/deny.toml check --help`, which parses iff the tool is new
+  enough for the gate's invocation and short-circuits before the config path is read (O(1),
+  offline). A `--version` presence probe — what harness#236 was closed on — passes on 0.19.9.
+- **Recorded, applied outside this review since 2026-07-21** (this entry is where their
+  effectiveness gets read): the reviewer leaf's memory scope after the OOM
+  (`pdca.toml:392-427`, #199), `default_timeout_secs = 7200` after 635's 19h mutants hang
+  (`:806`, #187), `confirm_gating_fail = true` after 648's transient C4-ci red (`:798`, #191),
+  and per-bundle leaf scratch reclaimed at publish (commit `9eeff48`, #200/#134).
+
+### Considered and deliberately not applied
+
+- **The reviewer-prompt clause** that would stop the 8-of-8 T4 escalation. `agents/*.md` is
+  template machinery under the boundary in `CLAUDE.md`; a local edit would be overwritten and
+  would fix one instance of a defect two other instances already report. Routed instead.
+- **Enabling the Plan-time sizer** (`pdca.toml:368`, `mode = "stub"`). Tempting against a
+  5-bundle stack that ran 5–13 rounds, but `size_signal.py:9-12` records that the a-priori
+  gate was *declined* at 62% precision, and the manual Plan-time budget from the 07-31
+  re-slicing already occupies that slot. The evidence this review found points at the
+  backstop's **input**, not at moving the question earlier.
+- **Retiring the per-brief defensive prose** to a single brief-template line (the 07-25
+  proposal's second half). It is premature: it should follow evidence that the gate now
+  distinguishes the cases, and today's delta has produced none yet. Re-read at the next review.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- Harness/driver (template): **eduralph/pdca-harness#434** — run-verify's RED leg scores a
+  compile failure as PASS; the same false-PASS exists in every rendered instance. Carries the
+  four-cell matrix and the applied `_red_verdict` shape.
+  <https://github.com/eduralph/pdca-harness/issues/434>
+- Harness/driver (template): **eduralph/pdca-harness#435** — doctor rows probe presence, not
+  invocation compatibility; sharpens closed #236 with the `--help`-with-a-throwaway-config
+  idiom. <https://github.com/eduralph/pdca-harness/issues/435>
+- Harness/driver (template): **eduralph/pdca-harness#436** — size-signal counts rounds lost to
+  environment faults as churn; asks for attribution using #371's `flaky` marker, in both the
+  live backstop and `size-calibrate`'s corpus. <https://github.com/eduralph/pdca-harness/issues/436>
+- Harness/driver (corroboration, **no new issue**): **#403** gains this instance's 8-of-8
+  deterministic case and the argument that bundle-scoped rows whose command is an instance-root
+  tool need machinery, not guidance —
+  <https://github.com/eduralph/pdca-harness/issues/403#issuecomment-5194469559>; **#401** gains
+  the note that here the default-open contribcheck and the unreachable batch-review row fuse
+  into one T4 verdict, so fixing either alone narrows the §6 item without removing it —
+  <https://github.com/eduralph/pdca-harness/issues/401#issuecomment-5194472938>.
+- This repo: **getwyrd/wyrd-pdca#209** — `review-branch` reports a model input-ceiling breach as
+  a failed review rather than a review that never ran (issue_635: 1,077,300 chars vs 1,048,576,
+  all passes + retries). <https://github.com/getwyrd/wyrd-pdca/issues/209> — and the constraint
+  is noted on the native replacement, harness#315
+  <https://github.com/eduralph/pdca-harness/issues/315#issuecomment-5194473108>.
+- Target tracker: **getwyrd/wyrd#690** (0.1 Alpha) — custodian restore silently skips a
+  malformed committed placement: no report field, and `is_clean()` still passes. Pre-existing
+  base behaviour, recorded-rejected in issue_651 as out of scope.
+  <https://github.com/getwyrd/wyrd/issues/690>
+- Target tracker (comment): **getwyrd/wyrd#687** — issue_652's DST note; the seeded Tier-0
+  coverage is owed there if #687 moves the allocator protocol.
+  <https://github.com/getwyrd/wyrd/issues/687#issuecomment-5194474817>
+
+## Still open (carried)
+
+- `enforcement-reach` and `false-red` (2026-07-22 churn classes, delta-owed on the **wyrd**
+  side). `enforcement-reach` earned its first applied delta today — in our own gate, not
+  wyrd's — which is evidence the class generalises beyond the PR guards it was mined from.
+- harness#278 (an infra-empty advisory verdict is indistinguishable from "no findings"), open
+  since 2026-07-10 and hit twice more this period (634, 652).
+- The ledger's `[open]` rows remain dominated by `Validation — fitness-to-purpose` entries.
+  Those are **always-human by design**, emitted every cycle; they are not process signals and
+  will never be "applied". Worth remembering when reading the recurring-signals block, whose
+  top five classes this period are all of that shape.
+
+## How effectiveness will be judged
+
+Per eduralph/pdca-harness#429 — *absence of a recurrence is not evidence a delta worked* —
+each of these names **what to read**, not a counter to watch:
+
+- **The RED-leg guard.** For the next ~5 bundles, open the C4-verify output in `gate-logs/`
+  and read the PASS line: it must now end with `(N test(s) ran red)` and `N` must be non-zero.
+  A PASS lacking that clause means the leg did not route through `_red_verdict` — the delta
+  regressed, most likely at a `copier update`.
+- **The first UNVERIFIABLE from the new cell.** When one appears, read the bundle at sign-off
+  and classify it: a net-new-symbol test that cannot compile against the reverted base (the
+  expected, honest cost) or a bundle that would otherwise have banked a green on a test that
+  never built (the reason this exists). Record which in the next entry — one instance of the
+  latter settles whether the §6 cost is worth paying.
+- **The doctor rows.** The next time C4-ci is red, read the failure text before anything else:
+  it must not name a `cargo-deny` flag. And confirm both rows appear in `pdca doctor` output —
+  a row that silently stopped running looks exactly like a row that keeps passing.
+- **The routed issues.** At the next review, read the state of #434/#435/#436, #209 and #690,
+  not just their existence. #434 in particular: until it lands, `engine/scripts/run-verify.sh`
+  carries a local patch that every template upgrade can quietly revert.
+
 # Act queue — 2026-07-25 — raised at Plan (issue_508 / issue_625 / issue_633), not an Act review
 
 > **Queued, not applied.** Raised by the planner while briefing the multipart stack; recorded

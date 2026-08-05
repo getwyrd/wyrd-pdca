@@ -258,4 +258,25 @@ check "multiple targets -> summed across summaries" \
   "7" \
   "$("$RV" --tests-ran "$TMP/out_multi.txt")"
 
+# 11. the RED leg's verdict is a function of BOTH cargo's status and what ran (Act
+#     2026-08-02). The load-bearing cell is `rc != 0, 0 tests`: a compile error exits
+#     non-zero exactly as a failing assertion does, and before this the leg asked only "did
+#     cargo fail?" — so a discriminator that did not BUILD against the reverted base was
+#     recorded as proof that it catches the bug. An evidence gate must not fail toward
+#     accept; the four cells are pinned here so it cannot drift back.
+check "RED: cargo failed AND a test ran -> PASS (the genuine red)" \
+  "PASS" "$("$RV" --red-verdict 101 3)"
+check "RED: cargo failed but NOTHING ran -> UNVERIFIABLE, not PASS (compile error)" \
+  "UNVERIFIABLE" "$("$RV" --red-verdict 101 0)"
+check "RED: cargo succeeded with tests run -> FAIL (test passes without the fix)" \
+  "FAIL" "$("$RV" --red-verdict 0 2)"
+check "RED: cargo succeeded with nothing run -> UNVERIFIABLE (#114, empty target)" \
+  "UNVERIFIABLE" "$("$RV" --red-verdict 0 0)"
+# Any non-zero status is the same evidence — 101 (assertion/panic), 1, or a signal-derived
+# 134: what decides the verdict is whether a test executed, never which code cargo returned.
+check "RED: a different non-zero status with a test run -> still PASS" \
+  "PASS" "$("$RV" --red-verdict 1 1)"
+check "RED: a different non-zero status with nothing run -> still UNVERIFIABLE" \
+  "UNVERIFIABLE" "$("$RV" --red-verdict 134 0)"
+
 [ "$fail" -eq 0 ] && { echo "test_run_verify.sh: all passed"; exit 0; } || { echo "test_run_verify.sh: FAILURES"; exit 1; }
