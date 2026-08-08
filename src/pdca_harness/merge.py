@@ -15,6 +15,11 @@ deterministic ``git``/``gh`` (no model); dry-run (stubbed publisher) prints the 
 merges nothing. The harness's own ``gh pr merge`` runs in the orchestrator, outside the
 ``builder_guard`` hook that blocks the model leaves from merging — exactly as publish's
 ``gh pr create`` does.
+
+``[driver].auto_merge = false`` turns the merging back off without leaving merge mode: the
+flow never calls :func:`merge_wave` and STOPs at the wave boundary instead, so the PRs keep
+the draft ``publish`` opened and the merge stays the human's (pdca-harness#462). This module
+is the mechanics only — it merges whenever it is called.
 """
 
 from __future__ import annotations

@@ -938,8 +938,15 @@ def _waves(cfg: Config, ids: list[str]) -> int:
     except ValueError as exc:
         print(f"unschedulable: {exc}", file=sys.stderr)
         return 1
-    print(f"{len(bundles)} bundle(s) → {len(plan)} wave(s) ({cfg.wave_mode} mode; "
-          f"each wave builds on the prior's accepted work):")
+    # With merge mode's auto_merge off (pdca-harness#462) the run STOPs at the first
+    # non-final boundary, so the usual "each wave builds on the prior's" promise would
+    # misdescribe the plan the flow will actually execute — say what happens instead.
+    held = cfg.wave_mode == "merge" and not cfg.auto_merge
+    carry = ("the driver merges nothing: wave 0 runs, then the flow STOPs for you to merge"
+             if held and len(plan) > 1 else
+             "the driver merges nothing" if held else
+             "each wave builds on the prior's accepted work")
+    print(f"{len(bundles)} bundle(s) → {len(plan)} wave(s) ({cfg.wave_mode} mode; {carry}):")
     for k, wave in enumerate(plan):
         print(f"  wave {k}: " + ", ".join(d.name.removeprefix("issue_") for d in wave))
     return 0

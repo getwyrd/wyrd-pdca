@@ -71,6 +71,18 @@
   serves as a PR base. This is distinct from the M4 pattern above: a *milestone's* durable
   `feat/*` integration branch remains the right shape for a planned PR sequence; `"merge"`
   governs the driver's own wave stacking within one batch run.
+- **But `auto_merge = false`** (2026-08-08): merge mode's *bases* are what this instance
+  wants — real `main`, no rebuilt-each-run branch under an open PR — not its merging. With
+  it off the driver readies and merges **nothing**: every accepted bundle stays the draft PR
+  publish opened, and a multi-wave batch STOPs after wave 0 with a message telling you to
+  merge that wave yourself and re-run (`compute_waves` levels by longest path, so wave *k*+1
+  always has a prerequisite in wave *k* — continuing would build it against a base that
+  prerequisite never reached; a re-run is idempotent via `merged.is_merged`). What forced
+  this: on 2026-08-08 the driver merged wyrd #703 six seconds after opening it, before the
+  required `gate` context had reported, so `gh pr merge` refused it and the wave stopped with
+  #703 readied and #704–706 untouched (getwyrd/pdca-harness#462). Turn back on once #462's
+  `--auto`/poll fix lands upstream. A single-wave batch is unaffected either way — the final
+  wave never merges.
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).
   `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:
@@ -255,6 +267,11 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
   the real gates (`rust`, `gate`, `dco` — as of 2026-08-02 only `docs-check` /
   `require-issue` / `docs-immutability` are required, which would NOT stop a red auto-merge;
   tighten before the first merge-mode batch).
+  **Superseded 2026-08-08 by `auto_merge = false`** (see §2): the trade above is off, so the
+  ready-mark gate now holds for **every** PR the driver opens, non-final waves included —
+  nothing is readied or merged without a human. `gate` did become a required context by
+  2026-08-08 (`docs-check`, `require-issue`, `docs-immutability`, `gate`, `dco`), so the
+  host-side guardrail is in place should auto-merge be turned back on.
 - **External-contribution flow:** standard GitHub PR against `main`, gated by
   `require-issue` / `dco` / `cargo xtask ci`.
 - **MAINTAINERS file:** `../wyrd/docs/governance/GOVERNANCE.md` is the authority (roles +
