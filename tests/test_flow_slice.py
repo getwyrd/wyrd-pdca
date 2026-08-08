@@ -1246,6 +1246,147 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(merge_calls, [["issue_GA"]])   # merged after wave 0 only
         self.assertEqual(fold_calls, [])                # fold not used in merge mode
 
+    def test_auto_merge_off_merges_nothing_and_stops_the_batch(self) -> None:
+        # wave_mode="merge" with [driver].auto_merge = false (pdca-harness#462): merge mode's
+        # real-base PRs, none of its merging. merge_wave is never called (so nothing is
+        # readied or merged), fold is never called, and the run STOPs after wave 0 — wave 1's
+        # GB depends on GA, and its base has not moved, so building it would be wrong.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("HA")
+        self._brief("HB", depends_on="HA")
+        merge_calls: list[list[str]] = []
+        fold_calls: list[int] = []
+        real_merge, real_fold = flow.merge.merge_wave, flow.integrate.fold
+        flow.merge.merge_wave = lambda cfg, bundles, **k: (
+            merge_calls.append([d.name for d in bundles]), 0)[1]
+        flow.integrate.fold = lambda *a, **k: (fold_calls.append(1), (None, None))[1]
+        try:
+            with redirect_stderr(io.StringIO()) as err:
+                results = flow.flow_ids(self.cfg, ["HA", "HB"], do_act=False,
+                                        today="2026-06-04")
+        finally:
+            flow.merge.merge_wave, flow.integrate.fold = real_merge, real_fold
+        self.assertEqual(merge_calls, [])   # nothing readied, nothing merged
+        self.assertEqual(fold_calls, [])    # and no integration branch either
+        self.assertEqual(results.get("HA"), state.COMPLETE)      # wave 0 still ran in full
+        self.assertNotEqual(results.get("HB"), state.COMPLETE)   # wave 1 never built
+        self.assertIn("auto_merge is off", err.getvalue())
+
+    def test_auto_merge_off_still_completes_a_single_wave_batch(self) -> None:
+        # The STOP is about the NEXT wave's base, so a batch that has no next wave is
+        # unaffected: both bundles complete and publish as drafts, and merge_wave — which
+        # the final wave never reaches even with auto_merge on — is still never called.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("IA")
+        self._brief("IB")
+        merge_calls: list[list[str]] = []
+        real_merge = flow.merge.merge_wave
+        flow.merge.merge_wave = lambda cfg, bundles, **k: (
+            merge_calls.append([d.name for d in bundles]), 0)[1]
+        try:
+            results = flow.flow_ids(self.cfg, ["IA", "IB"], do_act=False, today="2026-06-04")
+        finally:
+            flow.merge.merge_wave = real_merge
+        self.assertEqual(merge_calls, [])
+        self.assertEqual(results.get("IA"), state.COMPLETE)
+        self.assertEqual(results.get("IB"), state.COMPLETE)
+
+    # --- #462 review: the boundary stop is only half the guarantee ------------------
+
+    def test_auto_merge_off_reruns_verify_the_human_actually_merged(self) -> None:
+        # The P1 from the #462 review. Run 1 STOPs after wave 0 and tells the human to
+        # merge. On the RE-RUN, JA is COMPLETE — and COMPLETE alone used to satisfy JB's
+        # plain `Depends on`, so JB built against a base that had not moved: exactly the
+        # condition the stop exists to prevent, one invocation later. With auto_merge off
+        # the driver merges nothing, so the merge must be VERIFIED, not assumed.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("JA")
+        self._brief("JB", depends_on="JA")
+        with redirect_stderr(io.StringIO()):
+            first = flow.flow_ids(self.cfg, ["JA", "JB"], do_act=False, today="2026-06-04")
+        self.assertEqual(first.get("JA"), state.COMPLETE)
+        self.assertNotEqual(first.get("JB"), state.COMPLETE)
+
+        # Re-run WITHOUT having merged: JB must still be held back.
+        real_is_merged = flow.merged.is_merged
+        flow.merged.is_merged = lambda cfg, iid: False
+        try:
+            with redirect_stderr(io.StringIO()) as err:
+                unmerged = flow.flow_ids(self.cfg, ["JA", "JB"], do_act=False,
+                                         today="2026-06-05")
+        finally:
+            flow.merged.is_merged = real_is_merged
+        self.assertNotEqual(unmerged.get("JB"), state.COMPLETE)
+        self.assertIn("prerequisite(s) not ready", err.getvalue())
+
+        # Re-run AFTER the human merged: the gate opens and JB builds.
+        flow.merged.is_merged = lambda cfg, iid: True
+        try:
+            with redirect_stderr(io.StringIO()):
+                done = flow.flow_ids(self.cfg, ["JA", "JB"], do_act=False, today="2026-06-06")
+        finally:
+            flow.merged.is_merged = real_is_merged
+        self.assertEqual(done.get("JB"), state.COMPLETE)
+
+    def test_auto_merge_off_does_not_stop_a_wave_with_nothing_to_merge(self) -> None:
+        # A close / no-fix wave carries no patch and publish opens no PR for it, so no base
+        # has to move and `_merge_one` skips it anyway. Stopping there would tell the
+        # operator to merge PRs that do not exist and cost a second invocation for nothing.
+        # KA closes; KB depends on it and must still run in the SAME invocation.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        d = self._brief("KA")
+        (d / "brief.md").write_text(
+            (d / "brief.md").read_text(encoding="utf-8")
+            + f"- **Disposition hint:** {self.cfg.close_dispositions[0]}\n",
+            encoding="utf-8")
+        self._brief("KB", depends_on="KA")
+        with redirect_stderr(io.StringIO()) as err:
+            results = flow.flow_ids(self.cfg, ["KA", "KB"], do_act=False, today="2026-06-04")
+        self.assertFalse((self.cfg.bundle("KA") / "patch.diff").exists(),
+                         "the close fast path should build no patch")
+        self.assertIn("nothing to merge", err.getvalue())
+        self.assertNotIn("STOPPING", err.getvalue())
+        self.assertEqual(results.get("KA"), state.COMPLETE)
+        self.assertEqual(results.get("KB"), state.COMPLETE)  # ran in the same invocation
+
+    def test_act_is_deferred_when_a_wave_boundary_stops_the_batch(self) -> None:
+        # Act's contract is once across a FINISHED batch. With auto_merge off the boundary
+        # stop is the routine outcome of every multi-wave run, so an unguarded fall-through
+        # would fire Act after each wave — once per resume — over a partial batch.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("LA")
+        self._brief("LB", depends_on="LA")
+        act_calls: list[str] = []
+        real_act = flow._maybe_run_act
+        flow._maybe_run_act = lambda cfg, today, **k: act_calls.append(today)
+        try:
+            with redirect_stderr(io.StringIO()) as err:
+                flow.flow_ids(self.cfg, ["LA", "LB"], do_act=True, today="2026-06-04")
+        finally:
+            flow._maybe_run_act = real_act
+        self.assertEqual(act_calls, [], "Act ran over a batch that stopped before its end")
+        self.assertIn("deferring Act", err.getvalue())
+
+    def test_act_still_runs_when_the_batch_reaches_its_final_wave(self) -> None:
+        # The mirror of the above: no stop, so the deferral must not swallow Act.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("MA")
+        act_calls: list[str] = []
+        real_act = flow._maybe_run_act
+        flow._maybe_run_act = lambda cfg, today, **k: act_calls.append(today)
+        try:
+            with redirect_stderr(io.StringIO()):
+                flow.flow_ids(self.cfg, ["MA"], do_act=True, today="2026-06-04")
+        finally:
+            flow._maybe_run_act = real_act
+        self.assertEqual(act_calls, ["2026-06-04"])
+
     def test_stack_base_file_round_trips(self) -> None:
         # The flow records the integration branch for a wave>0 bundle; worktree + publish
         # read it via publish._stack_base_branch (the generalised stack base).
@@ -1263,6 +1404,20 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("wave 0: WX", out.getvalue())
         self.assertIn("wave 1: WY", out.getvalue())
+
+    def test_waves_command_says_the_driver_merges_nothing(self) -> None:
+        # The preview must describe the plan the flow will actually run: with auto_merge off
+        # a multi-wave batch stops at the boundary, so the stock "each wave builds on the
+        # prior's accepted work" line would be a promise the driver does not keep (#462).
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("WM1")
+        self._brief("WM2", depends_on="WM1")
+        with redirect_stdout(io.StringIO()) as out:
+            cli._waves(self.cfg, ["WM1", "WM2"])
+        self.assertIn("the driver merges nothing", out.getvalue())
+        self.assertIn("STOPs", out.getvalue())
+        self.assertNotIn("each wave builds on the prior", out.getvalue())
 
     def test_waves_command_reports_unschedulable(self) -> None:
         self._brief("CZ1", depends_on="CZ2")

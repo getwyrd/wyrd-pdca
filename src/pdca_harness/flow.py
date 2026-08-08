@@ -585,18 +585,40 @@ def _runnable(cfg: Config, wave: list[Path], batch_names: set[str]) -> list[Path
     so a dependent built on a COMPLETE-but-unmerged base would miss the prerequisite. It must
     wait until the PR is genuinely merged (``merged.is_merged``) — a later ``pdca flow`` run
     then picks it up. A skipped bundle never completes, so its own dependents fall out of later
-    waves the same way (the skip cascades)."""
+    waves the same way (the skip cascades).
+
+    **Merge mode with ``auto_merge`` off gates EVERY dep on the merge (#462 review).** That
+    combination stops the run at each non-final wave boundary and asks the human to merge, so
+    a resumed run's correctness rests entirely on their having actually done it. Nothing else
+    can carry the diff: the driver merges nothing, and the wave fold that would otherwise
+    carry an in-batch prereq is the ``stack`` path, not this one. So the reason given above
+    for an out-of-batch prereq — nothing in *this* run carries its diff into the base — holds
+    for **in-batch** and **plain ``Depends on``** prereqs too. Gating only ``Depends on
+    (merged)`` would let COMPLETE alone satisfy a dependent on the resumed run and build it
+    against a base the prerequisite never reached: precisely the condition the boundary stop
+    exists to prevent, reintroduced one invocation later."""
     runnable: list[Path] = []
+    # Merge mode that merges nothing: the human's merge is the ONLY thing that can advance a
+    # base, so verify it rather than trust it (#462 review).
+    verify_every_dep = cfg.wave_mode == "merge" and not cfg.auto_merge
     for d in wave:
         bp = d / "brief.md"
         merged_deps = set(brief.depends_on_merged(bp)) if bp.exists() else set()
         unmet: list[str] = []
         for dep in (waves.declared_deps(bp) if bp.exists() else []):
             out_of_batch = cfg.bundle(dep).name not in batch_names
-            if out_of_batch and dep in merged_deps:
+            dd = cfg.find_bundle(dep)
+            # A prereq with no contribution has no merge to wait for, and the boundary stop
+            # lets its wave through for the same reason — the two must agree or a close/no-fix
+            # prerequisite would gate its dependent forever on a PR nobody will ever open.
+            # Scoped to the new check: #186's `Depends on (merged)` gate keeps its own rule.
+            if verify_every_dep and merge.has_contribution(dd):
+                if not merged.is_merged(cfg, dep):
+                    unmet.append(dep)
+            elif out_of_batch and dep in merged_deps:
                 if not merged.is_merged(cfg, dep):  # PR not yet merged — wait, don't build (#186)
                     unmet.append(dep)
-            elif state.state(cfg.find_bundle(dep)) != state.COMPLETE:  # archived prereq too (#171)
+            elif state.state(dd) != state.COMPLETE:  # archived prereq too (#171)
                 unmet.append(dep)
         if unmet:
             print(f"flow: {d.name} skipped — prerequisite(s) not ready "
@@ -772,6 +794,7 @@ def _drive_and_act(
     accepted: list[Path] = []        # cumulative COMPLETE bundles, wave then name order
     integ: dict[tuple[str, str], str] = {}  # per-target (repo, base) → integration branch (#187)
     preflighted = False              # per-lane preflight runs at most once, before the first pool
+    stopped_early = False            # a wave boundary STOPped the batch — suppresses Act (#462)
     for k, wave in enumerate(wave_list):
         runnable = _runnable(cfg, wave, batch_names)
         if not runnable:
@@ -846,9 +869,39 @@ def _drive_and_act(
         if k < last and do_publish:
             dry = cfg.publisher.mode == "stub"
             if cfg.wave_mode == "merge":
+                # [driver].auto_merge = false — merge mode WITHOUT the driver merging
+                # (pdca-harness#462). The wave's PRs stay exactly as publish opened them:
+                # drafts, based on the real target base, readied by nobody. Stopping here is
+                # not a fallback but the only correct move: `compute_waves` levels by longest
+                # path (waves.py:179), so every wave k+1 bundle has a prerequisite in wave k
+                # — running on would build it against a base that prerequisite never reached.
+                # The human merges, then re-runs; `merged.is_merged` makes that idempotent.
+                #
+                # Only stop for a wave that actually has something to merge (#462 review).
+                # A close/no-fix bundle carries no patch and publish opens no PR for it, and
+                # `_merge_one` skips exactly those — so a wave that is entirely closes leaves
+                # every base already where the next wave needs it. Stopping there would tell
+                # the operator to go merge PRs that do not exist and cost a second
+                # invocation for nothing. Same test as `_merge_one`: COMPLETE with a
+                # non-empty patch.diff.
+                if not cfg.auto_merge:
+                    to_merge = [d for d in complete if merge.has_contribution(d)]
+                    if to_merge:
+                        print(f"flow: wave {k} is accepted and published as draft PR(s); "
+                              f"[driver].auto_merge is off, so the driver is NOT readying or "
+                              f"merging them. STOPPING — wave {k + 1} would build on a base "
+                              f"its prerequisite has not reached. Merge these yourself, then "
+                              f"re-run to continue: "
+                              f"{', '.join(d.name for d in to_merge)}.", file=sys.stderr)
+                        stopped_early = True
+                        break
+                    print(f"flow: wave {k} has nothing to merge (no accepted bundle carries "
+                          f"a patch), so no base needs to move — continuing to wave {k + 1} "
+                          f"despite [driver].auto_merge being off.", file=sys.stderr)
                 if merge.merge_wave(cfg, complete, dry_run=dry, method=cfg.merge_method):
                     print(f"flow: wave {k} did not merge; STOPPING — later waves not run.",
                           file=sys.stderr)
+                    stopped_early = True
                     break
             else:  # default: stack — fold onto a per-target integration branch
                 # ONE lock scope covers fold AND re-gate (#297 review round 10): the
@@ -863,6 +916,7 @@ def _drive_and_act(
                     except integrate.IntegrationError as exc:
                         print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
                               f"later waves not run.", file=sys.stderr)
+                        stopped_early = True
                         break
                     if folded and not dry:
                         integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
@@ -881,11 +935,22 @@ def _drive_and_act(
                                   f"STOPPING (later waves not run).", file=sys.stderr)
                             stop_wave = True
                 if stop_wave:
+                    stopped_early = True
                     break
 
     _sweep_quietly(cfg, bundles)  # publish/freeze boundary — reclaim footprint (#297)
     results = {d.name.replace("issue_", ""): state.state(d) for d in bundles}
-    if do_act:
+    # Act runs ONCE across a FINISHED batch (this function's contract, above). Every `break`
+    # above leaves later waves unrun, so the batch is partial and Act would be reviewing a
+    # slice of it (#462 review). That was survivable while each break was an error path taken
+    # once; `auto_merge = false` makes the boundary stop the ROUTINE outcome of any
+    # multi-wave run, so Act would fire after every wave — once per resume — instead of once
+    # per batch. Defer it to the invocation that actually reaches the final wave.
+    if do_act and stopped_early:
+        print("flow: batch STOPped before its final wave — deferring Act to the run that "
+              "finishes it (Act reviews a completed batch, not a slice of one).",
+              file=sys.stderr)
+    if do_act and not stopped_early:
         _maybe_run_act(cfg, today,
                        any_complete=any(s == state.COMPLETE for s in results.values()))
     return results

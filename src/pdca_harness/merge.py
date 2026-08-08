@@ -15,6 +15,11 @@ deterministic ``git``/``gh`` (no model); dry-run (stubbed publisher) prints the 
 merges nothing. The harness's own ``gh pr merge`` runs in the orchestrator, outside the
 ``builder_guard`` hook that blocks the model leaves from merging — exactly as publish's
 ``gh pr create`` does.
+
+``[driver].auto_merge = false`` turns the merging back off without leaving merge mode: the
+flow never calls :func:`merge_wave` and STOPs at the wave boundary instead, so the PRs keep
+the draft ``publish`` opened and the merge stays the human's (pdca-harness#462). This module
+is the mechanics only — it merges whenever it is called.
 """
 
 from __future__ import annotations
@@ -25,6 +30,29 @@ from pathlib import Path
 
 from . import merged, publish, state
 from .config import Config
+
+
+def has_contribution(d: Path) -> bool:
+    """True if this bundle has a patch that must reach its base.
+
+    A close / no-fix disposition writes no ``patch.diff`` (or an empty one) and publish opens
+    no PR for it, so nothing of it needs merging and no base has to move on its account.
+
+    Shared rather than inlined (#462 review): ``_merge_one`` skips these bundles, and the
+    ``[driver].auto_merge = false`` boundary stop in ``flow`` must skip exactly the same set
+    when deciding whether a completed wave has anything for the human to merge. Two copies of
+    the test would eventually disagree, and the disagreement is invisible — a wave that stops
+    for nothing, or one that does not stop when it should.
+    """
+    patch = d / "patch.diff"
+    try:
+        return patch.is_file() and bool(patch.read_text(encoding="utf-8").strip())
+    except OSError:
+        # Unreadable is not "nothing to merge". For the merge path this means attempting the
+        # merge (which reports its own failure); for the boundary stop it means stopping.
+        # Both cost an invocation; the opposite reading risks building on a base that never
+        # moved, so fail toward the loud outcome.
+        return True
 
 
 def merge_wave(cfg: Config, bundles: list[Path], *, dry_run: bool = False,
@@ -45,8 +73,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     post-merge base fetch across bundles that share a checkout."""
     if state.state(d) != state.COMPLETE:
         return 0  # not accepted — nothing of this bundle's to merge
-    patch = d / "patch.diff"
-    if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
+    if not has_contribution(d):
         return 0  # close / no-fix disposition — no contribution to merge
     rec = publish._publish_record(d)
     pr_url = rec.get("pr_url") if rec else None

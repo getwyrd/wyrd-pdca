@@ -116,5 +116,53 @@ class AutoIterateOptIn(unittest.TestCase):
         self.assertEqual(cfg.max_auto_iters, 0)
 
 
+class AutoMergeOptIn(unittest.TestCase):
+    """``[driver].auto_merge`` parses strictly too (#462 review).
+
+    Same hazard as ``auto_iterate``, opposite default: this one ships ON, so a
+    false-looking value read through ``bool()`` gives the instance the automatic merging
+    it explicitly wrote config to stop — the single behaviour the switch exists to
+    prevent. Unrecognised values fail CLOSED, which here means the driver merges nothing.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        saved = os.environ.pop("PDCA_LEAVES_MODE", None)
+        if saved is not None:
+            self.addCleanup(os.environ.__setitem__, "PDCA_LEAVES_MODE", saved)
+
+    def _load(self, extra: str = "") -> Config:
+        (self.tmp / "pdca.toml").write_text(
+            '[project]\ndefault_branch = "main"\n'
+            '[leaves.builder]\nmode = "stub"\n'
+            '[leaves.reviewer]\nmode = "stub"\n' + extra,
+            encoding="utf-8")
+        with redirect_stderr(io.StringIO()) as err:
+            cfg = Config.load(self.tmp)
+        self.stderr = err.getvalue()
+        return cfg
+
+    def test_default_is_on_so_upstream_behaviour_is_unchanged(self) -> None:
+        self.assertTrue(self._load().auto_merge)
+
+    def test_real_toml_booleans_parse(self) -> None:
+        self.assertTrue(self._load('[driver]\nauto_merge = true\n').auto_merge)
+        self.assertFalse(self._load('[driver]\nauto_merge = false\n').auto_merge)
+
+    def test_string_false_does_not_re_enable_merging(self) -> None:
+        # bool("false") is True. Read that way, an instance that wrote auto_merge = "false"
+        # would have its PRs readied and merged anyway.
+        self.assertFalse(self._load('[driver]\nauto_merge = "false"\n').auto_merge)
+
+    def test_string_true_is_on(self) -> None:
+        self.assertTrue(self._load('[driver]\nauto_merge = "true"\n').auto_merge)
+
+    def test_garbage_fails_closed_and_warns(self) -> None:
+        cfg = self._load('[driver]\nauto_merge = "flase"\n')
+        self.assertFalse(cfg.auto_merge)   # closed here = the driver merges nothing
+        self.assertIn("fails closed", self.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
