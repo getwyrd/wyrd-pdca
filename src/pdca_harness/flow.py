@@ -846,6 +846,20 @@ def _drive_and_act(
         if k < last and do_publish:
             dry = cfg.publisher.mode == "stub"
             if cfg.wave_mode == "merge":
+                # [driver].auto_merge = false — merge mode WITHOUT the driver merging
+                # (pdca-harness#462). The wave's PRs stay exactly as publish opened them:
+                # drafts, based on the real target base, readied by nobody. Stopping here is
+                # not a fallback but the only correct move: `compute_waves` levels by longest
+                # path (waves.py:179), so every wave k+1 bundle has a prerequisite in wave k
+                # — running on would build it against a base that prerequisite never reached.
+                # The human merges, then re-runs; `merged.is_merged` makes that idempotent.
+                if not cfg.auto_merge:
+                    print(f"flow: wave {k} is accepted and published as draft PR(s); "
+                          f"[driver].auto_merge is off, so the driver is NOT readying or "
+                          f"merging them. STOPPING — wave {k + 1} would build on a base its "
+                          f"prerequisite has not reached. Merge the wave's PRs yourself, "
+                          f"then re-run to continue.", file=sys.stderr)
+                    break
                 if merge.merge_wave(cfg, complete, dry_run=dry, method=cfg.merge_method):
                     print(f"flow: wave {k} did not merge; STOPPING — later waves not run.",
                           file=sys.stderr)

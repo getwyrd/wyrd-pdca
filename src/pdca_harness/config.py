@@ -333,6 +333,14 @@ class Config:
     # The `gh pr merge` strategy for wave_mode="merge" (issue #wave-model): merge | squash |
     # rebase. Default "merge" (a merge commit — auditable, bisectable). [driver].merge_method.
     merge_method: str = "merge"
+    # Whether wave_mode="merge" may actually merge (pdca-harness#462). On (default), a
+    # non-final wave's PRs are readied and merged at its boundary. Off, the driver merges
+    # NOTHING and readies NOTHING — every accepted bundle stays the draft PR publish opened,
+    # and the flow STOPs at the first non-final wave boundary rather than build the next wave
+    # on a base its prerequisite never reached. Keeps merge mode's real-base PRs (so
+    # C4-verify's `origin/<brief base>` still matches the PR base) while the merge stays the
+    # human's. No effect under wave_mode="stack". [driver].auto_merge.
+    auto_merge: bool = True
     # Optional integration re-gate (#wave-model): after each wave folds onto the
     # integration branch, run the repo-scoped gates over that tip before the next wave
     # builds on it, so a combination that is red though each fix was green alone STOPs the
@@ -655,6 +663,7 @@ class Config:
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
         wave_mode = driver_cfg.get("wave_mode", "stack")  # #wave-model: stack | merge
         merge_method = driver_cfg.get("merge_method", "merge")  # merge | squash | rebase
+        auto_merge = bool(driver_cfg.get("auto_merge", True))  # pdca-harness#462
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.
@@ -738,6 +747,7 @@ class Config:
             lane_preflight=lane_preflight,
             wave_mode=wave_mode,
             merge_method=merge_method,
+            auto_merge=auto_merge,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,

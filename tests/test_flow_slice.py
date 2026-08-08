@@ -1246,6 +1246,53 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(merge_calls, [["issue_GA"]])   # merged after wave 0 only
         self.assertEqual(fold_calls, [])                # fold not used in merge mode
 
+    def test_auto_merge_off_merges_nothing_and_stops_the_batch(self) -> None:
+        # wave_mode="merge" with [driver].auto_merge = false (pdca-harness#462): merge mode's
+        # real-base PRs, none of its merging. merge_wave is never called (so nothing is
+        # readied or merged), fold is never called, and the run STOPs after wave 0 — wave 1's
+        # GB depends on GA, and its base has not moved, so building it would be wrong.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("HA")
+        self._brief("HB", depends_on="HA")
+        merge_calls: list[list[str]] = []
+        fold_calls: list[int] = []
+        real_merge, real_fold = flow.merge.merge_wave, flow.integrate.fold
+        flow.merge.merge_wave = lambda cfg, bundles, **k: (
+            merge_calls.append([d.name for d in bundles]), 0)[1]
+        flow.integrate.fold = lambda *a, **k: (fold_calls.append(1), (None, None))[1]
+        try:
+            with redirect_stderr(io.StringIO()) as err:
+                results = flow.flow_ids(self.cfg, ["HA", "HB"], do_act=False,
+                                        today="2026-06-04")
+        finally:
+            flow.merge.merge_wave, flow.integrate.fold = real_merge, real_fold
+        self.assertEqual(merge_calls, [])   # nothing readied, nothing merged
+        self.assertEqual(fold_calls, [])    # and no integration branch either
+        self.assertEqual(results.get("HA"), state.COMPLETE)      # wave 0 still ran in full
+        self.assertNotEqual(results.get("HB"), state.COMPLETE)   # wave 1 never built
+        self.assertIn("auto_merge is off", err.getvalue())
+
+    def test_auto_merge_off_still_completes_a_single_wave_batch(self) -> None:
+        # The STOP is about the NEXT wave's base, so a batch that has no next wave is
+        # unaffected: both bundles complete and publish as drafts, and merge_wave — which
+        # the final wave never reaches even with auto_merge on — is still never called.
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("IA")
+        self._brief("IB")
+        merge_calls: list[list[str]] = []
+        real_merge = flow.merge.merge_wave
+        flow.merge.merge_wave = lambda cfg, bundles, **k: (
+            merge_calls.append([d.name for d in bundles]), 0)[1]
+        try:
+            results = flow.flow_ids(self.cfg, ["IA", "IB"], do_act=False, today="2026-06-04")
+        finally:
+            flow.merge.merge_wave = real_merge
+        self.assertEqual(merge_calls, [])
+        self.assertEqual(results.get("IA"), state.COMPLETE)
+        self.assertEqual(results.get("IB"), state.COMPLETE)
+
     def test_stack_base_file_round_trips(self) -> None:
         # The flow records the integration branch for a wave>0 bundle; worktree + publish
         # read it via publish._stack_base_branch (the generalised stack base).
@@ -1263,6 +1310,20 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("wave 0: WX", out.getvalue())
         self.assertIn("wave 1: WY", out.getvalue())
+
+    def test_waves_command_says_the_driver_merges_nothing(self) -> None:
+        # The preview must describe the plan the flow will actually run: with auto_merge off
+        # a multi-wave batch stops at the boundary, so the stock "each wave builds on the
+        # prior's accepted work" line would be a promise the driver does not keep (#462).
+        self.cfg.wave_mode = "merge"
+        self.cfg.auto_merge = False
+        self._brief("WM1")
+        self._brief("WM2", depends_on="WM1")
+        with redirect_stdout(io.StringIO()) as out:
+            cli._waves(self.cfg, ["WM1", "WM2"])
+        self.assertIn("the driver merges nothing", out.getvalue())
+        self.assertIn("STOPs", out.getvalue())
+        self.assertNotIn("each wave builds on the prior", out.getvalue())
 
     def test_waves_command_reports_unschedulable(self) -> None:
         self._brief("CZ1", depends_on="CZ2")
