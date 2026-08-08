@@ -77,12 +77,24 @@
   publish opened, and a multi-wave batch STOPs after wave 0 with a message telling you to
   merge that wave yourself and re-run (`compute_waves` levels by longest path, so wave *k*+1
   always has a prerequisite in wave *k* — continuing would build it against a base that
-  prerequisite never reached; a re-run is idempotent via `merged.is_merged`). What forced
-  this: on 2026-08-08 the driver merged wyrd #703 six seconds after opening it, before the
-  required `gate` context had reported, so `gh pr merge` refused it and the wave stopped with
-  #703 readied and #704–706 untouched (getwyrd/pdca-harness#462). Turn back on once #462's
-  `--auto`/poll fix lands upstream. A single-wave batch is unaffected either way — the final
-  wave never merges.
+  prerequisite never reached). What forced this: on 2026-08-08 the driver merged wyrd #703
+  six seconds after opening it, before the required `gate` context had reported, so `gh pr
+  merge` refused it and the wave stopped with #703 readied and #704–706 untouched
+  (getwyrd/pdca-harness#462). Turn back on once #462's `--auto`/poll fix lands upstream. A
+  single-wave batch is unaffected either way — the final wave never merges.
+  Three consequences of the stop, all from the #462 review:
+  - **The re-run verifies your merge; it does not assume it.** With this off, `_runnable`
+    gates *every* declared `Depends on` on `merged.is_merged`, not just the stricter
+    `Depends on (merged)`. Nothing else can move a base here — the driver merges nothing,
+    and the wave fold is the `stack` path — so a prerequisite that is COMPLETE but unmerged
+    holds its dependent back, and the next run says `prerequisite(s) not ready` rather than
+    quietly rebuilding the very mistake the stop prevented.
+  - **A wave with nothing to merge does not stop.** A close / no-fix bundle carries no patch
+    and gets no PR, so no base has to move; the run continues to the next wave in the same
+    invocation instead of telling you to merge PRs that do not exist.
+  - **Act is deferred past any stop.** Act reviews a *finished* batch, so a run that STOPs at
+    a boundary defers it to the invocation that reaches the final wave. Otherwise a
+    multi-wave batch would fire Act once per resume rather than once per batch.
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).
   `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:

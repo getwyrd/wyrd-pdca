@@ -663,7 +663,12 @@ class Config:
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
         wave_mode = driver_cfg.get("wave_mode", "stack")  # #wave-model: stack | merge
         merge_method = driver_cfg.get("merge_method", "merge")  # merge | squash | rebase
-        auto_merge = bool(driver_cfg.get("auto_merge", True))  # pdca-harness#462
+        # Strict, not `bool()` (#462 review): `bool("false")` is True, so an instance that
+        # wrote `auto_merge = "false"` would get the merging it explicitly asked to stop —
+        # the one direction this switch exists to prevent. `_parse_opt_in` fails CLOSED,
+        # which for this knob means "driver merges nothing", the safe reading. An absent key
+        # still arrives as the real bool `True`, so the upstream default is unchanged.
+        auto_merge = _parse_opt_in(driver_cfg.get("auto_merge", True), "auto_merge")
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.
