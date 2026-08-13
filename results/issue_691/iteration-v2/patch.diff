@@ -1,0 +1,1654 @@
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index fe572be..f298270 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -10,6 +10,7 @@
+ 
+ pub mod erasure;
+ pub mod metadata;
++pub mod multipart;
+ pub mod placement;
+ pub mod read;
+ pub mod repair;
+diff --git a/crates/core/src/multipart.rs b/crates/core/src/multipart.rs
+new file mode 100644
+index 0000000..1ac793e
+--- /dev/null
++++ b/crates/core/src/multipart.rs
+@@ -0,0 +1,795 @@
++//! The **multipart commit protocol**'s key space and the validated identity types it is
++//! spelled in (proposal 0016,
++//! `docs/design/proposals/draft/0016-multipart-commit-protocol.md`).
++//!
++//! This is slice 1 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
++//! deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
++//! `async fn`. After this module a reader can name every key the protocol will ever write
++//! (`0016` §1, `:333-527`) and parse it back — nothing more. The record **values** those
++//! keys address (`mpu:`'s session shape, `part:`'s chunk list, the `Budget` profile tuple,
++//! `encode_record`/`decode_record`) are the next child's; the outcome enums, the answer
++//! table and `multipart_etag` are the child after that's (`0016` decision 3, `:894-1037`,
++//! `0016:3064-3070`).
++//!
++//! # The keyed classes (`0016` §1, `:333-527`)
++//!
++//! | Key | What it addresses |
++//! |---|---|
++//! | `mpuctl` | the fleet **admission ledger** singleton — no id, no parser |
++//! | `mpu:<id>` | one **session** |
++//! | `slot:<id>:<k>` | one **in-flight part slot**; the key space *is* the per-session cap |
++//! | `part:<id>:<n>` | a **committed part** |
++//! | `psum:<id>:<n>` | that part's **summary** |
++//! | `sidx:<id>:<n>:<chunk>` | one **owned staging entry**, under a prefix disjoint from `pending:` (`0016:475-491`) |
++//! | `retire:bytes:<token>` | a **retirement obligation**: orphan-mark bytes, then delete the naming records |
++//! | `retire:records:<token>` | records to delete whose bytes something else protects |
++//!
++//! Every prefix here is disjoint from every other and from the pre-existing `inode:` /
++//! `dirent:` / `pending:` / `bucket:` / `orphan:` (`metadata.rs:30-70`), `seg:` / `seggrp:`
++//! (`metadata.rs:293-300`) and `desired:dserver:` (`custodian/src/desired_state.rs:33`),
++//! and none is a prefix of another, so no `scan` returns a neighbour's records
++//! (`0016:333-356`; ADR-0046 decision 1, disjoint first-class records under a disjoint
++//! prefix — never an encoding smuggled into an existing namespace).
++//!
++//! # Structural validity is a type, not a convention (ADR-0045)
++//!
++//! Every component a key is built from arrives here as a **validated type** —
++//! [`UploadId`], [`AttemptId`], [`PartNumber`], [`SlotIndex`], [`Digest`] — mirroring
++//! [`crate::metadata::SegmentNonce`], whose doc records why (`metadata.rs:714-733`):
++//! parsing the rule into the type is what makes an unvalidated value *unrepresentable*
++//! rather than merely unlikely (ADR-0045, parse-don't-validate). Two consequences this
++//! module leans on:
++//!
++//! * every key constructor is **total and infallible** — it cannot mint a key its own
++//!   parser would reject, the property `seg_key` states at `metadata.rs:1219-1233`;
++//! * `parse(key(x)) == x` for every keyed class, and a **non-canonical** spelling of the
++//!   same record (`slot:<id>:7`, `slot:<id>:0000007`, `slot:<id>:+7`) parses as **no**
++//!   record at all. Two spellings of one record would defeat a `require_absent` guard and
++//!   hide a record from a bounded range scan — residue nothing enumerates and therefore
++//!   nothing reclaims (**C-1**, `docs/principles.md` §5 C-1, the form
++//!   `metadata.rs:724` cites it in).
++//!
++//! Structural validity is checked **at decode**, never by convention at a call site
++//! (`0016:390-414`).
++//!
++//! # Nothing here is written yet — where the living-architecture update belongs
++//!
++//! This module is the key **grammar** only: it has no writer, no store call and no
++//! production consumer (the first writers are the store round trips, #656–#659). The living
++//! architecture doc describes the system **as it is** (`docs/design/README.md:28`), and its
++//! metadata model (`docs/design/architecture/05-building-block-view.md:183-195`) therefore
++//! gains these namespaces with the slice that first *persists* one — documenting records no
++//! code emits would make the living doc describe a system that does not exist. Until then the
++//! normative description of this key space is proposal 0016 §1 (`0016:333-356`), already
++//! merged on `main`.
++
++use std::fmt;
++
++use serde::de::Error as DeError;
++use serde::{Deserialize, Deserializer, Serialize};
++use wyrd_traits::ChunkId;
++
++use crate::metadata::{self, InodeId};
++
++// ===========================================================================
++// 1. Errors — every structural violation is a typed error, never a value
++//    (ADR-0045; `0016:390-414`)
++// ===========================================================================
++
++/// A structural violation of a multipart **key** — never a silently-corrected default
++/// (ADR-0045, parse-don't-validate; `0016:390-414`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RecordError {
++    /// A key whose prefix, field count or field syntax does not parse — including a key
++    /// whose bytes are not UTF-8, a truncated key and one with a trailing component.
++    MalformedKey {
++        /// The namespace expected.
++        namespace: &'static str,
++        /// The key as UTF-8 (lossy), for the operator signal.
++        key: String,
++    },
++    /// A token component (upload id, attempt id) that is not exactly [`TOKEN_HEX_LEN`]
++    /// lowercase-hex characters.
++    TokenNotHex {
++        /// The rejected token.
++        token: String,
++    },
++    /// A part number outside `[1, MAX_PART_NUMBER]` — the **format** bound the fixed-width
++    /// key grammar can spell, never a live capacity knob.
++    PartNumberOutOfRange {
++        /// The number found.
++        part_number: u64,
++    },
++    /// A slot index outside `[0, MAX_SLOT_INDEX]` — the **format** bound.
++    SlotIndexOutOfRange {
++        /// The index found.
++        index: u64,
++    },
++    /// A `retire:` key whose mode component is neither `bytes` nor `records`
++    /// (`0016:434-440`).
++    UnknownRetireMode {
++        /// The mode as read.
++        mode: String,
++    },
++    /// A digest that is not 64 **lowercase**-hex characters (a SHA-256, ADR-0047).
++    DigestNotHex {
++        /// The rejected text.
++        digest: String,
++    },
++}
++
++impl fmt::Display for RecordError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::MalformedKey { namespace, key } => {
++                write!(f, "malformed {namespace} key {key:?}")
++            }
++            Self::TokenNotHex { token } => write!(
++                f,
++                "{token:?} is not {TOKEN_HEX_LEN} lowercase-hex characters (a 128-bit token)"
++            ),
++            Self::PartNumberOutOfRange { part_number } => write!(
++                f,
++                "part number {part_number} is outside the format bound [1, {MAX_PART_NUMBER}]"
++            ),
++            Self::SlotIndexOutOfRange { index } => write!(
++                f,
++                "slot index {index} is outside the format bound [0, {MAX_SLOT_INDEX}]"
++            ),
++            Self::UnknownRetireMode { mode } => write!(
++                f,
++                "retire: key mode {mode:?} is neither `bytes` nor `records`"
++            ),
++            Self::DigestNotHex { digest } => write!(
++                f,
++                "{digest:?} is not 64 lowercase-hex characters (a SHA-256 digest)"
++            ),
++        }
++    }
++}
++
++impl std::error::Error for RecordError {}
++
++fn malformed_key(namespace: &'static str, key: &[u8]) -> RecordError {
++    RecordError::MalformedKey {
++        namespace,
++        key: String::from_utf8_lossy(key).into_owned(),
++    }
++}
++
++// ===========================================================================
++// 2. The validated components every key is built from
++// ===========================================================================
++
++/// A 128-bit token's canonical textual length: 32 lowercase-hex characters
++/// (`0016:493-497`). Taken from [`crate::metadata::SEG_NONCE_HEX_LEN`]
++/// (`metadata.rs:289`) rather than restated, since an upload id, an attempt id and a
++/// segment-group nonce are the same 128-bit-token shape minted the same way.
++pub const TOKEN_HEX_LEN: usize = metadata::SEG_NONCE_HEX_LEN;
++
++/// Whether `token` is a well-formed 128-bit token: exactly [`TOKEN_HEX_LEN`] lowercase-hex
++/// characters (`0016:493-497`). Rejects an empty string, a short or long token, uppercase
++/// hex, and — because `:` is never a hex digit — a token that embeds the key separator.
++pub fn is_token(token: &str) -> bool {
++    token.len() == TOKEN_HEX_LEN
++        && token
++            .bytes()
++            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++fn require_token(token: String) -> Result<String, RecordError> {
++    if is_token(&token) {
++        Ok(token)
++    } else {
++        Err(RecordError::TokenNotHex { token })
++    }
++}
++
++/// An **upload id**: the 128-bit token a gateway mints for one session, rendered as 32
++/// lowercase hex characters (`0016:493-497`).
++///
++/// A validated type rather than a `String` for the reason
++/// [`crate::metadata::SegmentNonce`] is (`metadata.rs:714-733`): it is the component every
++/// per-session **range** is derived from (`slot:<id>:`, `part:<id>:`, `sidx:<id>:`), so an
++/// id carrying the key separator would name another session's live range, and an empty one
++/// would name every session's.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct UploadId(String);
++
++impl UploadId {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(id: impl Into<String>) -> Result<Self, RecordError> {
++        require_token(id.into()).map(Self)
++    }
++
++    /// The id as its 32 hex characters.
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for UploadId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for UploadId {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// An **attempt id**: the 128-bit token one `UploadPart` attempt stamps into the `slot:`
++/// record it reserved, so an ambiguous reserve is settled by re-reading rather than by
++/// re-reserving a different index (`0016:349`). Same grammar as [`UploadId`].
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct AttemptId(String);
++
++impl AttemptId {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(id: impl Into<String>) -> Result<Self, RecordError> {
++        require_token(id.into()).map(Self)
++    }
++
++    /// The id as its 32 hex characters.
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for AttemptId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for AttemptId {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The decimal width a part number is zero-padded to in `part:` / `psum:` / `sidx:` keys, so
++/// the key's byte-lexicographic order equals part-number order — the property
++/// `metadata.rs:270-273` states for `SEG_INDEX_WIDTH`, mirrored for this slice's key space.
++///
++/// **Six digits, deliberately, pinned at Plan.** The gateway seam is protocol-neutral
++/// (ADR-0046 decision 6, `docs/design/adr/0046-bucket-model-real-namespace.md:54-57`:
++/// `crates/gateway-core` admits no S3 vocabulary), so the *format* must clear every known
++/// front door's ceiling with margin, not just S3's: S3 caps a multipart upload at 10,000
++/// parts per its wire protocol, Azure block blobs at 50,000 committed / 100,000 staged
++/// blocks. Five digits (S3's own headroom) does not clear Azure's; six does, with room to
++/// spare. Each *protocol's* cap is enforced at admission as **capacity**, never here —
++/// mirroring `SEG_INDEX_WIDTH` vs `MAX_ROOT_SEGMENTS` (`metadata.rs:270-321`). Widening the
++/// key space later is a stored-format change with a migration, exactly as that constant's
++/// doc records, so the headroom is bought now rather than borrowed.
++pub const PART_NUMBER_WIDTH: usize = 6;
++
++/// The largest part number the `part:`/`psum:`/`sidx:` key grammar can address — the whole
++/// key space [`PART_NUMBER_WIDTH`] opens, `999_999`.
++///
++/// A **format** bound (a constant of the encoding), never the live `MAX_PARTS_PER_SESSION`
++/// knob (#655's), which is enforced where a part is *admitted*. Mirrors
++/// [`crate::metadata::MAX_SEGMENT_INDEX`] and its reasoning (`metadata.rs:275-286`).
++pub const MAX_PART_NUMBER: u32 = 10u32.pow(PART_NUMBER_WIDTH as u32) - 1;
++
++/// A **part number**: `[1, MAX_PART_NUMBER]`, the range the fixed-width key grammar can both
++/// render and parse back. Zero is not a part (S3 numbers parts from 1) and a number past the
++/// key space would name a `part:` record no parser could read.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct PartNumber(u32);
++
++impl PartNumber {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(part_number: u32) -> Result<Self, RecordError> {
++        if part_number == 0 || part_number > MAX_PART_NUMBER {
++            return Err(RecordError::PartNumberOutOfRange {
++                part_number: u64::from(part_number),
++            });
++        }
++        Ok(Self(part_number))
++    }
++
++    /// The number.
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++impl fmt::Display for PartNumber {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for PartNumber {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(u32::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The decimal width a `slot:` key's index is zero-padded to, so byte-lexicographic key
++/// order equals index order (`metadata.rs:270-273`'s rule, mirrored).
++///
++/// **Six digits, pinned at Plan.** `MAX_INFLIGHT_PARTS`'s own clamp arithmetic
++/// (`0016:1471`) reaches **≈524,288** at `MAX_PART_CHUNKS = 1` before the `SCAN_CAP`
++/// byte-envelope clamp brings it back down — so the format must address at least that many
++/// indices, or a legal (if extreme) `MAX_INFLIGHT_PARTS` would mint a slot index no key
++/// could spell. Five digits tops out at 99,999, under that figure; six (`999_999`) clears
++/// it with margin, mirroring the `PART_NUMBER_WIDTH` headroom rule above.
++pub const SLOT_INDEX_WIDTH: usize = 6;
++
++/// The largest index the `slot:` key grammar can address — the whole key space
++/// [`SLOT_INDEX_WIDTH`] opens, `999_999`. A **format** bound: the live `MAX_INFLIGHT_PARTS`
++/// (#655's) is enforced at *reservation*, never at decode, because 0016 permits lowering it
++/// while live sessions still hold indices above the new cap (`0016:390-402`) — and a record
++/// that stopped decoding the moment a knob dropped could no longer be renewed, committed or
++/// torn down.
++pub const MAX_SLOT_INDEX: u32 = 10u32.pow(SLOT_INDEX_WIDTH as u32) - 1;
++
++/// An **in-flight slot index**: `[0, MAX_SLOT_INDEX]`. Index 0 is a real slot (the key space
++/// *is* the per-session cap, `0016:349`), so only the upper bound rejects.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct SlotIndex(u32);
++
++impl SlotIndex {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(index: u32) -> Result<Self, RecordError> {
++        if index > MAX_SLOT_INDEX {
++            return Err(RecordError::SlotIndexOutOfRange {
++                index: u64::from(index),
++            });
++        }
++        Ok(Self(index))
++    }
++
++    /// The index.
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++impl fmt::Display for SlotIndex {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for SlotIndex {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(u32::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// A SHA-256 digest, stored as 64 **lowercase**-hex characters.
++///
++/// The basis ADR-0047 settled for Wyrd's opaque change token — **never MD5**. A validated
++/// type because a digest's *shape* is structural: a short or uppercase digest is not a
++/// value any composition could use. Computing one (`Digest::of`, over `sha2`) is the next
++/// child's — `sha2` is not a dependency of this crate yet, so this slice carries only the
++/// **shape** every later child's [`Digest::of`] will populate: construction from raw bytes,
++/// and the validating hex parse.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Digest([u8; 32]);
++
++impl Digest {
++    /// A digest from its 32 raw bytes.
++    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
++        Self(bytes)
++    }
++
++    /// The validating parser: exactly 64 lowercase-hex characters. Rejects uppercase hex
++    /// (a second spelling of one digest), any other length, and any non-hex byte.
++    pub fn from_hex(text: &str) -> Result<Self, RecordError> {
++        let not_hex = || RecordError::DigestNotHex {
++            digest: text.to_string(),
++        };
++        let raw = text.as_bytes();
++        if raw.len() != 64 {
++            return Err(not_hex());
++        }
++        let mut out = [0u8; 32];
++        for (i, slot) in out.iter_mut().enumerate() {
++            let hi = lowercase_hex_digit(raw[2 * i]).ok_or_else(not_hex)?;
++            let lo = lowercase_hex_digit(raw[2 * i + 1]).ok_or_else(not_hex)?;
++            *slot = hi * 16 + lo;
++        }
++        Ok(Self(out))
++    }
++
++    /// The 32 raw digest bytes.
++    pub const fn as_bytes(&self) -> &[u8; 32] {
++        &self.0
++    }
++
++    /// The canonical lowercase-hex rendering.
++    pub fn to_hex(&self) -> String {
++        hex_lower(&self.0)
++    }
++}
++
++fn lowercase_hex_digit(byte: u8) -> Option<u8> {
++    match byte {
++        b'0'..=b'9' => Some(byte - b'0'),
++        b'a'..=b'f' => Some(byte - b'a' + 10),
++        _ => None,
++    }
++}
++
++impl fmt::Display for Digest {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.to_hex())
++    }
++}
++
++impl Serialize for Digest {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_str(&self.to_hex())
++    }
++}
++
++impl<'de> Deserialize<'de> for Digest {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::from_hex(&String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// Bytes as lowercase hex — the rendering ADR-0047 settled for the change token, matching
++/// the wrapper style `crates/gateway-s3/src/crypto.rs:21-60` carries for this workspace's
++/// other SHA-256 usage.
++pub fn hex_lower(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
++        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
++    }
++    out
++}
++
++// ===========================================================================
++// 3. Keys and their canonical parsers
++// ===========================================================================
++
++/// The singleton admission-ledger key (`0016:348`). Never deleted; an absent record reads
++/// as `{count: 0}` (a later slice's concern — this module states only the key). Its
++/// **lack** of a trailing `:` is exactly what keeps it disjoint from [`MPU_PREFIX`]: see
++/// that constant's doc.
++pub const MPUCTL_KEY: &[u8] = b"mpuctl";
++
++/// Key prefix for session records. The trailing `:` is what keeps this **disjoint from**
++/// [`MPUCTL_KEY`] — `"mpuctl".starts_with("mpu:")` is `false` because `mpuctl`'s 4th byte is
++/// `c`, not `:` — so `scan(MPU_PREFIX)` can never return the admission singleton
++/// (`0016:342-344`).
++pub const MPU_PREFIX: &[u8] = b"mpu:";
++/// Key prefix for in-flight part slots.
++pub const SLOT_PREFIX: &[u8] = b"slot:";
++/// Key prefix for committed part records.
++pub const PART_PREFIX: &[u8] = b"part:";
++/// Key prefix for committed part summaries.
++pub const PSUM_PREFIX: &[u8] = b"psum:";
++/// Key prefix for owned staging entries — **disjoint from `pending:`**, which is the whole
++/// point of the class: no global `scan("pending:")` (the restore pass, the expiry sweep)
++/// ever enumerates an owned entry (`0016:475-491`).
++pub const SIDX_PREFIX: &[u8] = b"sidx:";
++/// Key prefix for byte-mode retirement obligations: orphan-mark, then delete the naming
++/// records (`0016:355`).
++pub const RETIRE_BYTES_PREFIX: &[u8] = b"retire:bytes:";
++/// Key prefix for record-mode retirement obligations: delete records only — never
++/// orphan-mark (`0016:356`).
++pub const RETIRE_RECORDS_PREFIX: &[u8] = b"retire:records:";
++
++/// A **fixed-width** `width`-digit decimal: exactly `width` ASCII digits — no `+`/`-` sign,
++/// no short spelling, no over-wide one. This is the rule the zero-padded key fields are
++/// checked against, and it is what makes byte-lexicographic key order equal numeric order
++/// (`metadata.rs:270-273`). `u32::from_str` alone would accept `+7`, `7` and `0000007` as
++/// three spellings of one record.
++fn fixed_width_u32(text: &str, width: usize) -> Option<u32> {
++    if text.len() != width || !text.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    text.parse().ok()
++}
++
++/// A decimal in **canonical** form: ASCII digits only (no sign), and no leading zero unless
++/// the value *is* `0` — the rule `parse_seg_key` applies to its own un-padded epoch
++/// (`metadata.rs:1296-1300`), reused for every variable-width decimal this module parses (a
++/// chunk id, a retirement token's epoch, version and per-part-suffix part number).
++fn canonical_decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
++    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    if text.len() > 1 && text.starts_with('0') {
++        return None;
++    }
++    text.parse().ok()
++}
++
++/// Split `key` into exactly `fields` `:`-separated components after `prefix`, failing closed
++/// on a non-UTF-8 key, a missing prefix, or the wrong field count (a truncated key, or one
++/// with a trailing component) — the shape every keyed-record parser below shares.
++fn split_key<'a>(
++    key: &'a [u8],
++    prefix: &str,
++    namespace: &'static str,
++    fields: usize,
++) -> Result<Vec<&'a str>, RecordError> {
++    let text = std::str::from_utf8(key).map_err(|_| malformed_key(namespace, key))?;
++    let rest = text
++        .strip_prefix(prefix)
++        .ok_or_else(|| malformed_key(namespace, key))?;
++    let parts: Vec<&str> = rest.splitn(fields, ':').collect();
++    if parts.len() != fields {
++        return Err(malformed_key(namespace, key));
++    }
++    Ok(parts)
++}
++
++/// Key for a session record: `mpu:<upload-id>`.
++pub fn mpu_key(upload_id: &UploadId) -> Vec<u8> {
++    format!("mpu:{upload_id}").into_bytes()
++}
++
++/// Parse an [`mpu_key`] back into its upload id.
++pub fn parse_mpu_key(key: &[u8]) -> Result<UploadId, RecordError> {
++    let fields = split_key(key, "mpu:", "mpu:", 1)?;
++    UploadId::new(fields[0])
++}
++
++/// Key for one in-flight part slot: `slot:<upload-id>:<index>`, zero-padded to
++/// [`SLOT_INDEX_WIDTH`].
++pub fn slot_key(upload_id: &UploadId, index: SlotIndex) -> Vec<u8> {
++    format!(
++        "slot:{upload_id}:{:0width$}",
++        index.get(),
++        width = SLOT_INDEX_WIDTH
++    )
++    .into_bytes()
++}
++
++/// The bounded per-session slot range: `slot:<upload-id>:` (`0016:349`).
++pub fn slot_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("slot:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`slot_key`] back into `(upload_id, index)`, rejecting every non-canonical
++/// spelling of one slot.
++pub fn parse_slot_key(key: &[u8]) -> Result<(UploadId, SlotIndex), RecordError> {
++    let fields = split_key(key, "slot:", "slot:", 2)?;
++    let index =
++        fixed_width_u32(fields[1], SLOT_INDEX_WIDTH).ok_or_else(|| malformed_key("slot:", key))?;
++    Ok((UploadId::new(fields[0])?, SlotIndex::new(index)?))
++}
++
++fn part_scoped_key(prefix: &str, upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    format!(
++        "{prefix}{upload_id}:{:0width$}",
++        part_number.get(),
++        width = PART_NUMBER_WIDTH
++    )
++    .into_bytes()
++}
++
++fn parse_part_scoped_key(
++    key: &[u8],
++    prefix: &'static str,
++    namespace: &'static str,
++) -> Result<(UploadId, PartNumber), RecordError> {
++    let fields = split_key(key, prefix, namespace, 2)?;
++    let part_number = fixed_width_u32(fields[1], PART_NUMBER_WIDTH)
++        .ok_or_else(|| malformed_key(namespace, key))?;
++    Ok((UploadId::new(fields[0])?, PartNumber::new(part_number)?))
++}
++
++/// Key for a committed part: `part:<upload-id>:<part-number>`, zero-padded to
++/// [`PART_NUMBER_WIDTH`] so a range read is in part-number order.
++pub fn part_key(upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    part_scoped_key("part:", upload_id, part_number)
++}
++
++/// The bounded per-session part range: `part:<upload-id>:`.
++pub fn part_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("part:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`part_key`] back into `(upload_id, part_number)`.
++pub fn parse_part_key(key: &[u8]) -> Result<(UploadId, PartNumber), RecordError> {
++    parse_part_scoped_key(key, "part:", "part:")
++}
++
++/// Key for a committed part's summary: `psum:<upload-id>:<part-number>`.
++pub fn psum_key(upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    part_scoped_key("psum:", upload_id, part_number)
++}
++
++/// The bounded per-session summary range: `psum:<upload-id>:`.
++pub fn psum_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("psum:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`psum_key`] back into `(upload_id, part_number)`.
++pub fn parse_psum_key(key: &[u8]) -> Result<(UploadId, PartNumber), RecordError> {
++    parse_part_scoped_key(key, "psum:", "psum:")
++}
++
++/// Key for one **owned staging entry**: `sidx:<upload-id>:<part-number>:<chunk-id>`. The
++/// `<part-number>` component is what lets a reclaimer attribute residue to the part attempt
++/// that staged it (`0016:353`).
++pub fn sidx_key(upload_id: &UploadId, part_number: PartNumber, chunk: ChunkId) -> Vec<u8> {
++    format!(
++        "sidx:{upload_id}:{:0width$}:{chunk}",
++        part_number.get(),
++        width = PART_NUMBER_WIDTH
++    )
++    .into_bytes()
++}
++
++/// The bounded per-session owned range: `sidx:<upload-id>:` — the **only** way any pass
++/// reads owned entries; there is no global scan of them anywhere (`0016:475-491`).
++pub fn sidx_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("sidx:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`sidx_key`] back into `(upload_id, part_number, chunk_id)`. The chunk-id
++/// component is **canonical** decimal, not fixed-width — `7` and `007` must never both
++/// parse, the same canonicality rule the padded fields enforce by width instead.
++pub fn parse_sidx_key(key: &[u8]) -> Result<(UploadId, PartNumber, ChunkId), RecordError> {
++    let fields = split_key(key, "sidx:", "sidx:", 3)?;
++    let part_number =
++        fixed_width_u32(fields[1], PART_NUMBER_WIDTH).ok_or_else(|| malformed_key("sidx:", key))?;
++    let chunk: ChunkId = canonical_decimal(fields[2]).ok_or_else(|| malformed_key("sidx:", key))?;
++    Ok((
++        UploadId::new(fields[0])?,
++        PartNumber::new(part_number)?,
++        chunk,
++    ))
++}
++
++// ===========================================================================
++// 4. The `retire:` token grammar (`0016:358-380`)
++// ===========================================================================
++
++/// Which of the two retirement modes an obligation is in — read from the **key**, never a
++/// field: a boolean misread once is silent data loss, a malformed key prefix is an error at
++/// decode (`0016:434-440`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RetireMode {
++    /// Orphan-mark the bytes, then delete the records that named them.
++    Bytes,
++    /// Delete records only — **never** orphan-mark.
++    Records,
++}
++
++impl RetireMode {
++    /// Every mode, for a total dispatch.
++    pub const ALL: [Self; 2] = [Self::Bytes, Self::Records];
++
++    /// The key prefix this mode lives under.
++    pub const fn prefix(self) -> &'static [u8] {
++        match self {
++            Self::Bytes => RETIRE_BYTES_PREFIX,
++            Self::Records => RETIRE_RECORDS_PREFIX,
++        }
++    }
++}
++
++/// Parse the mode out of a `retire:` key, failing closed on any other spelling — the
++/// boundary the mode-in-the-key argument rests on (`0016:434-440`).
++pub fn parse_retire_mode(key: &[u8]) -> Result<RetireMode, RecordError> {
++    if key.starts_with(RETIRE_BYTES_PREFIX) {
++        Ok(RetireMode::Bytes)
++    } else if key.starts_with(RETIRE_RECORDS_PREFIX) {
++        Ok(RetireMode::Records)
++    } else {
++        let text = String::from_utf8_lossy(key);
++        Err(RecordError::UnknownRetireMode {
++            mode: text
++                .strip_prefix("retire:")
++                .unwrap_or(&text)
++                .split(':')
++                .next()
++                .unwrap_or_default()
++                .to_string(),
++        })
++    }
++}
++
++/// A retirement token, whose grammar makes reuse impossible (`0016:358-380`): every
++/// component is minted once — an epoch is bumped by every fence, a `(part, attempt)` pair
++/// belongs to one `UploadPart`, an `(inode, version)` pair is produced by exactly one
++/// publication. Installation is `require_absent(retire:<mode>:<token>)`, so a collision is a
++/// `Conflict` the installer classifies, never a silent overwrite that would replace one
++/// obligation's payload with another's and permanently lose the reclamation evidence.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RetireToken {
++    /// A **session-scoped** obligation: `s:<upload-id>:<epoch>` — the whole-session teardown
++    /// an epoch's fence installs — or, with the optional suffix,
++    /// `s:<upload-id>:<epoch>:<part-number>:<attempt-id>` for a **per-part** obligation (a
++    /// re-uploaded part's superseded chunks, a losing writer's compensation).
++    Session {
++        /// The owning session's upload id.
++        upload_id: UploadId,
++        /// The epoch whose fence installed the obligation.
++        epoch: u64,
++        /// The part attempt, for a per-part obligation.
++        part: Option<(PartNumber, AttemptId)>,
++    },
++    /// A **superseded or deleted generation**: `g:<inode-id>:<version>`.
++    Generation {
++        /// The inode.
++        inode: InodeId,
++        /// Its version.
++        version: u64,
++    },
++}
++
++impl fmt::Display for RetireToken {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Session {
++                upload_id,
++                epoch,
++                part: None,
++            } => write!(f, "s:{upload_id}:{epoch}"),
++            Self::Session {
++                upload_id,
++                epoch,
++                part: Some((part_number, attempt_id)),
++            } => write!(f, "s:{upload_id}:{epoch}:{part_number}:{attempt_id}"),
++            Self::Generation { inode, version } => write!(f, "g:{inode}:{version}"),
++        }
++    }
++}
++
++/// Key for a retirement obligation: `retire:<mode>:<token>`.
++pub fn retire_key(mode: RetireMode, token: &RetireToken) -> Vec<u8> {
++    let mut key = mode.prefix().to_vec();
++    key.extend_from_slice(token.to_string().as_bytes());
++    key
++}
++
++/// The bounded session-scoped obligation range for one mode: `retire:<mode>:s:<upload-id>:`.
++/// A session's terminal delete gate is two of these emptiness reads, never a walk of the
++/// whole `retire:` namespace, which is deliberately not cardinality-bounded
++/// (`0016:374-380`).
++pub fn retire_session_range(mode: RetireMode, upload_id: &UploadId) -> Vec<u8> {
++    let mut key = mode.prefix().to_vec();
++    key.extend_from_slice(format!("s:{upload_id}:").as_bytes());
++    key
++}
++
++/// Parse a [`retire_key`] back into `(mode, token)`, failing closed on any other spelling: a
++/// truncated token, a trailing component, a non-canonical epoch/version/part-number (a `+`
++/// sign or a leading zero), or a malformed upload/attempt id.
++pub fn parse_retire_key(key: &[u8]) -> Result<(RetireMode, RetireToken), RecordError> {
++    let mode = parse_retire_mode(key)?;
++    let text = std::str::from_utf8(key).map_err(|_| malformed_key("retire:", key))?;
++    let rest = &text[mode.prefix().len()..];
++    let fields: Vec<&str> = rest.split(':').collect();
++    let malformed = || malformed_key("retire:", key);
++    let token = match fields.as_slice() {
++        ["s", upload_id, epoch] => RetireToken::Session {
++            upload_id: UploadId::new(*upload_id)?,
++            epoch: canonical_decimal(epoch).ok_or_else(malformed)?,
++            part: None,
++        },
++        ["s", upload_id, epoch, part_number, attempt_id] => RetireToken::Session {
++            upload_id: UploadId::new(*upload_id)?,
++            epoch: canonical_decimal(epoch).ok_or_else(malformed)?,
++            part: Some((
++                PartNumber::new(canonical_decimal(part_number).ok_or_else(malformed)?)?,
++                AttemptId::new(*attempt_id)?,
++            )),
++        },
++        ["g", inode, version] => RetireToken::Generation {
++            inode: canonical_decimal(inode).ok_or_else(malformed)?,
++            version: canonical_decimal(version).ok_or_else(malformed)?,
++        },
++        _ => return Err(malformed()),
++    };
++    Ok((mode, token))
++}
+diff --git a/crates/core/tests/multipart_keys.rs b/crates/core/tests/multipart_keys.rs
+new file mode 100644
+index 0000000..518e602
+--- /dev/null
++++ b/crates/core/tests/multipart_keys.rs
+@@ -0,0 +1,835 @@
++//! Issue #691 — slice 1/3 of #654's own re-split (itself slice 1/7 of #636, proposal 0016).
++//! The multipart commit protocol's **key grammar and the validated identity types it is
++//! spelled in** — `wyrd_core::multipart::{RecordError, UploadId, AttemptId, PartNumber,
++//! SlotIndex, Digest}` and the key constructors/parsers for all seven keyed classes plus
++//! the `retire:` token grammar. **Pure**: no store, no async, no fixture beyond literals.
++//!
++//! Five legs, in the order the issue states them:
++//! 1. round-trip + canonical rejection, per keyed class;
++//! 2. byte-lexicographic order equals numeric order, across every digit-width boundary;
++//! 3. no key prefix is a prefix of another, over the full protocol key space;
++//! 4. the `retire:` token grammar distinguishes its two forms;
++//! 5. the pinned format constants hold.
++//!
++//! Ahead of leg 1 sit the identity types themselves — the token grammar, the accessors
++//! **by value**, the digest's hex form over every nibble, the `Deserialize` routes and the
++//! typed errors every rejection surfaces as — because a key is only as canonical as the
++//! components it is spelled from.
++//!
++//! No `#![cfg(...)]` here (the gate's vacuous-green hazard) — this file always compiles
++//! and always runs.
++
++#![forbid(unsafe_code)]
++
++use wyrd_core::metadata;
++use wyrd_core::multipart::{
++    self, mpu_key, parse_mpu_key, parse_part_key, parse_psum_key, parse_retire_key,
++    parse_retire_mode, parse_sidx_key, parse_slot_key, part_key, part_range, psum_key, psum_range,
++    retire_key, retire_session_range, sidx_key, sidx_range, slot_key, slot_range, AttemptId,
++    Digest, PartNumber, RecordError, RetireMode, RetireToken, SlotIndex, UploadId, MAX_PART_NUMBER,
++    MAX_SLOT_INDEX, MPUCTL_KEY, MPU_PREFIX, PART_NUMBER_WIDTH, PART_PREFIX, PSUM_PREFIX,
++    RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX, SIDX_PREFIX, SLOT_INDEX_WIDTH, SLOT_PREFIX,
++    TOKEN_HEX_LEN,
++};
++
++// ===========================================================================
++// Literals and small helpers
++// ===========================================================================
++
++/// A [`TOKEN_HEX_LEN`]-character token built by repeating `pattern`, so a test never has
++/// to hand-count hex characters (an off-by-one there would silently under-test).
++fn hex_token(pattern: &str) -> String {
++    let mut s = String::new();
++    while s.len() < TOKEN_HEX_LEN {
++        s.push_str(pattern);
++    }
++    s.truncate(TOKEN_HEX_LEN);
++    s
++}
++
++fn upload(pattern: &str) -> UploadId {
++    UploadId::new(hex_token(pattern)).expect("a well-formed token is an upload id")
++}
++
++fn attempt(pattern: &str) -> AttemptId {
++    AttemptId::new(hex_token(pattern)).expect("a well-formed token is an attempt id")
++}
++
++fn part(n: u32) -> PartNumber {
++    PartNumber::new(n).expect("a part number inside the key space")
++}
++
++/// Every short, over-wide, signed, whitespace-padded and non-decimal spelling of "the
++/// number 7" (or a variant of it) at [`PART_NUMBER_WIDTH`]/[`SLOT_INDEX_WIDTH`] = 6. Bare
++/// `"7"` and the padded-but-short `"007"` are named explicitly — the carried-forward
++/// MUST-FIX the archived #654 v2 review found missing from its fixed-width table
++/// (`multipart_records.rs:162` in that attempt).
++const NUMERIC_ADVERSITIES: [&str; 13] = [
++    "7", "07", "007", "0007", "00007", "0000007", "+00007", "-00007", " 00007", "00007 ", "00_007",
++    "abcdef", "",
++];
++
++fn assert_rejected<T: std::fmt::Debug>(label: &str, key: &[u8], result: Result<T, RecordError>) {
++    assert!(
++        result.is_err(),
++        "{label}: expected rejection for key {:?}, got {:?}",
++        String::from_utf8_lossy(key),
++        result
++    );
++}
++
++// ===========================================================================
++// The validated identity types
++// ===========================================================================
++
++#[test]
++fn upload_and_attempt_ids_validate_the_token_grammar() {
++    assert!(UploadId::new(hex_token("0123456789abcdef")).is_ok());
++    assert!(
++        UploadId::new("").is_err(),
++        "empty upload id must be rejected"
++    );
++    assert!(
++        multipart::is_token(&hex_token("0123456789abcdef")),
++        "the token predicate must accept what the constructors accept"
++    );
++    assert!(!multipart::is_token("nope"));
++    assert!(
++        UploadId::new("aa:bb").is_err(),
++        "an upload id containing ':' must be rejected"
++    );
++    assert!(
++        UploadId::new(hex_token("0123456789abcdef").to_uppercase()).is_err(),
++        "uppercase hex is a second spelling of one token and must be rejected"
++    );
++    assert!(
++        UploadId::new(hex_token("g")).is_err(),
++        "a non-hex letter must be rejected"
++    );
++    let short = &hex_token("0123456789abcdef")[..TOKEN_HEX_LEN - 1];
++    assert!(
++        UploadId::new(short).is_err(),
++        "a short token must be rejected"
++    );
++
++    assert!(AttemptId::new(hex_token("fedcba9876543210")).is_ok());
++    assert!(AttemptId::new("").is_err());
++}
++
++/// The accessors are load-bearing, so they are asserted **by value**, not merely exercised:
++/// `UploadId::as_str` / `AttemptId::as_str` are what every key, every per-session range and
++/// every `retire:` token is spelled from, so one returning some *other* string would mint a
++/// key naming a different session (or, empty, every session's range) — residue nothing
++/// enumerates and therefore nothing reclaims (`docs/principles.md` §5 C-1). An `is_ok()`
++/// check cannot see that; an equality against the token the id was built from can.
++#[test]
++fn the_identity_accessors_return_the_value_they_were_built_from() {
++    let upload_token = hex_token("0123456789abcdef");
++    let attempt_token = hex_token("fedcba9876543210");
++
++    let uid = UploadId::new(upload_token.clone()).unwrap();
++    assert_eq!(uid.as_str(), upload_token);
++    assert_eq!(uid.to_string(), upload_token);
++
++    let att = AttemptId::new(attempt_token.clone()).unwrap();
++    assert_eq!(att.as_str(), attempt_token);
++    assert_eq!(att.to_string(), attempt_token);
++    assert_ne!(
++        att.as_str(),
++        uid.as_str(),
++        "two distinct tokens must not read back as one"
++    );
++
++    // The `retire:` per-part token is the one key component spelled from an attempt id, so
++    // it is where a wrong `as_str` would actually land in a stored key.
++    let key = retire_key(
++        RetireMode::Bytes,
++        &RetireToken::Session {
++            upload_id: uid.clone(),
++            epoch: 3,
++            part: Some((part(4), att.clone())),
++        },
++    );
++    assert_eq!(
++        String::from_utf8(key).unwrap(),
++        format!("retire:bytes:s:{upload_token}:3:4:{attempt_token}")
++    );
++
++    assert_eq!(part(7).get(), 7, "PartNumber::get returns its number");
++    assert_eq!(
++        SlotIndex::new(7).unwrap().get(),
++        7,
++        "SlotIndex::get returns its index"
++    );
++}
++
++/// The hex rendering of bytes `0x00..=0x1f`: every **digit** `0`–`9` and every letter
++/// `a`–`f` appears in the low nibble, and the digits `0`/`1` in the high one.
++const DIGEST_HEX_DIGIT_LED: &str =
++    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
++
++/// The complementary vector: **letters** in the high nibble (`f`,`e`,`d`,`c`,`b`,`a`) and
++/// digits in the low one, so between the two every nibble value is decoded in **both**
++/// positions.
++const DIGEST_HEX_LETTER_LED: &str =
++    "f0e1d2c3b4a59687f0e1d2c3b4a59687f0e1d2c3b4a59687f0e1d2c3b4a59687";
++
++fn digit_led_bytes() -> [u8; 32] {
++    let mut raw = [0u8; 32];
++    for (i, byte) in raw.iter_mut().enumerate() {
++        *byte = u8::try_from(i).expect("0..32 fits in a u8");
++    }
++    raw
++}
++
++fn letter_led_bytes() -> [u8; 32] {
++    let pattern = [0xf0u8, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87];
++    let mut raw = [0u8; 32];
++    for (i, byte) in raw.iter_mut().enumerate() {
++        *byte = pattern[i % pattern.len()];
++    }
++    raw
++}
++
++/// Both directions of the digest's hex form, bound to the **bytes** — not just to
++/// "some 64 characters came back". A digest is an identity: `0xAB` repeated (the only
++/// vector the archived attempt carried) contains no decimal digit at all, so a decoder that
++/// read `0`–`9` as the wrong value — or refused them outright — round-tripped it perfectly
++/// while silently mapping two distinct digests onto one, or refusing a legitimate one.
++#[test]
++fn digest_hex_round_trips_every_nibble_and_rejects_a_second_spelling() {
++    for (raw, canonical) in [
++        (digit_led_bytes(), DIGEST_HEX_DIGIT_LED),
++        (letter_led_bytes(), DIGEST_HEX_LETTER_LED),
++    ] {
++        let d = Digest::from_bytes(raw);
++        assert_eq!(canonical.len(), 64);
++        // Encode: pinned to the literal, so a wrong nibble order or a wrong table shows up.
++        assert_eq!(d.to_hex(), canonical);
++        assert_eq!(multipart::hex_lower(&raw), canonical);
++        // Decode: pinned to the BYTES, so a digit that decodes to the wrong value (or not
++        // at all) fails here rather than round-tripping through the same defect twice.
++        let parsed = Digest::from_hex(canonical).expect("the canonical rendering must parse");
++        assert_eq!(parsed.as_bytes(), &raw);
++        assert_eq!(parsed, d);
++    }
++
++    let hex = DIGEST_HEX_LETTER_LED;
++    assert!(
++        Digest::from_hex(&hex.to_uppercase()).is_err(),
++        "uppercase hex is a second spelling of one digest"
++    );
++    assert!(
++        Digest::from_hex(&hex[..63]).is_err(),
++        "short digest rejected"
++    );
++    assert!(
++        Digest::from_hex(&format!("{hex}0")).is_err(),
++        "over-wide digest rejected"
++    );
++    // A non-hex byte is refused in EITHER nibble position and at either end of the run —
++    // both halves of every pair are checked, over the whole 32 bytes.
++    for at in [0usize, 1, 62, 63] {
++        let mut spoiled = hex.to_string();
++        spoiled.replace_range(at..=at, "g");
++        assert!(
++            Digest::from_hex(&spoiled).is_err(),
++            "a non-hex character at index {at} must be refused"
++        );
++    }
++}
++
++/// The decode route a stored record will arrive by. Every identity's `Deserialize` runs the
++/// **same** validating constructor a call site would (ADR-0045), so a hand-edited or
++/// corrupted record cannot deliver an identity the key grammar could not spell — and
++/// `Serialize` stays transparent, so the stored form is the plain JSON scalar it always was
++/// and the types remain a compile-time rule rather than a wire change
++/// (`metadata.rs:729-732`'s reasoning for `SegmentNonce`).
++#[test]
++fn serde_decode_routes_through_the_validating_constructors() {
++    let token = hex_token("0123456789abcdef");
++    let uid = UploadId::new(token.clone()).unwrap();
++    assert_eq!(serde_json::to_string(&uid).unwrap(), format!("\"{token}\""));
++    assert_eq!(
++        serde_json::from_str::<UploadId>(&format!("\"{token}\"")).unwrap(),
++        uid
++    );
++    assert!(serde_json::from_str::<UploadId>("\"nothex\"").is_err());
++    assert!(serde_json::from_str::<AttemptId>("\"nothex\"").is_err());
++    assert_eq!(
++        serde_json::from_str::<AttemptId>(&format!("\"{token}\"")).unwrap(),
++        AttemptId::new(token).unwrap()
++    );
++
++    assert_eq!(serde_json::to_string(&part(7)).unwrap(), "7");
++    assert_eq!(serde_json::from_str::<PartNumber>("7").unwrap(), part(7));
++    assert!(
++        serde_json::from_str::<PartNumber>("0").is_err(),
++        "zero is not a part number, on the wire either"
++    );
++    assert!(
++        serde_json::from_str::<PartNumber>(&format!("{}", u64::from(MAX_PART_NUMBER) + 1)).is_err(),
++        "a part number past the key space must not decode"
++    );
++
++    let slot = SlotIndex::new(0).unwrap();
++    assert_eq!(serde_json::to_string(&slot).unwrap(), "0");
++    assert_eq!(serde_json::from_str::<SlotIndex>("0").unwrap(), slot);
++    assert!(
++        serde_json::from_str::<SlotIndex>(&format!("{}", u64::from(MAX_SLOT_INDEX) + 1)).is_err(),
++        "a slot index past the key space must not decode"
++    );
++
++    let digest = Digest::from_bytes(letter_led_bytes());
++    assert_eq!(
++        serde_json::to_string(&digest).unwrap(),
++        format!("\"{DIGEST_HEX_LETTER_LED}\"")
++    );
++    assert_eq!(
++        serde_json::from_str::<Digest>(&format!("\"{DIGEST_HEX_LETTER_LED}\"")).unwrap(),
++        digest
++    );
++    assert!(
++        serde_json::from_str::<Digest>(&format!("\"{}\"", DIGEST_HEX_LETTER_LED.to_uppercase()))
++            .is_err(),
++        "uppercase hex must not decode — one digest, one spelling"
++    );
++}
++
++// ===========================================================================
++// Leg 1 — round-trip + canonical rejection, per keyed class
++// ===========================================================================
++
++#[test]
++fn mpu_key_round_trips() {
++    for uid in [
++        upload("0123456789abcdef"),
++        upload("fedcba9876543210"),
++        upload("0"),
++    ] {
++        let key = mpu_key(&uid);
++        assert_eq!(key, format!("mpu:{uid}").into_bytes());
++        assert_eq!(parse_mpu_key(&key).unwrap(), uid);
++    }
++}
++
++#[test]
++fn mpu_key_rejects_noncanonical_and_malformed() {
++    let id = hex_token("0123456789abcdef");
++    let cases: Vec<(&str, Vec<u8>)> = vec![
++        ("empty upload id", b"mpu:".to_vec()),
++        // A single-field key (`splitn(1, ':')`) folds "trailing component" and "id
++        // containing ':'" into the same shape: the whole remainder becomes one field,
++        // which then fails the token grammar.
++        (
++            "upload id containing ':' / trailing component",
++            format!("mpu:{id}:extra").into_bytes(),
++        ),
++        ("malformed key (no separator)", b"mpu".to_vec()),
++        ("malformed key (wrong prefix)", b"mp:x".to_vec()),
++        ("non-UTF-8 bytes", {
++            let mut v = b"mpu:".to_vec();
++            v.push(0xFF);
++            v
++        }),
++    ];
++    for (label, key) in cases {
++        assert_rejected(label, &key, parse_mpu_key(&key));
++    }
++}
++
++/// Leg 1's other half: a rejection is a **typed** error that names the violation, never a
++/// bare "something was wrong" — the signal an operator diagnoses a refused key from.
++/// Each case is asserted twice: the **variant** (the typed part) and the exact `Display`
++/// text, which carries the payload the variant holds (the namespace, the token, the number
++/// refused). `is_err()` alone would hold just as well if every parser returned one anonymous
++/// error carrying nothing.
++#[test]
++fn every_rejection_is_a_typed_error_that_names_the_violation() {
++    let id = hex_token("0123456789abcdef");
++
++    let key = format!("slot:{id}:0000007");
++    let err = parse_slot_key(key.as_bytes()).expect_err("an over-wide slot index");
++    assert!(matches!(
++        err,
++        RecordError::MalformedKey {
++            namespace: "slot:",
++            ..
++        }
++    ));
++    assert_eq!(err.to_string(), format!("malformed slot: key {key:?}"));
++
++    let err = parse_mpu_key(b"mpu:nothex").expect_err("a non-token upload id");
++    assert!(matches!(err, RecordError::TokenNotHex { .. }));
++    assert_eq!(
++        err.to_string(),
++        format!("\"nothex\" is not {TOKEN_HEX_LEN} lowercase-hex characters (a 128-bit token)")
++    );
++
++    let err = PartNumber::new(0).expect_err("zero is not a part");
++    assert!(matches!(err, RecordError::PartNumberOutOfRange { .. }));
++    assert_eq!(
++        err.to_string(),
++        format!("part number 0 is outside the format bound [1, {MAX_PART_NUMBER}]")
++    );
++
++    let err = SlotIndex::new(MAX_SLOT_INDEX + 1).expect_err("past the slot key space");
++    assert!(matches!(err, RecordError::SlotIndexOutOfRange { .. }));
++    assert_eq!(
++        err.to_string(),
++        format!(
++            "slot index {} is outside the format bound [0, {MAX_SLOT_INDEX}]",
++            u64::from(MAX_SLOT_INDEX) + 1
++        )
++    );
++
++    let err = parse_retire_mode(format!("retire:sideways:s:{id}:1").as_bytes())
++        .expect_err("a third retire mode");
++    assert!(matches!(err, RecordError::UnknownRetireMode { .. }));
++    assert_eq!(
++        err.to_string(),
++        "retire: key mode \"sideways\" is neither `bytes` nor `records`"
++    );
++
++    // Boxed as `std::error::Error`, the way a caller propagates it — the text survives.
++    let err: Box<dyn std::error::Error> =
++        Box::new(Digest::from_hex("nope").expect_err("a non-digest"));
++    assert_eq!(
++        err.to_string(),
++        "\"nope\" is not 64 lowercase-hex characters (a SHA-256 digest)"
++    );
++}
++
++/// Runs [`NUMERIC_ADVERSITIES`] against a `<prefix><id>:<body>` parser, then the
++/// structural adversities (empty/colon upload id, truncated key, trailing component,
++/// non-UTF-8), then asserts the canonical spelling still parses.
++fn check_scoped_numeric_key<T: std::fmt::Debug + PartialEq>(
++    class: &str,
++    prefix: &str,
++    id: &str,
++    canonical_body: &str,
++    expected: T,
++    parser: impl Fn(&[u8]) -> Result<T, RecordError>,
++) {
++    for body in NUMERIC_ADVERSITIES {
++        let key = format!("{prefix}{id}:{body}");
++        assert_rejected(
++            &format!("{class} non-canonical body {body:?}"),
++            key.as_bytes(),
++            parser(key.as_bytes()),
++        );
++    }
++
++    let structural: Vec<(&str, Vec<u8>)> = vec![
++        (
++            "empty upload id",
++            format!("{prefix}:{canonical_body}").into_bytes(),
++        ),
++        (
++            "upload id containing ':'",
++            format!("{prefix}aa:bb:{canonical_body}").into_bytes(),
++        ),
++        (
++            "malformed/truncated (missing field)",
++            format!("{prefix}{id}").into_bytes(),
++        ),
++        (
++            "trailing component",
++            format!("{prefix}{id}:{canonical_body}:extra").into_bytes(),
++        ),
++        ("non-UTF-8 bytes", {
++            let mut v = format!("{prefix}{id}:").into_bytes();
++            v.push(0xFF);
++            v
++        }),
++    ];
++    for (label, key) in structural {
++        assert_rejected(&format!("{class} {label}"), &key, parser(&key));
++    }
++
++    let canonical = format!("{prefix}{id}:{canonical_body}");
++    assert_eq!(
++        parser(canonical.as_bytes()).expect("canonical spelling must parse"),
++        expected,
++        "{class}: canonical spelling did not round-trip to the expected value"
++    );
++}
++
++#[test]
++fn slot_key_round_trips_and_rejects_noncanonical() {
++    let id = hex_token("0123456789abcdef");
++    let uid = UploadId::new(id.clone()).unwrap();
++    for index in [0u32, 1, 42, MAX_SLOT_INDEX] {
++        let index = SlotIndex::new(index).unwrap();
++        let key = slot_key(&uid, index);
++        assert_eq!(parse_slot_key(&key).unwrap(), (uid.clone(), index));
++        assert!(key.starts_with(&slot_range(&uid)));
++        assert!(
++            key.ends_with(format!("{:0width$}", index.get(), width = SLOT_INDEX_WIDTH).as_bytes())
++        );
++    }
++
++    check_scoped_numeric_key(
++        "slot:",
++        "slot:",
++        &id,
++        "000007",
++        (uid.clone(), SlotIndex::new(7).unwrap()),
++        parse_slot_key,
++    );
++}
++
++#[test]
++fn part_key_round_trips_and_rejects_noncanonical() {
++    let id = hex_token("0123456789abcdef");
++    let uid = UploadId::new(id.clone()).unwrap();
++    for n in [1u32, 7, 10_000, MAX_PART_NUMBER] {
++        let number = part(n);
++        let key = part_key(&uid, number);
++        assert_eq!(parse_part_key(&key).unwrap(), (uid.clone(), number));
++        assert!(key.starts_with(&part_range(&uid)));
++        assert!(key
++            .ends_with(format!("{:0width$}", number.get(), width = PART_NUMBER_WIDTH).as_bytes()));
++    }
++
++    check_scoped_numeric_key(
++        "part:",
++        "part:",
++        &id,
++        "000007",
++        (uid.clone(), part(7)),
++        parse_part_key,
++    );
++}
++
++#[test]
++fn psum_key_round_trips_and_rejects_noncanonical() {
++    let id = hex_token("0123456789abcdef");
++    let uid = UploadId::new(id.clone()).unwrap();
++    for n in [1u32, 7, 10_000, MAX_PART_NUMBER] {
++        let number = part(n);
++        let key = psum_key(&uid, number);
++        assert_eq!(parse_psum_key(&key).unwrap(), (uid.clone(), number));
++        assert!(key.starts_with(&psum_range(&uid)));
++    }
++
++    check_scoped_numeric_key(
++        "psum:",
++        "psum:",
++        &id,
++        "000007",
++        (uid.clone(), part(7)),
++        parse_psum_key,
++    );
++}
++
++#[test]
++fn sidx_key_round_trips_and_rejects_noncanonical() {
++    let id = hex_token("0123456789abcdef");
++    let uid = UploadId::new(id.clone()).unwrap();
++    for n in [1u32, 7, MAX_PART_NUMBER] {
++        let number = part(n);
++        for chunk in [0u128, 7, u128::from(u64::MAX) + 1] {
++            let key = sidx_key(&uid, number, chunk);
++            assert_eq!(parse_sidx_key(&key).unwrap(), (uid.clone(), number, chunk));
++            assert!(key.starts_with(&sidx_range(&uid)));
++        }
++    }
++
++    // The part-number component: every numeric adversity, at the middle field.
++    for body in NUMERIC_ADVERSITIES {
++        let key = format!("sidx:{id}:{body}:7");
++        assert_rejected(
++            &format!("sidx: non-canonical part number {body:?}"),
++            key.as_bytes(),
++            parse_sidx_key(key.as_bytes()),
++        );
++    }
++
++    // The chunk-id component is CANONICAL decimal, not fixed-width: "007" must never
++    // parse as chunk 7, mirroring the fixed-width rule the padded fields enforce by width
++    // instead (both forbid two spellings of one record).
++    for body in ["007", "+7", "-7", " 7", "7 ", "abc", ""] {
++        let key = format!("sidx:{id}:000007:{body}");
++        assert_rejected(
++            &format!("sidx: non-canonical chunk id {body:?}"),
++            key.as_bytes(),
++            parse_sidx_key(key.as_bytes()),
++        );
++    }
++    // The canonical chunk spellings DO parse.
++    assert_eq!(
++        parse_sidx_key(format!("sidx:{id}:000007:7").as_bytes()).unwrap(),
++        (uid.clone(), part(7), 7u128)
++    );
++    assert_eq!(
++        parse_sidx_key(format!("sidx:{id}:000007:0").as_bytes()).unwrap(),
++        (uid.clone(), part(7), 0u128)
++    );
++
++    let structural: Vec<(&str, Vec<u8>)> = vec![
++        ("empty upload id", b"sidx::000007:7".to_vec()),
++        ("upload id containing ':'", b"sidx:aa:bb:000007:7".to_vec()),
++        (
++            "malformed/truncated (missing chunk)",
++            format!("sidx:{id}:000007").into_bytes(),
++        ),
++        (
++            "trailing component",
++            format!("sidx:{id}:000007:7:extra").into_bytes(),
++        ),
++        ("non-UTF-8 bytes", {
++            let mut v = format!("sidx:{id}:000007:").into_bytes();
++            v.push(0xFF);
++            v
++        }),
++    ];
++    for (label, key) in structural {
++        assert_rejected(label, &key, parse_sidx_key(&key));
++    }
++}
++
++// ===========================================================================
++// Leg 2 — byte-lexicographic order equals numeric order, across every digit-width
++// boundary the fixed width can reach.
++// ===========================================================================
++
++const WIDTH_BOUNDARY_SERIES: [u32; 12] = [
++    1, 9, 10, 99, 100, 999, 1_000, 9_999, 10_000, 99_999, 100_000, 999_999,
++];
++
++#[test]
++fn slot_index_byte_order_matches_numeric_order() {
++    let uid = upload("0123456789abcdef");
++    let keys: Vec<Vec<u8>> = WIDTH_BOUNDARY_SERIES
++        .iter()
++        .map(|&n| slot_key(&uid, SlotIndex::new(n).unwrap()))
++        .collect();
++    for pair in keys.windows(2) {
++        assert!(
++            pair[0] < pair[1],
++            "slot: byte order diverges from numeric order across a digit-width boundary"
++        );
++    }
++}
++
++#[test]
++fn part_number_byte_order_matches_numeric_order() {
++    let uid = upload("0123456789abcdef");
++    let keys: Vec<Vec<u8>> = WIDTH_BOUNDARY_SERIES
++        .iter()
++        .map(|&n| part_key(&uid, part(n)))
++        .collect();
++    for pair in keys.windows(2) {
++        assert!(
++            pair[0] < pair[1],
++            "part: byte order diverges from numeric order across a digit-width boundary"
++        );
++    }
++}
++
++// ===========================================================================
++// Leg 3 — no key prefix is a prefix of another, over the full protocol key space.
++// ===========================================================================
++
++#[test]
++fn no_key_prefix_is_a_prefix_of_another() {
++    let prefixes: [&[u8]; 15] = [
++        MPU_PREFIX,
++        SLOT_PREFIX,
++        PART_PREFIX,
++        PSUM_PREFIX,
++        SIDX_PREFIX,
++        RETIRE_BYTES_PREFIX,
++        RETIRE_RECORDS_PREFIX,
++        b"inode:",   // metadata.rs:34 (inode_key)
++        b"dirent:",  // metadata.rs:39 (dirent_key)
++        b"pending:", // metadata.rs:44 (pending_key)
++        b"bucket:",  // metadata.rs:52 (bucket_key)
++        metadata::ORPHAN_PREFIX,
++        metadata::SEG_PREFIX,
++        metadata::SEGGRP_PREFIX,
++        b"desired:dserver:", // custodian/src/desired_state.rs:33
++    ];
++    for (i, a) in prefixes.iter().enumerate() {
++        for (j, b) in prefixes.iter().enumerate() {
++            if i == j {
++                continue;
++            }
++            assert!(
++                !a.starts_with(b),
++                "{:?} is a prefix of {:?}",
++                String::from_utf8_lossy(b),
++                String::from_utf8_lossy(a)
++            );
++        }
++    }
++}
++
++#[test]
++fn scan_mpu_does_not_reach_the_mpuctl_singleton() {
++    // The named near-miss (`0016:342-344`): `mpuctl`'s 4th byte is `c`, not `:`.
++    assert!(!MPUCTL_KEY.starts_with(MPU_PREFIX));
++}
++
++#[test]
++fn sidx_is_not_reachable_from_a_pending_scan() {
++    // The named near-miss (`0016:475-491`): the owned-staging prefix is disjoint from the
++    // global `pending:` sweep, so no restore/expiry pass sees an owned entry.
++    assert!(!SIDX_PREFIX.starts_with(b"pending:"));
++    let key = sidx_key(&upload("0123456789abcdef"), part(1), 0);
++    assert!(!key.starts_with(b"pending:"));
++}
++
++// ===========================================================================
++// Leg 4 — the `retire:` token grammar
++// ===========================================================================
++
++#[test]
++fn retire_key_round_trips_both_token_forms_under_both_modes() {
++    let uid = upload("0123456789abcdef");
++    let other = upload("fedcba9876543210");
++    let att = attempt("00112233445566778899aabbccddeeff");
++    let tokens = [
++        RetireToken::Session {
++            upload_id: uid.clone(),
++            epoch: 0,
++            part: None,
++        },
++        RetireToken::Session {
++            upload_id: uid.clone(),
++            epoch: 9,
++            part: None,
++        },
++        RetireToken::Session {
++            upload_id: uid.clone(),
++            epoch: 3,
++            part: Some((part(4), att.clone())),
++        },
++        RetireToken::Generation {
++            inode: 12,
++            version: 34,
++        },
++    ];
++    for mode in RetireMode::ALL {
++        for token in &tokens {
++            let key = retire_key(mode, token);
++            let (parsed_mode, parsed_token) = parse_retire_key(&key).unwrap();
++            assert_eq!(parsed_mode, mode);
++            assert_eq!(&parsed_token, token);
++            assert_eq!(parse_retire_mode(&key).unwrap(), mode);
++
++            // The two forms are distinguished at parse — never confused with each other.
++            match token {
++                RetireToken::Session { .. } => {
++                    assert!(matches!(parsed_token, RetireToken::Session { .. }));
++                    assert!(key.starts_with(&retire_session_range(mode, &uid)));
++                    assert!(!key.starts_with(&retire_session_range(mode, &other)));
++                }
++                RetireToken::Generation { .. } => {
++                    assert!(matches!(parsed_token, RetireToken::Generation { .. }));
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn retire_key_rejects_a_token_of_neither_form_and_every_malformed_spelling() {
++    let id = hex_token("0123456789abcdef");
++    let cases: Vec<(&str, Vec<u8>)> = vec![
++        (
++            "unknown mode",
++            format!("retire:unknown:s:{id}:7").into_bytes(),
++        ),
++        (
++            "token of neither `s:` nor `g:` form",
++            format!("retire:bytes:x:{id}:7").into_bytes(),
++        ),
++        (
++            "'+' sign on the epoch",
++            format!("retire:bytes:s:{id}:+7").into_bytes(),
++        ),
++        (
++            "padded-but-short-of-canonical epoch (leading zero)",
++            format!("retire:bytes:s:{id}:07").into_bytes(),
++        ),
++        (
++            "non-decimal epoch body",
++            format!("retire:bytes:s:{id}:abc").into_bytes(),
++        ),
++        ("empty upload id", b"retire:bytes:s::7".to_vec()),
++        (
++            "upload id containing ':' (extra field)",
++            b"retire:bytes:s:aa:bb:7".to_vec(),
++        ),
++        (
++            "malformed/truncated (missing epoch)",
++            format!("retire:bytes:s:{id}").into_bytes(),
++        ),
++        (
++            "trailing component (session form)",
++            format!("retire:bytes:s:{id}:7:extra").into_bytes(),
++        ),
++        (
++            "trailing component (per-part session form)",
++            format!(
++                "retire:bytes:s:{id}:7:4:{}:extra",
++                hex_token("fedcba9876543210")
++            )
++            .into_bytes(),
++        ),
++        (
++            "non-decimal generation version",
++            "retire:records:g:12:abc".to_string().into_bytes(),
++        ),
++        ("non-UTF-8 bytes", {
++            let mut v = b"retire:bytes:s:".to_vec();
++            v.push(0xFF);
++            v
++        }),
++    ];
++    for (label, key) in cases {
++        assert_rejected(label, &key, parse_retire_key(&key));
++    }
++}
++
++// ===========================================================================
++// Leg 5 — the pinned format constants hold.
++// ===========================================================================
++
++#[test]
++fn pinned_format_constants_hold() {
++    assert_eq!(PART_NUMBER_WIDTH, 6);
++    assert_eq!(MAX_PART_NUMBER, 999_999);
++    assert_eq!(SLOT_INDEX_WIDTH, 6);
++    assert_eq!(MAX_SLOT_INDEX, 999_999);
++
++    let uid = upload("0123456789abcdef");
++
++    // Each parser's width equals its constant: the widest legal value round-trips, and
++    // one past it is a typed format violation, never a silent clamp or wraparound.
++    let max_part = part(MAX_PART_NUMBER);
++    let part_key_bytes = part_key(&uid, max_part);
++    assert_eq!(
++        part_key_bytes.len(),
++        PART_PREFIX.len() + uid.as_str().len() + 1 + PART_NUMBER_WIDTH
++    );
++    assert_eq!(
++        parse_part_key(&part_key_bytes).unwrap(),
++        (uid.clone(), max_part)
++    );
++    assert!(PartNumber::new(MAX_PART_NUMBER + 1).is_err());
++
++    let max_slot = SlotIndex::new(MAX_SLOT_INDEX).unwrap();
++    let slot_key_bytes = slot_key(&uid, max_slot);
++    assert_eq!(
++        slot_key_bytes.len(),
++        SLOT_PREFIX.len() + uid.as_str().len() + 1 + SLOT_INDEX_WIDTH
++    );
++    assert_eq!(
++        parse_slot_key(&slot_key_bytes).unwrap(),
++        (uid.clone(), max_slot)
++    );
++    assert!(SlotIndex::new(MAX_SLOT_INDEX + 1).is_err());
++}

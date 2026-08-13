@@ -1,0 +1,15 @@
+Reviewing issue #697: make reconstruction resolve committed chunk maps once per non-empty pass, contain unreadable objects, and refuse segmented repairs without draining obligations.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief unambiguously binds one resolver-backed reading, per-object containment/refusal, no draining across an incomplete reading, and six observable legs. |
+| C2 Reproduction (red pre-fix) | PASS | Independent production-stash run produced five behavioral failures while the declared empty-queue guard stayed green; the discriminator drives the public fenced control point at `crates/custodian/tests/segmented_map_reconstruction.rs:451`. |
+| C3 Change | PASS | The scoped implementation exists in exactly the two required files and non-empty passes now construct one resolver-backed reading before assessment at `crates/custodian/src/reconstruction.rs:164`. |
+| C4 Verification (red→green) | PASS | Independent rerun was five-of-six red before the fix and six-of-six green after it; the real Rust, docs, dependency, conformance, statics, and DST checks passed after giving `cargo-deny` a writable scratch cache. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Rebuild must remove the per-plan full-map clone/encode path—every plan enters `repair_chunk` at `crates/custodian/src/reconstruction.rs:303`, then copies the whole map at `crates/custodian/src/reconstruction.rs:861`—or the claimed Q×N work bound remains false. |
+| T1 Structure | PASS | `Reading` separates one namespace walk, shared flat snapshots, per-chunk sites, incompleteness, and per-object refusals without widening trait seams at `crates/custodian/src/reconstruction.rs:355`. |
+| T2 Shape | PASS | The change remains exactly two scoped files and 143 added production semantic lines; the carried-forward brief explicitly accepts the test-file size overage. |
+| T3 Runtime | FAIL | Q obligations in one N-entry object each clone the full map and encode full prior/next records before their CAS at `crates/custodian/src/reconstruction.rs:861` and `crates/custodian/src/reconstruction.rs:874`, retaining Q×N CPU/heap work. |
+| T4 Contribution | NEEDS-HUMAN | Human must confirm closed/rejected-work prior art—merged affected-path history was checked, but the closed/rejected corpus and driver review output were not supplied, so contribution uniqueness is not mechanically settled. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Rebuild must add an oracle that fails on per-obligation full-map copying—the eight-chunk fixture and scan counters at `crates/custodian/tests/segmented_map_reconstruction.rs:597` and `crates/custodian/tests/segmented_map_reconstruction.rs:610` observe placement and reads, not clone/encode cost. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether the remaining Q×N CPU/heap path is acceptable at production object and queue sizes, because that determines whether reconstruction can converge at the scale this fix is meant to protect. |

@@ -1,0 +1,4415 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6637bb1..29260d6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5029,6 +5029,7 @@ dependencies = [
+  "reed-solomon-simd",
+  "serde",
+  "serde_json",
++ "sha2",
+  "tempfile",
+  "tokio",
+  "tokio-stream",
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index 187c14f..ad9431f 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -20,6 +20,11 @@ futures-util.workspace = true
+ reed-solomon-simd.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
++# The multipart commit protocol's ETag/fingerprint digests (`crates/core/src/multipart.rs`,
++# issue #654). Not a new-dependency decision: `sha2 = "0.11"` is already a workspace
++# dependency (`Cargo.toml:147`), already used by `gateway-s3`/`server`, and already inside
++# the `deny.toml` allowlist — so ADR-0003's three-test audit is not re-opened.
++sha2.workspace = true
+ 
+ [dev-dependencies]
+ # The fragment-fault audit tests assert on what the read path ACTUALLY emitted (#530) — a
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index fe572be..f298270 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -10,6 +10,7 @@
+ 
+ pub mod erasure;
+ pub mod metadata;
++pub mod multipart;
+ pub mod placement;
+ pub mod read;
+ pub mod repair;
+diff --git a/crates/core/src/metadata.rs b/crates/core/src/metadata.rs
+index 89ca889..1e5c1d3 100644
+--- a/crates/core/src/metadata.rs
++++ b/crates/core/src/metadata.rs
+@@ -1524,11 +1524,33 @@ pub struct DirentRecord {
+ }
+ 
+ /// A pending-chunk ledger entry: a lease on a provisionally-written chunk id.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++///
++/// `owner`/`staged` are additive (issue #654, `0016:442-491`): `Some(..)` **only** on an
++/// **owned** `sidx:<upload-id>:<part-number>:<chunk-id>` entry, `None` on an ordinary
++/// streaming-write `pending:<chunk-id>` entry. The multipart protocol makes the `sidx:`
++/// value *be* a `PendingEntry` rather than a parallel type precisely so the same half-TTL
++/// renewal loop and the same lease guards serve both ([`crate::multipart::OwnedEntry`],
++/// which is where the "both fields or neither" pairing is enforced — one of them alone is a
++/// torn record, not a value).
++///
++/// `skip_serializing_if` is load-bearing here exactly as it is for `InodeRecord`'s optional
++/// fields above (`:1370-1377`): [`renew_pending`] and [`live_lease_guards`] compare the
++/// *re-encoded* prior entry byte-for-byte against stored bytes, so decode -> encode must be
++/// the identity on a legacy `pending:` entry (both fields absent) or every renewal and every
++/// lease guard on a pre-#654 entry turns into a permanent `Conflict`.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct PendingEntry {
+     /// When the lease expires (logical milliseconds); a custodian sweep may
+     /// reclaim the chunk after this.
+     pub lease_expiry_millis: u64,
++    /// The owning upload id — a validated token, so a malformed owner is a decode error
++    /// rather than an id no per-session range could be derived from. `Some(..)` only on an
++    /// owned `sidx:` entry.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub owner: Option<crate::multipart::UploadId>,
++    /// The chunk's planned EC placement; `Some(..)` only on an owned `sidx:` entry.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub staged: Option<crate::multipart::StagedPlacement>,
+ }
+ 
+ /// Encode a record to its stored bytes. Serialization of these plain structs is
+@@ -3373,6 +3395,8 @@ mod segmented_shape_invariants {
+                     chunk,
+                     &PendingEntry {
+                         lease_expiry_millis,
++                        owner: None,
++                        staged: None,
+                     },
+                 )),
+                 None => pollster::block_on(sweep_pending(&store, &[chunk])),
+diff --git a/crates/core/src/multipart.rs b/crates/core/src/multipart.rs
+new file mode 100644
+index 0000000..2d217c9
+--- /dev/null
++++ b/crates/core/src/multipart.rs
+@@ -0,0 +1,2348 @@
++//! The **multipart commit protocol**'s record family and state machine — the pure
++//! vocabulary underneath `CompleteMultipartUpload` (proposal 0016,
++//! `docs/design/proposals/draft/0016-multipart-commit-protocol.md`).
++//!
++//! This is slice 1 of 7 of issue #636's re-split (issue #654). It is deliberately **pure**:
++//! no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no `async fn`. After this module
++//! a reader can name every record the protocol writes (`0016` §1, `:333-527`), parse every
++//! key it uses, decide what any verb answers in any state (`0016` decision 3, `:894-1037`),
++//! and compute an object's multipart ETag (`0016:3064-3070`) — all without a store. The
++//! store round trips (admission, staging, Complete, retirement) are five later, separately
++//! reviewed slices (#656-#660); the S3 verbs/XML/status mapping is #508's.
++//!
++//! # The records (`0016` §1)
++//!
++//! | Key | What it is |
++//! |---|---|
++//! | `mpuctl` | the fleet **admission ledger** — `{count, max_sessions, profile}`, CAS'd whole |
++//! | `mpu:<id>` | one **session**: target, state, epoch, attempts, publication |
++//! | `slot:<id>:<k>` | one **in-flight part slot**; the key space *is* the per-session cap |
++//! | `part:<id>:<n>` | a **committed part**: its chunk list, length and digest |
++//! | `psum:<id>:<n>` | that part's **summary** (no chunk list) |
++//! | `sidx:<id>:<n>:<chunk>` | one **owned staging entry** — a [`crate::metadata::PendingEntry`] with `owner` **and** `staged`, under a prefix **disjoint from `pending:`** |
++//! | `retire:bytes:<token>` | a **retirement obligation**: bytes to orphan-mark, then the naming records to delete |
++//! | `retire:records:<token>` | records to delete whose bytes something else protects |
++//!
++//! Every prefix here is disjoint from every other and from `inode:` / `dirent:` / `pending:`
++//! / `bucket:` / `orphan:` / `seg:` / `seggrp:` / `desired:dserver:`, and none is a prefix of
++//! another, so no `scan` returns a neighbour's records (`0016:333-356`).
++//!
++//! # Structural validity is a type, not a convention (ADR-0045)
++//!
++//! Every component a key or a record is built from arrives here as a **validated type** —
++//! [`UploadId`], [`AttemptId`], [`PartNumber`], [`SlotIndex`], [`Digest`] — mirroring
++//! [`crate::metadata::SegmentNonce`], whose doc records why (`metadata.rs:714-733`): parsing
++//! the rule into the type is what makes an unvalidated value *unrepresentable* rather than
++//! merely unlikely. Two consequences this module leans on:
++//!
++//! * every key constructor is **total and infallible** — it cannot mint a key its own parser
++//!   would reject, the property `seg_key` states at `metadata.rs:1219-1233`;
++//! * `parse(key(x)) == x` for every keyed record class, and a **non-canonical** spelling of
++//!   the same record (`slot:<id>:7`, `slot:<id>:0000007`, `slot:<id>:+7`) parses as **no**
++//!   record at all. Two spellings of one record would defeat a `require_absent` guard and
++//!   hide a record from a bounded range scan — residue nothing enumerates and therefore
++//!   nothing reclaims (C-1, `docs/principles.md:109`,`:137`).
++//!
++//! # What this slice does NOT define (§ Scope boundaries, settled at Plan)
++//!
++//! * **Capacity knobs.** [`Budget`] is the profile **tuple's shape** and its two pure
++//!   derivations ([`Budget::u_ref`], [`Budget::max_sessions`]); the deployment's concrete
++//!   values (`W_ref`, `MAX_PART_CHUNKS`, …) are #655's, mirroring the format/capacity split
++//!   `SEG_INDEX_WIDTH`/`MAX_SEGMENT_INDEX` vs `MAX_ROOT_SEGMENTS` already draws in
++//!   [`crate::metadata`] (`metadata.rs:270-322`).
++//! * **Capacity enforcement at decode.** A record past a *capacity* ceiling (as opposed to
++//!   past its *format*'s addressable key space) still decodes — decoding enforces only the
++//!   compile-time format bound, never a live knob, mirroring `MAX_ROOT_SEGMENTS`'s NOT being
++//!   a decode invariant (`metadata.rs:305-318`; `0016:390-402`). A `part:` record with more
++//!   chunks than a future `MAX_PART_CHUNKS` decodes; the cap is enforced where the work is
++//!   admitted.
++//! * **Every store round trip.** Admission, staging, Complete, retirement drain, terminal
++//!   delete: #656-#659. This module hands back typed values; it never reaches for a store.
++//!
++//! `sha2` is added to `crates/core` for [`multipart_etag`] / [`complete_fingerprint`]. It is
++//! not a new dependency decision: `sha2 = "0.11"` is already a workspace dependency
++//! (`Cargo.toml:147`), already used by `gateway-s3`/`server`, and already inside the
++//! `deny.toml` allowlist — so ADR-0003's three-test audit is not re-opened.
++
++use std::collections::BTreeMap;
++use std::fmt;
++
++use serde::de::Error as DeError;
++use serde::{Deserialize, Deserializer, Serialize};
++use sha2::{Digest as _, Sha256};
++use wyrd_traits::{ChunkId, DServerId};
++
++use crate::metadata::{self, ChunkRef, EcScheme, InodeId, PendingEntry, SegmentGroup};
++
++// ===========================================================================
++// 1. Errors — every structural violation is a typed error, never a value
++//    (ADR-0045; `0016:390-414`)
++// ===========================================================================
++
++/// A structural violation of a multipart key or record — never a silently-corrected
++/// default (ADR-0045, parse-don't-validate; `0016:390-414`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RecordError {
++    /// A key whose prefix, field count or field syntax does not parse — including a key
++    /// whose bytes are not UTF-8, a truncated key and one with a trailing component.
++    MalformedKey {
++        /// The namespace expected.
++        namespace: &'static str,
++        /// The key as UTF-8 (lossy), for the operator signal.
++        key: String,
++    },
++    /// A token component (upload id, attempt id) that is not exactly [`TOKEN_HEX_LEN`]
++    /// lowercase-hex characters.
++    TokenNotHex {
++        /// The rejected token.
++        token: String,
++    },
++    /// A part number outside `[1, MAX_PART_NUMBER]` — the **format** bound the fixed-width
++    /// key grammar can spell, never a live capacity knob.
++    PartNumberOutOfRange {
++        /// The number found.
++        part_number: u64,
++    },
++    /// A slot index outside `[0, MAX_SLOT_INDEX]` — the **format** bound.
++    SlotIndexOutOfRange {
++        /// The index found.
++        index: u64,
++    },
++    /// A `retire:` key whose mode component is neither `bytes` nor `records`
++    /// (`0016:434-440`).
++    UnknownRetireMode {
++        /// The mode as read.
++        mode: String,
++    },
++    /// A digest that is not 64 **lowercase**-hex characters (a SHA-256, ADR-0047).
++    DigestNotHex {
++        /// The rejected text.
++        digest: String,
++    },
++    /// A named-part list that names one part number twice — an assembly no Complete can
++    /// mean, and one whose ETag would otherwise depend on which duplicate a sort kept.
++    DuplicatePart {
++        /// The number named twice.
++        part_number: u32,
++    },
++    /// A named-part list with no parts: an object assembled from nothing.
++    NoPartsNamed,
++    /// A record whose fields contradict each other or the state they claim.
++    Structural {
++        /// The record class.
++        record: &'static str,
++        /// What was wrong.
++        reason: String,
++    },
++}
++
++impl fmt::Display for RecordError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::MalformedKey { namespace, key } => write!(f, "malformed {namespace} key {key:?}"),
++            Self::TokenNotHex { token } => write!(
++                f,
++                "{token:?} is not {TOKEN_HEX_LEN} lowercase-hex characters (a 128-bit token)"
++            ),
++            Self::PartNumberOutOfRange { part_number } => write!(
++                f,
++                "part number {part_number} is outside the format bound [1, {MAX_PART_NUMBER}]"
++            ),
++            Self::SlotIndexOutOfRange { index } => write!(
++                f,
++                "slot index {index} is outside the format bound [0, {MAX_SLOT_INDEX}]"
++            ),
++            Self::UnknownRetireMode { mode } => write!(
++                f,
++                "retire: key mode {mode:?} is neither `bytes` nor `records`"
++            ),
++            Self::DigestNotHex { digest } => write!(
++                f,
++                "{digest:?} is not 64 lowercase-hex characters (a SHA-256 digest)"
++            ),
++            Self::DuplicatePart { part_number } => {
++                write!(f, "part number {part_number} is named twice")
++            }
++            Self::NoPartsNamed => write!(f, "the named-part list is empty"),
++            Self::Structural { record, reason } => write!(f, "invalid {record} record: {reason}"),
++        }
++    }
++}
++
++impl std::error::Error for RecordError {}
++
++fn malformed_key(namespace: &'static str, key: &[u8]) -> RecordError {
++    RecordError::MalformedKey {
++        namespace,
++        key: String::from_utf8_lossy(key).into_owned(),
++    }
++}
++
++fn structural(record: &'static str, reason: impl Into<String>) -> RecordError {
++    RecordError::Structural {
++        record,
++        reason: reason.into(),
++    }
++}
++
++/// Decode one record class's stored JSON, turning a serde failure — including every
++/// validating-decode rejection below — into a typed [`RecordError`].
++fn decode_record<T: serde::de::DeserializeOwned>(
++    record: &'static str,
++    bytes: &[u8],
++) -> Result<T, RecordError> {
++    serde_json::from_slice(bytes).map_err(|error| structural(record, error.to_string()))
++}
++
++/// Encode a multipart record to its stored bytes, the same infallible JSON encoding every
++/// record in [`crate::metadata`] uses (`metadata.rs:1534-1540`).
++pub fn encode_record<T: Serialize>(record: &T) -> Vec<u8> {
++    serde_json::to_vec(record).expect("multipart record serialization is infallible")
++}
++
++// ===========================================================================
++// 2. The validated components every key and record is built from
++// ===========================================================================
++
++/// A 128-bit token's canonical textual length: 32 lowercase-hex characters
++/// (`0016:493-497`). Taken from [`crate::metadata::SEG_NONCE_HEX_LEN`] rather than
++/// restated, since an upload id, an attempt id and a segment-group nonce are the same
++/// 128-bit-token shape minted the same way.
++pub const TOKEN_HEX_LEN: usize = metadata::SEG_NONCE_HEX_LEN;
++
++/// Whether `token` is a well-formed 128-bit token: exactly [`TOKEN_HEX_LEN`] lowercase-hex
++/// characters (`0016:493-497`). Rejects an empty string, a short or long token, uppercase
++/// hex, and — because `:` is never a hex digit — a token that embeds the key separator.
++pub fn is_token(token: &str) -> bool {
++    token.len() == TOKEN_HEX_LEN
++        && token
++            .bytes()
++            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++fn require_token(token: String) -> Result<String, RecordError> {
++    if is_token(&token) {
++        Ok(token)
++    } else {
++        Err(RecordError::TokenNotHex { token })
++    }
++}
++
++/// An **upload id**: the 128-bit token a gateway mints for one session, rendered as 32
++/// lowercase hex characters (`0016:493-497`).
++///
++/// A validated type rather than a `String` for the reason
++/// [`crate::metadata::SegmentNonce`] is (`metadata.rs:714-733`): it is the component every
++/// per-session **range** is derived from (`slot:<id>:`, `part:<id>:`, `sidx:<id>:`), so an
++/// id carrying the key separator would name another session's live range, and an empty one
++/// would name every session's.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct UploadId(String);
++
++impl UploadId {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(id: impl Into<String>) -> Result<Self, RecordError> {
++        require_token(id.into()).map(Self)
++    }
++
++    /// The id as its 32 hex characters.
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for UploadId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for UploadId {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// An **attempt id**: the 128-bit token one `UploadPart` attempt stamps into the `slot:`
++/// record it reserved, so an ambiguous reserve is settled by re-reading rather than by
++/// re-reserving a different index (`0016:349`). Same grammar as [`UploadId`].
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct AttemptId(String);
++
++impl AttemptId {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(id: impl Into<String>) -> Result<Self, RecordError> {
++        require_token(id.into()).map(Self)
++    }
++
++    /// The id as its 32 hex characters.
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for AttemptId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for AttemptId {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The decimal width a part number is zero-padded to in `part:` / `psum:` / `sidx:` keys, so
++/// the key's byte-lexicographic order equals part-number order — the property
++/// `metadata.rs:270-273` states for `SEG_INDEX_WIDTH`, mirrored for this slice's key space.
++///
++/// **Five digits, deliberately.** S3's part-number maximum is 10,000, so five digits leave a
++/// full order of magnitude of headroom while keeping every per-session key short. Widening
++/// it later is a stored-format change with a migration, exactly as `SEG_INDEX_WIDTH`'s doc
++/// records, so the headroom is bought now rather than borrowed.
++pub const PART_NUMBER_WIDTH: usize = 5;
++
++/// The largest part number the `part:`/`psum:`/`sidx:` key grammar can address — the whole
++/// key space [`PART_NUMBER_WIDTH`] opens, `99_999`.
++///
++/// A **format** bound (a constant of the encoding), never the live `MAX_PARTS_PER_SESSION`
++/// knob (#655's), which is enforced where a part is *admitted*. Mirrors
++/// [`crate::metadata::MAX_SEGMENT_INDEX`] and its reasoning (`metadata.rs:275-286`).
++pub const MAX_PART_NUMBER: u32 = 10u32.pow(PART_NUMBER_WIDTH as u32) - 1;
++
++/// A **part number**: `[1, MAX_PART_NUMBER]`, the range the fixed-width key grammar can both
++/// render and parse back. Zero is not a part (S3 numbers parts from 1) and a number past the
++/// key space would name a `part:` record no parser could read.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct PartNumber(u32);
++
++impl PartNumber {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(part_number: u32) -> Result<Self, RecordError> {
++        if part_number == 0 || part_number > MAX_PART_NUMBER {
++            return Err(RecordError::PartNumberOutOfRange {
++                part_number: u64::from(part_number),
++            });
++        }
++        Ok(Self(part_number))
++    }
++
++    /// The number.
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++impl fmt::Display for PartNumber {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for PartNumber {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(u32::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The decimal width a `slot:` key's index is zero-padded to, so byte-lexicographic key
++/// order equals index order (`metadata.rs:270-273`'s rule, mirrored).
++pub const SLOT_INDEX_WIDTH: usize = 6;
++
++/// The largest index the `slot:` key grammar can address — the whole key space
++/// [`SLOT_INDEX_WIDTH`] opens, `999_999`. A **format** bound: the live `MAX_INFLIGHT_PARTS`
++/// (#655's) is enforced at *reservation*, never at decode, because 0016 permits lowering it
++/// while live sessions still hold indices above the new cap (`0016:390-402`) — and a record
++/// that stopped decoding the moment a knob dropped could no longer be renewed, committed or
++/// torn down.
++pub const MAX_SLOT_INDEX: u32 = 10u32.pow(SLOT_INDEX_WIDTH as u32) - 1;
++
++/// An **in-flight slot index**: `[0, MAX_SLOT_INDEX]`. Index 0 is a real slot (the key space
++/// *is* the per-session cap, `0016:349`), so only the upper bound rejects.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
++#[serde(transparent)]
++pub struct SlotIndex(u32);
++
++impl SlotIndex {
++    /// The validating constructor — the only way to obtain one.
++    pub fn new(index: u32) -> Result<Self, RecordError> {
++        if index > MAX_SLOT_INDEX {
++            return Err(RecordError::SlotIndexOutOfRange {
++                index: u64::from(index),
++            });
++        }
++        Ok(Self(index))
++    }
++
++    /// The index.
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++impl fmt::Display for SlotIndex {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
++impl<'de> Deserialize<'de> for SlotIndex {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(u32::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// A SHA-256 digest, stored as 64 **lowercase**-hex characters.
++///
++/// The basis ADR-0047 settled for Wyrd's opaque change token
++/// (`docs/design/adr/0047-object-metadata-model.md:73-89`) — **never MD5**. A validated type
++/// because a digest's *shape* is structural: [`multipart_etag`] concatenates raw digest
++/// bytes, so a short or uppercase digest is not a value any composition could use.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Digest([u8; 32]);
++
++impl Digest {
++    /// The SHA-256 of `data`.
++    pub fn of(data: &[u8]) -> Self {
++        let mut hasher = Sha256::new();
++        hasher.update(data);
++        Self(hasher.finalize().into())
++    }
++
++    /// A digest from its 32 raw bytes.
++    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
++        Self(bytes)
++    }
++
++    /// The validating parser: exactly 64 lowercase-hex characters. Rejects uppercase hex
++    /// (a second spelling of one digest), any other length, and any non-hex byte.
++    pub fn from_hex(text: &str) -> Result<Self, RecordError> {
++        let not_hex = || RecordError::DigestNotHex {
++            digest: text.to_string(),
++        };
++        let raw = text.as_bytes();
++        if raw.len() != 64 {
++            return Err(not_hex());
++        }
++        let mut out = [0u8; 32];
++        for (i, slot) in out.iter_mut().enumerate() {
++            let hi = lowercase_hex_digit(raw[2 * i]).ok_or_else(not_hex)?;
++            let lo = lowercase_hex_digit(raw[2 * i + 1]).ok_or_else(not_hex)?;
++            *slot = hi * 16 + lo;
++        }
++        Ok(Self(out))
++    }
++
++    /// The 32 raw digest bytes — what [`multipart_etag`] concatenates.
++    pub const fn as_bytes(&self) -> &[u8; 32] {
++        &self.0
++    }
++
++    /// The canonical lowercase-hex rendering.
++    pub fn to_hex(&self) -> String {
++        hex_lower(&self.0)
++    }
++}
++
++fn lowercase_hex_digit(byte: u8) -> Option<u8> {
++    match byte {
++        b'0'..=b'9' => Some(byte - b'0'),
++        b'a'..=b'f' => Some(byte - b'a' + 10),
++        _ => None,
++    }
++}
++
++impl fmt::Display for Digest {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.to_hex())
++    }
++}
++
++impl Serialize for Digest {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_str(&self.to_hex())
++    }
++}
++
++impl<'de> Deserialize<'de> for Digest {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::from_hex(&String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// Bytes as lowercase hex — the rendering ADR-0047 settled for the change token, matching
++/// the wrapper style `crates/gateway-s3/src/crypto.rs:21-60` carries for this workspace's
++/// other SHA-256 usage.
++pub fn hex_lower(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
++        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
++    }
++    out
++}
++
++// ===========================================================================
++// 3. Keys and their canonical parsers
++// ===========================================================================
++
++/// The singleton admission-ledger key (`0016:348`). Never deleted; an absent record reads
++/// as `{count: 0}` (a later slice's concern — this module states only the record shape).
++pub const MPUCTL_KEY: &[u8] = b"mpuctl";
++
++/// Key prefix for session records. The trailing `:` is what keeps this **disjoint from**
++/// [`MPUCTL_KEY`] — `"mpuctl".starts_with("mpu:")` is `false` because `mpuctl`'s 4th byte is
++/// `c`, not `:` — so `scan(MPU_PREFIX)` can never return the admission singleton
++/// (`0016:342-344`).
++pub const MPU_PREFIX: &[u8] = b"mpu:";
++/// Key prefix for in-flight part slots.
++pub const SLOT_PREFIX: &[u8] = b"slot:";
++/// Key prefix for committed part records.
++pub const PART_PREFIX: &[u8] = b"part:";
++/// Key prefix for committed part summaries.
++pub const PSUM_PREFIX: &[u8] = b"psum:";
++/// Key prefix for owned staging entries — **disjoint from `pending:`**, which is the whole
++/// point of the class: no global `scan("pending:")` (the restore pass, the expiry sweep)
++/// ever enumerates an owned entry (`0016:475-491`).
++pub const SIDX_PREFIX: &[u8] = b"sidx:";
++/// Key prefix for byte-mode retirement obligations: orphan-mark, then delete the naming
++/// records (`0016:355`).
++pub const RETIRE_BYTES_PREFIX: &[u8] = b"retire:bytes:";
++/// Key prefix for record-mode retirement obligations: delete records only — never
++/// orphan-mark (`0016:356`).
++pub const RETIRE_RECORDS_PREFIX: &[u8] = b"retire:records:";
++
++/// A **fixed-width** `width`-digit decimal: exactly `width` ASCII digits — no `+`/`-` sign,
++/// no short spelling, no over-wide one. This is the rule the zero-padded key fields are
++/// checked against, and it is what makes byte-lexicographic key order equal numeric order
++/// (`metadata.rs:270-273`). `u32::from_str` alone would accept `+7`, `7` and `0000007` as
++/// three spellings of one record.
++fn fixed_width_u32(text: &str, width: usize) -> Option<u32> {
++    if text.len() != width || !text.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    text.parse().ok()
++}
++
++/// A `u128`/`u64` in **canonical** decimal: ASCII digits only (no sign), and no leading zero
++/// unless the value *is* `0` — the rule `parse_seg_key` applies to its own un-padded epoch
++/// (`metadata.rs:1305-1315`), reused for every variable-width decimal this module parses (a
++/// chunk id, an epoch, a version).
++fn canonical_decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
++    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    if text.len() > 1 && text.starts_with('0') {
++        return None;
++    }
++    text.parse().ok()
++}
++
++/// Split `key` into exactly `fields` `:`-separated components after `prefix`, failing closed
++/// on a non-UTF-8 key, a missing prefix, or the wrong field count (a truncated key, or one
++/// with a trailing component) — the shape every keyed-record parser below shares.
++fn split_key<'a>(
++    key: &'a [u8],
++    prefix: &str,
++    namespace: &'static str,
++    fields: usize,
++) -> Result<Vec<&'a str>, RecordError> {
++    let text = std::str::from_utf8(key).map_err(|_| malformed_key(namespace, key))?;
++    let rest = text
++        .strip_prefix(prefix)
++        .ok_or_else(|| malformed_key(namespace, key))?;
++    let parts: Vec<&str> = rest.splitn(fields, ':').collect();
++    if parts.len() != fields {
++        return Err(malformed_key(namespace, key));
++    }
++    Ok(parts)
++}
++
++/// Key for a session record: `mpu:<upload-id>`.
++pub fn mpu_key(upload_id: &UploadId) -> Vec<u8> {
++    format!("mpu:{upload_id}").into_bytes()
++}
++
++/// Parse an [`mpu_key`] back into its upload id.
++pub fn parse_mpu_key(key: &[u8]) -> Result<UploadId, RecordError> {
++    let fields = split_key(key, "mpu:", "mpu:", 1)?;
++    UploadId::new(fields[0])
++}
++
++/// Key for one in-flight part slot: `slot:<upload-id>:<index>`, zero-padded to
++/// [`SLOT_INDEX_WIDTH`].
++pub fn slot_key(upload_id: &UploadId, index: SlotIndex) -> Vec<u8> {
++    format!(
++        "slot:{upload_id}:{:0width$}",
++        index.get(),
++        width = SLOT_INDEX_WIDTH
++    )
++    .into_bytes()
++}
++
++/// The bounded per-session slot range: `slot:<upload-id>:` (`0016:349`).
++pub fn slot_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("slot:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`slot_key`] back into `(upload_id, index)`, rejecting every non-canonical
++/// spelling of one slot.
++pub fn parse_slot_key(key: &[u8]) -> Result<(UploadId, SlotIndex), RecordError> {
++    let fields = split_key(key, "slot:", "slot:", 2)?;
++    let index =
++        fixed_width_u32(fields[1], SLOT_INDEX_WIDTH).ok_or_else(|| malformed_key("slot:", key))?;
++    Ok((UploadId::new(fields[0])?, SlotIndex::new(index)?))
++}
++
++fn part_scoped_key(prefix: &str, upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    format!(
++        "{prefix}{upload_id}:{:0width$}",
++        part_number.get(),
++        width = PART_NUMBER_WIDTH
++    )
++    .into_bytes()
++}
++
++fn parse_part_scoped_key(
++    key: &[u8],
++    prefix: &'static str,
++    namespace: &'static str,
++) -> Result<(UploadId, PartNumber), RecordError> {
++    let fields = split_key(key, prefix, namespace, 2)?;
++    let part_number = fixed_width_u32(fields[1], PART_NUMBER_WIDTH)
++        .ok_or_else(|| malformed_key(namespace, key))?;
++    Ok((UploadId::new(fields[0])?, PartNumber::new(part_number)?))
++}
++
++/// Key for a committed part: `part:<upload-id>:<part-number>`, zero-padded to
++/// [`PART_NUMBER_WIDTH`] so a range read is in part-number order.
++pub fn part_key(upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    part_scoped_key("part:", upload_id, part_number)
++}
++
++/// The bounded per-session part range: `part:<upload-id>:`.
++pub fn part_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("part:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`part_key`] back into `(upload_id, part_number)`.
++pub fn parse_part_key(key: &[u8]) -> Result<(UploadId, PartNumber), RecordError> {
++    parse_part_scoped_key(key, "part:", "part:")
++}
++
++/// Key for a committed part's summary: `psum:<upload-id>:<part-number>`.
++pub fn psum_key(upload_id: &UploadId, part_number: PartNumber) -> Vec<u8> {
++    part_scoped_key("psum:", upload_id, part_number)
++}
++
++/// The bounded per-session summary range: `psum:<upload-id>:`.
++pub fn psum_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("psum:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`psum_key`] back into `(upload_id, part_number)`.
++pub fn parse_psum_key(key: &[u8]) -> Result<(UploadId, PartNumber), RecordError> {
++    parse_part_scoped_key(key, "psum:", "psum:")
++}
++
++/// Key for one **owned staging entry**: `sidx:<upload-id>:<part-number>:<chunk-id>`. The
++/// `<part-number>` component is what lets a reclaimer attribute residue to the part attempt
++/// that staged it (`0016:353`).
++pub fn sidx_key(upload_id: &UploadId, part_number: PartNumber, chunk: ChunkId) -> Vec<u8> {
++    format!(
++        "sidx:{upload_id}:{:0width$}:{chunk}",
++        part_number.get(),
++        width = PART_NUMBER_WIDTH
++    )
++    .into_bytes()
++}
++
++/// The bounded per-session owned range: `sidx:<upload-id>:` — the **only** way any pass
++/// reads owned entries; there is no global scan of them anywhere (`0016:475-491`).
++pub fn sidx_range(upload_id: &UploadId) -> Vec<u8> {
++    format!("sidx:{upload_id}:").into_bytes()
++}
++
++/// Parse a [`sidx_key`] back into `(upload_id, part_number, chunk_id)`. The chunk-id
++/// component is **canonical** decimal, not fixed-width — `7` and `007` must never both
++/// parse, the same canonicality rule the padded fields enforce by width instead.
++pub fn parse_sidx_key(key: &[u8]) -> Result<(UploadId, PartNumber, ChunkId), RecordError> {
++    let fields = split_key(key, "sidx:", "sidx:", 3)?;
++    let part_number =
++        fixed_width_u32(fields[1], PART_NUMBER_WIDTH).ok_or_else(|| malformed_key("sidx:", key))?;
++    let chunk: ChunkId = canonical_decimal(fields[2]).ok_or_else(|| malformed_key("sidx:", key))?;
++    Ok((
++        UploadId::new(fields[0])?,
++        PartNumber::new(part_number)?,
++        chunk,
++    ))
++}
++
++// ===========================================================================
++// 4. The `retire:` token grammar (`0016:358-380`)
++// ===========================================================================
++
++/// Which of the two retirement modes an obligation is in — read from the **key**, never a
++/// field: a boolean misread once is silent data loss, a malformed key prefix is an error at
++/// decode (`0016:434-440`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RetireMode {
++    /// Orphan-mark the bytes, then delete the records that named them.
++    Bytes,
++    /// Delete records only — **never** orphan-mark.
++    Records,
++}
++
++impl RetireMode {
++    /// Every mode, for a total dispatch.
++    pub const ALL: [Self; 2] = [Self::Bytes, Self::Records];
++
++    /// The key prefix this mode lives under.
++    pub const fn prefix(self) -> &'static [u8] {
++        match self {
++            Self::Bytes => RETIRE_BYTES_PREFIX,
++            Self::Records => RETIRE_RECORDS_PREFIX,
++        }
++    }
++}
++
++/// Parse the mode out of a `retire:` key, failing closed on any other spelling — the
++/// boundary the mode-in-the-key argument rests on (`0016:434-440`).
++pub fn parse_retire_mode(key: &[u8]) -> Result<RetireMode, RecordError> {
++    if key.starts_with(RETIRE_BYTES_PREFIX) {
++        Ok(RetireMode::Bytes)
++    } else if key.starts_with(RETIRE_RECORDS_PREFIX) {
++        Ok(RetireMode::Records)
++    } else {
++        let text = String::from_utf8_lossy(key);
++        Err(RecordError::UnknownRetireMode {
++            mode: text
++                .strip_prefix("retire:")
++                .unwrap_or(&text)
++                .split(':')
++                .next()
++                .unwrap_or_default()
++                .to_string(),
++        })
++    }
++}
++
++/// A retirement token, whose grammar makes reuse impossible (`0016:358-380`): every
++/// component is minted once — an epoch is bumped by every fence, a `(part, attempt)` pair
++/// belongs to one `UploadPart`, an `(inode, version)` pair is produced by exactly one
++/// publication. Installation is `require_absent(retire:<mode>:<token>)`, so a collision is a
++/// `Conflict` the installer classifies, never a silent overwrite that would replace one
++/// obligation's payload with another's and permanently lose the reclamation evidence.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RetireToken {
++    /// A **session-scoped** obligation: `s:<upload-id>:<epoch>` — the whole-session teardown
++    /// an epoch's fence installs — or, with the optional suffix,
++    /// `s:<upload-id>:<epoch>:<part-number>:<attempt-id>` for a **per-part** obligation (a
++    /// re-uploaded part's superseded chunks, a losing writer's compensation).
++    Session {
++        /// The owning session's upload id.
++        upload_id: UploadId,
++        /// The epoch whose fence installed the obligation.
++        epoch: u64,
++        /// The part attempt, for a per-part obligation.
++        part: Option<(PartNumber, AttemptId)>,
++    },
++    /// A **superseded or deleted generation**: `g:<inode-id>:<version>`.
++    Generation {
++        /// The inode.
++        inode: InodeId,
++        /// Its version.
++        version: u64,
++    },
++}
++
++impl fmt::Display for RetireToken {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Session {
++                upload_id,
++                epoch,
++                part: None,
++            } => write!(f, "s:{upload_id}:{epoch}"),
++            Self::Session {
++                upload_id,
++                epoch,
++                part: Some((part_number, attempt_id)),
++            } => write!(f, "s:{upload_id}:{epoch}:{part_number}:{attempt_id}"),
++            Self::Generation { inode, version } => write!(f, "g:{inode}:{version}"),
++        }
++    }
++}
++
++/// Key for a retirement obligation: `retire:<mode>:<token>`.
++pub fn retire_key(mode: RetireMode, token: &RetireToken) -> Vec<u8> {
++    let mut key = mode.prefix().to_vec();
++    key.extend_from_slice(token.to_string().as_bytes());
++    key
++}
++
++/// The bounded session-scoped obligation range for one mode: `retire:<mode>:s:<upload-id>:`.
++/// A session's terminal delete gate is two of these emptiness reads, never a walk of the
++/// whole `retire:` namespace, which is deliberately not cardinality-bounded
++/// (`0016:374-380`).
++pub fn retire_session_range(mode: RetireMode, upload_id: &UploadId) -> Vec<u8> {
++    let mut key = mode.prefix().to_vec();
++    key.extend_from_slice(format!("s:{upload_id}:").as_bytes());
++    key
++}
++
++/// Parse a [`retire_key`] back into `(mode, token)`, failing closed on any other spelling: a
++/// truncated token, a trailing component, a non-canonical epoch/version/part-number (a `+`
++/// sign or a leading zero), or a malformed upload/attempt id.
++pub fn parse_retire_key(key: &[u8]) -> Result<(RetireMode, RetireToken), RecordError> {
++    let mode = parse_retire_mode(key)?;
++    let text = std::str::from_utf8(key).map_err(|_| malformed_key("retire:", key))?;
++    let rest = &text[mode.prefix().len()..];
++    let fields: Vec<&str> = rest.split(':').collect();
++    let malformed = || malformed_key("retire:", key);
++    let token = match fields.as_slice() {
++        ["s", upload_id, epoch] => RetireToken::Session {
++            upload_id: UploadId::new(*upload_id)?,
++            epoch: canonical_decimal(epoch).ok_or_else(malformed)?,
++            part: None,
++        },
++        ["s", upload_id, epoch, part_number, attempt_id] => RetireToken::Session {
++            upload_id: UploadId::new(*upload_id)?,
++            epoch: canonical_decimal(epoch).ok_or_else(malformed)?,
++            part: Some((
++                PartNumber::new(canonical_decimal(part_number).ok_or_else(malformed)?)?,
++                AttemptId::new(*attempt_id)?,
++            )),
++        },
++        ["g", inode, version] => RetireToken::Generation {
++            inode: canonical_decimal(inode).ok_or_else(malformed)?,
++            version: canonical_decimal(version).ok_or_else(malformed)?,
++        },
++        _ => return Err(malformed()),
++    };
++    Ok((mode, token))
++}
++
++// ===========================================================================
++// 5. The admission ledger — `mpuctl` (`0016:348`)
++// ===========================================================================
++
++/// The budget **profile** tuple `mpuctl` stores and every admitter/custodian compares whole
++/// (`0016:348`,`:1462-1480`). This slice owns the **shape** and the two pure derivations
++/// below (§ Scope boundary 3); the deployment's own values are #655's — mirroring the
++/// format/capacity split `metadata.rs:270-322` already draws.
++///
++/// The fields are private behind [`Budget::new`] because the derivations are safety
++/// arithmetic: a tuple with a zero component derives a `U_ref` of zero, and `MAX_SESSIONS`
++/// would then be a division by zero rather than a limit. No legal configuration has one, so
++/// it is refused at construction and at decode, and every `Budget` in existence therefore
++/// derives a defined limit.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
++pub struct Budget {
++    w_ref: u64,
++    max_part_chunks: u32,
++    max_parts_per_session: u32,
++    max_inflight_parts: u32,
++    max_staged_chunks: u32,
++}
++
++impl Budget {
++    /// The validating constructor — every component must be non-zero.
++    pub fn new(
++        w_ref: u64,
++        max_part_chunks: u32,
++        max_parts_per_session: u32,
++        max_inflight_parts: u32,
++        max_staged_chunks: u32,
++    ) -> Result<Self, RecordError> {
++        let zero = [
++            (w_ref == 0, "w_ref"),
++            (max_part_chunks == 0, "max_part_chunks"),
++            (max_parts_per_session == 0, "max_parts_per_session"),
++            (max_inflight_parts == 0, "max_inflight_parts"),
++            (max_staged_chunks == 0, "max_staged_chunks"),
++        ];
++        for (is_zero, field) in zero {
++            if is_zero {
++                return Err(structural(
++                    "mpuctl profile",
++                    format!("`{field}` is zero: no configuration admits a session under it"),
++                ));
++            }
++        }
++        Ok(Self {
++            w_ref,
++            max_part_chunks,
++            max_parts_per_session,
++            max_inflight_parts,
++            max_staged_chunks,
++        })
++    }
++
++    /// The reconcile pass's staged-reference memory budget, in chunk-refs (`W_ref`).
++    pub const fn w_ref(&self) -> u64 {
++        self.w_ref
++    }
++
++    /// The per-`part:`-record chunk ceiling (`MAX_PART_CHUNKS`).
++    pub const fn max_part_chunks(&self) -> u32 {
++        self.max_part_chunks
++    }
++
++    /// The per-session part-number space (`MAX_PARTS_PER_SESSION`).
++    pub const fn max_parts_per_session(&self) -> u32 {
++        self.max_parts_per_session
++    }
++
++    /// The per-session in-flight cap (`MAX_INFLIGHT_PARTS`).
++    pub const fn max_inflight_parts(&self) -> u32 {
++        self.max_inflight_parts
++    }
++
++    /// The per-session committed-staging ceiling (`MAX_STAGED_CHUNKS`).
++    pub const fn max_staged_chunks(&self) -> u32 {
++        self.max_staged_chunks
++    }
++
++    /// `U_ref` — the worst-case **per-session** staged-reference footprint, in chunk-refs
++    /// (`0016:1469`), pure arithmetic over the stored tuple (§ Scope boundary 3):
++    ///
++    /// ```text
++    /// U_ref = min( (MAX_PARTS_PER_SESSION + MAX_INFLIGHT_PARTS) x MAX_PART_CHUNKS,
++    ///              MAX_STAGED_CHUNKS + 2 x MAX_INFLIGHT_PARTS x MAX_PART_CHUNKS )
++    /// ```
++    ///
++    /// The first term is the raw part-number space; the second is the **enforced** staged
++    /// ceiling plus the bounded commit overshoot plus the in-flight owned entries — each
++    /// committed part charged its **full** `MAX_PART_CHUNKS` (charging a part as one record
++    /// under-bounds the footprint by up to `MAX_PART_CHUNKS`x, the iteration-4 defect 0016
++    /// fixed).
++    ///
++    /// **Saturating, never wrapping**: the operands are decoded `u32`s, so both products can
++    /// exceed `u64` (`(2^32 + 2^32) × 2^32 = 2^65`). Unchecked arithmetic here would panic in
++    /// a checked build and wrap in a release one, deriving a *small* `U_ref` from an enormous
++    /// profile and admitting sessions far past the memory the reconcile pass is sized for.
++    /// Saturation charges the whole budget to one session instead — the fail-closed
++    /// direction (C-1).
++    pub fn u_ref(&self) -> u64 {
++        let part_chunks = u64::from(self.max_part_chunks);
++        let inflight = u64::from(self.max_inflight_parts);
++        let raw = u64::from(self.max_parts_per_session)
++            .saturating_add(inflight)
++            .saturating_mul(part_chunks);
++        let ceiling = u64::from(self.max_staged_chunks)
++            .saturating_add(2u64.saturating_mul(inflight).saturating_mul(part_chunks));
++        raw.min(ceiling)
++    }
++
++    /// `MAX_SESSIONS` — the admission limit, `min(floor(W_ref / U_ref), SCAN_CAP/2)`,
++    /// **derived, never chosen** (`0016:1470`). The `SCAN_CAP/2` clamp is what keeps a legal
++    /// pairing (a large `W_ref` with small parts) from exceeding the reaper's one
++    /// `scan("mpu:")`; [`wyrd_traits::SCAN_CAP`] is a pre-existing store-seam constant, not a
++    /// multipart deployment knob, so consulting it here is still pure arithmetic over values
++    /// already fixed.
++    ///
++    /// [`Budget::new`] refuses a zero component, so `u_ref()` is at least 2 and the division
++    /// is total.
++    pub fn max_sessions(&self) -> u64 {
++        let quotient = self.w_ref / self.u_ref();
++        quotient.min((wyrd_traits::SCAN_CAP / 2) as u64)
++    }
++}
++
++#[derive(Deserialize)]
++struct BudgetWire {
++    w_ref: u64,
++    max_part_chunks: u32,
++    max_parts_per_session: u32,
++    max_inflight_parts: u32,
++    max_staged_chunks: u32,
++}
++
++impl<'de> Deserialize<'de> for Budget {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = BudgetWire::deserialize(deserializer)?;
++        Budget::new(
++            wire.w_ref,
++            wire.max_part_chunks,
++            wire.max_parts_per_session,
++            wire.max_inflight_parts,
++            wire.max_staged_chunks,
++        )
++        .map_err(DeError::custom)
++    }
++}
++
++/// The singleton **admission ledger** record, `mpuctl` (`0016:348`): one record, three
++/// fields, CAS'd **whole**, so the count and the limit it was checked against can never be
++/// read apart.
++///
++/// **`max_sessions` is checked against the profile at decode**, because it is *derived*
++/// ([`Budget::max_sessions`], `0016:1470`) and never independently chosen. Admission
++/// enforces the **stored** limit — deliberately, so every admitter in the fleet agrees on
++/// one number — which is exactly why the stored number may not be free: a torn or
++/// rolled-back `mpuctl` naming a larger `max_sessions` than its own profile derives would be
++/// trusted by every host, and `Σ_sessions(U_ref) ≤ W_ref` (the bound the whole reconcile pass
++/// is sized for) would be exceeded on hosts that never observe the overrun. The relation
++/// between the two fields is a structural invariant of this record class, so it surfaces as
++/// an error at decode rather than as an admitted value (ADR-0045; the defect #636's
++/// sign-off recorded).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct AdmissionRecord {
++    /// How many `mpu:` records exist, in any state (tombstones included).
++    pub count: u64,
++    /// The governing limit those increments were admitted against.
++    pub max_sessions: u64,
++    /// The budget tuple that establishes `max_sessions`.
++    pub profile: Budget,
++}
++
++impl AdmissionRecord {
++    /// The ledger a first Create initializes on a fresh or upgraded store: one session, the
++    /// limit its own profile derives (`0016:348`).
++    pub fn new(count: u64, profile: Budget) -> Self {
++        Self {
++            count,
++            max_sessions: profile.max_sessions(),
++            profile,
++        }
++    }
++}
++
++#[derive(Deserialize)]
++struct AdmissionRecordWire {
++    count: u64,
++    max_sessions: u64,
++    profile: Budget,
++}
++
++impl<'de> Deserialize<'de> for AdmissionRecord {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = AdmissionRecordWire::deserialize(deserializer)?;
++        let derived = wire.profile.max_sessions();
++        if wire.max_sessions != derived {
++            return Err(DeError::custom(format!(
++                "mpuctl records max_sessions={} but its own profile derives {derived} \
++                 (U_ref={}, W_ref={}): the stored limit is derived, never chosen",
++                wire.max_sessions,
++                wire.profile.u_ref(),
++                wire.profile.w_ref(),
++            )));
++        }
++        Ok(Self {
++            count: wire.count,
++            max_sessions: wire.max_sessions,
++            profile: wire.profile,
++        })
++    }
++}
++
++/// Decode the `mpuctl` singleton, with its relational invariant enforced.
++pub fn decode_admission_record(bytes: &[u8]) -> Result<AdmissionRecord, RecordError> {
++    decode_record("mpuctl", bytes)
++}
++
++// ===========================================================================
++// 6. The session record — `mpu:<upload-id>` (`0016:350`, §2's state machine)
++// ===========================================================================
++
++/// A session's lifecycle state (`0016:528-553`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum SessionState {
++    /// Accepting parts.
++    Open,
++    /// Fenced by a Complete that owns publication.
++    Completing,
++    /// Fenced for teardown; its `retire:bytes:{session}` obligation is installed.
++    Aborting,
++    /// Published. A **tombstone** that still answers an identical retry, still holds an
++    /// `mpu:` record, and is therefore still counted by the admission counter
++    /// (`0016:964-968`).
++    Completed,
++}
++
++impl SessionState {
++    /// Every state a session record can be in. Adding a variant without extending this
++    /// widens the verb x state product the answer table is asserted total over, so a new
++    /// state cannot be added silently.
++    pub const ALL: [Self; 4] = [
++        Self::Open,
++        Self::Completing,
++        Self::Aborting,
++        Self::Completed,
++    ];
++}
++
++/// The dirent identity a `Completing` session publishes to, plus the fence epoch that owns
++/// the attempt (`0016:350`).
++///
++/// **The key, never a frozen inode id**: an inode id is minted per create, so a concurrent
++/// delete-and-recreate of the same object name rebinds it to a *different* inode, and a flip
++/// that reused a frozen id would recreate an unlinked inode and CAS a dirent that now names
++/// another one. Each flip attempt therefore re-resolves the dirent.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PublishTarget {
++    /// The parent inode the object name lives under.
++    pub parent: InodeId,
++    /// The object name.
++    pub name: String,
++    /// The `Completing` fence epoch, so a resumed completer writes the same deterministic
++    /// segment-group range (`0016:940-949`).
++    pub fence_epoch: u64,
++}
++
++/// What a `Completed` session recorded (`0016:350`).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Completion {
++    /// The published inode.
++    pub inode: InodeId,
++    /// The published version — `prior.version + 1` recomputed from the re-read prior at the
++    /// winning flip, never a fence-frozen number (`0016:925-932`).
++    pub version: u64,
++    /// The composed ETag ([`multipart_etag`]), validated against its grammar at decode.
++    pub etag: MultipartEtag,
++    /// The publication instant.
++    pub completed_at_millis: u64,
++    /// A digest over the **ordered** `(part_number, digest)` list the winning Complete named
++    /// ([`complete_fingerprint`]) — the request identity the `Completed` tombstone answers a
++    /// retry on (`0016:898-908`).
++    pub complete_fingerprint: Digest,
++}
++
++/// One multipart upload session — the record every transition compare-and-sets on its
++/// **exact bytes** (`0016:350`,`:555-566`).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct SessionRecord {
++    /// The target bucket.
++    pub bucket: String,
++    /// The parent inode the object name lives under.
++    pub parent: InodeId,
++    /// The object name.
++    pub object: String,
++    /// The declared content type, stamped at publication (ADR-0047).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub content_type: Option<String>,
++    /// When the session was initiated — the instant `W_session` is measured from (#625).
++    pub created_at_millis: u64,
++    /// Which clock produced every session-scoped stamp — *one clock per correctness
++    /// lifecycle* (ADR-0009, `AGENTS.md:131-142`). Recorded here as a field; the clock guard
++    /// that reads it is #625's.
++    pub clock_source: String,
++    /// The lifecycle state.
++    pub state: SessionState,
++    /// A monotone counter bumped by every fence, so two successive states are textually
++    /// distinct even when nothing else changes.
++    pub epoch: u64,
++    /// Complete fences spent so far (capped at a later slice's `MAX_COMPLETE_ATTEMPTS`).
++    pub attempts: u32,
++    /// The **segment-group nonce**, minted with the session and deliberately independent of
++    /// its upload id, because the `seg:` records it keys outlive the `mpu:` tombstone that
++    /// would otherwise be their only reuse guard (`0016:499-527`). Validated at decode by
++    /// [`crate::metadata::SegmentNonce`]'s own constructor, so a stored session can never
++    /// name a segment range it could not address.
++    pub group_nonce: metadata::SegmentNonce,
++    /// When the session fenced into `Completing` — the instant `W_completing` is measured
++    /// from. `Completing`-only.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub fenced_at_millis: Option<u64>,
++    /// The segment-write cursor of the current attempt. `Completing`-only.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub segments_written: Option<u32>,
++    /// The dirent identity and fence epoch of the current attempt. `Completing`-only.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub publish_target: Option<PublishTarget>,
++    /// What the winning flip recorded. `Completed`-only.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub completion: Option<Completion>,
++}
++
++#[derive(Deserialize)]
++struct SessionRecordWire {
++    bucket: String,
++    parent: InodeId,
++    object: String,
++    #[serde(default)]
++    content_type: Option<String>,
++    created_at_millis: u64,
++    clock_source: String,
++    state: SessionState,
++    epoch: u64,
++    attempts: u32,
++    group_nonce: String,
++    #[serde(default)]
++    fenced_at_millis: Option<u64>,
++    #[serde(default)]
++    segments_written: Option<u32>,
++    #[serde(default)]
++    publish_target: Option<PublishTarget>,
++    #[serde(default)]
++    completion: Option<Completion>,
++}
++
++/// **Validating decode** (ADR-0045). Half of a state's meaning is in the fields the state
++/// carries, so a session value carrying a field its state forbids — a `Completing`-only
++/// `fenced_at_millis` on an `Open` session — or missing one its state requires is a record
++/// no writer in this protocol can produce, and admitting it as a *value* would let a
++/// consumer act on a session it does not actually understand (`0016:404-408`).
++///
++/// Three further structural rules, each a record whose halves would otherwise contradict:
++/// a session must name the target it publishes to (`bucket`/`object` non-empty); it must
++/// name the clock its stamps came from (`clock_source` non-empty, ADR-0009); and a
++/// `Completing` session's `publish_target.fence_epoch` must be **its own** epoch, since the
++/// segment records of the attempt are keyed by that epoch (`0016:940-949`) — a mismatch
++/// would resume a completer against another attempt's segment generation.
++impl<'de> Deserialize<'de> for SessionRecord {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = SessionRecordWire::deserialize(deserializer)?;
++        let group_nonce = metadata::SegmentNonce::new(wire.group_nonce).map_err(DeError::custom)?;
++        let (fenced, cursor, target, completion) = (
++            wire.fenced_at_millis.is_some(),
++            wire.segments_written.is_some(),
++            wire.publish_target.is_some(),
++            wire.completion.is_some(),
++        );
++        let required: &[(bool, &'static str)] = match wire.state {
++            SessionState::Completing => &[
++                (fenced, "fenced_at_millis"),
++                (cursor, "segments_written"),
++                (target, "publish_target"),
++            ],
++            SessionState::Completed => &[(completion, "completion")],
++            SessionState::Open | SessionState::Aborting => &[],
++        };
++        for (present, field) in required {
++            if !present {
++                return Err(DeError::custom(format!(
++                    "session in {:?} must carry the field `{field}`",
++                    wire.state
++                )));
++            }
++        }
++        let forbidden: &[(bool, &'static str)] = match wire.state {
++            // A fence release and a teardown fence both drop every `Completing`-only field,
++            // so an `Open`/`Aborting` record is identical in shape to a freshly created one.
++            SessionState::Open | SessionState::Aborting => &[
++                (fenced, "fenced_at_millis"),
++                (cursor, "segments_written"),
++                (target, "publish_target"),
++                (completion, "completion"),
++            ],
++            SessionState::Completing => &[(completion, "completion")],
++            SessionState::Completed => &[
++                (fenced, "fenced_at_millis"),
++                (cursor, "segments_written"),
++                (target, "publish_target"),
++            ],
++        };
++        for (present, field) in forbidden {
++            if *present {
++                return Err(DeError::custom(format!(
++                    "session in {:?} may not carry the field `{field}`",
++                    wire.state
++                )));
++            }
++        }
++        for (text, field) in [
++            (&wire.bucket, "bucket"),
++            (&wire.object, "object"),
++            (&wire.clock_source, "clock_source"),
++        ] {
++            if text.is_empty() {
++                return Err(DeError::custom(format!("session `{field}` is empty")));
++            }
++        }
++        if let Some(target) = &wire.publish_target {
++            if target.fence_epoch != wire.epoch {
++                return Err(DeError::custom(format!(
++                    "session at epoch {} carries a publish_target fenced at epoch {}: \
++                     the attempt's `seg:` records are keyed by the fence epoch",
++                    wire.epoch, target.fence_epoch
++                )));
++            }
++            if target.name.is_empty() {
++                return Err(DeError::custom("publish_target `name` is empty"));
++            }
++        }
++        Ok(Self {
++            bucket: wire.bucket,
++            parent: wire.parent,
++            object: wire.object,
++            content_type: wire.content_type,
++            created_at_millis: wire.created_at_millis,
++            clock_source: wire.clock_source,
++            state: wire.state,
++            epoch: wire.epoch,
++            attempts: wire.attempts,
++            group_nonce,
++            fenced_at_millis: wire.fenced_at_millis,
++            segments_written: wire.segments_written,
++            publish_target: wire.publish_target,
++            completion: wire.completion,
++        })
++    }
++}
++
++/// Decode an `mpu:<upload-id>` session record, with its state's field invariants enforced.
++pub fn decode_session(bytes: &[u8]) -> Result<SessionRecord, RecordError> {
++    decode_record("mpu:", bytes)
++}
++
++// ===========================================================================
++// 7. The slot, part and summary records (`0016:349-352`)
++// ===========================================================================
++
++/// One **in-flight part slot** — `slot:<upload-id>:<index>` (`0016:349`). The stamp records
++/// when the slot was claimed, so a request is observably alive from the instant it reserves,
++/// before it has written a byte; the lease is renewed in flight by the same half-TTL loop
++/// that renews the owned `sidx:` leases.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct SlotRecord {
++    /// The part number this attempt is uploading.
++    pub part_number: PartNumber,
++    /// A per-attempt token, so an ambiguous reserve is settled by re-reading rather than by
++    /// re-reserving a different index.
++    pub attempt_id: AttemptId,
++    /// When the slot was claimed.
++    pub reserved_at_millis: u64,
++    /// The slot's liveness lease.
++    pub lease_expiry_millis: u64,
++}
++
++#[derive(Deserialize)]
++struct SlotRecordWire {
++    part_number: PartNumber,
++    attempt_id: AttemptId,
++    reserved_at_millis: u64,
++    lease_expiry_millis: u64,
++}
++
++/// **Validating decode**: the part number and attempt id are validated by their own types,
++/// and a lease that expired *before* the slot was claimed is refused — under one clock
++/// (ADR-0009) no reserve can stamp one, and admitting it would present a slot that was born
++/// reapable as ordinary residue.
++impl<'de> Deserialize<'de> for SlotRecord {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = SlotRecordWire::deserialize(deserializer)?;
++        if wire.lease_expiry_millis < wire.reserved_at_millis {
++            return Err(DeError::custom(format!(
++                "slot lease expires at {} but was reserved at {}",
++                wire.lease_expiry_millis, wire.reserved_at_millis
++            )));
++        }
++        Ok(Self {
++            part_number: wire.part_number,
++            attempt_id: wire.attempt_id,
++            reserved_at_millis: wire.reserved_at_millis,
++            lease_expiry_millis: wire.lease_expiry_millis,
++        })
++    }
++}
++
++/// Decode a `slot:<upload-id>:<index>` reservation.
++pub fn decode_slot(bytes: &[u8]) -> Result<SlotRecord, RecordError> {
++    decode_record("slot:", bytes)
++}
++
++/// A committed part — `part:<upload-id>:<part-number>` (`0016:351`).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct PartRecord {
++    /// The part's chunk list, in object order.
++    pub chunks: Vec<ChunkRef>,
++    /// The part's length in bytes.
++    pub len: u64,
++    /// The part's content digest.
++    pub digest: Digest,
++    /// When the part committed.
++    pub committed_at_millis: u64,
++    /// The session epoch the commit was fenced on.
++    pub session_epoch: u64,
++}
++
++#[derive(Deserialize)]
++struct PartRecordWire {
++    chunks: Vec<ChunkRef>,
++    len: u64,
++    digest: Digest,
++    committed_at_millis: u64,
++    session_epoch: u64,
++}
++
++/// **Validating decode**: `len` is checked against the chunk list's own span, **checked**
++/// (never wrapped, mirroring `metadata.rs`'s `checked_chunk_bytes`, `:1180-1190`). The two
++/// state the *same* fact — Complete sums `len` into the published `size`, the read path sums
++/// the chunks it actually reads — so a record whose halves disagree would publish an object
++/// whose declared size is not the number of bytes a reader can get: a silent wrong answer at
++/// `HeadObject`/`GetObject`. A wrapped sum is the same defect with a forged agreement.
++impl<'de> Deserialize<'de> for PartRecord {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = PartRecordWire::deserialize(deserializer)?;
++        let span = wire
++            .chunks
++            .iter()
++            .try_fold(0u64, |total, chunk| total.checked_add(chunk.len))
++            .ok_or_else(|| {
++                DeError::custom(format!(
++                    "part record's {} chunk length(s) overflow u64",
++                    wire.chunks.len()
++                ))
++            })?;
++        if span != wire.len {
++            return Err(DeError::custom(format!(
++                "part record declares len={} but its {} chunk(s) span {span} B",
++                wire.len,
++                wire.chunks.len()
++            )));
++        }
++        Ok(Self {
++            chunks: wire.chunks,
++            len: wire.len,
++            digest: wire.digest,
++            committed_at_millis: wire.committed_at_millis,
++            session_epoch: wire.session_epoch,
++        })
++    }
++}
++
++/// Decode a `part:<upload-id>:<part-number>` record.
++pub fn decode_part(bytes: &[u8]) -> Result<PartRecord, RecordError> {
++    decode_record("part:", bytes)
++}
++
++/// A committed part's **summary** — `psum:<upload-id>:<part-number>`, written in the same
++/// batch as the `part:` record it summarizes (`0016:352`). Everything about a part except
++/// its chunk list, so the cumulative staged-chunk check and `ListParts` read tens of bytes
++/// per part instead of the fat lists.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct PartSummary {
++    /// How many chunks the part holds.
++    pub chunks: u32,
++    /// The part's length in bytes.
++    pub len: u64,
++    /// The part's content digest.
++    pub digest: Digest,
++    /// When the part committed.
++    pub committed_at_millis: u64,
++}
++
++#[derive(Deserialize)]
++struct PartSummaryWire {
++    chunks: u32,
++    len: u64,
++    digest: Digest,
++    committed_at_millis: u64,
++}
++
++/// **Validating decode**: the digest's shape is validated by [`Digest`], and a summary
++/// claiming bytes under no chunks (or chunks under no bytes) contradicts the `part:` record
++/// it was written beside in one batch. The summary is what the cumulative staged-chunk check
++/// and `ListParts` read *instead of* the part, so a self-contradicting one is a wrong answer
++/// nothing else re-checks.
++impl<'de> Deserialize<'de> for PartSummary {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let wire = PartSummaryWire::deserialize(deserializer)?;
++        if (wire.chunks == 0) != (wire.len == 0) {
++            return Err(DeError::custom(format!(
++                "part summary declares {} chunk(s) spanning {} B",
++                wire.chunks, wire.len
++            )));
++        }
++        Ok(Self {
++            chunks: wire.chunks,
++            len: wire.len,
++            digest: wire.digest,
++            committed_at_millis: wire.committed_at_millis,
++        })
++    }
++}
++
++/// Decode a `psum:<upload-id>:<part-number>` summary.
++pub fn decode_part_summary(bytes: &[u8]) -> Result<PartSummary, RecordError> {
++    decode_record("psum:", bytes)
++}
++
++// ===========================================================================
++// 8. The owned staging entry — `sidx:<id>:<part>:<chunk>` (`0016:442-491`)
++// ===========================================================================
++
++/// A chunk's **planned** EC placement, carried only on an **owned** `sidx:` entry
++/// ([`crate::metadata::PendingEntry::staged`], `0016:442-491`).
++///
++/// The same `(scheme, per-fragment D-server vector)` a committed [`ChunkRef`] carries,
++/// written at *intent* time — before any fragment reaches a D server — so a record-only
++/// reaper can compute the entry's `orphan:<dserver>:<chunk>:<index>` keys and a drain can
++/// count its fragments as held on a specific server without a live write plan in hand
++/// (`0016:459-473`).
++///
++/// **`placement`'s length is deliberately not checked here.** A placement whose length
++/// disagrees with its scheme's fragment count is a *contextual* check, and the standing
++/// convention puts contextual checks on the other side of the decode boundary (ADR-0045;
++/// `AGENTS.md:146-149` names placement length as **the** example): such a chunk is
++/// quarantined by GC's safety gate and attributed by the drain, which is strictly better
++/// than an error that aborts the whole reconcile step (`0016:502-517`).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StagedPlacement {
++    /// How the chunk is fragmented.
++    pub scheme: EcScheme,
++    /// The stable D-server id planned to hold each fragment, by fragment index.
++    pub placement: Vec<DServerId>,
++}
++
++/// The value under a `sidx:` key, with its two owned fields **present by type** rather than
++/// by convention (`0016:442-491`).
++///
++/// 0016 makes that value *be* a [`PendingEntry`] rather than a parallel type, so the same
++/// half-TTL renewal loop and the same `require(re-encode(prior))` lease guards serve an
++/// owned entry and an ordinary one (`crates/core/src/write.rs:474-500`,
++/// `metadata.rs:748-758`). `owner`/`staged` are therefore `Option`s on that shared record —
++/// and this type is where the pairing is *enforced*: an entry carrying exactly one of them
++/// is structurally impossible (no writer produces one), and admitting it as a value would
++/// leave a reader to guess whether an entry is owned. `pending:` and `sidx:` values are told
++/// apart by which decoder they go through, and this one refuses everything but an owned
++/// entry.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct OwnedEntry {
++    /// The owning session.
++    pub owner: UploadId,
++    /// When the lease expires (logical milliseconds).
++    pub lease_expiry_millis: u64,
++    /// The chunk's planned EC placement.
++    pub staged: StagedPlacement,
++}
++
++impl OwnedEntry {
++    /// The shared-record form this entry is stored as — the value a `sidx:` put writes and
++    /// the half-TTL renewal loop re-encodes.
++    pub fn to_pending(&self) -> PendingEntry {
++        PendingEntry {
++            lease_expiry_millis: self.lease_expiry_millis,
++            owner: Some(self.owner.clone()),
++            staged: Some(self.staged.clone()),
++        }
++    }
++
++    /// The validating view of a decoded [`PendingEntry`]: an owned entry carries **both**
++    /// optional fields, an ordinary `pending:` entry carries **neither**, and one of each is
++    /// a torn record refused rather than trusted.
++    pub fn from_pending(entry: &PendingEntry) -> Result<Self, RecordError> {
++        match (&entry.owner, &entry.staged) {
++            (Some(owner), Some(staged)) => Ok(Self {
++                owner: owner.clone(),
++                lease_expiry_millis: entry.lease_expiry_millis,
++                staged: staged.clone(),
++            }),
++            (None, None) => Err(structural(
++                "sidx:",
++                "an ordinary `pending:` entry (no owner, no staged placement) \
++                 is not an owned staging entry",
++            )),
++            (Some(_), None) => Err(structural(
++                "sidx:",
++                "an owned entry names an owner but no staged placement",
++            )),
++            (None, Some(_)) => Err(structural(
++                "sidx:",
++                "an owned entry carries a staged placement but no owner",
++            )),
++        }
++    }
++}
++
++/// Decode a `sidx:<upload-id>:<part-number>:<chunk-id>` owned staging entry.
++pub fn decode_owned_entry(bytes: &[u8]) -> Result<OwnedEntry, RecordError> {
++    OwnedEntry::from_pending(&decode_record::<PendingEntry>("sidx:", bytes)?)
++}
++
++// ===========================================================================
++// 9. Retirement obligation payloads (`0016:355-388`)
++// ===========================================================================
++
++/// A **range-encoded** part-number set (`0016:382-388`), so the common "every staged part
++/// was published" case is a few bytes and the worst case — 10,000 alternating numbers —
++/// still fits inside one value.
++///
++/// The encoding is **canonical and validated at decode**: coalesced, strictly ascending,
++/// non-adjacent runs of in-range part numbers. A derived `Deserialize` would admit reversed,
++/// overlapping and out-of-range runs, and each is a live defect rather than an aesthetic
++/// one — a reversed run underflows [`Self::len`], an unordered one makes
++/// [`Self::first_at_or_after`] (a drain cursor's "resume here" query) skip members, and a
++/// number past the key grammar names a `part:` record no parser can read back. A malformed
++/// obligation would then be *deleted* having reclaimed none of the parts it names.
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
++#[serde(transparent)]
++pub struct PartNumberSet(Vec<(u32, u32)>);
++
++impl PartNumberSet {
++    /// Build the set from any iterator of part numbers, coalescing contiguous runs.
++    pub fn from_numbers(numbers: impl IntoIterator<Item = PartNumber>) -> Self {
++        let sorted: std::collections::BTreeSet<u32> =
++            numbers.into_iter().map(PartNumber::get).collect();
++        let mut runs: Vec<(u32, u32)> = Vec::new();
++        for n in sorted {
++            match runs.last_mut() {
++                Some(last) if last.1 + 1 == n => last.1 = n,
++                _ => runs.push((n, n)),
++            }
++        }
++        Self(runs)
++    }
++
++    /// The validating constructor every decode routes through.
++    pub fn from_runs(runs: Vec<(u32, u32)>) -> Result<Self, RecordError> {
++        let mut previous_hi: Option<u32> = None;
++        for &(lo, hi) in &runs {
++            PartNumber::new(lo)?;
++            PartNumber::new(hi)?;
++            if lo > hi {
++                return Err(structural(
++                    "part-number set",
++                    format!("run [{lo}, {hi}] is reversed"),
++                ));
++            }
++            if let Some(previous) = previous_hi {
++                if lo <= previous + 1 {
++                    return Err(structural(
++                        "part-number set",
++                        format!(
++                            "run [{lo}, {hi}] overlaps or abuts the run ending at {previous}: \
++                             the encoding is coalesced, strictly ascending runs"
++                        ),
++                    ));
++                }
++            }
++            previous_hi = Some(hi);
++        }
++        Ok(Self(runs))
++    }
++
++    /// Whether the set names no part.
++    pub fn is_empty(&self) -> bool {
++        self.0.is_empty()
++    }
++
++    /// How many part numbers the set holds.
++    pub fn len(&self) -> u64 {
++        self.0
++            .iter()
++            .map(|(lo, hi)| u64::from(*hi) - u64::from(*lo) + 1)
++            .sum()
++    }
++
++    /// Whether `part_number` is in the set.
++    pub fn contains(&self, part_number: PartNumber) -> bool {
++        let n = part_number.get();
++        self.0.iter().any(|(lo, hi)| *lo <= n && n <= *hi)
++    }
++
++    /// Every part number in the set, ascending.
++    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
++        self.0.iter().flat_map(|(lo, hi)| *lo..=*hi)
++    }
++
++    /// The smallest member `>= from` — a drain cursor's "resume here" query.
++    pub fn first_at_or_after(&self, from: u32) -> Option<u32> {
++        self.0
++            .iter()
++            .find(|(_, hi)| *hi >= from)
++            .map(|(lo, _)| (*lo).max(from))
++    }
++}
++
++impl<'de> Deserialize<'de> for PartNumberSet {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::from_runs(Vec::<(u32, u32)>::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// What one retirement obligation owes (`0016:355-356`). The **mode lives in the key**, not
++/// in a field, so a payload and its key's mode are cross-checked at decode rather than
++/// trusted ([`decode_retire_obligation`]).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub enum RetirePayload {
++    /// `retire:bytes:` — a session teardown: orphan-mark every part the session still
++    /// holds, then delete the `part:`/`psum:` pairs that name them.
++    ///
++    /// **It carries no part list, deliberately.** A list frozen by the aborting caller is
++    /// read *before* its fence lands, so a part commit that wins the read-then-fence window
++    /// would be absent from it and its records would survive every teardown batch. The fence
++    /// makes the session's own `part:<id>:` range immutable, so the drain enumerates it **at
++    /// drain time** from the bounded range and is complete by construction, while the fence
++    /// batch stays O(1).
++    Session {},
++    /// `retire:bytes:` — the staged parts a Complete did **not** name, frozen under the
++    /// fence that already holds the part set immutable. One obligation that marks *then*
++    /// deletes, so no cross-obligation ordering can get it wrong (`0016:909-928`).
++    Parts {
++        /// The unnamed staged parts.
++        parts: PartNumberSet,
++    },
++    /// `retire:bytes:` — a specific chunk list with no naming record left: a losing writer's
++    /// compensation, or a post-staging local refusal.
++    Chunks {
++        /// The chunks to orphan-mark.
++        chunks: Vec<ChunkRef>,
++    },
++    /// `retire:bytes:` — a superseded or deleted object generation.
++    Generation {
++        /// The inode the generation belonged to.
++        inode: InodeId,
++        /// Its version.
++        version: u64,
++        /// Its flat chunk list, when it had one.
++        #[serde(default, skip_serializing_if = "Vec::is_empty")]
++        chunks: Vec<ChunkRef>,
++        /// Its `seg:` generation, when it was segmented — resolved page-wise at drain time,
++        /// never frozen here.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        segments: Option<SegmentGroup>,
++    },
++    /// `retire:records:` — records to delete whose bytes are protected by something else:
++    /// the **published** parts (never the unnamed ones, `0016:909-928`), and/or one
++    /// rolled-back attempt's dangling segments.
++    Records {
++        /// The published parts whose records the publication superseded.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        parts: Option<PartNumberSet>,
++        /// One attempt's dangling `seg:` generation.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        segments: Option<SegmentGroup>,
++    },
++}
++
++impl RetirePayload {
++    /// The mode this payload may live under — the cross-check that makes "the mode lives in
++    /// the key" a checked boundary rather than a convention (`0016:434-440`). A `Records`
++    /// payload under `retire:bytes:` would orphan-mark bytes a live object still names; a
++    /// byte payload under `retire:records:` would delete the only records naming durable
++    /// bytes, with no evidence written.
++    pub const fn mode(&self) -> RetireMode {
++        match self {
++            Self::Records { .. } => RetireMode::Records,
++            Self::Session {}
++            | Self::Parts { .. }
++            | Self::Chunks { .. }
++            | Self::Generation { .. } => RetireMode::Bytes,
++        }
++    }
++
++    /// The **structural** rules a payload must satisfy to be actionable at all, checked at
++    /// decode rather than discovered as a drain that owes nothing:
++    ///
++    /// * a `Generation` naming **both** an inline chunk list and a `seg:` generation — the
++    ///   two are alternatives, and a drain that picked one arm would evidence half the
++    ///   payload and then delete the obligation;
++    /// * an **empty** `Chunks`, `Parts` or `Records` payload — an obligation that owes
++    ///   nothing is a producer bug, and admitting it lets that bug look like completed work.
++    fn validate(&self) -> Result<(), RecordError> {
++        let invalid = |reason: &str| Err(structural("retire:", reason.to_string()));
++        match self {
++            Self::Session {} => Ok(()),
++            Self::Chunks { chunks } if chunks.is_empty() => {
++                invalid("a retire:bytes:{chunks} obligation names no chunks")
++            }
++            Self::Chunks { .. } => Ok(()),
++            Self::Parts { parts } if parts.is_empty() => {
++                invalid("a retire:bytes:{parts} obligation names no parts")
++            }
++            Self::Parts { .. } => Ok(()),
++            Self::Generation {
++                chunks, segments, ..
++            } => {
++                if !chunks.is_empty() && segments.is_some() {
++                    return invalid(
++                        "a generation obligation names either a flat chunk list or a seg: \
++                         generation, never both",
++                    );
++                }
++                Ok(())
++            }
++            Self::Records { parts, segments } => {
++                if parts.is_none() && segments.is_none() {
++                    return invalid(
++                        "a retire:records: obligation names neither parts nor segments",
++                    );
++                }
++                if parts.as_ref().is_some_and(PartNumberSet::is_empty) {
++                    return invalid("a retire:records: obligation names an empty part set");
++                }
++                Ok(())
++            }
++        }
++    }
++}
++
++/// Decode a retirement obligation from **both halves of the record** — its key and its
++/// value — returning the token the key names and the payload the value carries.
++///
++/// The mode cross-check is the point: `retire:bytes:` orphan-marks fragments and
++/// `retire:records:` must never orphan anything, so a payload found under the wrong prefix
++/// is an error at decode, never a default the drain would act on (`0016:434-440`).
++pub fn decode_retire_obligation(
++    key: &[u8],
++    value: &[u8],
++) -> Result<(RetireToken, RetirePayload), RecordError> {
++    let (mode, token) = parse_retire_key(key)?;
++    let payload: RetirePayload = decode_record("retire:", value)?;
++    payload.validate()?;
++    if payload.mode() != mode {
++        return Err(structural(
++            "retire:",
++            format!(
++                "a {:?}-mode payload is stored under the {:?} prefix",
++                payload.mode(),
++                mode
++            ),
++        ));
++    }
++    Ok((token, payload))
++}
++
++// ===========================================================================
++// 10. The ETag composition and the Complete request-identity fingerprint
++//     (ADR-0047; `0016:898-908`,`:3064-3070`)
++// ===========================================================================
++
++/// The parts a Complete named, in the **canonical** order both digests below are defined
++/// over: **ascending part number**, each number named once.
++///
++/// One definition, used by [`multipart_etag`] **and** [`complete_fingerprint`], so the ETag
++/// an object is published with and the fingerprint its tombstone answers a retry on can
++/// never disagree about what "the parts the client named" means. Sorting *here* rather than
++/// trusting the caller is what makes both functions pure functions of the **set** of named
++/// parts: a client that lists the same assembly in a different order gets the same object
++/// and the same idempotent answer, and a client that names one part twice gets an error
++/// instead of an ETag that depends on which duplicate survived.
++fn canonical_named_parts(
++    named: &[(PartNumber, Digest)],
++) -> Result<Vec<(u32, Digest)>, RecordError> {
++    if named.is_empty() {
++        return Err(RecordError::NoPartsNamed);
++    }
++    let mut ordered: BTreeMap<u32, Digest> = BTreeMap::new();
++    for (part_number, digest) in named {
++        if ordered.insert(part_number.get(), *digest).is_some() {
++            return Err(RecordError::DuplicatePart {
++                part_number: part_number.get(),
++            });
++        }
++    }
++    Ok(ordered.into_iter().collect())
++}
++
++/// A composed **multipart ETag**: `<64 lowercase hex>-<N>`, a validated type so a stored
++/// [`Completion`] can never carry a spelling a client comparison would treat as a different
++/// object.
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++pub struct MultipartEtag {
++    composed: Digest,
++    parts: u32,
++}
++
++impl MultipartEtag {
++    /// The validating parser — the inverse of [`fmt::Display`]: 64 lowercase-hex characters,
++    /// a `-`, then the **canonical** decimal part count (no `+`, no leading zero, non-zero).
++    pub fn parse(text: &str) -> Result<Self, RecordError> {
++        let malformed = || RecordError::DigestNotHex {
++            digest: text.to_string(),
++        };
++        let (hex, count) = text.rsplit_once('-').ok_or_else(malformed)?;
++        let parts: u32 = canonical_decimal(count).ok_or_else(malformed)?;
++        if parts == 0 {
++            return Err(RecordError::NoPartsNamed);
++        }
++        Ok(Self {
++            composed: Digest::from_hex(hex)?,
++            parts,
++        })
++    }
++
++    /// The SHA-256 over the concatenated raw part digests.
++    pub const fn composed(&self) -> Digest {
++        self.composed
++    }
++
++    /// How many parts the object was assembled from — the `-N` suffix.
++    pub const fn parts(&self) -> u32 {
++        self.parts
++    }
++}
++
++impl fmt::Display for MultipartEtag {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}-{}", self.composed, self.parts)
++    }
++}
++
++impl Serialize for MultipartEtag {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_str(&self.to_string())
++    }
++}
++
++impl<'de> Deserialize<'de> for MultipartEtag {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::parse(&String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The **multipart ETag** — the composition this slice settles on top of ADR-0047's basis,
++/// which closed the digest algorithm and deferred only the composition
++/// (`docs/design/adr/0047-object-metadata-model.md:73-89`,`:112`; `0016:3064-3070`):
++///
++/// ```text
++/// etag = lowercase_hex( SHA-256( d_1 || d_2 || ... || d_N ) ) + "-" + N
++/// ```
++///
++/// where `d_i` is the **raw 32 binary digest bytes** — never their hex text, no separators,
++/// no part numbers mixed in — of the *i*-th part in **ascending part-number order over
++/// exactly the parts the caller named**, and `N` is that count. The ordering is applied
++/// *here* ([`canonical_named_parts`]), not delegated to the caller, so no caller can publish
++/// an object whose ETag depends on the order it happened to list.
++///
++/// **Never MD5.** S3's own multipart ETag is an MD5-of-MD5s; Wyrd's change token is
++/// SHA-256-based (ADR-0047 rejected re-opening the dependency wall for a legacy equality S3
++/// itself does not guarantee), and the value is opaque to clients — compared for equality
++/// only — so the composition follows the basis rather than the wire folklore.
++pub fn multipart_etag(named: &[(PartNumber, Digest)]) -> Result<MultipartEtag, RecordError> {
++    let ordered = canonical_named_parts(named)?;
++    let mut hasher = Sha256::new();
++    for (_, digest) in &ordered {
++        hasher.update(digest.as_bytes());
++    }
++    Ok(MultipartEtag {
++        composed: Digest::from_bytes(hasher.finalize().into()),
++        parts: ordered.len() as u32,
++    })
++}
++
++/// The **request identity** a `Completed` tombstone answers a retry on — a digest over the
++/// ordered `(part_number, digest)` pairs the winning Complete named (`0016:898-908`).
++///
++/// Separate from [`multipart_etag`], deliberately: the ETag is a function of the digests
++/// alone, so two different part *numberings* of the same bodies would collide in it. The
++/// fingerprint mixes the numbers in, so a client that reuses an upload id with a **different
++/// assembly** is answered `NoSuchUpload` — the honest answer — rather than being told *its*
++/// assembly succeeded while the store holds an earlier one, a silent wrong answer that is
++/// worse than any error.
++///
++/// Both fields are fixed width (4 bytes of part number, 32 of digest) and the pair count is
++/// hashed first, so the encoding is injective: no crafted input can impersonate a different
++/// part list.
++pub fn complete_fingerprint(named: &[(PartNumber, Digest)]) -> Result<Digest, RecordError> {
++    let ordered = canonical_named_parts(named)?;
++    let mut hasher = Sha256::new();
++    hasher.update((ordered.len() as u64).to_be_bytes());
++    for (part_number, digest) in &ordered {
++        hasher.update(part_number.to_be_bytes());
++        hasher.update(digest.as_bytes());
++    }
++    Ok(Digest::from_bytes(hasher.finalize().into()))
++}
++
++// ===========================================================================
++// 11. Typed refusals — every non-success answer is a value, never "an error"
++//     (`0016:969-978`; the S3 status/XML mapping is #508's)
++// ===========================================================================
++
++/// Why a part a Complete named is invalid (`0016:993-999`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum InvalidPart {
++    /// The named part has no `part:` record — never committed, or superseded.
++    Absent,
++    /// The named part's recorded digest is not the one the client named.
++    DigestMismatch,
++    /// The named parts are not in strictly ascending part-number order.
++    OutOfOrder,
++}
++
++/// Which ceiling produced a backpressure refusal — designed behaviour, not a failure
++/// (`0016:129-136`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Backpressure {
++    /// The fleet admission ledger is at its stored `max_sessions`.
++    SessionCap {
++        /// The live session count the ledger records.
++        count: u64,
++        /// The limit **the ledger** was checked against — never a local derivation.
++        max_sessions: u64,
++    },
++    /// Every `MAX_INFLIGHT_PARTS` slot index of this session is taken — by live parts, or by
++    /// the residue of parts that crashed mid-stream and never released their slot, which is
++    /// deliberately *counted* rather than invisible (`0016:349`, F11a).
++    InflightParts {
++        /// The size of the session's slot key space.
++        max_inflight_parts: u32,
++    },
++    /// The create lost the serialized admission CAS this many times.
++    AdmissionContention {
++        /// Attempts spent.
++        attempts: u32,
++    },
++}
++
++/// A **typed** protocol answer other than success. #508 maps each to its S3 status and error
++/// code; this slice pins the answers and names no status code.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Refusal {
++    /// No session can serve this request: the upload id is unknown, the session is aborting,
++    /// or it already completed a **different** assembly.
++    NoSuchUpload,
++    /// The target bucket has no `bucket:` record (ADR-0046 §4).
++    NoSuchBucket,
++    /// The session is fenced into `Completing` by a publisher that still owns it. There is
++    /// **no** client path that resumes a `Completing` session (`0016:980-986`).
++    OperationAborted,
++    /// The named part list does not match the frozen part set. The fence is **released**
++    /// before this is answered, so a client typo never wedges a session (`0016:993-999`).
++    InvalidPart {
++        /// The offending part number.
++        part_number: PartNumber,
++        /// What was wrong with it.
++        reason: InvalidPart,
++    },
++    /// A part, or the session's cumulative staged chunks, is past a ceiling the protocol
++    /// enforces by **refusal** rather than by an over-envelope commit. The session stays
++    /// usable and abortable, and anything already staged is compensated.
++    EntityTooLarge {
++        /// The chunk count the request would have installed.
++        chunks: u64,
++        /// The ceiling it crossed.
++        limit: u64,
++    },
++    /// Designed backpressure.
++    SlowDown {
++        /// Which ceiling engaged.
++        pressure: Backpressure,
++    },
++    /// This process's [`Budget`] disagrees with the one stored in `mpuctl`, so it **refuses
++    /// to admit and alarms** rather than silently deferring to either value — a fail-closed
++    /// configuration-skew signal, since equal quotients can hide unequal footprints
++    /// (`0016:348`).
++    ProfileSkew {
++        /// What this process derives from its own configuration.
++        local: Box<Budget>,
++        /// What the ledger records.
++        ledger: Box<Budget>,
++    },
++    /// The session has spent all `MAX_COMPLETE_ATTEMPTS` fences; its only exit is Abort
++    /// (`0016:1477`).
++    CompleteAttemptsExhausted,
++}
++
++/// What a winning (or recorded) publication established.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Publication {
++    /// The inode the object key resolves to.
++    pub inode: InodeId,
++    /// The version the flip recorded — `prior.version + 1` computed from the **re-read**
++    /// prior at that attempt, never a fence-frozen number (`0016:925-932`).
++    pub version: u64,
++    /// The composed multipart ETag.
++    pub etag: MultipartEtag,
++    /// The publication instant.
++    pub completed_at_millis: u64,
++}
++
++impl Publication {
++    /// The publication a `Completed` tombstone recorded.
++    pub fn of(completion: &Completion) -> Self {
++        Self {
++            inode: completion.inode,
++            version: completion.version,
++            etag: completion.etag.clone(),
++            completed_at_millis: completion.completed_at_millis,
++        }
++    }
++}
++
++/// What `CreateMultipartUpload` answered (#656).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CreateOutcome {
++    /// A session record and its `seggrp:` reservation are durable and the admission counter
++    /// has been incremented exactly once.
++    Created {
++        /// The session's id.
++        upload_id: UploadId,
++    },
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What a slot reservation answered (#657).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReserveOutcome {
++    /// An in-flight slot index is held by this attempt.
++    Reserved {
++        /// The index claimed.
++        index: SlotIndex,
++        /// The attempt holding it.
++        attempt_id: AttemptId,
++    },
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `UploadPart` answered (#657).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum UploadPartOutcome {
++    /// The part is durable: its `part:` + `psum:` records exist, its slot is released and
++    /// its owned `sidx:` entries are gone — all in one batch.
++    Committed {
++        /// The part number.
++        part_number: PartNumber,
++        /// Its content digest.
++        digest: Digest,
++    },
++    /// A typed refusal. Anything this attempt staged has been **compensated** whenever the
++    /// session was still live enough to own the cleanup.
++    Refused(Refusal),
++}
++
++/// What `CompleteMultipartUpload` answered (#658).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CompleteOutcome {
++    /// The object is published: this call's flip won.
++    Published(Box<Publication>),
++    /// A `Completed` tombstone answered an **identical** retry inside its window, with the
++    /// **recorded** ETag (`0016:898-908`).
++    AlreadyCompleted(Box<Publication>),
++    /// A typed refusal; nothing was published and the session is not left fenced.
++    Refused(Refusal),
++}
++
++/// What `AbortMultipartUpload` answered (#656).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AbortOutcome {
++    /// The fence landed: the session is `Aborting` and its teardown obligation is durable.
++    /// **This is the response** — byte reclamation is the drain's, asynchronously, so a
++    /// 10,000-part teardown never rides inside one request (`0016:1000-1003`).
++    Fenced,
++    /// The session was already `Aborting` — idempotent success.
++    AlreadyAborting,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++// ===========================================================================
++// 12. Decision 3 — the verb x state answer table, as total pure functions
++//     (`0016:894-1037`, the table at `0016:969-978`)
++// ===========================================================================
++
++/// The five multipart verbs decision 3 answers (`0016:969-978`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum Verb {
++    /// Stage one part's bytes against an `Open` session.
++    UploadPart,
++    /// Fence and assemble the named parts into the published object.
++    CompleteMultipartUpload,
++    /// Fence for teardown without publishing.
++    AbortMultipartUpload,
++    /// List the parts staged (or frozen) under one session.
++    ListParts,
++    /// List the fleet's in-progress sessions.
++    ListMultipartUploads,
++}
++
++impl Verb {
++    /// Every verb the table answers. Adding one without extending this widens the product
++    /// the answer table is asserted total over, so a new verb cannot be added silently.
++    pub const ALL: [Self; 5] = [
++        Self::UploadPart,
++        Self::CompleteMultipartUpload,
++        Self::AbortMultipartUpload,
++        Self::ListParts,
++        Self::ListMultipartUploads,
++    ];
++}
++
++/// What `UploadPart` answers in a state (`0016:971`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum UploadPartAnswer {
++    /// The session is `Open`: the part is accepted.
++    Accepted,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `CompleteMultipartUpload` answers in a state (`0016:972`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CompleteAnswer {
++    /// The session is `Open`: this call may fence and publish.
++    Fences,
++    /// A `Completed` tombstone whose recorded `complete_fingerprint` **matches** the
++    /// request's: the identical retry is answered with the **recorded** publication
++    /// (`0016:898-908`).
++    AlreadyCompleted(Box<Publication>),
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `AbortMultipartUpload` answers in a state (`0016:973`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AbortAnswer {
++    /// The session is `Open`: the fence commit **is** the response.
++    Fences,
++    /// The session is already `Aborting`: idempotent success.
++    AlreadyAborting,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `ListParts` answers in a state (`0016:974`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ListPartsAnswer {
++    /// The session is `Open`: the still-growing part set.
++    OpenSet,
++    /// The session is `Completing`: the frozen part set the fence read.
++    FrozenSet,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// Whether `ListMultipartUploads` lists this session (`0016:975`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ListUploadsAnswer {
++    /// In progress: listed.
++    Listed,
++    /// Tearing down or torn down: not listed.
++    NotListed,
++}
++
++/// One cell of decision 3's table, so the whole verb x state product can be enumerated
++/// through a single entry point ([`answer`]) and asserted **total**.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Answer {
++    /// `UploadPart`'s answer.
++    UploadPart(UploadPartAnswer),
++    /// `CompleteMultipartUpload`'s answer.
++    Complete(CompleteAnswer),
++    /// `AbortMultipartUpload`'s answer.
++    Abort(AbortAnswer),
++    /// `ListParts`' answer.
++    ListParts(ListPartsAnswer),
++    /// `ListMultipartUploads`' answer.
++    ListUploads(ListUploadsAnswer),
++}
++
++/// What `UploadPart` answers against `state` (`None` = the record is absent).
++///
++/// A part accepted after the fence would be invisible to the publication that already read
++/// the set — a silently lost part — so every state but `Open` refuses (`0016:1029`).
++pub fn upload_part_answer(state: Option<SessionState>) -> UploadPartAnswer {
++    match state {
++        Some(SessionState::Open) => UploadPartAnswer::Accepted,
++        Some(SessionState::Completing | SessionState::Aborting | SessionState::Completed)
++        | None => UploadPartAnswer::Refused(Refusal::NoSuchUpload),
++    }
++}
++
++/// What `CompleteMultipartUpload` answers against `session` (`None` = the record is absent),
++/// for a request whose named parts fingerprint to `request_fingerprint`.
++///
++/// The tombstone cell is the one 0016 spends most words on, and the **only** cell with a
++/// condition: within its window a `Completed` session answers the recorded publication when
++/// the request's [`complete_fingerprint`] matches the recorded one, and `NoSuchUpload` when
++/// it does not — the honest answer, since the upload id is consumed and no session exists
++/// that could publish the assembly being asked for. It must be idempotence keyed on
++/// **request identity**, not on the upload id alone (`0016:898-908`).
++///
++/// The match is computed here from the stored record rather than accepted as a caller's
++/// boolean, so no caller can turn a different assembly into an identical retry.
++pub fn complete_answer(
++    session: Option<&SessionRecord>,
++    request_fingerprint: &Digest,
++) -> CompleteAnswer {
++    let Some(session) = session else {
++        return CompleteAnswer::Refused(Refusal::NoSuchUpload);
++    };
++    match session.state {
++        SessionState::Open => CompleteAnswer::Fences,
++        SessionState::Completing => CompleteAnswer::Refused(Refusal::OperationAborted),
++        SessionState::Aborting => CompleteAnswer::Refused(Refusal::NoSuchUpload),
++        SessionState::Completed => match &session.completion {
++            Some(completion) if completion.complete_fingerprint == *request_fingerprint => {
++                CompleteAnswer::AlreadyCompleted(Box::new(Publication::of(completion)))
++            }
++            // A `Completed` session without a completion cannot decode (§6), so the arm is
++            // reachable only for a hand-built value; it refuses rather than assuming a match.
++            _ => CompleteAnswer::Refused(Refusal::NoSuchUpload),
++        },
++    }
++}
++
++/// What `AbortMultipartUpload` answers against `state` (`None` = the record is absent).
++///
++/// `Completing` is `409` for **every** client verb including this one: an Abort that could
++/// preempt a live publisher would race the flip it is fencing against (`0016:980-986`).
++pub fn abort_answer(state: Option<SessionState>) -> AbortAnswer {
++    match state {
++        Some(SessionState::Open) => AbortAnswer::Fences,
++        Some(SessionState::Completing) => AbortAnswer::Refused(Refusal::OperationAborted),
++        Some(SessionState::Aborting) => AbortAnswer::AlreadyAborting,
++        Some(SessionState::Completed) | None => AbortAnswer::Refused(Refusal::NoSuchUpload),
++    }
++}
++
++/// What `ListParts` answers against `state` (`None` = the record is absent).
++pub fn list_parts_answer(state: Option<SessionState>) -> ListPartsAnswer {
++    match state {
++        Some(SessionState::Open) => ListPartsAnswer::OpenSet,
++        Some(SessionState::Completing) => ListPartsAnswer::FrozenSet,
++        Some(SessionState::Aborting | SessionState::Completed) | None => {
++            ListPartsAnswer::Refused(Refusal::NoSuchUpload)
++        }
++    }
++}
++
++/// Whether `ListMultipartUploads` lists a session in `state` (`None` = the record is
++/// absent). A session the reaper fenced at `W_session` is `Aborting`, so it drops out of the
++/// listing — the S3-visible signal that the upload expired.
++pub fn list_uploads_answer(state: Option<SessionState>) -> ListUploadsAnswer {
++    match state {
++        Some(SessionState::Open | SessionState::Completing) => ListUploadsAnswer::Listed,
++        Some(SessionState::Aborting | SessionState::Completed) | None => {
++            ListUploadsAnswer::NotListed
++        }
++    }
++}
++
++/// Decision 3's answer table (`0016:969-978`) as **one total pure function** over the 5-verb
++/// x 5-state product — `Open`/`Completing`/`Aborting`/`Completed`/absent.
++///
++/// `request_fingerprint` is consulted **only** for the one conditional cell
++/// (`CompleteMultipartUpload` against a `Completed` tombstone) and ignored everywhere else,
++/// so the function can be called uniformly over the whole product; an absent one cannot
++/// match any recorded fingerprint, which is the honest answer for a Complete that named no
++/// parts at all.
++///
++/// Every match below is exhaustive, so answering a new (verb, state) cell is a compile-time
++/// obligation rather than a silent gap; [`Verb::ALL`] and [`SessionState::ALL`] make the
++/// same obligation visible to the table test.
++pub fn answer(
++    verb: Verb,
++    session: Option<&SessionRecord>,
++    request_fingerprint: Option<&Digest>,
++) -> Answer {
++    let state = session.map(|session| session.state);
++    match verb {
++        Verb::UploadPart => Answer::UploadPart(upload_part_answer(state)),
++        Verb::CompleteMultipartUpload => Answer::Complete(match request_fingerprint {
++            Some(fingerprint) => complete_answer(session, fingerprint),
++            None => match state {
++                Some(SessionState::Open) => CompleteAnswer::Fences,
++                Some(SessionState::Completing) => {
++                    CompleteAnswer::Refused(Refusal::OperationAborted)
++                }
++                Some(SessionState::Aborting | SessionState::Completed) | None => {
++                    CompleteAnswer::Refused(Refusal::NoSuchUpload)
++                }
++            },
++        }),
++        Verb::AbortMultipartUpload => Answer::Abort(abort_answer(state)),
++        Verb::ListParts => Answer::ListParts(list_parts_answer(state)),
++        Verb::ListMultipartUploads => Answer::ListUploads(list_uploads_answer(state)),
++    }
++}
+diff --git a/crates/core/src/write.rs b/crates/core/src/write.rs
+index ce805d4..40cd8ea 100644
+--- a/crates/core/src/write.rs
++++ b/crates/core/src/write.rs
+@@ -206,6 +206,8 @@ pub async fn intent(
+             chunk.id,
+             &PendingEntry {
+                 lease_expiry_millis,
++                owner: None,
++                staged: None,
+             },
+         )
+         .await?;
+@@ -432,6 +434,8 @@ async fn intent_and_write_chunk(
+         id,
+         &PendingEntry {
+             lease_expiry_millis,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await?;
+@@ -493,6 +497,8 @@ async fn lease_write_chunk(
+             now_millis,
+             &PendingEntry {
+                 lease_expiry_millis: now_millis + lease_ttl_millis,
++                owner: None,
++                staged: None,
+             },
+         )
+         .await?;
+diff --git a/crates/core/tests/multipart_records.rs b/crates/core/tests/multipart_records.rs
+new file mode 100644
+index 0000000..4b3b12f
+--- /dev/null
++++ b/crates/core/tests/multipart_records.rs
+@@ -0,0 +1,1796 @@
++//! The multipart record family, its key grammar, its answer table and its two digests —
++//! **pure** tests over values (issue #654, proposal 0016).
++//!
++//! No store, no async runtime, no fixture beyond literals: every symbol under test is a pure
++//! function or a `serde` codec, so each leg below is a statement about the *vocabulary* the
++//! later multipart slices (#655-#660) write, read and answer in.
++//!
++//! The six legs, in the order the issue states them:
++//!
++//! 1. key grammars round-trip, and every non-canonical spelling is rejected at decode;
++//! 2. no record prefix is a prefix of another;
++//! 3. every record's decode validates, and `decode -> encode` is the identity on a legacy
++//!    `pending:` value;
++//! 4. every reachable decision-3 cell is answered by a pure function with a typed outcome;
++//! 5. `multipart_etag` matches an independent oracle;
++//! 6. `complete_fingerprint` tells an identical retry from a different assembly.
++
++#![forbid(unsafe_code)]
++
++use serde_json::json;
++use sha2::{Digest as _, Sha256};
++
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, PendingEntry, SegmentGroup};
++use wyrd_core::multipart::{
++    self, abort_answer, answer, complete_answer, complete_fingerprint, decode_admission_record,
++    decode_owned_entry, decode_part, decode_part_summary, decode_retire_obligation, decode_session,
++    decode_slot, encode_record, hex_lower, is_token, list_parts_answer, list_uploads_answer,
++    mpu_key, multipart_etag, parse_mpu_key, parse_part_key, parse_psum_key, parse_retire_key,
++    parse_retire_mode, parse_sidx_key, parse_slot_key, part_key, part_range, psum_key, psum_range,
++    retire_key, retire_session_range, sidx_key, sidx_range, slot_key, slot_range,
++    upload_part_answer, AbortAnswer, AdmissionRecord, Answer, AttemptId, Budget, CompleteAnswer,
++    Completion, Digest, ListPartsAnswer, ListUploadsAnswer, MultipartEtag, OwnedEntry, PartNumber,
++    PartNumberSet, PartRecord, PartSummary, Publication, PublishTarget, RecordError, Refusal,
++    RetireMode, RetirePayload, RetireToken, SessionRecord, SessionState, SlotIndex, SlotRecord,
++    StagedPlacement, UploadId, UploadPartAnswer, Verb, MAX_PART_NUMBER, MAX_SLOT_INDEX, MPUCTL_KEY,
++    MPU_PREFIX, PART_NUMBER_WIDTH, PART_PREFIX, PSUM_PREFIX, RETIRE_BYTES_PREFIX,
++    RETIRE_RECORDS_PREFIX, SIDX_PREFIX, SLOT_INDEX_WIDTH, SLOT_PREFIX, TOKEN_HEX_LEN,
++};
++
++// ---------------------------------------------------------------------------
++// Literals — two distinct 128-bit tokens and a digest generator.
++// ---------------------------------------------------------------------------
++
++const ID_A: &str = "0123456789abcdef0123456789abcdef";
++const ID_B: &str = "fedcba9876543210fedcba9876543210";
++const NONCE: &str = "00112233445566778899aabbccddeeff";
++
++fn upload_a() -> UploadId {
++    UploadId::new(ID_A).expect("a 32-character lowercase-hex token is an upload id")
++}
++
++fn upload_b() -> UploadId {
++    UploadId::new(ID_B).expect("a 32-character lowercase-hex token is an upload id")
++}
++
++fn attempt() -> AttemptId {
++    AttemptId::new(ID_B).expect("a 32-character lowercase-hex token is an attempt id")
++}
++
++fn part(n: u32) -> PartNumber {
++    PartNumber::new(n).expect("a part number inside the key space")
++}
++
++/// A distinct, reproducible digest per label — the *content* is irrelevant, only that two
++/// labels never collide.
++fn digest_of(label: &str) -> Digest {
++    Digest::of(label.as_bytes())
++}
++
++fn chunk_ref(id: u128, len: u64) -> ChunkRef {
++    ChunkRef {
++        id,
++        scheme: EcScheme::None,
++        len,
++        placement: vec![7],
++    }
++}
++
++// ===========================================================================
++// Leg 1 — the key grammar round-trips, and non-canonical spellings are REJECTED
++// ===========================================================================
++
++#[test]
++fn every_keyed_record_round_trips_through_its_parser() {
++    let a = upload_a();
++
++    assert_eq!(
++        mpu_key(&a),
++        b"mpu:0123456789abcdef0123456789abcdef".to_vec()
++    );
++    assert_eq!(parse_mpu_key(&mpu_key(&a)).unwrap(), a);
++
++    for index in [0u32, 1, 42, MAX_SLOT_INDEX] {
++        let index = SlotIndex::new(index).unwrap();
++        let key = slot_key(&a, index);
++        assert_eq!(parse_slot_key(&key).unwrap(), (a.clone(), index));
++        // Zero-padded to the fixed width, so the key sorts by index (see the order test).
++        assert!(
++            key.ends_with(format!("{:0width$}", index.get(), width = SLOT_INDEX_WIDTH).as_bytes())
++        );
++        assert!(key.starts_with(&slot_range(&a)));
++    }
++
++    for number in [1u32, 7, 10_000, MAX_PART_NUMBER] {
++        let number = part(number);
++        let padded = format!("{:0width$}", number.get(), width = PART_NUMBER_WIDTH);
++        let part_key = part_key(&a, number);
++        assert_eq!(parse_part_key(&part_key).unwrap(), (a.clone(), number));
++        assert!(part_key.starts_with(&part_range(&a)));
++        assert!(part_key.ends_with(padded.as_bytes()));
++
++        let psum_key = psum_key(&a, number);
++        assert_eq!(parse_psum_key(&psum_key).unwrap(), (a.clone(), number));
++        assert!(psum_key.starts_with(&psum_range(&a)));
++        assert!(psum_key.ends_with(padded.as_bytes()));
++
++        for chunk in [0u128, 7, u128::from(u64::MAX) + 1] {
++            let key = sidx_key(&a, number, chunk);
++            assert_eq!(parse_sidx_key(&key).unwrap(), (a.clone(), number, chunk));
++            assert!(key.starts_with(&sidx_range(&a)));
++        }
++    }
++
++    for mode in RetireMode::ALL {
++        for token in [
++            RetireToken::Session {
++                upload_id: a.clone(),
++                epoch: 0,
++                part: None,
++            },
++            RetireToken::Session {
++                upload_id: a.clone(),
++                epoch: 9,
++                part: None,
++            },
++            RetireToken::Session {
++                upload_id: a.clone(),
++                epoch: 3,
++                part: Some((part(4), attempt())),
++            },
++            RetireToken::Generation {
++                inode: 12,
++                version: 34,
++            },
++        ] {
++            let key = retire_key(mode, &token);
++            assert_eq!(parse_retire_key(&key).unwrap(), (mode, token.clone()));
++            assert_eq!(parse_retire_mode(&key).unwrap(), mode);
++            if matches!(token, RetireToken::Session { .. }) {
++                assert!(key.starts_with(&retire_session_range(mode, &a)));
++                assert!(!key.starts_with(&retire_session_range(mode, &upload_b())));
++            }
++        }
++    }
++}
++
++#[test]
++fn a_fixed_width_field_accepts_exactly_one_spelling_of_one_record() {
++    // Every spelling below denotes "part 7" (or "slot 7") to a permissive `from_str`, and
++    // each MUST be refused: two spellings of one record defeat a `require_absent` guard and
++    // hide a record from a bounded range scan (C-1).
++    for body in [
++        "7",       // short
++        "07",      // short
++        "0007",    // short by one
++        "0000007", // over-wide
++        "+0007",   // a `+` sign `u32::from_str` would accept
++        "-0007",   // a `-` sign
++        " 0007",   // leading space
++        "0007 ",   // trailing space
++        "000_7",   // non-decimal body
++        "0x007",   // non-decimal body
++        "abcde",   // non-decimal body
++        "",        // empty
++    ] {
++        let part_spelling = format!("part:{ID_A}:{body}");
++        assert!(
++            parse_part_key(part_spelling.as_bytes()).is_err(),
++            "part: key accepted the non-canonical part-number spelling {body:?}"
++        );
++        let psum_spelling = format!("psum:{ID_A}:{body}");
++        assert!(
++            parse_psum_key(psum_spelling.as_bytes()).is_err(),
++            "psum: key accepted the non-canonical part-number spelling {body:?}"
++        );
++        let sidx_spelling = format!("sidx:{ID_A}:{body}:12");
++        assert!(
++            parse_sidx_key(sidx_spelling.as_bytes()).is_err(),
++            "sidx: key accepted the non-canonical part-number spelling {body:?}"
++        );
++    }
++
++    for body in [
++        "7", "07", "000007 ", "0000007", "+00007", "-00007", "abcdef", "",
++    ] {
++        let spelling = format!("slot:{ID_A}:{body}");
++        assert!(
++            parse_slot_key(spelling.as_bytes()).is_err(),
++            "slot: key accepted the non-canonical index spelling {body:?}"
++        );
++    }
++
++    // The canonical spelling of the same records DOES parse — so the rejections above are
++    // about the spelling, not about a parser that refuses everything.
++    assert_eq!(
++        parse_part_key(format!("part:{ID_A}:00007").as_bytes()).unwrap(),
++        (upload_a(), part(7))
++    );
++    assert_eq!(
++        parse_slot_key(format!("slot:{ID_A}:000007").as_bytes()).unwrap(),
++        (upload_a(), SlotIndex::new(7).unwrap())
++    );
++    assert_eq!(
++        parse_sidx_key(format!("sidx:{ID_A}:00007:12").as_bytes()).unwrap(),
++        (upload_a(), part(7), 12)
++    );
++}
++
++#[test]
++fn a_variable_width_field_accepts_exactly_one_spelling_too() {
++    // The `sidx:` chunk id and the `retire:` epoch/version are NOT zero-padded, so their
++    // canonicality rule is "no leading zero unless the value is zero".
++    for chunk in ["007", "+7", "-7", "0x7", "7 ", "", "1e3"] {
++        let key = format!("sidx:{ID_A}:00007:{chunk}");
++        assert!(
++            parse_sidx_key(key.as_bytes()).is_err(),
++            "sidx: key accepted the non-canonical chunk id {chunk:?}"
++        );
++    }
++    // ... and a single `0` IS canonical: epoch 0 is a real epoch, chunk 0 a real chunk id.
++    assert_eq!(
++        parse_sidx_key(format!("sidx:{ID_A}:00007:0").as_bytes()).unwrap(),
++        (upload_a(), part(7), 0)
++    );
++    assert_eq!(
++        parse_retire_key(format!("retire:bytes:s:{ID_A}:0").as_bytes()).unwrap(),
++        (
++            RetireMode::Bytes,
++            RetireToken::Session {
++                upload_id: upload_a(),
++                epoch: 0,
++                part: None
++            }
++        )
++    );
++    for epoch in ["00", "007", "+7", "-1", ""] {
++        let key = format!("retire:bytes:s:{ID_A}:{epoch}");
++        assert!(
++            parse_retire_key(key.as_bytes()).is_err(),
++            "retire: key accepted the non-canonical epoch {epoch:?}"
++        );
++    }
++    // The per-part suffix's own components are checked the same way.
++    assert!(parse_retire_key(format!("retire:bytes:s:{ID_A}:1:04:{ID_B}").as_bytes()).is_err());
++    assert!(parse_retire_key(format!("retire:bytes:s:{ID_A}:1:0:{ID_B}").as_bytes()).is_err());
++    assert!(parse_retire_key(format!("retire:bytes:s:{ID_A}:1:100000:{ID_B}").as_bytes()).is_err());
++    assert!(parse_retire_key(format!("retire:bytes:s:{ID_A}:1:4:nope").as_bytes()).is_err());
++    assert!(parse_retire_key(format!("retire:bytes:s:{ID_A}:1:4:{ID_B}").as_bytes()).is_ok());
++    // A generation token's inode and version are canonical decimals too.
++    assert!(parse_retire_key(b"retire:bytes:g:012:3").is_err());
++    assert!(parse_retire_key(b"retire:bytes:g:12:03").is_err());
++    assert!(parse_retire_key(b"retire:bytes:g:12:3").is_ok());
++}
++
++#[test]
++fn a_malformed_key_is_a_typed_error_never_a_value() {
++    let cases: Vec<(&str, Vec<u8>)> = vec![
++        // An empty upload id would make every per-session range the whole namespace.
++        ("empty upload id", b"mpu:".to_vec()),
++        ("empty upload id", b"part::00007".to_vec()),
++        ("empty upload id", b"slot::000007".to_vec()),
++        // An id embedding the separator would name another session's range.
++        (
++            "separator in the upload id",
++            format!("part:{ID_A}:{ID_B}:00007").into_bytes(),
++        ),
++        (
++            "separator in the upload id",
++            format!("mpu:{ID_A}:x").into_bytes(),
++        ),
++        // Truncated keys.
++        ("truncated", format!("part:{ID_A}").into_bytes()),
++        ("truncated", format!("slot:{ID_A}").into_bytes()),
++        ("truncated", format!("sidx:{ID_A}:00007").into_bytes()),
++        ("truncated", b"retire:bytes:".to_vec()),
++        // A trailing component: one record MUST NOT be addressable by a longer key.
++        (
++            "trailing component",
++            format!("mpu:{ID_A}:extra").into_bytes(),
++        ),
++        (
++            "trailing component",
++            format!("part:{ID_A}:00007:extra").into_bytes(),
++        ),
++        (
++            "trailing component",
++            format!("slot:{ID_A}:000007:extra").into_bytes(),
++        ),
++        (
++            "trailing component",
++            format!("retire:bytes:s:{ID_A}:1:extra").into_bytes(),
++        ),
++        // A short/long/uppercase token is not a token.
++        ("short token", format!("mpu:{}", &ID_A[..31]).into_bytes()),
++        ("long token", format!("mpu:{ID_A}0").into_bytes()),
++        (
++            "uppercase token",
++            format!("mpu:{}", ID_A.to_uppercase()).into_bytes(),
++        ),
++        // A wrong prefix must never parse as this record class.
++        ("wrong prefix", format!("psum:{ID_A}:00007").into_bytes()),
++        ("wrong prefix", b"mpuctl".to_vec()),
++    ];
++    for (why, key) in cases {
++        let parsed: Result<(), RecordError> = if key.starts_with(PART_PREFIX) {
++            parse_part_key(&key).map(|_| ())
++        } else if key.starts_with(SLOT_PREFIX) {
++            parse_slot_key(&key).map(|_| ())
++        } else if key.starts_with(SIDX_PREFIX) {
++            parse_sidx_key(&key).map(|_| ())
++        } else if key.starts_with(b"retire:") {
++            parse_retire_key(&key).map(|_| ())
++        } else {
++            parse_mpu_key(&key).map(|_| ())
++        };
++        assert!(
++            parsed.is_err(),
++            "{why}: {:?} parsed as a valid key",
++            String::from_utf8_lossy(&key)
++        );
++    }
++
++    // A key whose bytes are not UTF-8 fails closed rather than panicking or lossily
++    // "repairing" itself into a neighbouring record.
++    let mut not_utf8 = format!("part:{ID_A}:0000").into_bytes();
++    not_utf8.push(0xff);
++    assert!(matches!(
++        parse_part_key(&not_utf8),
++        Err(RecordError::MalformedKey { .. })
++    ));
++    let mut not_utf8_mpu = b"mpu:".to_vec();
++    not_utf8_mpu.extend_from_slice(&[0xff; 32]);
++    assert!(parse_mpu_key(&not_utf8_mpu).is_err());
++    let mut not_utf8_retire = b"retire:bytes:s:".to_vec();
++    not_utf8_retire.extend_from_slice(&[0xff; 32]);
++    assert!(parse_retire_key(&not_utf8_retire).is_err());
++}
++
++#[test]
++fn byte_lexicographic_key_order_equals_numeric_order() {
++    // The property the zero-padding exists for (`metadata.rs:270-273`): a bounded range read
++    // returns slots and parts in numeric order, so a cursor-keyed drain resumes where it
++    // stopped instead of skipping records.
++    let a = upload_a();
++
++    let mut slot_keys: Vec<Vec<u8>> = [0u32, 1, 2, 9, 10, 99, 100, 999, 1_000, MAX_SLOT_INDEX]
++        .into_iter()
++        .map(|i| slot_key(&a, SlotIndex::new(i).unwrap()))
++        .collect();
++    let numeric = slot_keys.clone();
++    slot_keys.sort();
++    assert_eq!(slot_keys, numeric, "slot: keys do not sort by index");
++
++    let mut part_keys: Vec<Vec<u8>> = [1u32, 2, 9, 10, 99, 100, 9_999, 10_000, MAX_PART_NUMBER]
++        .into_iter()
++        .map(|n| part_key(&a, part(n)))
++        .collect();
++    let numeric = part_keys.clone();
++    part_keys.sort();
++    assert_eq!(part_keys, numeric, "part: keys do not sort by part number");
++
++    // Un-padded, `10` would sort before `9` — the exact defect the width forbids.
++    assert!(b"part:x:00009".to_vec() < b"part:x:00010".to_vec());
++    assert!(b"part:x:9".to_vec() > b"part:x:10".to_vec());
++}
++
++#[test]
++fn a_component_outside_its_format_bound_is_refused_by_its_type() {
++    assert!(matches!(
++        PartNumber::new(0),
++        Err(RecordError::PartNumberOutOfRange { part_number: 0 })
++    ));
++    assert_eq!(
++        PartNumber::new(MAX_PART_NUMBER).unwrap().get(),
++        MAX_PART_NUMBER
++    );
++    assert!(matches!(
++        PartNumber::new(MAX_PART_NUMBER + 1),
++        Err(RecordError::PartNumberOutOfRange { .. })
++    ));
++    assert_eq!(MAX_PART_NUMBER, 99_999, "five digits address [1, 99_999]");
++
++    // Index 0 IS a slot: the key space is the cap, so it starts at zero.
++    assert_eq!(SlotIndex::new(0).unwrap().get(), 0);
++    assert_eq!(
++        SlotIndex::new(MAX_SLOT_INDEX).unwrap().get(),
++        MAX_SLOT_INDEX
++    );
++    assert!(matches!(
++        SlotIndex::new(MAX_SLOT_INDEX + 1),
++        Err(RecordError::SlotIndexOutOfRange { .. })
++    ));
++    assert_eq!(MAX_SLOT_INDEX, 999_999, "six digits address [0, 999_999]");
++
++    assert!(is_token(ID_A));
++    assert_eq!(TOKEN_HEX_LEN, 32);
++    // A validated token reports the id it validated — every per-session range is derived
++    // from this string, so a constructor that kept a different one would name another
++    // session's records.
++    assert_eq!(upload_a().as_str(), ID_A);
++    assert_eq!(upload_a().to_string(), ID_A);
++    assert_eq!(attempt().as_str(), ID_B);
++    assert_eq!(attempt().to_string(), ID_B);
++    assert_ne!(upload_a(), upload_b());
++    for not_a_token in [
++        String::new(),
++        ID_A[..31].to_string(),
++        format!("{ID_A}0"),
++        ID_A.to_uppercase(),
++        format!("{}:{}", &ID_A[..16], &ID_A[17..]),
++        format!("{}g{}", &ID_A[..16], &ID_A[17..]),
++    ] {
++        assert!(!is_token(&not_a_token), "{not_a_token:?} parsed as a token");
++        assert!(UploadId::new(not_a_token.clone()).is_err());
++        assert!(AttemptId::new(not_a_token).is_err());
++    }
++}
++
++// ===========================================================================
++// Leg 2 — no prefix is a prefix of another
++// ===========================================================================
++
++/// Every key prefix the store holds, this slice's and the pre-existing ones. The
++/// pre-existing spellings are asserted against their defining constants where the crate
++/// exports them; `desired:dserver:` is `crates/custodian/src/desired_state.rs:33` and is
++/// quoted literally because `core` must not depend on `custodian` (ADR-0010's direction).
++fn all_prefixes() -> Vec<(&'static str, Vec<u8>)> {
++    vec![
++        ("mpuctl", MPUCTL_KEY.to_vec()),
++        ("mpu:", MPU_PREFIX.to_vec()),
++        ("slot:", SLOT_PREFIX.to_vec()),
++        ("part:", PART_PREFIX.to_vec()),
++        ("psum:", PSUM_PREFIX.to_vec()),
++        ("sidx:", SIDX_PREFIX.to_vec()),
++        ("retire:bytes:", RETIRE_BYTES_PREFIX.to_vec()),
++        ("retire:records:", RETIRE_RECORDS_PREFIX.to_vec()),
++        ("inode:", b"inode:".to_vec()),
++        ("dirent:", b"dirent:".to_vec()),
++        ("pending:", b"pending:".to_vec()),
++        ("bucket:", b"bucket:".to_vec()),
++        ("orphan:", metadata::ORPHAN_PREFIX.to_vec()),
++        ("seg:", metadata::SEG_PREFIX.to_vec()),
++        ("seggrp:", metadata::SEGGRP_PREFIX.to_vec()),
++        ("desired:dserver:", b"desired:dserver:".to_vec()),
++        ("meta:version", metadata::VERSION_KEY.to_vec()),
++    ]
++}
++
++#[test]
++fn no_record_prefix_is_a_prefix_of_another() {
++    let prefixes = all_prefixes();
++    assert_eq!(prefixes.len(), 17);
++    for (name, prefix) in &prefixes {
++        for (other_name, other) in &prefixes {
++            if name == other_name {
++                continue;
++            }
++            assert!(
++                !prefix.starts_with(other),
++                "scan({other_name:?}) would return {name:?} records"
++            );
++        }
++    }
++}
++
++#[test]
++fn the_pre_existing_prefix_spellings_are_the_ones_the_module_uses() {
++    // The literals above are only meaningful if they are the SAME bytes the key
++    // constructors produce, so the disjointness test is about the real key space.
++    assert!(metadata::inode_key(1).starts_with(b"inode:"));
++    assert!(metadata::dirent_key(1, "x").starts_with(b"dirent:"));
++    assert!(metadata::pending_key(1).starts_with(b"pending:"));
++    assert!(metadata::bucket_key("b").starts_with(b"bucket:"));
++    assert!(
++        metadata::orphan_key(1, wyrd_traits::FragmentId { chunk: 2, index: 3 })
++            .starts_with(metadata::ORPHAN_PREFIX)
++    );
++    assert!(
++        metadata::seg_range_prefix(&SegmentGroup::new(NONCE, 1).unwrap())
++            .starts_with(metadata::SEG_PREFIX)
++    );
++}
++
++#[test]
++fn scanning_the_session_prefix_never_returns_the_admission_singleton() {
++    // The near-miss the issue names: spelling the prefix `mpu` rather than `mpu:` sweeps the
++    // fleet admission ledger into every per-session scan — and a session iteration that
++    // decoded `mpuctl` as a session would fail closed on every pass.
++    assert!(!MPUCTL_KEY.starts_with(MPU_PREFIX));
++    assert!(!mpu_key(&upload_a()).starts_with(MPUCTL_KEY));
++    assert!(
++        MPUCTL_KEY.starts_with(b"mpu"),
++        "the near-miss is real: only the `:` separates them"
++    );
++    assert!(parse_mpu_key(MPUCTL_KEY).is_err());
++}
++
++#[test]
++fn an_owned_staging_entry_is_not_reachable_from_a_pending_scan() {
++    // The disjointness of `sidx:` from `pending:` is the ONLY thing keeping the global
++    // expiry sweep and the restore pass from reaping live owned staging entries
++    // (`0016:475-491`), and it is what lets restore keep today's `pending:` bound.
++    let owned = sidx_key(&upload_a(), part(1), 42);
++    assert!(!owned.starts_with(b"pending:"));
++    assert!(!metadata::pending_key(42).starts_with(SIDX_PREFIX));
++    // Nor does one session's range reach another's.
++    assert!(!owned.starts_with(&sidx_range(&upload_b())));
++    assert!(owned.starts_with(&sidx_range(&upload_a())));
++}
++
++// ===========================================================================
++// Leg 3 — every record's decode validates; encode -> decode is the identity
++// ===========================================================================
++
++fn budget() -> Budget {
++    // A legal, deliberately small profile: `U_ref = min((4+2)*3, 8+2*2*3) = min(18, 20) = 18`.
++    Budget::new(1_800, 3, 4, 2, 8).unwrap()
++}
++
++fn session(state: SessionState) -> SessionRecord {
++    let epoch = 7;
++    SessionRecord {
++        bucket: "bucket".to_string(),
++        parent: 1,
++        object: "object".to_string(),
++        content_type: Some("text/plain".to_string()),
++        created_at_millis: 1_000,
++        clock_source: "logical".to_string(),
++        state,
++        epoch,
++        attempts: 1,
++        group_nonce: metadata::SegmentNonce::new(NONCE).unwrap(),
++        fenced_at_millis: matches!(state, SessionState::Completing).then_some(2_000),
++        segments_written: matches!(state, SessionState::Completing).then_some(3),
++        publish_target: matches!(state, SessionState::Completing).then(|| PublishTarget {
++            parent: 1,
++            name: "object".to_string(),
++            fence_epoch: epoch,
++        }),
++        completion: matches!(state, SessionState::Completed).then(|| Completion {
++            inode: 5,
++            version: 2,
++            etag: multipart_etag(&[(part(1), digest_of("one"))]).unwrap(),
++            completed_at_millis: 4_000,
++            complete_fingerprint: complete_fingerprint(&[(part(1), digest_of("one"))]).unwrap(),
++        }),
++    }
++}
++
++fn owned_entry() -> OwnedEntry {
++    OwnedEntry {
++        owner: upload_a(),
++        lease_expiry_millis: 500,
++        staged: StagedPlacement {
++            scheme: EcScheme::ReedSolomon { k: 4, m: 2 },
++            placement: vec![1, 2, 3, 4, 5, 6],
++        },
++    }
++}
++
++fn round_trips<T>(record: &T) -> T
++where
++    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
++{
++    let bytes = encode_record(record);
++    let decoded: T = serde_json::from_slice(&bytes).expect("a record this crate encoded decodes");
++    assert_eq!(&decoded, record, "encode -> decode is not the identity");
++    assert_eq!(
++        encode_record(&decoded),
++        bytes,
++        "decode -> encode is not byte-identical"
++    );
++    decoded
++}
++
++#[test]
++fn every_record_round_trips_through_encode_and_decode() {
++    round_trips(&AdmissionRecord::new(3, budget()));
++    for state in SessionState::ALL {
++        round_trips(&session(state));
++    }
++    round_trips(&SlotRecord {
++        part_number: part(4),
++        attempt_id: attempt(),
++        reserved_at_millis: 10,
++        lease_expiry_millis: 10,
++    });
++    round_trips(&PartRecord {
++        chunks: vec![chunk_ref(1, 100), chunk_ref(2, 50)],
++        len: 150,
++        digest: digest_of("part-4"),
++        committed_at_millis: 11,
++        session_epoch: 7,
++    });
++    round_trips(&PartSummary {
++        chunks: 2,
++        len: 150,
++        digest: digest_of("part-4"),
++        committed_at_millis: 11,
++    });
++    round_trips(&StagedPlacement {
++        scheme: EcScheme::ReedSolomon { k: 4, m: 2 },
++        placement: vec![1, 2, 3, 4, 5, 6],
++    });
++    round_trips(&owned_entry().to_pending());
++    for payload in [
++        RetirePayload::Session {},
++        RetirePayload::Parts {
++            parts: PartNumberSet::from_numbers([part(1), part(2), part(9)]),
++        },
++        RetirePayload::Chunks {
++            chunks: vec![chunk_ref(1, 100)],
++        },
++        RetirePayload::Generation {
++            inode: 5,
++            version: 2,
++            chunks: vec![chunk_ref(1, 100)],
++            segments: None,
++        },
++        RetirePayload::Generation {
++            inode: 5,
++            version: 2,
++            chunks: Vec::new(),
++            segments: Some(SegmentGroup::new(NONCE, 3).unwrap()),
++        },
++        RetirePayload::Records {
++            parts: Some(PartNumberSet::from_numbers([part(1)])),
++            segments: Some(SegmentGroup::new(NONCE, 3).unwrap()),
++        },
++    ] {
++        round_trips(&payload);
++    }
++    // The decoders the later slices call route through the same validating codecs.
++    assert_eq!(
++        decode_session(&encode_record(&session(SessionState::Open))).unwrap(),
++        session(SessionState::Open)
++    );
++    assert_eq!(
++        decode_admission_record(&encode_record(&AdmissionRecord::new(3, budget()))).unwrap(),
++        AdmissionRecord::new(3, budget())
++    );
++}
++
++#[test]
++fn an_admission_record_whose_limit_disagrees_with_its_profile_is_rejected_at_decode() {
++    // The carried-forward MUST-FIX. `max_sessions` is DERIVED (`floor(W_ref / U_ref)`,
++    // clamped), so a stored limit that disagrees with its own profile is a torn or
++    // rolled-back value. Admission enforces the STORED limit — deliberately, so the fleet
++    // agrees on one number — which is exactly why the stored number may not be free: every
++    // host would trust it, and `sum(U_ref) <= W_ref` would be exceeded on hosts that never
++    // observe the overrun.
++    let profile = budget();
++    assert_eq!(profile.u_ref(), 18);
++    assert_eq!(profile.max_sessions(), 100);
++
++    let ledger = |max_sessions: u64| {
++        json!({
++            "count": 3,
++            "max_sessions": max_sessions,
++            "profile": {
++                "w_ref": 1_800, "max_part_chunks": 3, "max_parts_per_session": 4,
++                "max_inflight_parts": 2, "max_staged_chunks": 8
++            }
++        })
++        .to_string()
++    };
++
++    assert_eq!(
++        decode_admission_record(ledger(100).as_bytes()).unwrap(),
++        AdmissionRecord::new(3, profile)
++    );
++
++    // A hand-authored torn value: the same profile, a larger stored limit.
++    let error = decode_admission_record(ledger(4_000).as_bytes()).unwrap_err();
++    assert!(
++        format!("{error}").contains("derived, never chosen"),
++        "the torn mpuctl was accepted or rejected for the wrong reason: {error}"
++    );
++    // ... and a SMALLER one is refused too: the relation is equality, not a ceiling.
++    assert!(decode_admission_record(ledger(99).as_bytes()).is_err());
++    assert!(decode_admission_record(ledger(0).as_bytes()).is_err());
++}
++
++#[test]
++fn the_profile_derivations_are_pure_arithmetic_over_the_stored_tuple() {
++    // Both branches of `U_ref = min(raw, ceiling)` are exercised, so a swapped comparison or
++    // a swapped operator cannot pass.
++    // raw = (4 + 2) * 3 = 18; ceiling = 8 + 2*2*3 = 20  ->  raw binds
++    assert_eq!(Budget::new(1_800, 3, 4, 2, 8).unwrap().u_ref(), 18);
++    // raw = (400 + 2) * 3 = 1206; ceiling = 8 + 2*2*3 = 20  ->  ceiling binds
++    assert_eq!(Budget::new(1_800, 3, 400, 2, 8).unwrap().u_ref(), 20);
++    // W_ref / U_ref, floored.
++    assert_eq!(Budget::new(1_800, 3, 4, 2, 8).unwrap().max_sessions(), 100);
++    assert_eq!(Budget::new(1_799, 3, 4, 2, 8).unwrap().max_sessions(), 99);
++    assert_eq!(Budget::new(17, 3, 4, 2, 8).unwrap().max_sessions(), 0);
++
++    // The SCAN_CAP/2 clamp: a large W_ref with small parts would otherwise exceed the one
++    // `scan("mpu:")` the reaper issues.
++    let clamp = (wyrd_traits::SCAN_CAP / 2) as u64;
++    let unclamped = Budget::new(u64::MAX, 1, 1, 1, 1).unwrap();
++    assert_eq!(unclamped.u_ref(), 2);
++    assert_eq!(unclamped.max_sessions(), clamp);
++    // Exactly at the clamp is the clamp; one below is itself.
++    assert_eq!(
++        Budget::new(2 * clamp, 1, 1, 1, 1).unwrap().max_sessions(),
++        clamp
++    );
++    assert_eq!(
++        Budget::new(2 * (clamp - 1), 1, 1, 1, 1)
++            .unwrap()
++            .max_sessions(),
++        clamp - 1
++    );
++
++    // Saturating, never wrapping. `(2^32 + 2^32) x 2^32` exceeds `u64`, so unchecked
++    // arithmetic over these DECODED fields would panic in a checked build and wrap in a
++    // release one — deriving a per-session footprint smaller than the truth and admitting
++    // past the memory the reconcile pass is sized for. Saturation charges the whole budget
++    // to one session instead, which is the fail-closed direction.
++    let huge = Budget::new(u64::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX).unwrap();
++    assert_eq!(huge.u_ref(), u64::MAX);
++    assert_eq!(huge.max_sessions(), 1);
++    let huge_but_short = Budget::new(u64::MAX - 1, u32::MAX, u32::MAX, u32::MAX, u32::MAX).unwrap();
++    assert_eq!(huge_but_short.max_sessions(), 0);
++    // ... and the same arithmetic runs at DECODE, over bytes no writer in this crate
++    // produced, so it must not panic there either.
++    let untrusted = json!({
++        "count": 0,
++        "max_sessions": 1,
++        "profile": {
++            "w_ref": u64::MAX, "max_part_chunks": u32::MAX, "max_parts_per_session": u32::MAX,
++            "max_inflight_parts": u32::MAX, "max_staged_chunks": u32::MAX
++        }
++    });
++    assert_eq!(
++        decode_admission_record(untrusted.to_string().as_bytes())
++            .unwrap()
++            .max_sessions,
++        1
++    );
++
++    // A zero component is refused at construction AND at decode: no configuration admits a
++    // session under it, and `W_ref / 0` is not a limit.
++    for tuple in [
++        (0u64, 3u32, 4u32, 2u32, 8u32),
++        (1_800, 0, 4, 2, 8),
++        (1_800, 3, 0, 2, 8),
++        (1_800, 3, 4, 0, 8),
++        (1_800, 3, 4, 2, 0),
++    ] {
++        assert!(Budget::new(tuple.0, tuple.1, tuple.2, tuple.3, tuple.4).is_err());
++        let value = json!({
++            "w_ref": tuple.0, "max_part_chunks": tuple.1, "max_parts_per_session": tuple.2,
++            "max_inflight_parts": tuple.3, "max_staged_chunks": tuple.4
++        });
++        assert!(serde_json::from_str::<Budget>(&value.to_string()).is_err());
++    }
++
++    // The accessors report the stored tuple.
++    let profile = budget();
++    assert_eq!(
++        (
++            profile.w_ref(),
++            profile.max_part_chunks(),
++            profile.max_parts_per_session(),
++            profile.max_inflight_parts(),
++            profile.max_staged_chunks()
++        ),
++        (1_800, 3, 4, 2, 8)
++    );
++}
++
++#[test]
++fn a_session_value_its_state_forbids_is_rejected_at_decode() {
++    let completing = encode_record(&session(SessionState::Completing));
++    let mut value: serde_json::Value = serde_json::from_slice(&completing).unwrap();
++
++    // Every `Completing`-only field is REQUIRED there ...
++    for field in ["fenced_at_millis", "segments_written", "publish_target"] {
++        let mut missing = value.clone();
++        missing.as_object_mut().unwrap().remove(field);
++        let error = decode_session(missing.to_string().as_bytes()).unwrap_err();
++        assert!(
++            format!("{error}").contains(field),
++            "a Completing session decoded without `{field}`: {error}"
++        );
++    }
++    // ... and FORBIDDEN on an Open one: half of a state's meaning is in its fields.
++    for field in ["fenced_at_millis", "segments_written", "publish_target"] {
++        let mut open: serde_json::Value =
++            serde_json::from_slice(&encode_record(&session(SessionState::Open))).unwrap();
++        open.as_object_mut()
++            .unwrap()
++            .insert(field.to_string(), value[field].clone());
++        assert!(
++            decode_session(open.to_string().as_bytes()).is_err(),
++            "an Open session decoded carrying the Completing-only `{field}`"
++        );
++    }
++    // A `Completed` session must carry its completion; an `Open` one must not.
++    let mut completed: serde_json::Value =
++        serde_json::from_slice(&encode_record(&session(SessionState::Completed))).unwrap();
++    let completion = completed["completion"].clone();
++    completed.as_object_mut().unwrap().remove("completion");
++    assert!(decode_session(completed.to_string().as_bytes()).is_err());
++    let mut open: serde_json::Value =
++        serde_json::from_slice(&encode_record(&session(SessionState::Open))).unwrap();
++    open.as_object_mut()
++        .unwrap()
++        .insert("completion".to_string(), completion);
++    assert!(decode_session(open.to_string().as_bytes()).is_err());
++
++    // The fence epoch in `publish_target` IS the session's own epoch: the attempt's `seg:`
++    // records are keyed by it, so a mismatch would resume a completer against another
++    // attempt's segment generation.
++    value["publish_target"]["fence_epoch"] = json!(6);
++    let error = decode_session(value.to_string().as_bytes()).unwrap_err();
++    assert!(format!("{error}").contains("fence epoch"), "{error}");
++
++    // A structurally impossible identity is refused, not carried.
++    for (field, bad) in [
++        ("group_nonce", json!("not-a-nonce")),
++        ("group_nonce", json!(NONCE.to_uppercase())),
++        ("clock_source", json!("")),
++        ("bucket", json!("")),
++        ("object", json!("")),
++    ] {
++        let mut open: serde_json::Value =
++            serde_json::from_slice(&encode_record(&session(SessionState::Open))).unwrap();
++        open.as_object_mut().unwrap().insert(field.to_string(), bad);
++        assert!(
++            decode_session(open.to_string().as_bytes()).is_err(),
++            "a session decoded with an invalid `{field}`"
++        );
++    }
++
++    // A completion carries a well-formed ETag and fingerprint or it is not a completion.
++    for (field, bad) in [
++        ("etag", json!("deadbeef-1")),
++        ("etag", json!(digest_of("x").to_hex())),
++        ("complete_fingerprint", json!("deadbeef")),
++    ] {
++        let mut tombstone: serde_json::Value =
++            serde_json::from_slice(&encode_record(&session(SessionState::Completed))).unwrap();
++        tombstone["completion"]
++            .as_object_mut()
++            .unwrap()
++            .insert(field.to_string(), bad);
++        assert!(
++            decode_session(tombstone.to_string().as_bytes()).is_err(),
++            "a tombstone decoded with an invalid `{field}`"
++        );
++    }
++}
++
++#[test]
++fn a_slot_a_part_and_a_summary_are_validated_at_decode() {
++    // A lease that expired before the slot was claimed cannot be stamped under one clock.
++    let slot = |reserved: u64, expiry: u64| {
++        json!({
++            "part_number": 4, "attempt_id": ID_B,
++            "reserved_at_millis": reserved, "lease_expiry_millis": expiry
++        })
++    };
++    assert!(decode_slot(slot(100, 99).to_string().as_bytes()).is_err());
++    assert!(decode_slot(slot(100, 100).to_string().as_bytes()).is_ok());
++    assert!(decode_slot(slot(100, 101).to_string().as_bytes()).is_ok());
++    // The part number and the attempt id are validated by their own types.
++    for (field, bad) in [
++        ("part_number", json!(0)),
++        ("part_number", json!(MAX_PART_NUMBER + 1)),
++        ("attempt_id", json!("nope")),
++        ("attempt_id", json!(ID_B.to_uppercase())),
++    ] {
++        let mut value = slot(100, 100);
++        value
++            .as_object_mut()
++            .unwrap()
++            .insert(field.to_string(), bad);
++        assert!(
++            decode_slot(value.to_string().as_bytes()).is_err(),
++            "a slot decoded with an invalid `{field}`"
++        );
++    }
++
++    // `len` and the chunk list state the SAME fact: Complete sums `len` into the published
++    // size, the read path sums the chunks it reads. A record whose halves disagree would
++    // publish an object whose declared size is not the number of bytes a reader can get.
++    let part_value = |len: u64, chunk_lens: &[u64]| {
++        json!({
++            "chunks": chunk_lens.iter().enumerate().map(|(i, l)| json!({
++                "id": i + 1, "scheme": "None", "len": l, "placement": [7]
++            })).collect::<Vec<_>>(),
++            "len": len,
++            "digest": digest_of("p").to_hex(),
++            "committed_at_millis": 1,
++            "session_epoch": 7
++        })
++    };
++    assert!(decode_part(part_value(150, &[100, 50]).to_string().as_bytes()).is_ok());
++    assert!(decode_part(part_value(151, &[100, 50]).to_string().as_bytes()).is_err());
++    assert!(decode_part(part_value(149, &[100, 50]).to_string().as_bytes()).is_err());
++    // A wrapped sum is the same defect with a forged agreement: `u64::MAX + 1 == 0`.
++    let overflow = part_value(0, &[u64::MAX, 1]);
++    let error = decode_part(overflow.to_string().as_bytes()).unwrap_err();
++    assert!(format!("{error}").contains("overflow"), "{error}");
++    // A digest that is not 64 lowercase-hex characters is not a digest.
++    for bad in [
++        json!("deadbeef"),
++        json!(digest_of("p").to_hex().to_uppercase()),
++        json!(format!("{}0", digest_of("p").to_hex())),
++    ] {
++        let mut value = part_value(150, &[100, 50]);
++        value
++            .as_object_mut()
++            .unwrap()
++            .insert("digest".to_string(), bad);
++        assert!(decode_part(value.to_string().as_bytes()).is_err());
++    }
++
++    // A summary claiming bytes under no chunks contradicts the `part:` record written beside
++    // it in one batch — and the summary is what the staged-chunk check reads INSTEAD of the
++    // part, so nothing else would re-check it.
++    let summary = |chunks: u32, len: u64| {
++        json!({
++            "chunks": chunks, "len": len,
++            "digest": digest_of("p").to_hex(), "committed_at_millis": 1
++        })
++    };
++    assert!(decode_part_summary(summary(2, 150).to_string().as_bytes()).is_ok());
++    assert!(decode_part_summary(summary(0, 0).to_string().as_bytes()).is_ok());
++    assert!(decode_part_summary(summary(0, 150).to_string().as_bytes()).is_err());
++    assert!(decode_part_summary(summary(2, 0).to_string().as_bytes()).is_err());
++    let mut bad_digest = summary(2, 150);
++    bad_digest
++        .as_object_mut()
++        .unwrap()
++        .insert("digest".to_string(), json!("deadbeef"));
++    assert!(decode_part_summary(bad_digest.to_string().as_bytes()).is_err());
++}
++
++#[test]
++fn an_owned_staging_entry_carries_both_of_its_fields_or_neither() {
++    let owned = owned_entry();
++    let stored = encode_record(&owned.to_pending());
++    assert_eq!(decode_owned_entry(&stored).unwrap(), owned);
++
++    // Exactly one of the two fields is a torn record: a reader would have to guess whether
++    // the entry is owned, and an owned entry read as ordinary is one a global sweep reaps.
++    let owner_only = json!({ "lease_expiry_millis": 500, "owner": ID_A });
++    assert!(decode_owned_entry(owner_only.to_string().as_bytes()).is_err());
++    let staged_only = json!({
++        "lease_expiry_millis": 500,
++        "staged": { "scheme": "None", "placement": [7] }
++    });
++    assert!(decode_owned_entry(staged_only.to_string().as_bytes()).is_err());
++    // An ordinary `pending:` entry is not an owned one — it is refused by this decoder
++    // rather than silently answering "unowned".
++    let ordinary = json!({ "lease_expiry_millis": 500 });
++    assert!(decode_owned_entry(ordinary.to_string().as_bytes()).is_err());
++    assert!(OwnedEntry::from_pending(&PendingEntry {
++        lease_expiry_millis: 500,
++        owner: None,
++        staged: None,
++    })
++    .is_err());
++    // A malformed owner token would name a per-session range nothing could derive — and it
++    // is refused by `PendingEntry`'s own decode, so no reader ever holds one.
++    let bad_owner = json!({
++        "lease_expiry_millis": 500, "owner": "nope",
++        "staged": { "scheme": "None", "placement": [7] }
++    });
++    assert!(decode_owned_entry(bad_owner.to_string().as_bytes()).is_err());
++    assert!(serde_json::from_str::<PendingEntry>(&bad_owner.to_string()).is_err());
++    // The placement's LENGTH is deliberately contextual, not structural (ADR-0045,
++    // `AGENTS.md:146-149`): a length-mismatched staged placement decodes, so the fleet can
++    // quarantine it instead of aborting the whole reconcile step.
++    let short_placement = json!({
++        "lease_expiry_millis": 500, "owner": ID_A,
++        "staged": { "scheme": { "ReedSolomon": { "k": 4, "m": 2 } }, "placement": [1] }
++    });
++    assert!(decode_owned_entry(short_placement.to_string().as_bytes()).is_ok());
++}
++
++#[test]
++fn a_legacy_pending_value_round_trips_byte_identically() {
++    // The `skip_serializing_if` identity every `require(key, encode(prior))` CAS depends on
++    // (`metadata.rs:1368-1391`, ADR-0047): `renew_pending` and `live_lease_guards` compare
++    // the RE-ENCODED prior entry byte-for-byte against the stored bytes, so emitting
++    // `"owner":null` would turn every renewal and every lease guard on a pre-#654 entry into
++    // a permanent Conflict.
++    let legacy = br#"{"lease_expiry_millis":1234}"#;
++    let decoded: PendingEntry = serde_json::from_slice(legacy).unwrap();
++    assert_eq!(decoded.owner, None);
++    assert_eq!(decoded.staged, None);
++    assert_eq!(
++        metadata::encode(&decoded).as_ref(),
++        legacy.as_slice(),
++        "a legacy pending: entry does not re-encode to its stored bytes"
++    );
++
++    // An OWNED entry re-encodes identically across its own renewals too — the same guard
++    // path renews it (`write.rs:474-500`).
++    let owned = owned_entry().to_pending();
++    let stored = metadata::encode(&owned);
++    let decoded: PendingEntry = serde_json::from_slice(&stored).unwrap();
++    assert_eq!(metadata::encode(&decoded), stored);
++    assert_eq!(decoded, owned);
++    assert_eq!(OwnedEntry::from_pending(&decoded).unwrap(), owned_entry());
++}
++
++#[test]
++fn a_retirement_obligation_is_validated_against_its_own_key() {
++    let token = RetireToken::Session {
++        upload_id: upload_a(),
++        epoch: 3,
++        part: None,
++    };
++    let bytes_key = retire_key(RetireMode::Bytes, &token);
++    let records_key = retire_key(RetireMode::Records, &token);
++    let session_payload = encode_record(&RetirePayload::Session {});
++    let records_payload = encode_record(&RetirePayload::Records {
++        parts: Some(PartNumberSet::from_numbers([part(1), part(2)])),
++        segments: None,
++    });
++
++    assert_eq!(
++        decode_retire_obligation(&bytes_key, &session_payload).unwrap(),
++        (token.clone(), RetirePayload::Session {})
++    );
++    assert!(decode_retire_obligation(&records_key, &records_payload).is_ok());
++
++    // The mode lives in the KEY: a record payload under `retire:bytes:` would orphan-mark
++    // bytes a live object still names; a byte payload under `retire:records:` would delete
++    // the only records naming durable bytes with no evidence written.
++    assert!(decode_retire_obligation(&bytes_key, &records_payload).is_err());
++    assert!(decode_retire_obligation(&records_key, &session_payload).is_err());
++    // An unknown mode is an error, never a default.
++    assert!(matches!(
++        parse_retire_mode(b"retire:maybe:s:x:1"),
++        Err(RecordError::UnknownRetireMode { .. })
++    ));
++    assert!(parse_retire_mode(b"retire:").is_err());
++    assert!(decode_retire_obligation(b"retire:maybe:s:x:1", &session_payload).is_err());
++
++    // An obligation that owes nothing is a producer bug, and admitting it would let that bug
++    // look like completed work — while one that DOES name work is actionable and decodes.
++    for empty in [
++        encode_record(&RetirePayload::Chunks { chunks: Vec::new() }),
++        encode_record(&RetirePayload::Parts {
++            parts: PartNumberSet::default(),
++        }),
++    ] {
++        assert!(decode_retire_obligation(&bytes_key, &empty).is_err());
++    }
++    for owed in [
++        encode_record(&RetirePayload::Chunks {
++            chunks: vec![chunk_ref(1, 10)],
++        }),
++        encode_record(&RetirePayload::Parts {
++            parts: PartNumberSet::from_numbers([part(1)]),
++        }),
++    ] {
++        assert!(
++            decode_retire_obligation(&bytes_key, &owed).is_ok(),
++            "an obligation that names real work was refused"
++        );
++    }
++    let nothing_named = encode_record(&RetirePayload::Records {
++        parts: None,
++        segments: None,
++    });
++    assert!(decode_retire_obligation(&records_key, &nothing_named).is_err());
++    let empty_parts = encode_record(&RetirePayload::Records {
++        parts: Some(PartNumberSet::default()),
++        segments: None,
++    });
++    assert!(decode_retire_obligation(&records_key, &empty_parts).is_err());
++    // A generation names EITHER a flat chunk list or a `seg:` generation, never both: a
++    // drain that picked one arm would evidence half the payload and then delete it. Either
++    // one ALONE is the ordinary case and must decode.
++    let generation = |chunks: Vec<ChunkRef>, segments: Option<SegmentGroup>| {
++        encode_record(&RetirePayload::Generation {
++            inode: 5,
++            version: 2,
++            chunks,
++            segments,
++        })
++    };
++    assert!(decode_retire_obligation(
++        &bytes_key,
++        &generation(
++            vec![chunk_ref(1, 10)],
++            Some(SegmentGroup::new(NONCE, 3).unwrap())
++        )
++    )
++    .is_err());
++    assert!(
++        decode_retire_obligation(&bytes_key, &generation(vec![chunk_ref(1, 10)], None)).is_ok()
++    );
++    assert!(decode_retire_obligation(
++        &bytes_key,
++        &generation(Vec::new(), Some(SegmentGroup::new(NONCE, 3).unwrap()))
++    )
++    .is_ok());
++    // Each payload knows the one mode it may live under.
++    assert_eq!(RetirePayload::Session {}.mode(), RetireMode::Bytes);
++    assert_eq!(
++        RetirePayload::Records {
++            parts: None,
++            segments: None
++        }
++        .mode(),
++        RetireMode::Records
++    );
++    assert_eq!(RetireMode::Bytes.prefix(), RETIRE_BYTES_PREFIX);
++    assert_eq!(RetireMode::Records.prefix(), RETIRE_RECORDS_PREFIX);
++}
++
++#[test]
++fn a_part_number_set_is_canonical_or_it_is_not_a_set() {
++    let set = PartNumberSet::from_numbers([part(1), part(2), part(3), part(9), part(10)]);
++    assert_eq!(set.len(), 5);
++    assert!(!set.is_empty());
++    assert!(set.contains(part(3)));
++    assert!(!set.contains(part(4)));
++    assert_eq!(set.iter().collect::<Vec<_>>(), vec![1, 2, 3, 9, 10]);
++    assert_eq!(set.first_at_or_after(1), Some(1));
++    assert_eq!(set.first_at_or_after(4), Some(9));
++    assert_eq!(set.first_at_or_after(10), Some(10));
++    assert_eq!(set.first_at_or_after(11), None);
++    // Coalesced: [1,3] and [9,10] — the "every staged part was published" case is a few
++    // bytes rather than 10,000 numbers.
++    assert_eq!(
++        String::from_utf8(encode_record(&set)).unwrap(),
++        "[[1,3],[9,10]]"
++    );
++    assert_eq!(PartNumberSet::default().len(), 0);
++    assert!(PartNumberSet::default().is_empty());
++    assert_eq!(PartNumberSet::default().first_at_or_after(1), None);
++
++    // Every non-canonical spelling is refused at decode: a reversed run underflows `len`, an
++    // unordered one makes a drain cursor skip members, and a number past the key grammar
++    // names a `part:` record no parser can read back.
++    for bad in [
++        "[[3,1]]",        // reversed
++        "[[1,3],[2,4]]",  // overlapping
++        "[[1,3],[4,5]]",  // adjacent (a second spelling of [[1,5]])
++        "[[9,10],[1,3]]", // descending
++        "[[0,3]]",        // part 0 is not a part
++        "[[1,100000]]",   // past the five-digit key space
++        "[[100000,100001]]",
++    ] {
++        assert!(
++            serde_json::from_str::<PartNumberSet>(bad).is_err(),
++            "the non-canonical part-number set {bad} decoded"
++        );
++    }
++    assert!(serde_json::from_str::<PartNumberSet>("[[1,3],[5,6]]").is_ok());
++    assert!(serde_json::from_str::<PartNumberSet>("[]").is_ok());
++}
++
++// ===========================================================================
++// Leg 4 — every reachable decision-3 cell, answered with a typed outcome
++// ===========================================================================
++
++fn recorded_publication() -> Publication {
++    Publication::of(
++        session(SessionState::Completed)
++            .completion
++            .as_ref()
++            .unwrap(),
++    )
++}
++
++/// The fingerprint the `Completed` fixture recorded — an identical retry names these parts.
++fn recorded_fingerprint() -> Digest {
++    complete_fingerprint(&[(part(1), digest_of("one"))]).unwrap()
++}
++
++/// The 25 cells of `0016:969-978`, spelled out. `None` is "the record is absent".
++fn decision3_table() -> Vec<(Verb, Option<SessionState>, Answer)> {
++    use SessionState::{Aborting, Completed, Completing, Open};
++    let no_such = || Refusal::NoSuchUpload;
++    vec![
++        // UploadPart — accepted only while Open; a part accepted after the fence would be
++        // invisible to the publication that already read the set.
++        (
++            Verb::UploadPart,
++            Some(Open),
++            Answer::UploadPart(UploadPartAnswer::Accepted),
++        ),
++        (
++            Verb::UploadPart,
++            Some(Completing),
++            Answer::UploadPart(UploadPartAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::UploadPart,
++            Some(Aborting),
++            Answer::UploadPart(UploadPartAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::UploadPart,
++            Some(Completed),
++            Answer::UploadPart(UploadPartAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::UploadPart,
++            None,
++            Answer::UploadPart(UploadPartAnswer::Refused(no_such())),
++        ),
++        // Complete — fences from Open; a different fence already owns publication while
++        // Completing; the tombstone cell is conditional (both branches asserted below).
++        (
++            Verb::CompleteMultipartUpload,
++            Some(Open),
++            Answer::Complete(CompleteAnswer::Fences),
++        ),
++        (
++            Verb::CompleteMultipartUpload,
++            Some(Completing),
++            Answer::Complete(CompleteAnswer::Refused(Refusal::OperationAborted)),
++        ),
++        (
++            Verb::CompleteMultipartUpload,
++            Some(Aborting),
++            Answer::Complete(CompleteAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::CompleteMultipartUpload,
++            Some(Completed),
++            Answer::Complete(CompleteAnswer::AlreadyCompleted(Box::new(
++                recorded_publication(),
++            ))),
++        ),
++        (
++            Verb::CompleteMultipartUpload,
++            None,
++            Answer::Complete(CompleteAnswer::Refused(no_such())),
++        ),
++        // Abort — the fence commit IS the response; idempotent while already Aborting.
++        (
++            Verb::AbortMultipartUpload,
++            Some(Open),
++            Answer::Abort(AbortAnswer::Fences),
++        ),
++        (
++            Verb::AbortMultipartUpload,
++            Some(Completing),
++            Answer::Abort(AbortAnswer::Refused(Refusal::OperationAborted)),
++        ),
++        (
++            Verb::AbortMultipartUpload,
++            Some(Aborting),
++            Answer::Abort(AbortAnswer::AlreadyAborting),
++        ),
++        (
++            Verb::AbortMultipartUpload,
++            Some(Completed),
++            Answer::Abort(AbortAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::AbortMultipartUpload,
++            None,
++            Answer::Abort(AbortAnswer::Refused(no_such())),
++        ),
++        // ListParts — the growing set, then the frozen one, then nothing.
++        (
++            Verb::ListParts,
++            Some(Open),
++            Answer::ListParts(ListPartsAnswer::OpenSet),
++        ),
++        (
++            Verb::ListParts,
++            Some(Completing),
++            Answer::ListParts(ListPartsAnswer::FrozenSet),
++        ),
++        (
++            Verb::ListParts,
++            Some(Aborting),
++            Answer::ListParts(ListPartsAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::ListParts,
++            Some(Completed),
++            Answer::ListParts(ListPartsAnswer::Refused(no_such())),
++        ),
++        (
++            Verb::ListParts,
++            None,
++            Answer::ListParts(ListPartsAnswer::Refused(no_such())),
++        ),
++        // ListMultipartUploads — in progress is listed; tearing down or torn down is not.
++        (
++            Verb::ListMultipartUploads,
++            Some(Open),
++            Answer::ListUploads(ListUploadsAnswer::Listed),
++        ),
++        (
++            Verb::ListMultipartUploads,
++            Some(Completing),
++            Answer::ListUploads(ListUploadsAnswer::Listed),
++        ),
++        (
++            Verb::ListMultipartUploads,
++            Some(Aborting),
++            Answer::ListUploads(ListUploadsAnswer::NotListed),
++        ),
++        (
++            Verb::ListMultipartUploads,
++            Some(Completed),
++            Answer::ListUploads(ListUploadsAnswer::NotListed),
++        ),
++        (
++            Verb::ListMultipartUploads,
++            None,
++            Answer::ListUploads(ListUploadsAnswer::NotListed),
++        ),
++    ]
++}
++
++#[test]
++fn every_verb_x_state_cell_is_answered_with_its_typed_outcome() {
++    for (verb, state, expected) in decision3_table() {
++        let record = state.map(session);
++        let got = answer(verb, record.as_ref(), Some(&recorded_fingerprint()));
++        assert_eq!(got, expected, "decision 3 cell ({verb:?}, {state:?})");
++    }
++}
++
++#[test]
++fn the_answer_table_is_total_over_the_verb_x_state_product() {
++    // A helper that enumerates the product and fails if a cell is unanswered: adding a
++    // `Verb` or a `SessionState` variant widens this product, so a new state or verb cannot
++    // be added without answering its cells here.
++    let table = decision3_table();
++    let states: Vec<Option<SessionState>> = std::iter::once(None)
++        .chain(SessionState::ALL.into_iter().map(Some))
++        .collect();
++    assert_eq!(states.len(), 5);
++    assert_eq!(Verb::ALL.len(), 5);
++    assert_eq!(
++        table.len(),
++        Verb::ALL.len() * states.len(),
++        "the table does not name exactly the verb x state product"
++    );
++    for verb in Verb::ALL {
++        for state in &states {
++            let cell = table
++                .iter()
++                .find(|(v, s, _)| *v == verb && s == state)
++                .unwrap_or_else(|| panic!("decision 3 cell ({verb:?}, {state:?}) is unanswered"));
++            // Each cell is answered by the per-verb function too, so the union entry point
++            // and the functions the later slices call cannot drift apart.
++            let record = state.map(session);
++            let per_verb = match verb {
++                Verb::UploadPart => Answer::UploadPart(upload_part_answer(*state)),
++                Verb::CompleteMultipartUpload => {
++                    Answer::Complete(complete_answer(record.as_ref(), &recorded_fingerprint()))
++                }
++                Verb::AbortMultipartUpload => Answer::Abort(abort_answer(*state)),
++                Verb::ListParts => Answer::ListParts(list_parts_answer(*state)),
++                Verb::ListMultipartUploads => Answer::ListUploads(list_uploads_answer(*state)),
++            };
++            assert_eq!(per_verb, cell.2, "({verb:?}, {state:?}) disagrees per verb");
++        }
++    }
++}
++
++#[test]
++fn a_tombstone_answers_an_identical_retry_and_only_an_identical_retry() {
++    // The cell 0016 spends most words on. A client that reuses the upload id with a
++    // DIFFERENT part list must not be told ITS assembly succeeded while the store holds the
++    // earlier one — a silent wrong answer, worse than any error (`0016:898-908`).
++    let tombstone = session(SessionState::Completed);
++    let recorded = recorded_fingerprint();
++
++    match complete_answer(Some(&tombstone), &recorded) {
++        CompleteAnswer::AlreadyCompleted(publication) => {
++            assert_eq!(*publication, recorded_publication());
++            assert_eq!(
++                publication.etag,
++                multipart_etag(&[(part(1), digest_of("one"))]).unwrap(),
++                "the retry is answered with the RECORDED etag"
++            );
++        }
++        other => panic!("an identical retry was answered {other:?}"),
++    }
++
++    // A different assembly under the same id: a different digest ...
++    let different_body = complete_fingerprint(&[(part(1), digest_of("two"))]).unwrap();
++    assert_eq!(
++        complete_answer(Some(&tombstone), &different_body),
++        CompleteAnswer::Refused(Refusal::NoSuchUpload)
++    );
++    // ... and the same digest under a different part number.
++    let different_numbering = complete_fingerprint(&[(part(2), digest_of("one"))]).unwrap();
++    assert_eq!(
++        complete_answer(Some(&tombstone), &different_numbering),
++        CompleteAnswer::Refused(Refusal::NoSuchUpload)
++    );
++    // ... and one more part than the recorded assembly named.
++    let superset =
++        complete_fingerprint(&[(part(1), digest_of("one")), (part(2), digest_of("two"))]).unwrap();
++    assert_eq!(
++        complete_answer(Some(&tombstone), &superset),
++        CompleteAnswer::Refused(Refusal::NoSuchUpload)
++    );
++    // The union entry point routes the same condition.
++    assert_eq!(
++        answer(
++            Verb::CompleteMultipartUpload,
++            Some(&tombstone),
++            Some(&different_body)
++        ),
++        Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++    );
++    // A Complete that named no parts at all cannot match any recorded fingerprint.
++    assert_eq!(
++        answer(Verb::CompleteMultipartUpload, Some(&tombstone), None),
++        Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++    );
++    assert_eq!(
++        answer(
++            Verb::CompleteMultipartUpload,
++            Some(&session(SessionState::Open)),
++            None
++        ),
++        Answer::Complete(CompleteAnswer::Fences)
++    );
++    assert_eq!(
++        answer(
++            Verb::CompleteMultipartUpload,
++            Some(&session(SessionState::Completing)),
++            None
++        ),
++        Answer::Complete(CompleteAnswer::Refused(Refusal::OperationAborted))
++    );
++    assert_eq!(
++        answer(Verb::CompleteMultipartUpload, None, None),
++        Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++    );
++}
++
++#[test]
++fn the_answers_are_typed_outcomes_the_later_slices_share() {
++    // The vocabulary #656-#659 answer with: every refusal is a value, never "an error" and
++    // never an HTTP status (the S3 mapping is #508's).
++    let refusal = Refusal::SlowDown {
++        pressure: multipart::Backpressure::SessionCap {
++            count: 100,
++            max_sessions: 100,
++        },
++    };
++    assert_eq!(
++        multipart::CreateOutcome::Refused(refusal.clone()),
++        multipart::CreateOutcome::Refused(refusal.clone())
++    );
++    assert_ne!(
++        multipart::CreateOutcome::Refused(refusal),
++        multipart::CreateOutcome::Created {
++            upload_id: upload_a()
++        }
++    );
++    assert_ne!(
++        multipart::ReserveOutcome::Reserved {
++            index: SlotIndex::new(0).unwrap(),
++            attempt_id: attempt(),
++        },
++        multipart::ReserveOutcome::Refused(Refusal::SlowDown {
++            pressure: multipart::Backpressure::InflightParts {
++                max_inflight_parts: 2
++            }
++        })
++    );
++    assert_ne!(
++        multipart::UploadPartOutcome::Committed {
++            part_number: part(1),
++            digest: digest_of("one"),
++        },
++        multipart::UploadPartOutcome::Refused(Refusal::InvalidPart {
++            part_number: part(1),
++            reason: multipart::InvalidPart::DigestMismatch,
++        })
++    );
++    let publication = Box::new(recorded_publication());
++    assert_ne!(
++        multipart::CompleteOutcome::Published(publication.clone()),
++        multipart::CompleteOutcome::AlreadyCompleted(publication)
++    );
++    assert_ne!(
++        multipart::AbortOutcome::Fenced,
++        multipart::AbortOutcome::AlreadyAborting
++    );
++    // A profile skew is a fail-closed refusal carrying BOTH tuples, so an operator can see
++    // which host disagrees with the ledger.
++    assert_ne!(
++        Refusal::ProfileSkew {
++            local: Box::new(budget()),
++            ledger: Box::new(Budget::new(1_800, 3, 400, 2, 8).unwrap()),
++        },
++        Refusal::ProfileSkew {
++            local: Box::new(budget()),
++            ledger: Box::new(budget()),
++        }
++    );
++    assert_ne!(
++        Refusal::EntityTooLarge {
++            chunks: 10,
++            limit: 9
++        },
++        Refusal::CompleteAttemptsExhausted
++    );
++    assert_ne!(Refusal::NoSuchBucket, Refusal::NoSuchUpload);
++}
++
++// ===========================================================================
++// Leg 5 — `multipart_etag`, proved against an independent oracle
++// ===========================================================================
++
++/// The oracle, computed here from the spec text rather than from the implementation:
++/// `lowercase_hex( SHA-256( d_1 || d_2 || ... || d_N ) ) + "-" + N`, over the RAW 32 digest
++/// bytes in ascending part-number order.
++fn etag_oracle(mut named: Vec<(u32, Digest)>) -> String {
++    named.sort_by_key(|(number, _)| *number);
++    let mut hasher = Sha256::new();
++    for (_, digest) in &named {
++        hasher.update(digest.as_bytes());
++    }
++    let composed: [u8; 32] = hasher.finalize().into();
++    format!("{}-{}", hex_lower(&composed), named.len())
++}
++
++#[test]
++fn the_multipart_etag_is_the_settled_composition() {
++    let one = digest_of("one");
++    let two = digest_of("two");
++    let three = digest_of("three");
++
++    // N = 1.
++    assert_eq!(
++        multipart_etag(&[(part(1), one)]).unwrap().to_string(),
++        etag_oracle(vec![(1, one)])
++    );
++
++    // N = 3, and the `-N` suffix is the NAMED count.
++    let named = vec![(part(1), one), (part(2), two), (part(7), three)];
++    let etag = multipart_etag(&named).unwrap();
++    assert_eq!(
++        etag.to_string(),
++        etag_oracle(vec![(1, one), (2, two), (7, three)])
++    );
++    assert_eq!(etag.parts(), 3);
++    assert!(etag.to_string().ends_with("-3"));
++
++    // Ascending part-number order is enforced HERE, not delegated to the caller: the same
++    // assembly listed in any order publishes the same object.
++    let shuffled = vec![(part(7), three), (part(1), one), (part(2), two)];
++    assert_ne!(shuffled, named, "the shuffled case must actually reorder");
++    assert_eq!(multipart_etag(&shuffled).unwrap(), etag);
++    // ... and it really is ASCENDING order, not "whatever the caller handed us": the
++    // descending concatenation of the same digests is a different value.
++    let mut descending = Sha256::new();
++    for digest in [three, two, one] {
++        descending.update(digest.as_bytes());
++    }
++    let descending: [u8; 32] = descending.finalize().into();
++    assert_ne!(
++        etag.to_string(),
++        format!("{}-3", hex_lower(&descending)),
++        "the composition is not order-sensitive at all"
++    );
++
++    // A STRICT SUBSET of the staged parts is a different object.
++    let subset = multipart_etag(&[(part(1), one), (part(2), two)]).unwrap();
++    assert_ne!(subset, etag);
++    assert_eq!(subset.parts(), 2);
++
++    // HEX TEXT concatenation is a different value from RAW BYTE concatenation, so a
++    // hex-vs-raw slip cannot pass this leg.
++    let mut hex_hasher = Sha256::new();
++    for digest in [one, two, three] {
++        hex_hasher.update(digest.to_hex().as_bytes());
++    }
++    let hex_composed: [u8; 32] = hex_hasher.finalize().into();
++    assert_ne!(
++        etag.to_string(),
++        format!("{}-3", hex_lower(&hex_composed)),
++        "the ETag concatenates hex TEXT, not the raw digest bytes"
++    );
++
++    // Part numbers are NOT mixed into the ETag — that is the fingerprint's job — so the same
++    // bodies under different numbers give the same ETag ...
++    let renumbered = multipart_etag(&[(part(3), one), (part(4), two), (part(9), three)]).unwrap();
++    assert_eq!(renumbered, etag);
++    // ... which is exactly why Complete's idempotence is keyed on the fingerprint (leg 6).
++
++    // An assembly of nothing, or one naming a part twice, is an error rather than an ETag
++    // that depends on which duplicate survived.
++    assert!(matches!(
++        multipart_etag(&[]),
++        Err(RecordError::NoPartsNamed)
++    ));
++    assert!(matches!(
++        multipart_etag(&[(part(1), one), (part(1), two)]),
++        Err(RecordError::DuplicatePart { part_number: 1 })
++    ));
++}
++
++#[test]
++fn a_composed_etag_parses_back_and_a_malformed_one_does_not() {
++    let etag = multipart_etag(&[(part(1), digest_of("one")), (part(2), digest_of("two"))]).unwrap();
++    let text = etag.to_string();
++    assert_eq!(MultipartEtag::parse(&text).unwrap(), etag);
++    assert_eq!(MultipartEtag::parse(&text).unwrap().parts(), 2);
++    assert_eq!(
++        MultipartEtag::parse(&text).unwrap().composed().to_hex(),
++        text.split('-').next().unwrap()
++    );
++    for bad in [
++        String::new(),
++        "deadbeef-1".to_string(),
++        format!("{}-0", digest_of("x").to_hex()),
++        format!("{}-01", digest_of("x").to_hex()),
++        format!("{}-+1", digest_of("x").to_hex()),
++        digest_of("x").to_hex(),
++        format!("{}-x", digest_of("x").to_hex()),
++        digest_of("x").to_hex().to_uppercase(),
++    ] {
++        assert!(
++            MultipartEtag::parse(&bad).is_err(),
++            "the malformed etag {bad:?} parsed"
++        );
++    }
++}
++
++#[test]
++fn a_digest_is_exactly_64_lowercase_hex_characters() {
++    // `Digest` is what makes "the raw 32 bytes" a type rather than a convention, so these
++    // rejections are what keep a short or uppercase digest out of every composition.
++    let digest =
++        Digest::from_hex("1f00ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d")
++            .unwrap();
++    assert_eq!(digest.as_bytes()[0], 0x1f, "hi*16 + lo, not hi + lo");
++    assert_eq!(digest.as_bytes()[1], 0x00);
++    assert_eq!(digest.as_bytes()[2], 0xff);
++    assert_eq!(digest.as_bytes()[3], 0x01);
++    assert_eq!(
++        digest.to_hex(),
++        "1f00ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d"
++    );
++    assert_eq!(hex_lower(&[0x00, 0x0f, 0xf0, 0xff]), "000ff0ff");
++    assert_eq!(Digest::from_bytes(*digest.as_bytes()), digest);
++
++    let sixty_four = digest.to_hex();
++    for bad in [
++        String::new(),
++        sixty_four[..63].to_string(),
++        format!("{sixty_four}0"),
++        sixty_four.to_uppercase(),
++        format!("{}Ff{}", &sixty_four[..2], &sixty_four[4..]),
++        format!("{}g0{}", &sixty_four[..2], &sixty_four[4..]),
++        format!("{}0g{}", &sixty_four[..2], &sixty_four[4..]),
++        format!("{} 0{}", &sixty_four[..2], &sixty_four[4..]),
++    ] {
++        assert!(
++            Digest::from_hex(&bad).is_err(),
++            "{bad:?} parsed as a SHA-256 digest"
++        );
++    }
++    // The digest of known content is SHA-256's, not some other function's (FIPS-180-4's
++    // published `abc` vector).
++    assert_eq!(
++        Digest::of(b"abc").to_hex(),
++        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++    );
++}
++
++// ===========================================================================
++// Leg 6 — `complete_fingerprint` tells an identical retry from a different assembly
++// ===========================================================================
++
++/// The oracle: the pair count, then each `(part_number, digest)` in ascending part-number
++/// order, both fixed width.
++fn fingerprint_oracle(mut named: Vec<(u32, Digest)>) -> Digest {
++    named.sort_by_key(|(number, _)| *number);
++    let mut hasher = Sha256::new();
++    hasher.update((named.len() as u64).to_be_bytes());
++    for (number, digest) in &named {
++        hasher.update(number.to_be_bytes());
++        hasher.update(digest.as_bytes());
++    }
++    Digest::from_bytes(hasher.finalize().into())
++}
++
++#[test]
++fn the_complete_fingerprint_distinguishes_a_retry_from_a_different_assembly() {
++    let one = digest_of("one");
++    let two = digest_of("two");
++    let three = digest_of("three");
++    let named = vec![(part(1), one), (part(2), two), (part(3), three)];
++
++    // It is the settled function, not merely self-consistent.
++    let fingerprint = complete_fingerprint(&named).unwrap();
++    assert_eq!(
++        fingerprint,
++        fingerprint_oracle(vec![(1, one), (2, two), (3, three)])
++    );
++
++    // Identical lists agree.
++    assert_eq!(complete_fingerprint(&named).unwrap(), fingerprint);
++
++    // One digest changed disagrees — this is what stops a client being told its assembly
++    // succeeded while the store holds an earlier one.
++    let changed = vec![
++        (part(1), one),
++        (part(2), digest_of("two-prime")),
++        (part(3), three),
++    ];
++    assert_ne!(complete_fingerprint(&changed).unwrap(), fingerprint);
++
++    // The SAME digests under DIFFERENT part numbers disagree: the numbers are mixed in,
++    // which is exactly what the ETag does not do (leg 5). This pair is the whole reason the
++    // fingerprint exists — the two assemblies are indistinguishable to the ETag, so a
++    // tombstone keyed on the ETag would answer the second one with the first one's success.
++    let renumbered = vec![(part(1), one), (part(2), two), (part(4), three)];
++    assert_ne!(complete_fingerprint(&renumbered).unwrap(), fingerprint);
++    assert_eq!(
++        multipart_etag(&renumbered).unwrap(),
++        multipart_etag(&named).unwrap(),
++        "the renumbering is invisible to the ETag, which is why the fingerprint exists"
++    );
++    // Swapping which digest belongs to which part number is a different assembly too.
++    let swapped = vec![(part(1), two), (part(2), one), (part(3), three)];
++    assert_ne!(complete_fingerprint(&swapped).unwrap(), fingerprint);
++
++    // A REORDERED list of the same pairs agrees, because the canonical order is pinned:
++    // part-number ASCENDING, applied inside the function. A client that lists its parts in a
++    // different order is retrying the same assembly and must get the same answer.
++    let reordered = vec![(part(3), three), (part(1), one), (part(2), two)];
++    assert_ne!(
++        reordered, named,
++        "the reordered case must actually reorder the input"
++    );
++    assert_eq!(complete_fingerprint(&reordered).unwrap(), fingerprint);
++    // And ascending really is the canonical order: hashing the caller's descending order
++    // would give a different value.
++    let mut descending = Sha256::new();
++    descending.update(3u64.to_be_bytes());
++    for (number, digest) in [(3u32, three), (2, two), (1, one)] {
++        descending.update(number.to_be_bytes());
++        descending.update(digest.as_bytes());
++    }
++    assert_ne!(
++        Digest::from_bytes(descending.finalize().into()),
++        fingerprint,
++        "the encoding is not order-sensitive at all"
++    );
++
++    // A strict subset disagrees.
++    let subset = vec![(part(1), one), (part(2), two)];
++    assert_ne!(complete_fingerprint(&subset).unwrap(), fingerprint);
++
++    // An empty list, or one naming a part twice, is an error rather than a fingerprint.
++    assert!(matches!(
++        complete_fingerprint(&[]),
++        Err(RecordError::NoPartsNamed)
++    ));
++    assert!(matches!(
++        complete_fingerprint(&[(part(1), one), (part(1), two)]),
++        Err(RecordError::DuplicatePart { part_number: 1 })
++    ));
++}
++
++#[test]
++fn the_fingerprint_and_the_etag_are_different_functions_of_the_same_input() {
++    // They must not be interchangeable: the ETag ignores part numbers (so two numberings of
++    // the same bodies collide in it) and the fingerprint does not. Storing one where the
++    // other belongs would make a tombstone answer a different assembly with success.
++    let named = vec![(part(1), digest_of("one")), (part(2), digest_of("two"))];
++    let etag = multipart_etag(&named).unwrap();
++    let fingerprint = complete_fingerprint(&named).unwrap();
++    assert_ne!(etag.composed(), fingerprint);
++    assert_ne!(etag.to_string(), fingerprint.to_hex());
++}
+diff --git a/crates/core/tests/mutation_regressions.rs b/crates/core/tests/mutation_regressions.rs
+index e11a902..76d9573 100644
+--- a/crates/core/tests/mutation_regressions.rs
++++ b/crates/core/tests/mutation_regressions.rs
+@@ -218,6 +218,8 @@ async fn sweep_reclaims_at_expiry_boundary_and_deletes() {
+         0xAAAA,
+         &PendingEntry {
+             lease_expiry_millis: 100,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+@@ -227,6 +229,8 @@ async fn sweep_reclaims_at_expiry_boundary_and_deletes() {
+         0xBBBB,
+         &PendingEntry {
+             lease_expiry_millis: 200,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+@@ -561,6 +565,8 @@ async fn commit_chunk_map_superseding_leased_stamps_a_fresh_modified() {
+         new_chunk,
+         &PendingEntry {
+             lease_expiry_millis: 1_000,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+diff --git a/crates/custodian/tests/gc.rs b/crates/custodian/tests/gc.rs
+index cb6d6be..d1b5f35 100644
+--- a/crates/custodian/tests/gc.rs
++++ b/crates/custodian/tests/gc.rs
+@@ -196,6 +196,8 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
+         pending_chunk,
+         &PendingEntry {
+             lease_expiry_millis: 100,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+diff --git a/crates/custodian/tests/restore_reconcile.rs b/crates/custodian/tests/restore_reconcile.rs
+index ebd7905..ec77893 100644
+--- a/crates/custodian/tests/restore_reconcile.rs
++++ b/crates/custodian/tests/restore_reconcile.rs
+@@ -378,6 +378,8 @@ async fn an_in_flight_pending_chunk_is_left_to_gc() {
+ 
+     let entry = PendingEntry {
+         lease_expiry_millis: NOW + 60_000,
++        owner: None,
++        staged: None,
+     };
+     meta.commit(WriteBatch::new().put(metadata::pending_key(11), metadata::encode(&entry)))
+         .await
+diff --git a/crates/custodian/tests/segmented_map_consumers.rs b/crates/custodian/tests/segmented_map_consumers.rs
+index 5a47c16..670f526 100644
+--- a/crates/custodian/tests/segmented_map_consumers.rs
++++ b/crates/custodian/tests/segmented_map_consumers.rs
+@@ -492,6 +492,8 @@ async fn seed_expired_lease(meta: &MemMeta, d0: &MemDServer, chunk: ChunkId) {
+         chunk,
+         &metadata::PendingEntry {
+             lease_expiry_millis: 10,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index 0f024b4..4193443 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -903,6 +903,8 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
+         LEASED,
+         &PendingEntry {
+             lease_expiry_millis: lease_expiry,
++            owner: None,
++            staged: None,
+         },
+     )
+     .await
+diff --git a/crates/metadata-redb/tests/conformance.rs b/crates/metadata-redb/tests/conformance.rs
+index 5bcf30b..7b69dff 100644
+--- a/crates/metadata-redb/tests/conformance.rs
++++ b/crates/metadata-redb/tests/conformance.rs
+@@ -116,6 +116,8 @@ fn pending_ledger_written_and_cleared() {
+             chunk,
+             &PendingEntry {
+                 lease_expiry_millis: 5_000,
++                owner: None,
++                staged: None,
+             },
+         )
+         .await
+diff --git a/crates/server/tests/custodian_gc.rs b/crates/server/tests/custodian_gc.rs
+index c336659..334440f 100644
+--- a/crates/server/tests/custodian_gc.rs
++++ b/crates/server/tests/custodian_gc.rs
+@@ -629,6 +629,8 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
+         pending_key(LEASED_CHUNK),
+         metadata::encode(&PendingEntry {
+             lease_expiry_millis: LEASE_EXPIRY,
++            owner: None,
++            staged: None,
+         }),
+     ))
+     .await
+@@ -708,6 +710,8 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
+         pending_key(LEASED_CHUNK),
+         metadata::encode(&PendingEntry {
+             lease_expiry_millis: LOGICAL_ZERO_LEASE_EXPIRY,
++            owner: None,
++            staged: None,
+         }),
+     ))
+     .await
+@@ -901,6 +905,8 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
+         pending_key(LEASED_CHUNK),
+         metadata::encode(&PendingEntry {
+             lease_expiry_millis: LEASE_EXPIRY,
++            owner: None,
++            staged: None,
+         }),
+     ))
+     .await
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index fe86c9d..48cea46 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -84,6 +84,8 @@ A half-upgraded fleet is the normal state during a rolling upgrade (constraint 2
+ 
+ **A metadata record's shape evolves the same way (proposal 0016 decision 7(a)).** An inode's chunk map is either **flat** (the chunk list inline, a JSON array — the shape every record written before segmentation carries, needed because one metadata value has a size ceiling far below the launch object-size target) or **segmented** (a JSON object: the segment-group identity `{nonce, epoch}`, a segment count, and the segment table, with the chunks themselves in per-segment `seg:<nonce>:<epoch>:<index>` records). The two are told apart by JSON *type*, so a pre-existing record decodes and re-encodes **byte-identically** — a correctness requirement, not hygiene: every metadata compare-and-swap in the system is `require(key, encode(prior))` compared byte-for-byte against the stored value, so an encoding that gained a tag or a wrapper would turn every overwrite, backfill, reconstruction and rebalance of every pre-existing object into a permanent conflict. `seg:`/`seggrp:` are **new key prefixes** over which nothing older reads, so their introduction needs no migration and rewrites no existing record. Structural invariants of the segmented shape — the segment count agreeing with the table, a gap-free ascending index sequence, every index inside the fixed-width key space the `seg:` grammar can address (which is therefore also the *format's* maximum segment count), a contiguous byte tiling that spans exactly the object's recorded size (and one whose arithmetic stays inside `u64`, since a wrapped span would agree with a forged size), a well-formed nonce, and one segment record's chunk lengths summing (checked, never wrapped) to the span it declares — are enforced **at decode**: a malformed record is an error, never a value a consumer could half-resolve. **Capacity** is deliberately not one of those invariants: the ceiling on how many segments a root may name is a number a deployment picks, so it is enforced only where a table becomes *work* — a publication that writes one, and the range read that would spend one — and a limit that moves later can never make an already-published object *undecodable*. That ceiling is itself sized with **2× headroom**: a worst-case segment *table* encodes to at most *half* the tightest backend's value limit and the other half is a reserve for the rest of the record — the object metadata a client supplies, whose width is the caller's, and whatever field a later revision adds — because a root that only just fits is one a later field addition would make unwritable, and an object whose root can no longer be re-written is an object whose placement can never be repaired. The nonce is a **validated type** rather than a string for the same class of reason: the `seg:` range derived from it is what a cleanup pass deletes, so a nonce carrying the key grammar's separator would name another generation's live range. The key space is the opposite case and that is why it *is* checked at decode: a segment past it has no canonical key at any setting, so no reader, GC pass or repair could ever address its record. Symmetrically, a shape this build cannot yet resolve or publish is refused **on the way in** as well: until the staged-publication committer exists, creating an inode with a segmented map, or superseding one, is a typed error rather than a root written over segments that do not exist (or one whose `seg:` records nothing would ever reclaim). Every *existing* consumer of a chunk map obeys the same rule from the other side — the read path, the delete that must orphan an object's fragments, the maintenance loops that reclaim or move them, the id recovery that must not re-mint them all treat a shape they cannot resolve as a typed error **for that object** rather than as an empty chunk list, because "this object owns no chunks" is indistinguishable from a zero-length object and is precisely how a live object's fragments would become unreferenced and be collected. Landing the shape and its codec ahead of any producer or resolver (this slice) keeps the byte-identical, always-flat behaviour of every object in the fleet unchanged until a later slice actually publishes a segmented map.
+ 
++**A new record FAMILY arrives the same way — vocabulary first, writers later (proposal 0016 §1, issue #654).** The multipart commit protocol adds eight record classes: a fleet **admission ledger** singleton, one **session** record per upload, an **in-flight slot** whose key space *is* the per-session concurrency cap, a committed **part** and its **summary** sibling, an **owned staging entry** for a chunk written but not yet committed, and two **retirement obligations** — one that orphan-marks bytes before deleting the records that named them, one that deletes records whose bytes something else already protects. Each lives under its own prefix, and no prefix is a prefix of another, so no bounded range read ever returns a neighbour's records: that disjointness is what keeps the fleet-wide expiry sweep of ordinary write leases from reaping a live upload's staged chunks, and what keeps a per-session scan from sweeping up the fleet admission ledger. Every component a key is built from — the upload id, the attempt id, the part number, the slot index, the digest — is a **validated type** rather than a string or a bare integer, so the numeric fields are fixed-width and zero-padded (byte order equals numeric order, the property a resumable cursor rests on) and a non-canonical spelling of one record parses as *no* record at all: two spellings would let a create-if-absent guard admit past its cap and let a bounded scan miss a record that exists — residue nothing enumerates and therefore nothing reclaims. Structural invariants are checked at decode and surface as errors, never as values: a session carrying a field its lifecycle state forbids, an admission ledger whose stored limit disagrees with the budget tuple that derives it, a part whose declared length disagrees with (or overflows) its own chunk list, an obligation whose payload contradicts the mode its key names. **Capacity is deliberately not one of those invariants** — the same boundary the segmented map draws above: the ceilings a deployment picks are enforced where work is *admitted*, so lowering one can never make an already-written record undecodable at exactly the moment the teardown path needs to read it. The one change to an existing record is additive and inert: the pending-lease entry gains two optional fields (the owning upload, and the planned placement of the chunk being staged), omitted entirely when absent so a pre-existing entry re-encodes to its stored bytes — the byte-identical requirement every compare-and-swap in the metadata layer rests on — and set together or not at all, since an entry that is half-owned is a torn record rather than a value. As with the segmented map, this slice lands the vocabulary and its codecs **ahead of any writer**: nothing yet creates, reads or reclaims one of these records, so no on-disk shape changes and no migration is needed until a later slice publishes one.
++
+ ## 8.8 Multi-tenancy
+ 
+ The primary deployment is a provider serving many tenants on shared infrastructure (section 1.4), so a **tenant** is a first-class unit — a namespace partition plus an identity domain, carrying its own policy (residency, replication factor, encryption, quotas, rate limits). See ADR-0022.

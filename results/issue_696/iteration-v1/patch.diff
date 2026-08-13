@@ -1,0 +1,891 @@
+diff --git a/crates/custodian/src/rebalance.rs b/crates/custodian/src/rebalance.rs
+index 319b330..fa29ddf 100644
+--- a/crates/custodian/src/rebalance.rs
++++ b/crates/custodian/src/rebalance.rs
+@@ -47,8 +47,9 @@
+ //! on-disk-format knowledge of its own.
+ 
+ use std::collections::{BTreeSet, HashMap};
++use std::fmt::Display;
+ 
+-use wyrd_core::metadata::{self, ChunkMapError, InodeId, InodeRecord, InodeState};
++use wyrd_core::metadata::{self, ChunkMapError, ChunkRef, InodeRecord, InodeState};
+ use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
+ use wyrd_core::repair;
+ use wyrd_traits::{
+@@ -82,7 +83,12 @@ pub struct RebalanceContext<'a> {
+ /// chunk lives (for the CAS), and the failure domains its surviving fragments occupy
+ /// (to keep the move disjoint).
+ struct EvacPlan {
+-    inode_id: InodeId,
++    /// The record's `inode:` key **exactly as the store spelled it** — CAS'd on and
++    /// written back under, never re-derived from a parsed id: `"inode:007"` and
++    /// `"inode:7"` both parse to id `7`, so re-deriving the key from a parsed id would
++    /// read one record and CAS another (Rule C; the same precedent `gc.rs:280-294`,
++    /// `:402` follows for its own `unresolvable` map).
++    inode_key: Vec<u8>,
+     prior: InodeRecord,
+     chunk_index: usize,
+     chunk_id: ChunkId,
+@@ -99,10 +105,18 @@ struct EvacPlan {
+     survivor_domains: Vec<FailureDomain>,
+ }
+ 
+-/// One rebalance reconciliation pass over `ctx` at logical time `now_millis`.
+-/// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
+-/// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
+-/// repointed, [`Reconciled::Satisfied`] otherwise.
++/// One rebalance reconciliation pass over `ctx` at logical time `now_millis`. Dispatched
++/// only from [`crate::reconcile_step`] (the fenced control point) — never a parallel
++/// entry. Returns [`Reconciled::Changed`] if any chunk's placement record was repointed,
++/// [`Reconciled::Blocked`] if the scan refused an evacuation or could not account for
++/// part of the namespace, [`Reconciled::Satisfied`] otherwise.
++///
++/// Every committed record is resolved through the ONE resolver every other consumer
++/// shares ([`metadata::resolve_chunk_map`], 0016 decision 7(e)), so a **segmented**
++/// object's fragments are seen by the drain like any other's — a fragment nobody can see
++/// is a fragment nobody evacuates. Containment is **per object**, never per store
++/// (`docs/principles.md` §5 C-1): one damaged or segmented record is named and refused,
++/// the walk goes on, and every other object's evacuation still happens.
+ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Result<Reconciled> {
+     let stores: HashMap<DServerId, &dyn ChunkStore> = ctx.fleet.iter().copied().collect();
+ 
+@@ -117,9 +131,15 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+     }
+     let draining_set: BTreeSet<DServerId> = draining.keys().copied().collect();
+ 
+-    // Plan an evacuation for each committed chunk with a fragment on a draining server.
+-    let plans = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
++    // Plan an evacuation for each committed chunk with a fragment on a draining server —
++    // and, beside them, what the scan could not answer for (`refused`).
++    let (plans, refused) = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
+ 
++    // The planned moves run even when the scan could not read (or may not repoint) every
++    // object — that containment is the point: one damaged or segmented record may not
++    // cost every healthy object its evacuation (§5 C-1). An incomplete/refused scan
++    // changes the ANSWER below, never the work: `Blocked` withholds the certification a
++    // decommission is read off, it never withholds the moves already proven safe.
+     let mut changed = false;
+     for plan in &plans {
+         match evacuate_chunk(ctx, &stores, plan, &draining_set, now_millis).await? {
+@@ -129,40 +149,144 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+         }
+     }
+ 
+-    Ok(if changed {
++    Ok(if refused.total() > 0 {
++        // Refuse to certify the drain: a refused evacuation leaves a fragment ON the
++        // draining server, and an object this scan could not account for hides whether
++        // it has fragments there at all — `Satisfied` tells an operator a decommission
++        // is safe (§5 C-1), which this pass never claims more than it read.
++        Reconciled::Blocked
++    } else if changed {
+         Reconciled::Changed
+     } else {
+         Reconciled::Satisfied
+     })
+ }
+ 
+-/// Scan the committed chunk maps for fragments sitting on a draining server, building
+-/// one [`EvacPlan`] per affected chunk.
++/// How many committed OBJECTS one scan could not answer for: those it could not read (or
++/// whose resolve did not answer from the generation this scan just read — Rule A), plus
++/// those holding something for the drain this scan may not move (a segmented map) — each
++/// counted through ONE entry point, so a site can neither name without counting nor count
++/// without naming (Rule D: once per OBJECT, never once per chunk). While it is non-zero
++/// the drain is not satisfied.
++#[derive(Default)]
++struct Refusals(usize);
++
++impl Refusals {
++    /// NAME one object this scan could not account for on the audit seam, and count it —
++    /// where the object is READ, before any evacuation runs (Rule E, mirroring
++    /// `gc.rs:164-166`), so a transient store fault later in the pass cannot cost the
++    /// operator the name of the record to repair.
++    fn unreadable(&mut self, key: &[u8], fault: &dyn Display) {
++        emit_unaccounted(&crate::gc::object_name(key), fault);
++        self.0 += 1;
++    }
++
++    /// NAME one object whose `chunks` this scan may not repoint (a **segmented** map —
++    /// #682's to repoint), weighing what that leaves on the draining servers: the
++    /// FRAGMENTS it can see there, plus the chunks whose committed placement it cannot
++    /// even classify (those may put fragments there too and nothing can show they do
++    /// not — each still raises the malformed-placement NEEDS-HUMAN signal) — and count
++    /// it ONCE, per Rule D. Fragments, not chunks: one chunk with three fragments there
++    /// is three still on the machine. Nothing here is ever WRITTEN — a refusal writes
++    /// nothing at all (Rule B).
++    fn refuse(&mut self, key: &[u8], chunks: &[ChunkRef], draining: &BTreeSet<DServerId>) {
++        let (mut fragments, mut unreadable) = (0usize, 0usize);
++        for chunk in chunks {
++            match chunk.checked_fragments() {
++                Ok(at) => fragments += at.filter(|(_, at)| draining.contains(at)).count(),
++                Err(_) => {
++                    emit_needs_human(chunk.id);
++                    unreadable += 1;
++                }
++            }
++        }
++        // Nothing of this object's is on a draining server and every chunk of it was
++        // readable: the drain is not waiting on it, so there is nothing to refuse.
++        if fragments + unreadable == 0 {
++            return;
++        }
++        emit_refused(&crate::gc::object_name(key), fragments, unreadable);
++        self.0 += 1;
++    }
++
++    /// Everything this scan owes the drain's certification but could not give it.
++    fn total(&self) -> usize {
++        self.0
++    }
++}
++
++/// Scan the committed chunk maps for fragments sitting on a draining server, building one
++/// [`EvacPlan`] per affected chunk — and, beside them, what the scan could not answer for.
++/// Every record is read through the ONE resolver every consumer shares
++/// ([`metadata::resolve_chunk_map`], 0016 decision 7(e)), so a **segmented** object's
++/// fragments are seen by the drain like any other's: a fragment nobody can see is a
++/// fragment nobody evacuates. One this scan cannot read — or whose resolve did not answer
++/// from the generation just scanned (Rule A) — is CONTAINED by `gc::referenced_fragments`'
++/// rule (`gc.rs:360-455`): named, the walk going on.
+ async fn plan_evacuations(
+     meta: &dyn MetadataStore,
+     topology: &Topology,
+     draining: &BTreeSet<DServerId>,
+-) -> Result<Vec<EvacPlan>> {
++) -> Result<(Vec<EvacPlan>, Refusals)> {
+     let mut plans = Vec::new();
++    let mut refused = Refusals::default();
+     for (key, value) in meta.scan(b"inode:").await? {
+-        let record: InodeRecord = metadata::decode(&value)?;
++        // A decode failure is THIS object's fault — contained exactly as
++        // `gc.rs:366-384` states in full, never a `?` that ends the whole scan.
++        let record: InodeRecord = match metadata::decode(&value) {
++            Ok(record) => record,
++            Err(fault) => {
++                refused.unreadable(&key, &fault);
++                continue;
++            }
++        };
+         if record.state != InodeState::Committed {
+             continue;
+         }
+-        let Some(inode_id) = parse_inode_key(&key) else {
+-            continue;
++        // `Ok(None)`: no live committed generation left under this key (deleted, or
++        // retired since the scan read it) — nothing to evacuate, skipped exactly as an
++        // already-uncommitted record is. The network bound on this await is the
++        // STORE's (#508/#636), not this caller's.
++        let resolved = match metadata::resolve_chunk_map(meta, &key, &record).await {
++            Ok(Some(resolved)) => resolved,
++            Ok(None) => continue,
++            Err(err) => match err.downcast::<ChunkMapError>() {
++                // The resolver's own typed verdict that THIS generation cannot be
++                // read — recovered by downcast because the trait seam boxes every
++                // error. Contained.
++                Ok(fault) => {
++                    refused.unreadable(&key, &fault);
++                    continue;
++                }
++                // Not a chunk-map anomaly: a store fault under the read, not this
++                // object's own — propagate (`gc.rs:355-359`'s rule).
++                Err(err) => return Err(err),
++            },
+         };
+-        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+-        // scan exactly as an unreadable record already does via `decode(&value)?`
+-        // above.
+-        let flat_chunk_map =
+-            record
+-                .chunk_map
+-                .as_flat()
+-                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+-                    operation: "rebalance::plan_evacuations",
+-                })?;
+-        for (chunk_index, chunk) in flat_chunk_map.iter().enumerate() {
++        // Rule A — act only on a resolve that answered from the generation THIS scan
++        // just read. `resolve_chunk_map` restarts onto the LIVE root when the scanned
++        // snapshot was superseded mid-resolve (`metadata.rs:2624-2632`) and returns a
++        // **different** generation's `ResolvedChunkMap` — a `Cow::Owned` record, never
++        // a `Cow::Borrowed` of `record` above. Mixing that generation's chunk list with
++        // `record`'s bytes below is exactly what made unchecked indexing panic before
++        // the stale CAS could reject the plan (round 7's T4 blocker). Contained instead:
++        // nothing about this object is planned or reported on the draining servers,
++        // nothing is written, and the object is re-read next pass.
++        if !matches!(resolved.record, std::borrow::Cow::Borrowed(_)) {
++            refused.unreadable(
++                &key,
++                &"resolve restarted onto a generation this scan did not read",
++            );
++            continue;
++        }
++        // What this pass may WRITE: a **segmented** record is #682's to repoint, so
++        // NOTHING in it moves, chunks whose placement cannot even be classified
++        // included — refused, once per object (Rule D), never once per chunk.
++        if record.chunk_map.is_segmented() {
++            refused.refuse(&key, &resolved.chunks, draining);
++            continue;
++        }
++        for (chunk_index, chunk) in resolved.chunks.iter().enumerate() {
+             // Resolve the FULL `0..fragment_count()` index space through the shared
+             // STRICT companion (`ChunkRef::checked_fragments`, `core/src/metadata.rs`,
+             // ADR-0040 decision 4) — classify the committed placement BEFORE expanding it,
+@@ -202,7 +326,7 @@ async fn plan_evacuations(
+                 .filter_map(|(_, server)| topology.domain_of(*server).cloned())
+                 .collect();
+             plans.push(EvacPlan {
+-                inode_id,
++                inode_key: key.clone(),
+                 prior: record.clone(),
+                 chunk_index,
+                 chunk_id: chunk.id,
+@@ -212,7 +336,7 @@ async fn plan_evacuations(
+             });
+         }
+     }
+-    Ok(plans)
++    Ok((plans, refused))
+ }
+ 
+ /// The outcome of evacuating one chunk.
+@@ -250,15 +374,15 @@ async fn evacuate_chunk(
+         Err(_) => return Ok(EvacOutcome::Aborted),
+     };
+ 
+-    // A segmented map has no resolver yet (#649-#651): fail closed rather than treat
+-    // the object as owning no chunks.
+-    let prior_chunk_map =
+-        plan.prior
+-            .chunk_map
+-            .as_flat()
+-            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+-                operation: "rebalance::evacuate_chunk",
+-            })?;
++    // `plan` is built only over a FLAT generation — `plan_evacuations` refuses a
++    // segmented object's chunks wholesale, never planning one (Rule B: an incomplete /
++    // refused reading changes what this pass may CLAIM, never what it does for an
++    // object it read successfully). So `None` here is unreachable in practice; an
++    // abort — nothing copied, nothing committed — is the fail-safe answer regardless,
++    // never a `?` that would end the pass over every OTHER plan too.
++    let Some(prior_chunk_map) = plan.prior.chunk_map.as_flat() else {
++        return Ok(EvacOutcome::Aborted);
++    };
+ 
+     // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
+     // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
+@@ -307,7 +431,11 @@ async fn evacuate_chunk(
+         // the content type.
+         ..plan.prior.clone()
+     };
+-    let inode_key = metadata::inode_key(plan.inode_id);
++    // CAS'd on, and written back under, the key the store gave this record — never a
++    // re-derivation via `parse_inode_key` → `inode_key(id)`, which would collapse
++    // distinct keys like `"inode:007"` and `"inode:7"` onto the same CAS target (Rule
++    // C).
++    let inode_key = plan.inode_key.clone();
+     let mut batch = WriteBatch::new()
+         .require(inode_key.clone(), metadata::encode(&plan.prior))
+         .put(inode_key, metadata::encode(&next));
+@@ -329,14 +457,6 @@ async fn evacuate_chunk(
+     }
+ }
+ 
+-fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
+-    std::str::from_utf8(key)
+-        .ok()?
+-        .strip_prefix("inode:")?
+-        .parse()
+-        .ok()
+-}
+-
+ /// Emit the **capacity plane's per-failure-domain utilization** on the durability-plane
+ /// seam (ADR-0011 / ADR-0012, `0005:341-343`): one gauge sample per failure domain, the
+ /// `DurabilityTelemetry` `tracing`→OTel bridge fans out (the `domain` label carries the
+@@ -379,6 +499,40 @@ fn emit_needs_human(chunk: ChunkId) {
+     );
+ }
+ 
++/// Emit an **unaccounted committed object** on the durability-plane seam: this scan could
++/// not read that object's record, resolve its chunk map, or trust the generation the
++/// resolve answered from (Rule A) — so it cannot say whether the object holds fragments
++/// on a draining server, and the drain is NOT satisfied until it is repaired. Named as GC
++/// names one ([`crate::gc::object_name`]).
++fn emit_unaccounted(object: &str, fault: &dyn Display) {
++    tracing::warn!(monotonic_counter.rebalance_unaccounted_records = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.rebalance.audit",
++        action = "unresolvable-chunk-map",
++        inode = %object,
++        fault = %fault,
++        "rebalance could not account for a committed object's chunk map; it cannot see whether that object holds fragments on a draining server, so the drain is NOT satisfied — operator signal",
++    );
++}
++
++/// Emit a **refused evacuation** — **once per object** (Rule D), never once per chunk.
++/// NOTHING is written, `fragments` fragments STAY on the draining server and the pass
++/// answers [`Reconciled::Blocked`]: a drain reported satisfied over them says a
++/// decommission is safe when it is not. `unreadable` is why `fragments` is a floor, not
++/// an exact count.
++fn emit_refused(object: &str, fragments: usize, unreadable: usize) {
++    tracing::warn!(monotonic_counter.rebalance_evacuation_refused = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.rebalance.audit",
++        action = "refused",
++        inode = %object,
++        reason = "segmented-chunk-map",
++        fragments,
++        unreadable,
++        "rebalance refused to evacuate fragment(s) off a draining server; they stay put, NOTHING was written and the drain is not satisfied",
++    );
++}
++
+ /// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the
+ /// copied fragments are now collectable garbage.
+ fn emit_conflict(chunk: ChunkId) {
+diff --git a/crates/custodian/tests/segmented_map_rebalance.rs b/crates/custodian/tests/segmented_map_rebalance.rs
+new file mode 100644
+index 0000000..29afea8
+--- /dev/null
++++ b/crates/custodian/tests/segmented_map_rebalance.rs
+@@ -0,0 +1,540 @@
++//! Issue #696 (child 2 of 3 of the #681 split, 0016 decision 7(e)): rebalance resolves every
++//! committed object the way every other consumer already resolves one, contains per object
++//! what it cannot read, and refuses — rather than aborts or silently discards — the
++//! evacuation it does not own.
++//!
++//! On the base, `rebalance.rs` `?`-s out on `ChunkMapError::SegmentedMapUnsupported`: one
++//! segmented object anywhere stops every drain. Drives the real fenced control point
++//! [`reconcile_step`](wyrd_custodian::reconcile_step) over ONE shared `MemMeta` double.
++//!
++//! No assertion names a symbol this patch introduces: the red leg reverts `rebalance.rs`, so
++//! a new symbol would fail to COMPILE, not fail the assertion. `Reconciled::Blocked` already
++//! exists on the base (#650). Legs 1-4 and 6 are base-red; 5 and 7 bind over-containment.
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{
++    decode, encode, inode_key, resolve_chunk_map, seg_key, ChunkMap, ChunkRef, EcScheme,
++    InodeRecord, InodeState, SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap,
++};
++use wyrd_core::placement::Topology;
++use wyrd_core::write::{plan_write, write_fragments};
++use wyrd_custodian::desired_state::{set_lifecycle, DServerLifecycle};
++use wyrd_custodian::{
++    reconcile_step, Custodian, FencedZone, RebalanceContext, ReconcileError, Reconciled,
++};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
++    PlacementChunkStore, Result, WriteBatch,
++};
++
++// ---- ONE metadata double, shared by every leg ----
++
++/// `BTreeMap`: `scan` answers in key order, so a damaged/refused object sorts first.
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
++    /// Leg 4: the STALE bytes `scan` answers for this key, while `get` answers LIVE ones.
++    stale_scan: Mutex<Option<(Vec<u8>, Bytes)>>,
++    /// Leg 7: the key whose `get` fails with a plain (non-`ChunkMapError`) fault.
++    failing_get: Mutex<Option<Vec<u8>>>,
++}
++
++impl MemMeta {
++    fn stale_scan_of(self, key: Vec<u8>, stale: Bytes) -> Self {
++        *self.stale_scan.lock().unwrap() = Some((key, stale));
++        self
++    }
++
++    fn fail_get(self, key: Vec<u8>) -> Self {
++        *self.failing_get.lock().unwrap() = Some(key);
++        self
++    }
++}
++
++const STORE_FAULT: &str = "simulated store fault";
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        if self.failing_get.lock().unwrap().as_deref() == Some(key) {
++            return Err(Box::new(std::io::Error::other(STORE_FAULT)));
++        }
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        let mut rows: Vec<(Vec<u8>, Bytes)> = self
++            .kv
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(k, _)| k.starts_with(prefix))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++        if let Some((sk, stale)) = self.stale_scan.lock().unwrap().as_ref() {
++            for (_, v) in rows.iter_mut().filter(|(k, _)| k == sk) {
++                *v = stale.clone();
++            }
++        }
++        Ok(rows)
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<wyrd_traits::ScanPage> {
++        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key).cloned() != pre.expected {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        for (k, v) in batch.puts {
++            kv.insert(k, v);
++        }
++        for k in batch.deletes {
++            kv.remove(&k);
++        }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// One D server's fragment bytes.
++#[derive(Default)]
++struct MemDServer {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++impl PlacementChunkStore for MemDServer {}
++
++// ---- audit capture ----
++#[derive(Clone, Default)]
++struct Capture(Arc<Mutex<Vec<u8>>>);
++
++impl std::io::Write for Capture {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.0.lock().unwrap().extend_from_slice(buf);
++        Ok(buf.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
++    type Writer = Self;
++    fn make_writer(&'w self) -> Self::Writer {
++        self.clone()
++    }
++}
++
++/// Whether the audit trail carries this `action`/`inode` pair (legs 2, 3, 6).
++fn logged(capture: &str, action: &str, object: &str) -> bool {
++    capture.contains(&format!(r#""action":"{action}""#))
++        && capture.contains(&format!(r#""inode":"{object}""#))
++}
++
++// ---- fixture helpers ----
++const CHUNK_LEN: u64 = 5;
++/// `plan_write`'s default identity placement for a single-fragment chunk.
++const DRAINING: DServerId = 0;
++const TARGET: DServerId = 1;
++const NONCE_A: &str = "0123456789abcdef0123456789abcdef";
++const NONCE_B: &str = "fedcba9876543210fedcba9876543210";
++
++fn frag(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++fn group(nonce: &str, epoch: u64) -> SegmentGroup {
++    SegmentGroup::new(nonce, epoch).unwrap()
++}
++
++/// A committed flat, one-chunk record with no real on-disk fragment behind it (legs 3, 4).
++fn flat_record(chunk: ChunkId, dserver: DServerId, version: u64) -> InodeRecord {
++    let chunk_ref = ChunkRef {
++        id: chunk,
++        scheme: EcScheme::None,
++        len: CHUNK_LEN,
++        placement: vec![dserver],
++    };
++    InodeRecord {
++        size: CHUNK_LEN,
++        chunk_map: vec![chunk_ref].into(),
++        state: InodeState::Committed,
++        version,
++        ..Default::default()
++    }
++}
++
++/// A committed segmented record naming `n` one-chunk segments, no `seg:` records behind it.
++fn segmented_record(nonce: &str, epoch: u64, n: u32, version: u64) -> InodeRecord {
++    let segs = (0..n)
++        .map(|i| SegmentRef {
++            index: i,
++            byte_offset: u64::from(i) * CHUNK_LEN,
++            byte_len: CHUNK_LEN,
++        })
++        .collect();
++    let map = SegmentedMap::new(group(nonce, epoch), segs).unwrap();
++    InodeRecord {
++        size: u64::from(n) * CHUNK_LEN,
++        chunk_map: ChunkMap::Segmented(map),
++        state: InodeState::Committed,
++        version,
++        ..Default::default()
++    }
++}
++
++async fn commit(meta: &MemMeta, batch: WriteBatch) {
++    assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
++}
++
++async fn read(meta: &MemMeta, key: &[u8]) -> InodeRecord {
++    decode(&meta.get(key).await.unwrap().unwrap()).unwrap()
++}
++
++/// Mark [`DRAINING`] draining and drive `reconcile_step`, returning its audit trail too.
++async fn run(
++    meta: &MemMeta,
++    fleet: &[(DServerId, &dyn ChunkStore)],
++) -> (std::result::Result<Reconciled, ReconcileError>, String) {
++    use std::sync::Once;
++    static INIT: Once = Once::new(); // audit callsites must never latch `Interest::never` (#214)
++    INIT.call_once(|| {
++        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++    });
++    set_lifecycle(meta, DRAINING, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++    let mut topo = Topology::default();
++    topo.register(DRAINING, "A").register(TARGET, "B");
++    let ctx = RebalanceContext {
++        meta,
++        fleet,
++        topology: &topo,
++    };
++    let leader = Custodian::elect(&MemCoordination::new(), "zone-696")
++        .await
++        .unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    let capture = Capture::default();
++    let dispatch = tracing::Dispatch::new(
++        tracing_subscriber::registry().with(
++            tracing_subscriber::fmt::layer()
++                .json()
++                .with_writer(capture.clone()),
++        ),
++    );
++    let outcome = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), 500)
++        .with_subscriber(dispatch)
++        .await;
++    let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
++    (outcome, logged)
++}
++
++/// Write a real, checksummed chunk onto `d` and commit a flat root naming it under `key` —
++/// the smallest object `evacuate_chunk` can genuinely move (`fragment_intact` needs real bytes).
++async fn write_flat_on(meta: &MemMeta, d: &MemDServer, key: &[u8], chunk: ChunkId) {
++    let plan = plan_write(b"evacuate me", 11, EcScheme::None, || chunk).unwrap();
++    write_fragments(d, &plan).await.unwrap();
++    let root = InodeRecord {
++        size: 11,
++        chunk_map: plan.chunk_refs().into(),
++        state: InodeState::Committed,
++        version: 1,
++        ..Default::default()
++    };
++    commit(meta, WriteBatch::new().put(key.to_vec(), encode(&root))).await;
++}
++
++/// Seed a segmented root at `key` naming `chunks.len()` one-chunk segments, writing only the
++/// first `written` of their `seg:` records (`written < len` is `SegmentAbsent`'s real gap).
++async fn seed_segmented(
++    meta: &MemMeta,
++    key: &[u8],
++    nonce: &str,
++    chunks: &[(ChunkId, DServerId)],
++    written: usize,
++) {
++    for (index, &(chunk_id, dserver)) in chunks.iter().enumerate() {
++        if index < written {
++            let chunk_ref = ChunkRef {
++                id: chunk_id,
++                scheme: EcScheme::None,
++                len: CHUNK_LEN,
++                placement: vec![dserver],
++            };
++            let record = SegmentRecord::new(vec![chunk_ref], index as u64 * CHUNK_LEN).unwrap();
++            let sk = seg_key(&group(nonce, 1), index as u32).unwrap();
++            commit(meta, WriteBatch::new().put(sk, encode(&record))).await;
++        }
++    }
++    let root = segmented_record(nonce, 1, chunks.len() as u32, 1);
++    commit(meta, WriteBatch::new().put(key.to_vec(), encode(&root))).await;
++}
++
++// ---- leg 1: a segmented object no longer stops the flat work beside it ----
++
++#[tokio::test]
++async fn a_segmented_object_no_longer_stops_the_flat_evacuation_beside_it() {
++    let meta = MemMeta::default();
++    let (d0, d1, d2) = (
++        MemDServer::default(),
++        MemDServer::default(),
++        MemDServer::default(),
++    );
++    // A healthy segmented object holding nothing on the draining server, beside a flat
++    // chunk with a fragment ON the draining server.
++    seed_segmented(&meta, b"inode:1", NONCE_A, &[(0xA1, 2)], 1).await;
++    write_flat_on(&meta, &d0, b"inode:2", 0xB1).await;
++
++    let fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (1, &d1), (2, &d2)];
++    let (outcome, _) = run(&meta, &fleet).await;
++    assert_eq!(
++        outcome.expect("BASE-RED: a segmented object anywhere must not `Err` the pass"),
++        Reconciled::Changed,
++        "the flat fragment beside the segmented object is still evacuated"
++    );
++    let after = read(&meta, b"inode:2").await;
++    assert_eq!(
++        after.chunk_map.as_flat().unwrap()[0].placement,
++        vec![TARGET]
++    );
++    assert!(d1.get_fragment(frag(0xB1, 0)).await.unwrap().is_some());
++}
++
++// ---- leg 2: a segmented fragment stays put, refused, and the drain does not certify ----
++
++#[tokio::test]
++async fn a_fragment_in_a_seg_record_stays_put_refused_and_does_not_certify() {
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++    // A refused chunk is never read by `evacuate_chunk` — no genuine bytes needed.
++    d0.put_fragment(frag(0xA1, 0), Bytes::from_static(b"x"))
++        .await
++        .unwrap();
++    seed_segmented(&meta, b"inode:1", NONCE_A, &[(0xA1, 0)], 1).await;
++    let root_before = meta.get(b"inode:1").await.unwrap().unwrap();
++    let sk = seg_key(&group(NONCE_A, 1), 0).unwrap();
++    let seg_before = meta.get(&sk).await.unwrap().unwrap();
++
++    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
++    let (outcome, log) = run(&meta, &fleet).await;
++    assert_eq!(
++        outcome.unwrap(),
++        Reconciled::Blocked,
++        "BASE-RED: a fragment held only by a segmented map may not certify the drain"
++    );
++    assert!(
++        d0.get_fragment(frag(0xA1, 0)).await.unwrap().is_some(),
++        "stays put (Rule B)"
++    );
++    assert_eq!(
++        meta.get(b"inode:1").await.unwrap().unwrap(),
++        root_before,
++        "root unwritten"
++    );
++    assert_eq!(
++        meta.get(&sk).await.unwrap().unwrap(),
++        seg_before,
++        "seg: record unwritten"
++    );
++    assert!(
++        logged(&log, "refused", "inode:1"),
++        "refusal names the object: {log}"
++    );
++    assert!(
++        log.contains("monotonic_counter.rebalance_evacuation_refused"),
++        "counted: {log}"
++    );
++}
++
++// ---- leg 3 (+ Rule C): unreadable objects are named, the walk continues, nothing certifies ----
++
++#[tokio::test]
++async fn an_unreadable_object_is_named_the_walk_continues_and_nothing_certifies() {
++    let meta = MemMeta::default();
++    let (d0, d1) = (MemDServer::default(), MemDServer::default());
++
++    // (a) FIRST in key order: a root naming a `SegmentRef` whose `seg:` record was never
++    // written. (b) a committed record whose own bytes will not decode.
++    seed_segmented(&meta, b"inode:1", NONCE_A, &[(0xA1, 2)], 0).await;
++    let root: InodeRecord = read(&meta, b"inode:1").await;
++    assert!(
++        resolve_chunk_map(&meta, b"inode:1", &root).await.is_err(),
++        "fixture: unreadable"
++    );
++    let garbage = WriteBatch::new().put(b"inode:2".to_vec(), Bytes::from_static(b"not a record"));
++    commit(&meta, garbage).await;
++    // Rule C: `"inode:007"` parses to the same id as `"inode:7"` — never re-derived.
++    write_flat_on(&meta, &d0, b"inode:007", 0xC1).await;
++    let bystander = flat_record(0xC2, TARGET, 1);
++    commit(
++        &meta,
++        WriteBatch::new().put(inode_key(7), encode(&bystander)),
++    )
++    .await;
++    let bystander_before = meta.get(&inode_key(7)).await.unwrap().unwrap();
++
++    let fleet: [(DServerId, &dyn ChunkStore); 2] = [(0, &d0), (1, &d1)];
++    let (outcome, log) = run(&meta, &fleet).await;
++    assert_eq!(
++        outcome.expect("BASE-RED: a damaged object must not `Err` the whole pass"),
++        Reconciled::Blocked,
++        "an unreadable committed object withholds certification"
++    );
++    let after007 = read(&meta, b"inode:007").await;
++    assert_eq!(
++        (
++            after007.chunk_map.as_flat().unwrap()[0].placement.clone(),
++            after007.version
++        ),
++        (vec![TARGET], 2),
++        "evacuated exactly once, under its OWN key `inode:007`"
++    );
++    assert_eq!(
++        meta.get(&inode_key(7)).await.unwrap().unwrap(),
++        bystander_before,
++        "Rule C: `inode:7` is never touched — `inode:007` is never reinterpreted into it"
++    );
++    for object in ["inode:1", "inode:2"] {
++        assert!(
++            logged(&log, "unresolvable-chunk-map", object),
++            "both damaged objects are named on the audit seam: {log}"
++        );
++    }
++}
++
++// ---- leg 4: Rule A — the pass never writes to a generation it did not read ----
++
++#[tokio::test]
++async fn rule_a_the_pass_never_writes_to_a_generation_it_did_not_read() {
++    let (d0, d1) = (MemDServer::default(), MemDServer::default());
++    // LIVE: a flat root on the draining server. STALE: what `scan` answers instead — a
++    // segmented root this pass's snapshot read, superseded before the resolver re-reads it.
++    let live = flat_record(0xD1, DRAINING, 5);
++    let stale = segmented_record(NONCE_B, 9, 1, 3);
++    let meta = MemMeta::default().stale_scan_of(b"inode:1".to_vec(), encode(&stale));
++    commit(
++        &meta,
++        WriteBatch::new().put(b"inode:1".to_vec(), encode(&live)),
++    )
++    .await;
++
++    let fleet: [(DServerId, &dyn ChunkStore); 2] = [(0, &d0), (1, &d1)];
++    let (outcome, _) = run(&meta, &fleet).await;
++    assert_eq!(
++        outcome.expect("BASE-RED: a stale-vs-live generation mismatch must not `Err`"),
++        Reconciled::Blocked,
++        "a resolve restarted onto a generation this scan did not read may not certify"
++    );
++    assert_eq!(
++        meta.get(b"inode:1").await.unwrap().unwrap(),
++        encode(&live),
++        "unwritten"
++    );
++    assert!(
++        d0.get_fragment(frag(0xD1, 0)).await.unwrap().is_none(),
++        "nothing copied"
++    );
++}
++
++// ---- leg 5: the containment guard is not over-broad ----
++
++#[tokio::test]
++async fn a_healthy_segmented_object_holding_nothing_draining_costs_the_drain_nothing() {
++    let meta = MemMeta::default();
++    // Healthy, resolvable, its fragment on a NON-draining server — nothing else to evacuate.
++    seed_segmented(&meta, b"inode:1", NONCE_A, &[(0xE1, 1)], 1).await;
++
++    let fleet: [(DServerId, &dyn ChunkStore); 0] = [];
++    let (outcome, _) = run(&meta, &fleet).await;
++    assert_eq!(
++        outcome.unwrap(),
++        Reconciled::Satisfied,
++        "REQUIRED: a segmented object holding NOTHING on the draining server must not cost \
++         the drain its certification — the over-containment a guard that only LOOKS bound \
++         can hide (`results/issue_681/iteration-v7`)"
++    );
++}
++
++// ---- leg 6: Rule D — one refusal line per object, never per chunk ----
++
++#[tokio::test]
++async fn rule_d_one_refusal_line_per_object_not_per_chunk() {
++    let meta = MemMeta::default();
++    // Three chunks, two fragments on the draining server (0), one on a non-draining peer.
++    let chunks = [(0xF1, 0), (0xF2, 0), (0xF3, 1)];
++    seed_segmented(&meta, b"inode:1", NONCE_A, &chunks, 3).await;
++
++    let fleet: [(DServerId, &dyn ChunkStore); 0] = [];
++    let (outcome, log) = run(&meta, &fleet).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Blocked);
++    let refusals = log
++        .lines()
++        .filter(|l| l.contains(r#""action":"refused""#))
++        .count();
++    assert_eq!(
++        refusals, 1,
++        "BASE-RED (Rule D): ONE refusal line, not one per fragment/chunk"
++    );
++}
++
++// ---- leg 7: a fault that is not one object's map still ends the pass ----
++
++#[tokio::test]
++async fn a_non_chunk_map_fault_still_ends_the_pass() {
++    let meta = MemMeta::default().fail_get(b"inode:1".to_vec());
++    seed_segmented(&meta, b"inode:1", NONCE_A, &[(0xA9, 1)], 1).await;
++
++    let fleet: [(DServerId, &dyn ChunkStore); 0] = [];
++    let (outcome, _) = run(&meta, &fleet).await;
++    assert!(
++        matches!(outcome, Err(ReconcileError::Store(_))),
++        "NOT base-red (over-containment guard): a genuine store fault under the resolver's \
++         own settle re-read is not this object's fault and must propagate, got {outcome:?}"
++    );
++}

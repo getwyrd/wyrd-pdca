@@ -1,0 +1,15 @@
+Review of issue #696: make custodian rebalance resolve segmented chunk maps per object, continue safe flat evacuations, and withhold drain certification for unreadable or refused objects.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | Acceptance is concrete, bounded to two files, and drives the real fenced control point with seven enumerated outcomes (`crates/custodian/tests/segmented_map_rebalance.rs:259`). |
+| C2 Reproduction (red pre-fix) | PASS | With only production stashed, six tests fail by assertion on the segmented-map error while the non-map store-fault control passes (`crates/custodian/tests/segmented_map_rebalance.rs:291`, `crates/custodian/tests/segmented_map_rebalance.rs:459`). |
+| C3 Change | PASS | The change uses the shared resolver, contains only typed per-object map faults, refuses segmented writes, and preserves the scanned key for CAS (`crates/custodian/src/rebalance.rs:236`, `crates/custodian/src/rebalance.rs:442`). |
+| C4 Verification (red→green) | PASS | Independent reruns produced 6-fail/1-pass pre-fix and 7/7 green post-fix; full `cargo xtask ci` and the 25-mutant in-diff campaign also pass (`crates/custodian/tests/segmented_map_rebalance.rs:291`). |
+| C5 Causal adequacy | PASS | The failing inline flat-map assumption is replaced by generation-aware resolution and per-object refusal, with all 15 viable in-diff mutants caught and no capability-probe smell (`crates/custodian/src/rebalance.rs:253`, `crates/custodian/src/rebalance.rs:279`). |
+| T1 Structure | PASS | One per-object planner and one shared ordered metadata/audit fixture keep containment local and avoid new seams (`crates/custodian/src/rebalance.rs:229`, `crates/custodian/tests/segmented_map_rebalance.rs:42`). |
+| T2 Shape | PASS | Patch-derived counts meet the exact budget: two files, 94 production semantic additions, and a 472-raw/327-semantic-line test (`crates/custodian/src/rebalance.rs:192`, `crates/custodian/tests/segmented_map_rebalance.rs:233`). |
+| T3 Runtime | PASS | Real `reconcile_step` execution over the fenced in-memory seam observes evacuation, refusal, attribution, stale-generation blocking, certification, and store-fault propagation (`crates/custodian/tests/segmented_map_rebalance.rs:261`). |
+| T4 Contribution | NEEDS-HUMAN | Decide whether the two reported batch-review blockers and closed/rejected prior work are settled — the supplied bundle omits the failing review wrapper/log and rejection archive, so contribution readiness cannot be independently established. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Rebuild must make leg 5 genuinely non-base-red (or return the classification to Plan) — its first `expect` fails on base before the `Satisfied` control, contrary to the brief's explicit evidence signature (`crates/custodian/tests/segmented_map_rebalance.rs:417`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether continuing proven-safe evacuations while withholding certification is operationally fit for drain workflows — in-memory automation verifies mechanics, not the operator-level policy choice (`crates/custodian/src/rebalance.rs:138`). |

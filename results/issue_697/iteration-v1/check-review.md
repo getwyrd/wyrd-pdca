@@ -1,0 +1,15 @@
+Review of issue #697's reconstruction change: resolve committed maps once per non-empty pass, contain unreadable objects, refuse non-owned or ambiguous repairs, and preserve flat repair progress.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | FAIL | The declared red partition is internally false: leg 8 is specified as base-green although its required store-fault/audit outcome cannot survive the base walk's earlier decode abort at `crates/custodian/tests/segmented_map_reconstruction.rs:655`. |
+| C2 Reproduction (red pre-fix) | FAIL | The independent base run compiled but produced 7 failing and 1 passing test, not the asserted six-red/two-green partition; isolated leg 8 also exited 101 at `crates/custodian/tests/segmented_map_reconstruction.rs:655`. |
+| C3 Change | FAIL | Rule D is not delivered: refusal reporting occurs inside the per-obligation queue loop at `crates/custodian/src/reconstruction.rs:209` and `crates/custodian/src/reconstruction.rs:254`, so one object can be reported once per queued chunk. |
+| C4 Verification (red→green) | PASS | Restoring production made all 8 new tests pass, and an isolated writable-cache rerun completed full `cargo xtask ci`; the behavioral discriminator enters through `crates/custodian/tests/segmented_map_reconstruction.rs:410`. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Whether refusal accounting is truly per object must be re-established with a multi-obligation fixture — the current one-obligation refusal leg at `crates/custodian/tests/segmented_map_reconstruction.rs:434` cannot expose the Rule D violation. |
+| T1 Structure | PASS | The patch is confined to the expected production file and one new integration test that drives the public fenced control point at `crates/custodian/tests/segmented_map_reconstruction.rs:375`. |
+| T2 Shape | FAIL | The new test reaches 657 raw lines at `crates/custodian/tests/segmented_map_reconstruction.rs:657`, exceeding the brief's hard 620-line ceiling and therefore requiring the prescribed STOP/restructure. |
+| T3 Runtime | FAIL | A segmented object with multiple queued chunks emits multiple refusal counters and audit rows through `crates/custodian/src/reconstruction.rs:1037`, inflating the operator signal that Rule D defines per object. |
+| T4 Contribution | FAIL | Contribution sign-off is premature while the T2/T3 defects remain; affected-path prior art found closed #647 and no open overlap, while the declared `scripts/pdca contribcheck` runner was unavailable for an independent rerun. |
+| T5 Judgment | NEEDS-HUMAN [impl] | Restore direct oracles before rebuild sign-off — leg 1's queue-drain assertion is commented out at `crates/custodian/tests/segmented_map_reconstruction.rs:427`, and leg 5 checks only index 0 rather than the duplicate second placement at `crates/custodian/tests/segmented_map_reconstruction.rs:571`. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide production fitness and whether Tier-1 disk-fault or Tier-2 kill-and-reconstruct observation is warranted — CI/DST are green, but operational reconstruction risk remains a human sign-off decision. |
