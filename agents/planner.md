@@ -156,19 +156,28 @@ You do **not** leave the session to file issues by hand. `--accept` does it (pas
 instead only when the issues already exist, or when the tracker is not one the driver can
 reach — it will say so plainly rather than skipping).
 
-What happens next depends on how this run was started, and the difference is worth
-knowing:
+What happens next no longer depends on how this run was started:
 
-- **A CSV-driven batch run** (`pdca flow --csv …`, no ids) re-enumerates every in-flight
-  bundle *from disk* after the Plan beat, so the children you just created are picked up by
-  the same run and scheduled into waves automatically — independent ones in parallel,
-  dependent ones stacked. Nothing further is needed from you.
-- **Every other shape** — `pdca flow <id>`, and an explicit list like `pdca flow 500 501` —
-  drives exactly the ids it was given and never looks for new ones. `--accept` prints the
-  exact `pdca flow <child-ids>` command; run it, and the children are driven as waves.
-
-An explicit id list looks like a batch and is not one on this point: it iterates the ids
-you named, so children born during its Plan beat are not among them.
+- **The run you are in adopts them.** A bundle that reaches `close-disposition = split`
+  while a flow is driving it has its children read from the split's lineage record and
+  spliced into the waves *after* its own — independent ones in parallel, dependent ones
+  stacked — and driven in the same run. That holds for every shape: a CSV-driven batch
+  (`pdca flow --csv …`), an explicit list like `pdca flow 500 501`, and a
+  single `pdca flow <id>`. Nothing further is needed from you.
+- **Every wave the split creates is funded, none of them twice.** `max_passes` is the
+  allowance one wave gets, and the run's pool holds one per wave its schedule currently
+  has — re-sized when a split grows it, so an adopted wave is neither starved by
+  arithmetic done before it existed nor handed a second allowance. Whatever a wave does
+  not finish is named on stderr with the command that resumes it.
+- **A child the run could not schedule is held, not dropped.** One whose declared
+  `Depends on:` cannot be resolved is named on stderr and left in flight; resolve it and
+  re-run that one.
+- **A split an earlier run left behind is recovered by naming the parent.** If the run that
+  accepted the split ended before its children were driven, `pdca flow <parent-id>`
+  picks them up — the parent is still skipped as finished, its children (and theirs, through
+  a generation that already closed) are adopted into that run.
+- **`--accept` still prints the `pdca flow <child-ids>` command.** That is the remedy
+  for whatever a run could not adopt, and for a child that was held.
 
 Either way the `Depends on:` / `Conflicts with:` fields between children are what makes the
 scheduling work, which is why they are the part to get right.

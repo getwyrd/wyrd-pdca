@@ -67,6 +67,19 @@ Write the patch against the brief's **target branch** (targeting resolved at Pla
 patch commit-ready for the target's own commit hooks (formatter / linters).
 
 
+## Filesystem — the harness owns it, you don't
+
+Write only inside **the roots the harness gives you**: the per-cycle git worktree at
+`$PDCA_WORKTREE` for every target-source edit, and the bundle directory the driver prompt
+names for your three artifacts. Do **not** create files outside those roots — not the
+host's primary checkout, not a scratch directory of your own under `/tmp`, `/var/tmp` or
+your home; working files belong inside the worktree.
+
+Cleanup is **not yours to perform**: the harness created those roots and reclaims them
+itself, so no `rm`-style command is ever warranted. Some vendor sandboxes refuse `rm`-style
+commands outright and reject the **whole** command they appear in, so a self-cleanup step
+can cost you the work it was attached to.
+
 **When you reject an alternative on cost, show the cost** — a diff sketch or a concrete
 line count someone can check, never an adjective ("heavier", "larger", "touches every
 reader"). This matters most when your chosen fix *guards a symptom* (adds a probe/guard)

@@ -16,19 +16,52 @@ label set (subset = AND). The bundle is classified from its brief: a primary axi
 (``[gates.target_flags]``); unset ⇒ no filtering. A check passes iff its ``cmd``
 exits 0, fails on any other exit, and may instead declare itself **unverifiable**
 when it genuinely cannot run its mechanical check (issue #46): exit
-:data:`UNVERIFIABLE_RC` (77, the automake SKIP convention) **or** print a line
-containing :data:`UNVERIFIABLE_MARKER` (``PDCA-UNVERIFIABLE: <reason>``) **while exiting
-0 or 77** — the marker lets a gate that did NOT fail defer to the human, and is ignored on
-any other exit code, because a gate that failed has failed whatever it printed (#329). When
+:data:`UNVERIFIABLE_RC` (77, the automake SKIP convention) **or** *declare* it by printing
+a line that STARTS with :data:`UNVERIFIABLE_MARKER` (``PDCA-UNVERIFIABLE: <reason>``;
+leading whitespace ignored) **while exiting 0 or 77** — the marker lets a gate that did NOT
+fail defer to the human. It counts only on a non-failing exit, because a gate that failed
+has failed whatever it printed (#329), and only at the start of a line, because a mid-line
+occurrence is text the gate merely RELAYED (a child's log line, a quoted source comment),
+not a verdict the gate declared (#428). When
 ``[[gates.checks]]`` is empty the driver falls back to all-PASS stub rows, so the
 offline vertical slice still runs.
 
-A row: {check, result, oracle, rule_id, path_line, gating}. ``result`` ∈
-``pass`` / ``fail`` / ``unverifiable`` / ``none``. A ``none`` row is a judgment cell
-decided by the reviewer + human (docs 04 §judgment cell); it is listed for matrix
-alignment and never gates. An ``unverifiable`` row does **not** count toward
+The row's **evidence line** follows the same declaration rule (issue #402): a gate states
+its verdict summary by printing a line that STARTS with :data:`EVIDENCE_MARKER`
+(``PDCA-EVIDENCE: <summary>``), and that summary — the LAST such line, a gate's final word
+— becomes the row's ``path_line`` whatever the command relays afterwards. Without a
+declaration the evidence falls back to the command's last output line, which is only ever
+the gate's verdict by luck: the capture is one merged stdout+stderr stream, so a wrapper
+that shells out to a suite files whatever that suite's children happened to flush last
+(a scratch ``/tmp`` path from a since-deleted sandbox is not a reconstructable basis). The
+marker declares evidence only — it never changes a verdict; the exit code alone decides
+pass/fail, and only the ``PDCA-UNVERIFIABLE``/``PDCA-DEFERRED`` declarations can change
+a ``result``.
+
+A row: {check, result, oracle, rule_id, path_line, gating}. A row produced by a
+bundle-scoped :func:`run_gates` additionally carries ``log`` (the bundle-relative path of
+its full-output evidence log, ``gate-logs/<rule_id>.log``) and ``duration_secs`` (issue
+#370) — additive keys, existing consumers unchanged. When that evidence log could NOT be
+written, the row instead carries ``log_error`` (the reason) so a persistence failure is
+never silent — the verdict itself is unaffected either way. ``result`` ∈
+``pass`` / ``fail`` / ``unverifiable`` / ``deferred`` / ``none``. A ``none`` row is a
+judgment cell decided by the reviewer + human (docs 04 §judgment cell); it is listed for
+matrix alignment and never gates. An ``unverifiable`` row does **not** count toward
 ``overall`` (it is not a failure); the driver routes it into SUMMARY §6 NEEDS-HUMAN,
 where the C6 accept-guard forces the human to clear it before sign-off.
+
+A **``deferred``** row (issue #401) is the fourth member: the gate RAN and found its
+subject **absent by design**, because the artifacts it audits are drafted later — the
+Check-time run of a bundle-scoped T4 contribution row, whose ``commit-msg.txt`` /
+``pr-description.md`` do not exist until publish. It is declared the same way
+``unverifiable`` is — a line the gate STARTS with :data:`DEFERRED_MARKER`
+(``PDCA-DEFERRED: <reason>``) while exiting 0 — and, like ``unverifiable``, it does not
+count toward ``overall``. Unlike ``unverifiable`` it is **not** lifted into SUMMARY §6:
+the condition is by-design and its substantive verdict is owed to a later gate, so a §6
+checkbox on every cycle trains the human to tick §6 unread — the guard C6 depends on.
+The deferral is honoured only for a row that is genuinely **re-gated later**
+(:func:`_deferrable` → ``publish.publish_gates``); a row nothing re-runs has no later
+verdict to defer to and keeps its pass/fail.
 """
 
 from __future__ import annotations
@@ -41,8 +74,7 @@ import shutil
 import subprocess
 import sys
 import time
-import zlib
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import brief, lane, progress, scratch, state, worktree
@@ -54,6 +86,24 @@ from .config import Config
 UNVERIFIABLE_RC = 77
 UNVERIFIABLE_MARKER = "PDCA-UNVERIFIABLE:"
 
+# A gate states the summary that goes into the row's `path_line` the same way it declares
+# `unverifiable`: a line that STARTS with this marker (issue #402). Anything else in the
+# capture is output the gate RELAYED from what it ran, and must not be filed as its verdict.
+EVIDENCE_MARKER = "PDCA-EVIDENCE:"
+
+# A gate that ran and found its subject ABSENT BY DESIGN — the audit it performs has no
+# subject yet, because the artifacts it lints are drafted later — declares the deferral
+# with this marker while exiting 0 (issue #401). Same declaration rule as the two above:
+# only at the start of a line, never a mid-line quotation the gate relayed (#428). Neither
+# a pass nor a failure (see _finalize), and NOT routed to §6 (see assemble): the verdict is
+# owed to the later gate that re-runs the row (see _deferrable).
+DEFERRED_MARKER = "PDCA-DEFERRED:"
+
+# The bundle directory holding one full-output evidence log per gate rule (issue #370).
+# Defined in `state` (next to the archive list that moves it per round) — re-exported
+# here because gates is the writer.
+GATE_LOGS_DIR = state.GATE_LOGS_DIR
+
 
 # ----------------------------------------------------------------------------
 # Gate-promotion lifecycle (issue #156): a check may carry ``promote_after = N``; once it
@@ -64,15 +114,6 @@ UNVERIFIABLE_MARKER = "PDCA-UNVERIFIABLE:"
 # ----------------------------------------------------------------------------
 GATES_JSON = "check-gates.json"
 _PROMO_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
-
-# Where a bundle-scoped gate run persists each command's FULL output
-# (eduralph/pdca-harness#370). The row's 120-char evidence line is the right SUMMARY of a
-# verdict, but it was also the entire RECORD: a one-off red gate (issue_648's C4-ci, exit
-# 101 in a run that is green on every re-run) left no way to even name the failing test.
-# One `<rule_id>.log` per check, rewritten each Check run; the iterate archive moves them
-# with the attempt (state.DOWNSTREAM_GLOBS), so every round keeps its own evidence.
-GATE_LOG_DIR = "gate-logs"
-
 
 def _gates_record(d: Path) -> dict | None:
     """A bundle's frozen ``check-gates.json``, or None if absent/unreadable."""
@@ -146,8 +187,15 @@ def promotion_candidates(cfg: Config) -> list[dict]:
 
 
 def run_gates(d: Path, cfg: Config) -> dict:
-    """Run every gate for bundle ``d`` (both repo- and bundle-scoped); write JSON."""
-    rows = _run_checks(cfg, cwd=cfg.root, bundle=d, scopes=("repo", "bundle"))
+    """Run every gate for bundle ``d`` (both repo- and bundle-scoped); write JSON.
+
+    The FULL output of each check is persisted to ``<d>/gate-logs/<rule_id>.log``
+    (issue #370): the 120-char ``path_line`` is the right *summary*, but it must not be
+    the entire *record* — a gating red that parks the bundle needs its whole basis
+    reconstructable from bundle files alone (the state-is-files doctrine). One file per
+    rule id, overwritten per Check run."""
+    rows = _run_checks(cfg, cwd=cfg.root, bundle=d, scopes=("repo", "bundle"),
+                       log_dir=d / GATE_LOGS_DIR)
     return _finalize(rows, name=d.name, write_to=d)
 
 
@@ -220,11 +268,10 @@ def run_gates_dry(d: Path, cfg: Config) -> dict:
     frozen ``check-gates.json`` — the gate runner behind ``pdca revalidate`` (issue #11).
 
     Same single-sourced ``_run_checks`` as :func:`run_gates`, but ``write_to=None`` so a
-    re-gate of an already-COMPLETE bundle never mutates its frozen record —
-    ``persist_logs=False`` for the same reason: the bundle's ``gate-logs/`` are the
-    frozen Check's evidence, and a revalidation must not overwrite them (#370)."""
-    rows = _run_checks(cfg, cwd=cfg.root, bundle=d, scopes=("repo", "bundle"),
-                       persist_logs=False)
+    re-gate of an already-COMPLETE bundle never mutates its frozen record. For the same
+    reason no ``log_dir`` is passed (issue #370): ``gate-logs/`` is the frozen evidence
+    behind the frozen verdict, and a later dry re-gate must not overwrite it either."""
+    rows = _run_checks(cfg, cwd=cfg.root, bundle=d, scopes=("repo", "bundle"))
     return _finalize(rows, name=d.name, write_to=None)
 
 
@@ -291,10 +338,11 @@ def _applies(chk: dict, scopes: tuple[str, ...], labels: frozenset[str] | None) 
 
 def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[str, ...],
                 worktree_override: Path | None = None,
-                persist_logs: bool = True) -> list[dict]:
+                log_dir: Path | None = None) -> list[dict]:
     # No configured gates → the offline stub: the full 5/5/1 with the mechanical
-    # gate elements stub-passed (so the offline slice runs green).
-    if not cfg.gates_checks:
+    # gate elements stub-passed (so the offline slice runs green). A declared
+    # [gates] host_ci row counts as real configuration too (#311).
+    if not cfg.gates_checks and not cfg.host_ci_checks:
         return _assemble_matrix([], stub=True)
 
     labels = _bundle_target(bundle, cfg.gate_target_match, cfg.gate_target_default, cfg.gate_target_flags)
@@ -329,6 +377,13 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
                 gating=True, element="C4")], stub=False)
     else:
         wt, ovf_primary = None, None
+    if log_dir is not None:
+        # One evidence set per Check run (issue #370): clear the previous run's logs, so
+        # gate-logs/ holds exactly THIS run's files — a check since removed from the
+        # config leaves no stale log masquerading as current evidence. A non-directory
+        # squatting on the path survives this (ignore_errors) and is surfaced per row as
+        # ``log_error`` by _write_gate_log — visibly, never silently (#370 iteration 2).
+        shutil.rmtree(log_dir, ignore_errors=True)
     configured: list[dict] = []
     try:
         for chk in cfg.gates_checks:
@@ -338,17 +393,49 @@ def _run_checks(cfg: Config, *, cwd: Path, bundle: Path | None, scopes: tuple[st
                           f"(target={chk.get('target')}, bundle labels {set(labels)})",
                           file=sys.stderr, flush=True)
                 continue
-            configured.append(_run_one(chk, cwd=cwd, bundle=bundle, runner=cfg.gates_runner,
+            configured.append(_run_one(chk, cfg=cfg, cwd=cwd, bundle=bundle,
+                                       runner=cfg.gates_runner,
                                        worktree_path=wt,
-                                       default_timeout_secs=cfg.gates_default_timeout_secs,
+                                       default_timeout=cfg.gates_default_timeout_secs,
+                                       log_dir=log_dir,
                                        confirm_fail=cfg.gates_confirm_fail,
-                                       persist_logs=persist_logs,
                                        # This bundle's scratch (#200). Resolved HERE, where
-                                       # cfg is in scope: _run_one deliberately takes no
-                                       # Config, and a gate shells out to cargo/make, whose
-                                       # own temp files must land in the bundle's dir too.
+                                       # cfg is in scope: _run_one takes no Config for this,
+                                       # and a gate shells out to cargo/make, whose own temp
+                                       # files must land in the bundle's dir too.
                                        scratch_env=(scratch.env_for(cfg, bundle)
-                                                    if bundle is not None else {})))
+                                                    if bundle is not None else None)))
+        # Host-only CI parity rows ([gates] host_ci, issue #311): commands the host's CI
+        # runs on every PR but the delegated gate runner does not cover (a spell-checker,
+        # a docs lint). Unlike the rows above (cwd=cfg.root; each command must target
+        # $PDCA_WORKTREE itself), these run FROM the reconstructed base + patch.diff
+        # tree: the point of the feature is that the HARNESS guarantees the tree under
+        # test is the patched one — the T4 slot runs pre-apply, so it structurally cannot
+        # see content that arrives in the patch. No bundle (the CI working-tree /
+        # integration re-gate) ⇒ skipped: there the host's own CI runs these for real.
+        # No patched tree (isolation off / target not a git checkout) ⇒ an UNVERIFIABLE
+        # row (→ SUMMARY §6 NEEDS-HUMAN), never a run against the wrong tree — a green
+        # over unpatched content is the exact lie this feature closes (#296 doctrine).
+        if bundle is not None:
+            for chk in cfg.host_ci_checks:
+                if wt is None:
+                    configured.append(_row(
+                        f"{chk.get('tier', 'T4')} {chk.get('label', chk.get('id', ''))}",
+                        "unverifiable",
+                        oracle=chk.get("cmd", "") or chk.get("subcmd", ""),
+                        rule_id=chk.get("id", ""),
+                        path_line="host CI needs the patched tree — no worktree "
+                                  "([driver].worktree off or target not a git checkout)",
+                        gating=bool(chk.get("gating", True)),
+                        element=chk.get("tier", "T4")))
+                else:
+                    configured.append(_run_one(chk, cfg=cfg, cwd=wt, bundle=bundle,
+                                               runner=cfg.gates_runner, worktree_path=wt,
+                                               default_timeout=cfg.gates_default_timeout_secs,
+                                               log_dir=log_dir,
+                                               confirm_fail=cfg.gates_confirm_fail,
+                                               scratch_env=(scratch.env_for(cfg, bundle)
+                                                            if bundle is not None else None)))
     finally:
         if ovf_primary is not None and wt is not None:
             worktree.overflow_remove(ovf_primary, wt)
@@ -376,40 +463,35 @@ def _delegated_cmd(chk: dict, runner: str) -> tuple[str, str]:
     return f"{runner} {subcmd}", ""
 
 
-def _timeout_for(chk: dict, default_secs: int) -> int | None:
-    """The wall-clock bound for one check, or ``None`` for unbounded.
+def _gate_timeout(chk: dict, default: int | None) -> int | None:
+    """The wall-clock bound (seconds) for one ``[[gates.checks]]`` row (issue #368).
 
-    Resolution order: the check's own ``timeout_secs``, else ``[gates]
-    default_timeout_secs``. An explicit ``0`` on the check is a deliberate opt-OUT
-    (\"this one really may run as long as it likes\"), so it beats the default rather
-    than falling through to it — otherwise a project-wide default could not be
-    escaped by the one gate that genuinely needs to. A malformed value — a typo, or a
-    NEGATIVE bound, which is not the documented opt-out and is far likelier a mistake
-    than an intent to run unbounded — falls back to the default rather than crashing the
-    gate run or silently unbounding the gate.
+    The row's own ``timeout_secs`` wins; else the ``[gates] default_timeout_secs``
+    fallback; else ``None`` (unbounded — today's behaviour, unchanged). ``0`` or a
+    negative value means "explicitly unbounded", so one long row can opt out of a
+    configured default. A non-numeric value is treated as unconfigured rather than
+    crashing the gate run.
     """
-    raw = chk.get("timeout_secs", None)
-    if raw is None:
-        raw = default_secs
+    raw = chk.get("timeout_secs", default)
     try:
         secs = int(raw)
     except (TypeError, ValueError):
-        secs = -1  # malformed → fall back below, exactly as a negative value does
-    if secs < 0:
-        secs = max(0, int(default_secs))
+        return None
     return secs if secs > 0 else None
 
 
-def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
-             worktree_path: Path | None = None, default_timeout_secs: int = 0,
-             confirm_fail: bool = True, persist_logs: bool = True,
+def _run_one(chk: dict, *, cfg: Config, cwd: Path, bundle: Path | None, runner: str = "",
+             worktree_path: Path | None = None,
+             default_timeout: int | None = None,
+             log_dir: Path | None = None,
+             confirm_fail: bool = True,
              scratch_env: dict | None = None) -> dict:
+    # ``cfg`` is required (issue #387): the bundle-scoped base export resolves the brief's
+    # own base as `<cfg.base_remote>/<branch or cfg.default_branch>` — the same ref publish
+    # commits against — so it cannot be derived from the check row alone.
     cmd, cmd_error = _delegated_cmd(chk, runner)
     gating = bool(chk.get("gating", True))
     label = f"{chk.get('id', '')}: {chk.get('label', '')}".strip(": ")
-    # Per-check bound wins over the [gates] default; 0 / absent on BOTH ⇒ unbounded
-    # (the pre-#187 behaviour, so a project that has not set a default is unchanged).
-    timeout_secs = _timeout_for(chk, default_timeout_secs)
     if cmd_error:
         # Misconfigured delegation — surface as a failing row with a fix hint, never crash.
         print(f"  · gate {label}: {cmd_error}", file=sys.stderr, flush=True)
@@ -425,7 +507,7 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
         env = {**(env or {}), "PDCA_WORKTREE": str(worktree_path)}
     # The base a per-fix verifier must reset to before applying patch.diff. The governing
     # invariant (issue #54): the TEST base and the DEPLOY base must not diverge — the gate has
-    # to establish red→green on the very branch publish will commit to. So these two exports
+    # to establish red→green on the very branch publish will commit to. So these three exports
     # are MUTUALLY EXCLUSIVE, resolved in the same order publish resolves its own base:
     #
     #   1. `Onto branch` (#54) → PDCA_BASE. The brief names an existing PR's head; publish
@@ -437,10 +519,22 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
     #      verifier that instead reset to the brief's origin base would, for a dependent
     #      sharing a file with its prereq, either false-fail "patch does not apply — stale" or
     #      measure red→green against a tree LACKING the prereq.
+    #   3. else the brief's own `Repo + branch target` base (#387) → PDCA_BRIEF_BASE, as
+    #      `<base_remote>/<branch>` — the very ref publish checks the fix out against
+    #      (`publish.publish`'s `checkout_base`: `f"{base_remote}/{base}"`), or
+    #      `<base_remote>/<default>`
+    #      when the brief names no target. This is the last rung of the ladder
+    #      `engine/scripts/run-verify.sh` publishes to every instance, and it used to be the
+    #      one the driver never supplied: a shell gate had to re-derive the ANCHORED parse
+    #      (`brief._clean_ref`, got wrong and fixed twice in Python — #235, #262) from a
+    #      comment, and the two implementations then disagreed on the very briefs that need
+    #      the base most. Exported unconditionally at this rung so the gate reads a resolved
+    #      ref rather than `brief.md`; a script composing `origin/$VAR` over it would double
+    #      the remote, so the value is always fully qualified, like the other two.
     #
-    # Exporting both would tell the gate to verify against the integration branch while
-    # publish commits to the Onto branch — exactly the divergence #54 exists to prevent
-    # (PR #282 review). Neither applies (wave 0, no Onto) ⇒ no export, unchanged behaviour.
+    # Exporting more than one would tell the gate to verify against the integration branch
+    # while publish commits to the Onto branch — exactly the divergence #54 exists to prevent
+    # (PR #282 review). Exactly one is set for every bundle-scoped gate invocation.
     if bundle is not None:
         onto = brief.onto_branch(bundle / "brief.md")
         if onto is not None:
@@ -450,6 +544,9 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
             stack_base = publish.read_stack_base(bundle)
             if stack_base:
                 env = {**(env or {}), "PDCA_VERIFY_BASE": f"origin/{stack_base}"}
+            else:
+                base = brief.base_branch(bundle / "brief.md", cfg.default_branch)
+                env = {**(env or {}), "PDCA_BRIEF_BASE": f"{cfg.base_remote}/{base}"}
     # Under in-driver lane concurrency, expose the worker-slot id so a gate command can
     # scope its checkout / container name / port / scratch per lane (docs 09). Absent
     # (serial driver) → no PDCA_LANE, so gates run exactly as before.
@@ -457,134 +554,241 @@ def _run_one(chk: dict, *, cwd: Path, bundle: Path | None, runner: str = "",
     if lane_id is not None:
         env = {**(env or {}), "PDCA_LANE": str(lane_id)}
     watch = bundle or cwd
+    bound = _gate_timeout(chk, default_timeout)
+    # May this row declare itself `deferred` (issue #401)? Only if a later gate re-runs it,
+    # so the deferred verdict is genuinely owed rather than waived — resolved here, where
+    # both the row and the config are in hand (`_classify` sees neither).
+    deferrable = _deferrable(chk, cfg)
     print(f"  · gate {label} (a Docker-backed gate can take minutes)…", file=sys.stderr, flush=True)
-    attempts = [_execute(cmd, cwd=cwd, env=env, label=label,
-                         timeout_secs=timeout_secs, watch=watch)]
+
+    def _attempt() -> dict:
+        """One run of the command → its verdict, evidence, raw output and timing.
+
+        Factored out of upstream's inline body (instance delta, eduralph/pdca-harness#371)
+        so the confirm-once below can run the command a SECOND time. Upstream executes
+        once inline; everything inside here is upstream's code, unchanged."""
+        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        t0 = time.monotonic()
+        rc: int | None = None
+        output = ""
+        try:
+            # Output is captured for the evidence line; the heartbeat ticks meanwhile so
+            # a long, silent gate (e.g. a Docker-backed test suite) doesn't look hung.
+            # `bound` (issue #368) caps the wall-clock when configured: on expiry the
+            # process group is killed and TIMEOUT_RC comes back instead of an exit code.
+            rc, output, _ = progress.run_with_heartbeat(
+                cmd, cwd=cwd, shell=True, env=_merged_env(env), capture=True, label=label,
+                timeout=bound, status=lambda: progress.bundle_activity(watch),
+            )
+            if rc == progress.TIMEOUT_RC:
+                # The oracle did not answer (#368): a timed-out gate is `unverifiable`
+                # (the #46 outcome — routed to SUMMARY §6 NEEDS-HUMAN, kept out of the
+                # gating verdict), never a pass/fail verdict the command did not reach.
+                result, evidence = "unverifiable", [f"gate exceeded its {bound}s timeout"]
+            else:
+                result, evidence = _classify(rc, output, deferrable=deferrable)
+        except Exception as exc:  # command not found, etc. — a failing gate, surfaced
+            result, evidence = "fail", [str(exc)]
+            output = f"{exc}\n"  # the exception IS the run's whole output — log it (#370)
+        return {"result": result, "evidence": evidence, "output": output, "rc": rc,
+                "started": started, "duration": round(time.monotonic() - t0, 2)}
+
+    attempts = [_attempt()]
     result, evidence = attempts[0]["result"], attempts[0]["evidence"]
     # A check may opt out of the confirm with `confirm_fail = false` — REQUIRED on any
     # gate whose command is itself model-backed (a batched review row): re-running it
     # re-samples a nondeterministic judge, so a second, luckier sample could overwrite
     # real first-run blockers and pass as "flaky". The confirm is for deterministic
     # oracles only; the check author knows which kind theirs is.
-    confirm_this = bool(chk.get("confirm_fail", confirm_fail))
-    if result == "fail" and gating and confirm_this:
-        # Confirm-once (eduralph/pdca-harness#371): a gating row is otherwise a SINGLE
-        # sample, and the substrate under the gate is not the patch — a straggler still
-        # holding a port, a momentary spike — so one transient red parks the bundle
-        # (issue_648: C4-ci exit 101 in ~90s of a ~7-minute-green step, green on every
-        # re-run). Re-run ONCE and record BOTH verdicts: fail→fail keeps the fresher
-        # evidence; fail→pass records the pass WITH the flip on the row, and assemble
-        # routes it into §6 as a flake the human must acknowledge — a second sample,
-        # never silence. A confirm that gives NO verdict (timeout / unverifiable)
-        # cannot overturn the first fail. This never applies to the model leaves:
-        # re-sampling a nondeterministic judge and keeping one answer is the opposite
-        # of re-sampling a deterministic oracle and keeping both.
+    if result == "fail" and gating and bool(chk.get("confirm_fail", confirm_fail)):
+        # Confirm-once (eduralph/pdca-harness#371, still OPEN at v0.57.0 — instance delta):
+        # a gating row is otherwise a SINGLE sample, and the substrate under the gate is not
+        # the patch — a straggler still holding a port, a momentary spike — so one transient
+        # red parks the bundle (issue_648: C4-ci exit 101 in ~90s of a ~7-minute-green step,
+        # green on every re-run). Re-run ONCE and record BOTH verdicts: fail→fail keeps the
+        # fresher evidence; fail→pass records the pass WITH the flip on the row, and assemble
+        # routes it into §6 as a flake the human must acknowledge — a second sample, never
+        # silence. A confirm that gives NO verdict (timeout / unverifiable) cannot overturn
+        # the first fail.
         print(f"  · gate {label}: FAILED — confirming once before recording the verdict…",
               file=sys.stderr, flush=True)
-        attempts.append(_execute(cmd, cwd=cwd, env=env, label=label,
-                                 timeout_secs=timeout_secs, watch=watch))
+        attempts.append(_attempt())
         confirm = attempts[1]
         if confirm["result"] == "pass":
             result = "pass"
             evidence = [f"PASS on confirm — first run failed transiently: {evidence[0]}"]
         elif confirm["result"] == "fail":
             evidence = confirm["evidence"]
+    # The log carries EVERY attempt (#371 × #370): a flip is only diagnosable from both
+    # runs' output, so the confirm's capture is appended under its own banner rather than
+    # replacing the first run's. Single-attempt rows are byte-identical to upstream's.
+    started = attempts[0]["started"]
+    rc = attempts[-1]["rc"]
+    duration = round(sum(a["duration"] for a in attempts), 2)
+    output = attempts[0]["output"]
+    if len(attempts) > 1:
+        output += (f"\n# ---- confirm re-run (attempt 2/2): {attempts[1]['result']} "
+                   f"(exit {attempts[1]['rc']}) ----\n" + attempts[1]["output"])
     row = _row(
         f"{chk.get('tier', '?')} {chk.get('label', chk.get('id', ''))}",
         result, oracle=cmd, rule_id=chk.get("id", ""),
         path_line=evidence[0][:120], gating=gating, element=chk.get("tier", ""),
     )
-    row["duration_secs"] = sum(a["duration_secs"] for a in attempts)
     if len(attempts) > 1:
+        # #371's additive keys, recorded whatever `log_dir` says: `attempts` is what each
+        # sample said, `flaky` the fail→pass flip assemble._flaky_gate_items turns into a
+        # §6 item. A revalidation persists no logs but must still not swallow a flake.
         row["attempts"] = [a["result"] for a in attempts]
         row["flaky"] = attempts[0]["result"] == "fail" and result == "pass"
-    if persist_logs:
-        log_rel = _write_gate_log(bundle, chk, cmd=cmd, cwd=cwd,
-                                  worktree_path=worktree_path, attempts=attempts)
-        if log_rel:
-            row["log"] = log_rel
+    if log_dir is not None:
+        # Persist the FULL evidence (issue #370): the truncated path_line above stays the
+        # summary, but the verdict's whole basis — including the partial capture of a
+        # timed-out gate — must be reconstructable from bundle files alone.
+        rel, log_error = _write_gate_log(log_dir, chk, cmd=cmd, cwd=cwd,
+                                         worktree_path=worktree_path, started=started,
+                                         duration=duration, rc=rc, result=result,
+                                         timeout=bound, output=output)
+        row["duration_secs"] = duration  # additive keys — existing consumers unchanged
+        if log_error is None:
+            row["log"] = rel             # bundle-relative
+        else:
+            # A persistence failure must never break the gate run or alter the verdict —
+            # but it must NOT be silent either (#370 iteration 2): the feature's promise
+            # is "full basis reconstructable from bundle files alone", so a run where
+            # that silently did not happen re-creates the original defect. Record the
+            # reason in the row (additive) and say so on stderr.
+            row["log_error"] = log_error
+            print(f"  ! gate {label}: evidence log {GATE_LOGS_DIR}/ not written — "
+                  f"{log_error}", file=sys.stderr, flush=True)
     return row
 
 
-def _execute(cmd: str, *, cwd: Path, env: dict | None, label: str,
-             timeout_secs: int | None, watch: Path) -> dict:
-    """One run of a gate command → ``{result, evidence, output, duration_secs, started,
-    note}``. The full combined output rides along for the gate log (#370); on a timeout
-    the partial capture the killed child produced is what the log gets — the only record
-    of where it hung."""
-    started = datetime.now().astimezone().isoformat(timespec="seconds")
-    t0 = time.monotonic()
+def _write_gate_log(log_dir: Path, chk: dict, *, cmd: str, cwd: Path,
+                    worktree_path: Path | None, started: str, duration: float,
+                    rc: int | None, result: str, timeout: int | None,
+                    output: str) -> tuple[str | None, str | None]:
+    """Write ``gate-logs/<rule_id>.log`` — a small header, then the combined
+    stdout+stderr VERBATIM (issue #370). Returns ``(bundle_relative_path, None)`` on
+    success, or ``(None, reason)`` on a write failure: evidence persistence is
+    best-effort and must never break the gate run (the verdict itself is already in the
+    row) — but the failure is returned, not swallowed, so the caller surfaces it as the
+    row's ``log_error`` (#370 iteration 2)."""
+    name = f"{re.sub(r'[^A-Za-z0-9._-]', '_', chk.get('id', '')) or 'gate'}.log"
+    if rc == progress.TIMEOUT_RC:
+        # (#368 × #370) the bound expired: attach what the gate DID say before the kill,
+        # so a hung gate's log shows where it hung instead of nothing.
+        exit_line = f"timeout — killed after its {timeout}s bound (partial output below)"
+    elif rc is None:
+        exit_line = "exception — the command could not be run"
+    else:
+        exit_line = str(rc)
+    header = "\n".join([
+        f"# gate: {chk.get('id', '')} — {chk.get('label', '')}",
+        f"# cmd: {cmd}",
+        f"# cwd: {cwd}",
+        f"# PDCA_WORKTREE: {worktree_path if worktree_path is not None else '(none)'}",
+        f"# start: {started}",
+        f"# duration_secs: {duration}",
+        f"# exit: {exit_line}",
+        f"# outcome: {result}",
+        "# ---- combined stdout+stderr (verbatim) ----",
+        "",
+    ])
     try:
-        # Output is captured for the evidence line; the heartbeat ticks meanwhile so
-        # a long, silent gate (e.g. a Docker-backed test suite) doesn't look hung.
-        rc, output, _ = progress.run_with_heartbeat(
-            cmd, cwd=cwd, shell=True, env=_merged_env(env), capture=True, label=label,
-            timeout=timeout_secs, status=lambda: progress.bundle_activity(watch),
-        )
-        result, evidence = _classify(rc, output)
-        note = f"exit {rc}"
-    except subprocess.TimeoutExpired as exc:
-        # A bound gate that ran out of wall clock is UNVERIFIABLE, not failed (issue #46):
-        # the oracle never answered, so it has no verdict to give — reporting `fail` would
-        # blame the fix for the gate's own hang, and on a gating row would block a
-        # possibly-good patch. The human sees it in §6 and re-runs or adjudicates.
-        result = "unverifiable"
-        evidence = [f"gate exceeded its {timeout_secs}s timeout and was killed (no verdict "
-                    f"— re-run it, or raise the check's timeout_secs / "
-                    f"[gates] default_timeout_secs)"]
-        output = exc.output if isinstance(exc.output, str) else ""
-        note = f"killed at the {timeout_secs}s timeout"
-    except Exception as exc:  # command not found, etc. — a failing gate, surfaced
-        result, evidence, output, note = "fail", [str(exc)], "", f"did not run: {exc}"
-    return {"result": result, "evidence": evidence, "output": output,
-            "duration_secs": int(time.monotonic() - t0), "started": started, "note": note}
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / name).write_text(header + output, encoding="utf-8")
+    except OSError as exc:
+        return None, f"could not write {GATE_LOGS_DIR}/{name}: {exc}"
+    return f"{GATE_LOGS_DIR}/{name}", None
 
 
-def _write_gate_log(bundle: Path | None, chk: dict, *, cmd: str, cwd: Path,
-                    worktree_path: Path | None, attempts: list[dict]) -> str | None:
-    """Persist a gate run's FULL output under the bundle (#370). The row keeps its
-    120-char evidence line as the summary; this file is the record behind it — without
-    one, a red gate that does not reproduce (issue_648's C4-ci) cannot even be named.
-    Returns the bundle-relative path, or None when there is no bundle (a repo-scoped
-    working-tree run owns its own console) or the write fails — best-effort, because a
-    log that cannot be written must not fail the gate that ran."""
-    if bundle is None:
-        return None
-    raw = chk.get("id") or chk.get("tier") or "gate"
-    safe = re.sub(r"[^\w.-]+", "_", raw)
-    if safe != raw:
-        # The sanitizer is not injective ("foo bar" and "foo_bar" both map to
-        # "foo_bar"), and two rows sharing one log file would each point at the
-        # other's evidence — suffix the original id's checksum to keep names distinct.
-        safe = f"{safe}-{zlib.crc32(raw.encode('utf-8')):08x}"
-    name = safe + ".log"
-    rel = f"{GATE_LOG_DIR}/{name}"
-    parts = []
-    for i, a in enumerate(attempts, 1):
-        header = [
-            f"# gate {chk.get('id', '')} — attempt {i}/{len(attempts)}: "
-            f"{a['result']} ({a['note']})",
-            f"# cmd: {cmd}",
-            f"# cwd: {cwd}",
-        ]
-        if worktree_path is not None:
-            header.append(f"# PDCA_WORKTREE: {worktree_path}")
-        header.append(f"# started: {a['started']}   duration: {a['duration_secs']}s")
-        parts.append("\n".join(header) + "\n\n" + (a["output"] or "(no output captured)\n"))
-    try:
-        (bundle / GATE_LOG_DIR).mkdir(parents=True, exist_ok=True)
-        (bundle / rel).write_text("\n".join(parts), encoding="utf-8")
-    except OSError:
-        return None
-    return rel
+def _declarations(output: str, marker: str) -> list[str]:
+    """Every line of ``output`` the gate **declared** with ``marker``, in order — the text
+    after the marker (possibly empty).
+
+    A **declaration** is a line whose first text is the marker (leading whitespace ignored)
+    — how every documented emitter writes it: the shipped advisory check
+    (``scripts/checks/test_exercises_production.py``) prints ``f"{UNVERIFIABLE} {reason}"``,
+    and the gate wrappers ``echo`` the marker at the start of the line.
+
+    A mid-line occurrence is NOT a declaration: it is text the gate merely **relayed** from
+    something it ran (#428) — see :func:`_classify`. One notion of "the gate said this",
+    shared by both markers (#402)."""
+    out: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(marker):
+            out.append(stripped[len(marker):].strip())
+    return out
 
 
-def _classify(rc: int, output: str) -> tuple[str, list[str]]:
+def _declared_unverifiable(output: str) -> str | None:
+    """The gate's OWN ``unverifiable`` declaration in ``output`` — its reason — or ``None``.
+
+    The FIRST declaration wins: the reason a gate gives for deferring is the one it gave
+    when it stopped being able to verify, and later output cannot retract it."""
+    declared = _declarations(output, UNVERIFIABLE_MARKER)
+    return declared[0] if declared else None
+
+
+def _declared_evidence(output: str) -> str | None:
+    """The gate's OWN verdict summary in ``output`` — the row's evidence line — or ``None``.
+
+    The LAST non-empty declaration wins (issue #402): a wrapper with several legs declares
+    per leg, and its final word is the summary of the run as a whole — where the last
+    *output* line is merely whatever flushed last, usually a child's. A bare
+    ``PDCA-EVIDENCE:`` with no text is no summary and falls back with the undeclared case."""
+    declared = [text for text in _declarations(output, EVIDENCE_MARKER) if text]
+    return declared[-1] if declared else None
+
+
+def _declared_deferred(output: str) -> str | None:
+    """The gate's OWN ``deferred`` declaration in ``output`` — the reason its substantive
+    audit is owed later — or ``None`` (issue #401).
+
+    The FIRST declaration wins, as for :func:`_declared_unverifiable`: the reason a gate
+    gives when it finds its subject absent is the one it gave at that moment."""
+    declared = _declarations(output, DEFERRED_MARKER)
+    return declared[0] if declared else None
+
+
+def _deferrable(chk: dict, cfg: Config) -> bool:
+    """True iff ``chk`` is **re-gated later**, so a ``deferred`` row has a later verdict to
+    defer to (issue #401).
+
+    Deferral is legitimate only where the substantive audit actually happens afterwards:
+    the row must be one ``publish`` re-runs before it pushes anything
+    (:func:`publish.publish_gates` — a bundle-scoped T4 row, or an explicit
+    ``at_publish = true``). A row nothing re-gates owes its verdict to nobody, so its
+    declaration is ignored and it keeps today's ``pass``/``fail``. This is the guard that
+    keeps ``PDCA-DEFERRED:`` from becoming a way for any gate to opt out of scrutiny: a
+    deferral is a *hand-off* to a named later gate, not a waiver.
+    """
+    from . import publish  # lazy: publish imports leaves→gates; avoid an import cycle
+    return any(c is chk or c == chk for c in publish.publish_gates(cfg))
+
+
+def _classify(rc: int, output: str, *, deferrable: bool = False) -> tuple[str, list[str]]:
     """Map a gate command's exit code + output to (result, evidence-lines).
 
     ``unverifiable`` (issue #46) lets a gate that did NOT fail defer to the human: it may
-    exit 0 and still print the marker. The text after the marker is the reason; otherwise the
-    evidence is the command's last output line (as for pass/fail).
+    exit 0 and still declare the marker. The text after the marker is the reason; otherwise
+    the evidence is the gate's declared summary, and failing that the command's last output
+    line (as for pass/fail).
+
+    The evidence line obeys the same declaration rule as the verdict (#402): the row records
+    what the gate declared with :data:`EVIDENCE_MARKER`, and only where it declared nothing
+    does it fall back to ``output``'s last line. That fallback is what made a GREEN gate's
+    frozen record read like a failure path: the capture is one merged stdout+stderr stream
+    (``progress.run_with_heartbeat``), so a wrapper that shells out to a test suite files
+    whatever that suite's children flushed last — a ``/tmp`` scratch path from a sandbox
+    that no longer exists was recorded as a passing C4's whole evidence, which is neither
+    the *basis* of the verdict nor *reconstructable* (the invariant :func:`_write_gate_log`
+    exists to keep, #370). Declaring is the only way a gate can be sure what gets filed, so
+    the marker is the convention gate authors write to (docs 04 §Gate result vocabulary);
+    the undeclared fallback stays defined, and the full basis stays in ``row["log"]``.
+    The evidence marker never changes the verdict — a declaring gate that exits non-zero
+    still FAILS, with its declaration as the evidence.
 
     The marker is honoured only for an exit code that is not a failure — 0, or the dedicated
     ``UNVERIFIABLE_RC``. A gate that exits non-zero FAILED, whatever its output happens to
@@ -596,16 +800,43 @@ def _classify(rc: int, output: str) -> tuple[str, list[str]]:
     §6 in the path: the between-waves integration re-gate (``flow``) would not stop and later
     waves would build on a red tip, ``revalidate`` would not count it as a PASS→FAIL
     regression, and ``cli`` would exit 0. A gate with no possible verdict has its own channel;
-    it must use it rather than piggy-backing on a failure."""
+    it must use it rather than piggy-backing on a failure.
+
+    The same reason narrows *whose* marker counts (#428, the exit-0 half of #329). The
+    verdict is the GATE's to declare, so only a line the gate started with the marker is one
+    (:func:`_declared_unverifiable`); an occurrence anywhere else on a line is text the gate
+    **relayed** from what it ran — a child's log, an assertion diff, a source comment a test
+    read back — and it used to convert the gate's real verdict. It is structural for any project
+    whose tests exercise this machinery: a green C4 whose captured output quoted the
+    documented contract line (``... Emit `PDCA-UNVERIFIABLE: <reason>` and exit 77 ...``) was
+    recorded ``unverifiable``, so a real green stopped counting toward ``overall`` and a real
+    red would equally have been laundered into "defer to the human".
+
+    ``deferred`` (issue #401) is the same family with a different addressee: the gate RAN,
+    found its subject absent BY DESIGN, and owes its substantive verdict to a later gate —
+    a bundle-scoped T4 contribution row at Check time, whose ``pr-description.md`` publish
+    has not drafted yet. Recording that non-event as ``pass`` asserted a green no reviewer
+    could reproduce (the artifacts the row names are not among its inputs), so every cycle
+    escalated the by-design condition to §6 NEEDS-HUMAN; recording it ``unverifiable``
+    would route it to §6 too. It is honoured only on exit **0** — 77 is the ``unverifiable``
+    channel and a non-zero exit is a failure whatever the gate printed (#329) —
+    ``unverifiable`` wins when both are declared (the safer channel: it stops for a human),
+    and only when ``deferrable`` says a later gate actually re-runs this row
+    (:func:`_deferrable`)."""
     if rc in (0, UNVERIFIABLE_RC):
-        for line in output.splitlines():
-            if UNVERIFIABLE_MARKER in line:
-                reason = line.split(UNVERIFIABLE_MARKER, 1)[1].strip()
-                return "unverifiable", [reason or "gate declared itself unverifiable"]
-    last = output.strip().splitlines()[-1:] or [""]
+        reason = _declared_unverifiable(output)
+        if reason is not None:
+            return "unverifiable", [reason or "gate declared itself unverifiable"]
+        if rc == 0 and deferrable:
+            owed = _declared_deferred(output)
+            if owed is not None:
+                return "deferred", [owed or "substantive audit runs at publish"]
+    evidence = _declared_evidence(output)
+    if evidence is None:
+        evidence = (output.strip().splitlines()[-1:] or [""])[0]
     if rc == UNVERIFIABLE_RC:
-        return "unverifiable", [last[0] or f"gate exited unverifiable (rc {UNVERIFIABLE_RC})"]
-    return ("pass" if rc == 0 else "fail"), last
+        return "unverifiable", [evidence or f"gate exited unverifiable (rc {UNVERIFIABLE_RC})"]
+    return ("pass" if rc == 0 else "fail"), [evidence]
 
 
 def _merged_env(extra: dict | None) -> dict | None:
@@ -617,6 +848,9 @@ def _merged_env(extra: dict | None) -> dict | None:
 
 # ----------------------------------------------------------------------------
 def _finalize(rows: list[dict], *, name: str, write_to: Path | None) -> dict:
+    # Only a hard `fail` gates. `unverifiable` (#46) and `deferred` (#401) are verdicts the
+    # gate did NOT reach — neither a green nor a gating red — so neither counts toward
+    # `overall`; each has its own downstream route (§6 NEEDS-HUMAN / the later re-gate).
     gating_fail = any(r["gating"] and r["result"] == "fail" for r in rows)
     result = {"issue_dir": name, "overall": "fail" if gating_fail else "pass", "rows": rows}
     if write_to is not None:

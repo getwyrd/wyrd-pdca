@@ -8,6 +8,7 @@ stdlib ``tomllib`` so the harness has no runtime dependencies.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -34,6 +35,30 @@ DEFAULT_CLOSE_DISPOSITIONS = [
     # ordinary fixes. An accepted split writes an explicit close MARKER, which
     # `driver._close_class` honours outright — no hint token is needed for it (#323 review).
 ]
+
+# A leaf memory bound (issue #420) as systemd's resource-control grammar writes it: a
+# byte value with an optional K/M/G/T/P/E suffix, a percentage of physical RAM, the
+# literal `infinity`, or `off` (an explicit "no bound here", the per-leaf opt-out).
+_MEMORY_MAX_RE = re.compile(r"(?i)\A(off|infinity|\d+(\.\d+)?%|\d+(\.\d+)?[KMGTPE]?)\Z")
+
+
+def memory_max_value(raw, where: str) -> str:
+    """Validate one configured leaf memory bound; nonsense ⇒ ``""`` plus a note (#420).
+
+    Fail-safe like ``sweep_worktrees``' unknown-mode fallback — but in the OTHER
+    direction: an unparseable bound degrades to *unbounded* (today's behaviour), never
+    to a guessed number, because a wrong cap kills a run exactly as dead as no cap. The
+    note is what keeps the degradation from being silent. ``""``/absent ⇒ ``""``.
+    """
+    val = str(raw or "").strip()
+    if not val:
+        return ""
+    if not _MEMORY_MAX_RE.match(val):
+        print(f"config: {where} must be a systemd byte value such as \"8G\", a "
+              f"percentage (\"50%\"), or \"off\" — got {val!r}; ignoring it, so leaf "
+              "spawns stay unbounded (today's behaviour)", file=sys.stderr)
+        return ""
+    return val
 
 
 def _parse_opt_in(value, name: str) -> bool:
@@ -74,6 +99,13 @@ class LeafConfig:
     prepended to the task prompt. ``model`` / ``effort`` (optional) are mapped
     through the profile's ``model_flag`` / ``effort_argv``; flags already present
     in ``argv`` remain the explicit escape hatch and always win.
+
+    ``memory_max`` (optional, issue #420) is this leaf's memory bound — a systemd
+    byte value (``"8G"``, ``"50%"``) that overrides ``[driver].leaf_memory_max``
+    for this leaf alone, or the literal ``"off"`` to opt this leaf OUT of a
+    driver-level bound (the same "explicit setting always wins" escape hatch as
+    ``argv``). ``""`` (the default) inherits the driver-level bound, which is
+    itself unset by default ⇒ today's unbounded spawn, unchanged.
     """
 
     mode: str = "stub"
@@ -83,6 +115,7 @@ class LeafConfig:
     agent: str = ""
     model: str = ""
     effort: str = ""
+    memory_max: str = ""
 
 
 # ----------------------------------------------------------------------------
@@ -145,6 +178,18 @@ class Config:
     issue_url_pattern: str = ""
     repo_checkouts: dict[str, str] = field(default_factory=dict)  # repo_spec → local path
     gates_checks: list[dict] = field(default_factory=list)
+    # Host-only CI parity commands (issue #311): ``[gates] host_ci`` — CI jobs the host
+    # runs on EVERY PR but the delegated gate runner does not cover (a spell-checker like
+    # `typos`, a docs lint). The T4 slot runs before ``patch.diff`` is applied, so it
+    # structurally cannot see content that arrives in the patch — a bundle could pass
+    # Check green and open a PR that immediately fails a required status. Each declared
+    # command runs FROM a reconstructed base + ``patch.diff`` tree: at Check as a gate
+    # row (``gates._run_checks``, the lane worktree) and again in ``publish`` immediately
+    # before anything is pushed (``publish._host_ci_passes``, an ephemeral tree pinned to
+    # the exact base commit the push will build on). A bare string is shorthand for
+    # ``{cmd = "..."}``; rows are normalized by :func:`_normalize_host_ci` (always
+    # gating). Empty (the default) ⇒ byte-identical behaviour everywhere.
+    host_ci_checks: list[dict] = field(default_factory=list)
     # Reverse registry-consistency (issue #205): [gates.registry_consistency] naming an
     # instance's manifest files ({files=[...], pattern="<regex, group 1 = path>"}). The
     # `registry-check` subcommand (wired as a bundle-scoped gate) fails a patch that adds a
@@ -240,15 +285,15 @@ class Config:
     # / absent fields fall back to the default [leaves.builder] (default-open — a missing
     # difficulty tag never reduces capability). The escalation ladder overrides the variant.
     builder_variants: list[dict] = field(default_factory=list)
+    # Per-gate wall-clock bound fallback (issue #368): ``[gates] default_timeout_secs``.
+    # A ``[[gates.checks]]`` row's own ``timeout_secs`` wins over it; a row that times
+    # out is recorded ``unverifiable`` (→ SUMMARY §6 NEEDS-HUMAN), never pass/fail.
+    # ``None`` (unset / 0) ⇒ unbounded — today's behaviour, unchanged.
+    gates_default_timeout_secs: int | None = None
     # Delegated gates (issue #67): a host runner that single-sources its own gates
     # (e.g. "cargo xtask"). A check's bare ``subcmd`` is run as ``<runner> <subcmd>``, so
     # PDCA orchestrates the host runner instead of re-declaring the gates. "" ⇒ inline only.
     gates_runner: str = ""
-    # Wall-clock bound applied to every gate that doesn't set its own ``timeout_secs``
-    # (issue #187). 0 ⇒ unbounded, the pre-#187 behaviour. A gate that outruns its bound
-    # is killed (whole process group) and recorded ``unverifiable``, never ``fail``: the
-    # oracle gave no verdict, so it has none to hold against the fix.
-    gates_default_timeout_secs: int = 0
     # Confirm-once on a failed GATING row (eduralph/pdca-harness#371): re-run the command
     # once and record both verdicts; a fail→pass flip passes flagged ``flaky`` and routes
     # a §6 flake item to the human. On by default — one transient red must not park the
@@ -270,9 +315,14 @@ class Config:
     lanes: int = 1
     # Sign-off pass budget for one `pdca flow` run (issue #260): how many build-all →
     # sign-off passes a wave (or iterations a single issue) gets before the driver stops
-    # driving it. A bundle still iterating when the budget runs out is left un-terminal and
-    # NAMED on stderr with a resume hint — never silently dropped. ``[driver].max_passes``;
-    # ``PDCA_MAX_PASSES`` overrides for one run; ``--max-passes`` overrides both.
+    # driving it. It also sizes the RUN's pool (#469) — this many passes per wave the run
+    # set out to drive, spent down by every wave in turn — so a run whose drive set GROWS
+    # (a split whose children it adopts) draws the extra waves from the same pool instead
+    # of multiplying what the operator allowed. A run that adopts nothing can never reach
+    # that pool, so nothing about it changes. A bundle still iterating when the budget runs
+    # out is left un-terminal and NAMED on stderr with a resume hint — never silently
+    # dropped. ``[driver].max_passes``; ``PDCA_MAX_PASSES`` overrides for one run;
+    # ``--max-passes`` overrides both.
     max_passes: int = 20
     # Auto-iterate (issues #264/#332): while SUMMARY §6 carries implementation-level work —
     # a `gate` cell of the 5/5/1 (C2/C4/T1..T4), an advisory finding tagged `[impl]`, or a
@@ -291,10 +341,23 @@ class Config:
     # ``[driver].auto_iterate``; ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
     auto_iterate: bool = False
     # The per-bundle cap on those automatic rounds; on exhaustion the bundle halts at
-    # AWAITING_SIGNOFF for the human. Clamped below ``max_passes`` so a wave's pass budget
-    # can't run out mid-auto-iteration (which #260 would then report as abandoned).
-    # This is the HARD ceiling: a round at or below it fires regardless of whether the
-    # previous one made progress.
+    # AWAITING_SIGNOFF for the human. Clamped below ``max_passes``
+    # (``max_auto_iters = min(max_auto_iters, max(1, max_passes - 1))``, ``config.py:686``)
+    # so a wave driven on its FULL allowance can't run its pass budget out
+    # mid-auto-iteration (which #260 would then report as abandoned).
+    #
+    # That clamp is a statement about the ALLOWANCE, not a promise about every wave (#469).
+    # A wave that split adoption ADDED is drawn from what is left of the run's pool
+    # (``min(allowance, budget - spent)``, ``flow.py:1429``), which can be smaller than
+    # ``max_passes`` — so an adopted child can be cut off mid-auto-iteration after all.
+    # That is the run-wide cap binding, and it is the intended trade: the alternative —
+    # flooring an adopted wave at ``max_auto_iters`` — spends more passes than the operator
+    # allowed, which is the one thing the pool exists to prevent
+    # (``test_the_pass_budget_is_one_cap_for_the_whole_run`` measures exactly that). It is
+    # never silent: such a wave is named with its allowance and a resume hint
+    # (``flow.py:1310``, pinned by
+    # ``test_an_adopted_wave_only_gets_what_is_left_of_the_run_budget``). A run that adopts
+    # nothing cannot reach the pool at all, so the clamp holds there exactly as before.
     max_auto_iters: int = 3
     # The SOFT floor (issue #332): rounds up to it fire unconditionally, rounds ABOVE it
     # fire only while the implementation-finding count is not increasing. 0 ⇒ unset ⇒
@@ -341,6 +404,14 @@ class Config:
     # C4-verify's `origin/<brief base>` still matches the PR base) while the merge stays the
     # human's. No effect under wave_mode="stack". [driver].auto_merge.
     auto_merge: bool = True
+    # Which checks must be green before wave_mode="merge" merges a non-final wave's PR
+    # (issue #413). "all" (the default) reads the PR's FULL check rollup — `gh pr checks`,
+    # after the ready-mark, immediately before the merge — and refuses on any failing,
+    # pending or MISSING check, so a later wave cannot build on a base whose CI never went
+    # green. "required" restores host-config-only semantics: skip that gate and let `gh pr
+    # merge`'s own enforcement (whatever branch protection marks required — possibly
+    # nothing) decide, including merging with an empty rollup. [driver].merge_requires.
+    merge_requires: str = "all"
     # Optional integration re-gate (#wave-model): after each wave folds onto the
     # integration branch, run the repo-scoped gates over that tip before the next wave
     # builds on it, so a combination that is red though each fix was green alone STOPs the
@@ -354,6 +425,18 @@ class Config:
     # footprint (dominated by per-lane build dirs) has exhausted disk quotas and
     # false-redded gating gates mid-run. ``[driver].sweep_worktrees``.
     sweep_worktrees: str = "clean"
+    # Per-leaf memory bound (issue #420): a systemd byte value ("8G", "50%") every leaf
+    # subprocess the driver spawns is confined to, so a leaf that overruns dies as ITSELF
+    # and the flow survives to record that leaf's failure. Left unbounded, one leaf's
+    # build footprint takes down the run: two concurrent reviewer leaves wrote ~69 GB of
+    # cold build trees and systemd-oomd killed the whole terminal cgroup — driver, every
+    # lane, every bundle — with nothing in any gate log to say why, because oomd kills the
+    # CGROUP, not the offending process. "" (the default) ⇒ no wrapping and byte-identical
+    # argv, i.e. today's behaviour: there is no portable numeric default, and a wrong cap
+    # is itself a way to kill a run. A host with no usable containment facility degrades to
+    # the same no-op (leaves.py's probe), never to a hard failure. Per-leaf override:
+    # ``[leaves.*].memory_max``. ``[driver].leaf_memory_max``.
+    leaf_memory_max: str = ""
     # Free-space preflight threshold in GiB for `pdca doctor`'s workspace row (issue
     # #297): WARN when the filesystem under the project root has less free space, so
     # quota exhaustion is a preflight warning instead of a mid-gate `os error 122`.
@@ -383,6 +466,11 @@ class Config:
     # Structural size-estimate weights + cutoffs ([driver.sizing], issue #320). A raw
     # table so an instance can retune against its OWN corpus without patching the engine —
     # the whole point of #324's calibration loop. Empty => sizing.DEFAULT_* apply.
+    # Also carries `model_weight` (#359) — how much a sizer-leaf escalation adds to the
+    # numeric score (sizing.DEFAULT_MODEL_WEIGHT = 0, i.e. band-only, today's behaviour).
+    # Like every key here it is REVIEWED AT ACT CADENCE against the Act index's
+    # estimate-vs-outcome sizing column plus a fresh scripts/size-calibrate run — the
+    # retuning walk is documented in pdca.toml's [driver.sizing] comment block.
     sizing: dict = field(default_factory=dict)
     # Empirical Check-time backstop thresholds ([driver.size_signal], issue #324). Same
     # shape and same reason as `sizing` above: an instance retunes against its own corpus.
@@ -394,13 +482,28 @@ class Config:
     # #342's update test asserts. An instance opts in.
     size_guard: str = "off"
     # Plan-exit reconciliation of brief-declared external dependencies
-    # ([driver].dependency_guard, #333): "hold" (default) | "warn" | "off".
+    # ([driver].dependency_guard, #333): "hold" (default) | "warn" | "off". Since #340
+    # the same guard also EXECUTES the detect cmd of exactly the registered rows the
+    # brief's tokens name — registration alone was dischargeable on a host where the
+    # dependency is absent, because nothing ever ran the row.
     #
-    # Defaults to HOLD, unlike size_guard, because the verdict is set membership rather
-    # than a heuristic — there is no false-positive class to trade against — and because
-    # it moves an EXISTING block earlier rather than adding one: the same condition
-    # already refuses `signoff --accept` through the C6 guard.
+    # Defaults to HOLD, unlike size_guard, because the verdict is deterministic rather
+    # than a heuristic — set membership plus an exit code, with no false-positive class
+    # to trade against — and because it moves an EXISTING block earlier rather than
+    # adding one: the same condition already refuses `signoff --accept` through the C6
+    # guard.
     dependency_guard: str = "hold"
+    # Do-exit halt on a BUILDER-declared unmet external dependency
+    # ([driver].dependency_halt, #341): when build-notes.md carries the builder-contract
+    # marker `NEEDS-HUMAN external dependency:` AND the claim is confirmed
+    # deterministically — the named [[doctor.checks]] row (registered, or parsed from
+    # the builder's proposed fenced TOML block) has a detect cmd that exits non-zero —
+    # the driver reroutes BUILT through the close fast path to sign-off instead of
+    # spending gates + reviewer + adversary adjudicating a patch already stated to be
+    # unverifiable. A refuted or unresolvable claim runs full Check unchanged (fail
+    # toward review). STRICT boolean, default False: opt-in for one release, and while
+    # off the beat is byte-identical to today.
+    dependency_halt: bool = False
     close_dispositions: list[str] = field(
         default_factory=lambda: list(DEFAULT_CLOSE_DISPOSITIONS))
     # Family-profile overrides ([families.<name>] in pdca.toml): per-vendor CLI
@@ -409,8 +512,34 @@ class Config:
     families: dict[str, dict] = field(default_factory=dict)
     # Instance-declared doctor rows ([[doctor.checks]]): {id, cmd, hint, required}.
     # `pdca doctor` runs each cmd (exit 0 = OK) after its config-derived checks, the
-    # same declare-in-config pattern as [[gates.checks]].
+    # same declare-in-config pattern as [[gates.checks]]. A row a brief's `External
+    # dependencies` token names is also executed by the pre-dispatch dependency guard
+    # (#340), every beat the policy is consulted — detect cmds must stay cheap and
+    # side-effect-free.
     doctor_checks: list[dict] = field(default_factory=list)
+    # PR-review triage (#316): the optional single MODEL pass over the findings the
+    # keyword heuristics could not classify — a shell command fed the unclassified
+    # findings as a JSON list on stdin that must print a JSON list of class names.
+    # "" (the default) ⇒ keyword-only: the model pass never runs, and an instance
+    # taking a `copier update` gains no model call it did not ask for.
+    # ``[triage].model_cmd``.
+    triage_model_cmd: str = ""
+    # Result-bundle recording ([records], issue #317): `pdca record` commits the bundles
+    # whose state is terminal-finished (state.TERMINAL — the cycle is over) to the
+    # instance repo as ONE batch commit; mode = "pr" additionally branches, pushes and
+    # opens ONE draft PR for the batch. "off" (the default) disables the whole feature —
+    # no new behaviour anywhere, including the post-publish call-in and instances that
+    # do not version results/ at all.
+    records_mode: str = "off"
+    # The records branch (pr mode) — a `.format(date=)` pattern, like the publisher's
+    # branch patterns.
+    records_branch: str = "records/{date}"
+    # The batch commit's conventional subject — `.format(n=, ids=, date=)`.
+    records_subject: str = "chore(records): record {n} result bundle(s)"
+    # The tracker issue a records PR references (one-issue-per-PR instance rules):
+    # "" = none, "ask" = prompt when interactive (a headless run falls back to
+    # commit-only and reports), or a literal issue number.
+    records_issue: str = ""
 
     def __post_init__(self) -> None:
         self._normalize_auto_iters()
@@ -518,11 +647,16 @@ class Config:
         leaves = data.get("leaves", {})
         gates = data.get("gates", {})
         gates_checks = list(gates.get("checks", []))
+        host_ci_checks = _normalize_host_ci(gates.get("host_ci", []))
         gates_runner = gates.get("runner", "")
-        try:  # a typo'd bound must not crash config load — unbounded is the safe read
-            gates_default_timeout_secs = max(0, int(gates.get("default_timeout_secs", 0)))
+        # Per-gate timeout fallback (issue #368): [gates] default_timeout_secs. Unset,
+        # 0 or a non-numeric value ⇒ None (unbounded — behaviour unchanged).
+        try:
+            gates_default_timeout_secs = int(gates.get("default_timeout_secs", 0)) or None
         except (TypeError, ValueError):
-            gates_default_timeout_secs = 0
+            gates_default_timeout_secs = None
+        if gates_default_timeout_secs is not None and gates_default_timeout_secs < 0:
+            gates_default_timeout_secs = None
         gates_confirm_fail = bool(gates.get("confirm_gating_fail", True))
         registry_consistency = dict(gates.get("registry_consistency", {}))
         install_extra_bootstrap = data.get("install", {}).get("extra_bootstrap", "")
@@ -537,8 +671,11 @@ class Config:
         }
         # PDCA_GATES_MODE=stub empties the configured checks → the all-PASS stub
         # rows, so an offline "rehearse" runs the control flow without Docker.
+        # host_ci rows are emptied too (#311): same determinism reason — a rehearse
+        # must not run instance CI commands (or reconstruct worktrees) offline.
         if os.environ.get("PDCA_GATES_MODE") == "stub":
             gates_checks = []
+            host_ci_checks = []
 
         # PDCA_LEAVES_MODE forces every leaf's mode regardless of pdca.toml — so
         # CI and the offline self-test (`make`) stay deterministic (=stub, no
@@ -555,6 +692,10 @@ class Config:
                 agent=d.get("agent", ""),
                 model=d.get("model", ""),
                 effort=d.get("effort", ""),
+                # Per-leaf memory bound (#420): overrides [driver].leaf_memory_max for
+                # this leaf; "off" opts it out entirely, "" inherits the driver bound.
+                memory_max=memory_max_value(
+                    d.get("memory_max", ""), f"[leaves.{name}].memory_max"),
             )
 
         # Advisory reviewer leaves (issue #64) — an open list under [[leaves.advisory]].
@@ -669,6 +810,14 @@ class Config:
         # which for this knob means "driver merges nothing", the safe reading. An absent key
         # still arrives as the real bool `True`, so the upstream default is unchanged.
         auto_merge = _parse_opt_in(driver_cfg.get("auto_merge", True), "auto_merge")
+        # Check-rollup policy for merge mode (issue #413). An unknown value falls back to
+        # "all" with a note — the fail-safe direction is the STRICTER reading (verify the
+        # rollup ourselves), never a typo silently buying host-config-only semantics.
+        merge_requires = str(driver_cfg.get("merge_requires", "all")).strip().lower()
+        if merge_requires not in ("all", "required"):
+            print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
+                  "all | required; using 'all'", file=sys.stderr)
+            merge_requires = "all"
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.
@@ -680,6 +829,10 @@ class Config:
             print(f"config: unknown [driver].sweep_worktrees '{sweep_worktrees}' — "
                   "expected clean | remove | off; using 'clean'", file=sys.stderr)
             sweep_worktrees = "clean"
+        # Per-leaf memory bound (issue #420). Unset ⇒ "" ⇒ no wrapping at all; an
+        # unparseable value degrades to the same unbounded default, with a note.
+        leaf_memory_max = memory_max_value(
+            driver_cfg.get("leaf_memory_max", ""), "[driver].leaf_memory_max")
         try:  # free-space WARN threshold (issue #297); 0 disables the doctor row
             doctor_min_free_gb = max(0.0, float(data.get("doctor", {}).get("min_free_gb", 10.0)))
         except (TypeError, ValueError):
@@ -693,6 +846,27 @@ class Config:
         size_signal = dict(driver_cfg.get("size_signal", {}))
         size_guard = str(driver_cfg.get("size_guard", "off"))
         dependency_guard = str(driver_cfg.get("dependency_guard", "hold"))
+        # Do-exit dependency halt (#341) — STRICT boolean, like [leaves.sandbox]
+        # network_access (PR #292): this setting lets a confirmed claim skip the
+        # reviewer, so a non-boolean (`dependency_halt = "false"` is a truthy string)
+        # must fail CLOSED — feature off, full Check runs — and be reported, not guessed.
+        _halt = driver_cfg.get("dependency_halt", False)
+        if not isinstance(_halt, bool):
+            print(f"config: [driver].dependency_halt must be a boolean, got {_halt!r} — "
+                  "treating it as FALSE (full Check runs). Write "
+                  "`dependency_halt = true`, unquoted.", file=sys.stderr)
+        dependency_halt = _halt is True
+
+        # Result-bundle recording ([records], issue #317). An unknown mode fails CLOSED
+        # to "off", loudly — the fail-safe direction here is "invent no git commits",
+        # the opposite call from sweep_worktrees' "still sweeps" (#297): recording
+        # writes repo history, sweeping reclaims scratch.
+        records_cfg = data.get("records", {})
+        records_mode = str(records_cfg.get("mode", "off")).strip().lower()
+        if records_mode not in ("off", "commit", "pr"):
+            print(f"config: unknown [records] mode '{records_mode}' — expected "
+                  "off | commit | pr; using 'off' (recording disabled)", file=sys.stderr)
+            records_mode = "off"
 
         return cls(
             root=root,
@@ -725,6 +899,7 @@ class Config:
             act=leaf("act"),
             author=data.get("project", {}).get("author", ""),
             gates_checks=gates_checks,
+            host_ci_checks=host_ci_checks,
             registry_consistency=registry_consistency,
             install_extra_bootstrap=install_extra_bootstrap,
             manual_test_cmd=manual_test_cmd,
@@ -753,20 +928,67 @@ class Config:
             wave_mode=wave_mode,
             merge_method=merge_method,
             auto_merge=auto_merge,
+            merge_requires=merge_requires,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,
             sweep_worktrees=sweep_worktrees,
+            leaf_memory_max=leaf_memory_max,
             doctor_min_free_gb=doctor_min_free_gb,
             close_dispositions=close_dispositions,
             sizing=sizing,
             size_signal=size_signal,
             size_guard=size_guard,
             dependency_guard=dependency_guard,
+            dependency_halt=dependency_halt,
             families={k.strip().lower(): dict(v)
                       for k, v in data.get("families", {}).items()},
             doctor_checks=list(data.get("doctor", {}).get("checks", [])),
+            triage_model_cmd=str(data.get("triage", {}).get("model_cmd", "") or ""),
+            records_mode=records_mode,
+            records_branch=str(records_cfg.get("branch", "records/{date}")),
+            records_subject=str(records_cfg.get(
+                "subject", "chore(records): record {n} result bundle(s)")),
+            records_issue=str(records_cfg.get("issue", "") or ""),
         )
+
+
+def _normalize_host_ci(entries: list) -> list[dict]:
+    """Normalize ``[gates] host_ci`` (issue #311) into gate-check-shaped rows.
+
+    A bare string is shorthand for ``{cmd = "<string>"}``. Defaults, chosen so a
+    declared row closes the blind spot without further configuration: ``tier = "T4"``
+    (the CI-parity slot the issue names — the contribution as the host's CI will see
+    it), ``scope = "bundle"`` (they need the patched tree), and an ``id``/``label``
+    derived from the command so a failure always names what ran. Explicit id / label /
+    tier keys on a table row win over those defaults — but ``gating`` is FORCED true,
+    a contract rather than a default: the host's CI will fail the PR on every declared
+    command regardless of what an advisory row believed, and the #311 criterion is
+    literal — a command that exits non-zero blocks publish. A declared
+    ``gating = false`` is therefore ignored, loudly (the sign-off round that reviewed
+    this feature did not bless a bypass carve-out).
+    """
+    out: list[dict] = []
+    for i, entry in enumerate(entries):
+        row = dict(entry) if isinstance(entry, dict) else {"cmd": str(entry)}
+        cmd = str(row.get("cmd", "") or row.get("subcmd", ""))
+        if not cmd.strip():
+            # The #338 lesson: `subprocess.run("")` exits 0, so a command-less row
+            # would pass VACUOUSLY at every seam it is meant to guard. Drop it loudly.
+            print(f"config: [gates] host_ci entry {i} has no cmd/subcmd — ignoring it",
+                  file=sys.stderr)
+            continue
+        if not row.pop("gating", True):
+            print(f"config: [gates] host_ci entry {i} declares gating = false — "
+                  "ignored: a declared host-CI command always blocks (the host's CI "
+                  "will fail the PR on it either way, #311)", file=sys.stderr)
+        row["gating"] = True
+        row.setdefault("id", f"host-ci-{i}")
+        row.setdefault("tier", "T4")
+        row.setdefault("scope", "bundle")
+        row.setdefault("label", f"host CI: {cmd}")
+        out.append(row)
+    return out
 
 
 def _find_root(start: Path) -> Path:

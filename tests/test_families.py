@@ -267,10 +267,13 @@ class InteractiveSeedSpill(unittest.TestCase):
         # A fake interactive CLI: record its arg count, the seed it got, and — copying
         # any spill file named in that seed — the bytes the REPL would actually read.
         self.cli = self.tmp / "fake-claude.sh"
+        # The seed is the LAST positional: since v0.57.0 (upstream #396) the claude spawn
+        # inserts the family's `seed_separator` ("--") ahead of it, so the prompt is $2 and
+        # `$#` is 2 — a flag with an optional value must never sit last and swallow it.
         self.cli.write_text(
             "#!/bin/sh\n"
             'printf "%s" "$#" > argc.txt\n'
-            'printf "%s" "$1" > seed.txt\n'
+            'for a in "$@"; do printf "%s" "$a" > seed.txt; done\n'
             "for f in .pdca-prompt-*.md; do [ -e \"$f\" ] && cp \"$f\" spill.txt; done\n",
             encoding="utf-8")
         self.cli.chmod(0o755)
@@ -279,7 +282,7 @@ class InteractiveSeedSpill(unittest.TestCase):
 
     def test_small_seed_is_passed_inline(self) -> None:
         leaves._invoke(self.leaf, self.wd, "SHORT-PROMPT", cfg=self.cfg)
-        self.assertEqual((self.wd / "argc.txt").read_text(), "1")
+        self.assertEqual((self.wd / "argc.txt").read_text(), "2")   # "--" + the seed (#396)
         self.assertEqual((self.wd / "seed.txt").read_text(), "SHORT-PROMPT")
         self.assertFalse(list(self.wd.glob(".pdca-prompt-*.md")))
 
@@ -287,8 +290,8 @@ class InteractiveSeedSpill(unittest.TestCase):
         big = "ACT-INDEX-LINE\n" * 12000            # ~180 KiB, over MAX_ARG_STRLEN
         self.assertGreater(len(big.encode()), leaves._SEED_ARG_BUDGET)
         leaves._invoke(self.leaf, self.wd, big, cfg=self.cfg)   # must NOT raise E2BIG
-        # Still one positional, but now a short pointer — not the 180 KiB blob.
-        self.assertEqual((self.wd / "argc.txt").read_text(), "1")
+        # Still one seed positional, but now a short pointer — not the 180 KiB blob.
+        self.assertEqual((self.wd / "argc.txt").read_text(), "2")   # "--" + the seed (#396)
         seed = (self.wd / "seed.txt").read_text()
         self.assertLess(len(seed.encode()), leaves._SEED_ARG_BUDGET)
         self.assertIn(".pdca-prompt-", seed)

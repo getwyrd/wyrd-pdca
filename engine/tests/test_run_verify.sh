@@ -122,73 +122,56 @@ check "WYRD_VERIFY override + lane -> custom dir, lane-scoped branch" \
   $'VERIFY custom-verify\nBRANCH pdca-verify-l1' \
   "$(PDCA_LANE=1 WYRD_VERIFY=/tmp/custom-verify "$RV" --print-isolation)"
 
-# 8. base resolution (#91): the verify base follows the brief's "Repo + branch target",
-#    so a stacked milestone slice validates against ITS integration branch — not a
-#    hardcoded origin/main. Precedence: $WYRD_VERIFY_BASE > brief base > origin/main.
+# 8. base resolution (harness v0.57.0 / eduralph/pdca-harness#387). The brief parse this
+#    block used to exercise is GONE: `_brief_base()` was a shell twin of publish._clean_ref,
+#    and keeping two implementations of a subtle parse in step is the drift #387 removes.
+#    The driver now resolves the brief's base with the SAME parser publish commits against
+#    and exports it as $PDCA_BRIEF_BASE, already fully qualified. So what is pinned here is
+#    the PRECEDENCE and the pass-through — the parse itself is covered upstream, in Python,
+#    once (tests/test_verify_base.py + the brief._clean_ref suite).
+#    Precedence: $PDCA_BASE > $PDCA_VERIFY_BASE > $WYRD_VERIFY_BASE > $PDCA_BRIEF_BASE.
 mkbrief() { mkdir -p "$1"; printf '%s\n' "$2" > "$1/brief.md"; }
 
-mkbrief "$TMP/b_main"  '- **Repo + branch target:** getwyrd/wyrd @ main'
-check "brief base=main -> origin/main (historical default)" \
-  "origin/main" \
-  "$(PDCA_BUNDLE="$TMP/b_main" "$RV" --print-base)"
-
 mkbrief "$TMP/b_m4" '- **Repo + branch target:** getwyrd/wyrd @ `feat/m4-production-metadata-backend`'
-check "brief base=integration branch -> origin/<branch> (#91)" \
+
+# The value is used AS IT COMES. Composing `origin/$VAR` over it would double the remote —
+# the `origin/origin/main` shape the deleted twin produced for a verified-at-Plan note.
+check "PDCA_BRIEF_BASE is passed through verbatim (#387)" \
   "origin/feat/m4-production-metadata-backend" \
-  "$(PDCA_BUNDLE="$TMP/b_m4" "$RV" --print-base)"
+  "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_BRIEF_BASE=origin/feat/m4-production-metadata-backend \
+     "$RV" --print-base)"
 
-# Parity with publish._clean_ref, ANCHORED (#204). A backtick span wins only at the START of
-# the field; one in trailing prose is a parenthetical about a DIFFERENT branch and must not
-# hijack the base. This assertion used to pin the opposite, in the name of the very parity it
-# was breaking: _clean_ref was anchored upstream (#235/#262) and this twin never followed, so
-# publish opened the PR against main while C4-verify validated against feat/x-slice.
-mkbrief "$TMP/b_paren" '- **Repo + branch target:** getwyrd/wyrd @ main (feature branch `feat/x-slice`)'
-check "trailing backtick span does NOT hijack the base (#204) -> origin/main" \
-  "origin/main" \
-  "$(PDCA_BUNDLE="$TMP/b_paren" "$RV" --print-base)"
+check "a non-origin remote in PDCA_BRIEF_BASE survives intact (#387)" \
+  "upstream/main" \
+  "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_BRIEF_BASE=upstream/main "$RV" --print-base)"
 
-# The shape a planner actually writes — a verified-at-Plan note. Pre-#204 this yielded
-# `origin/origin/main`, a ref that resolves to nothing.
-mkbrief "$TMP/b_verified" '- **Repo + branch target:** getwyrd/wyrd @ main   (verified at Plan: `origin/main` = `9120f7a`)'
-check "verified-at-Plan note does not double the remote (#204) -> origin/main" \
-  "origin/main" \
-  "$(PDCA_BUNDLE="$TMP/b_verified" "$RV" --print-base)"
-
-# The other direction still holds: an anchored span IS the ref (already covered by b_m4
-# above; this pins the short form the issue tabulates).
-mkbrief "$TMP/b_anchored" '- **Repo + branch target:** getwyrd/wyrd @ `feat/x`'
-check "anchored backtick span is the base (#204) -> origin/feat/x" \
-  "origin/feat/x" \
-  "$(PDCA_BUNDLE="$TMP/b_anchored" "$RV" --print-base)"
-
-# Trailing sentence punctuation is stripped repeatedly, as _clean_ref's .rstrip(",.;:") does.
-mkbrief "$TMP/b_punct" '- **Repo + branch target:** getwyrd/wyrd @ main.'
-check "trailing punctuation stripped (matches _clean_ref) -> origin/main" \
-  "origin/main" \
-  "$(PDCA_BUNDLE="$TMP/b_punct" "$RV" --print-base)"
-
+# No driver env at all — a hand-run. The brief is NOT parsed any more, so the tail is the
+# project default, not the branch this brief names.
 mkbrief "$TMP/b_none" $'- **Kind:** bug\n- **Slug:** something'
-check "no branch target field -> origin/main default" \
+check "no driver export and no override -> origin/main default" \
   "origin/main" \
   "$(PDCA_BUNDLE="$TMP/b_none" "$RV" --print-base)"
 
-check "WYRD_VERIFY_BASE override wins over the brief" \
+check "WYRD_VERIFY_BASE override wins over the driver's brief base" \
   "origin/release-1.2" \
-  "$(PDCA_BUNDLE="$TMP/b_m4" WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
+  "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_BRIEF_BASE=origin/feat/m4-production-metadata-backend \
+     WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
 
-# driver-named bases (harness v0.54.0): at most one of PDCA_BASE (#54, an `Onto branch`
-# PR head) / PDCA_VERIFY_BASE (#273, the wave's folded integration branch) is exported,
-# already as a full ref; either outranks the local override and the brief — the test base
-# must never diverge from the base publish commits to.
-check "PDCA_VERIFY_BASE (wave fold, #273) wins over override + brief" \
+# The driver exports EXACTLY ONE of the three, but pin the order anyway: PDCA_BASE (#54, an
+# `Onto branch` PR head) / PDCA_VERIFY_BASE (#273, the wave's folded integration branch) /
+# PDCA_BRIEF_BASE (#387). The first two outrank the local override — the test base must never
+# diverge from the base publish commits to.
+check "PDCA_VERIFY_BASE (wave fold, #273) wins over override + brief base" \
   "origin/pdca-integration/main" \
   "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_VERIFY_BASE=origin/pdca-integration/main \
+     PDCA_BRIEF_BASE=origin/feat/m4-production-metadata-backend \
      WYRD_VERIFY_BASE=origin/release-1.2 "$RV" --print-base)"
 
 check "PDCA_BASE (Onto branch, #54) outranks everything" \
   "origin/feat/existing-pr-head" \
   "$(PDCA_BUNDLE="$TMP/b_m4" PDCA_BASE=origin/feat/existing-pr-head \
-     PDCA_VERIFY_BASE=origin/pdca-integration/main "$RV" --print-base)"
+     PDCA_VERIFY_BASE=origin/pdca-integration/main \
+     PDCA_BRIEF_BASE=origin/feat/m4-production-metadata-backend "$RV" --print-base)"
 
 # 9. cfg-gated test targets (#104). A test whose crate root is `#![cfg(NAME)]` compiles to
 #    an EMPTY binary without `--cfg NAME` — "running 0 tests", exit 0 — which an exit-status

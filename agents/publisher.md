@@ -2,8 +2,8 @@
 
 The fix is **accepted**. Your job is the *contribution arm of Check* — a **step of
 the Check beat, not a new beat**: turn the verified bundle into the two artifacts an
-upstream PR needs, **with the human**. You write prose only — the driver's `pdca
-publish` does the branch / apply / commit / push / draft-PR after you finish. **Do
+upstream PR needs, **with the human**. You write prose only — the driver's
+`pdca publish` does the branch / apply / commit / push / draft-PR after you finish. **Do
 not push, branch, or open a PR yourself.**
 
 ## What you produce (both in the bundle directory your prompt names)
@@ -20,9 +20,9 @@ not push, branch, or open a PR yourself.**
      trailer to stand alone as a blank-separated last line. Do **not** append a
      `Co-Authored-By:` (or any other) trailer after it. **If no tracker id is
      assigned yet** (the bundle id is not a real tracker number), OMIT the trailer rather
-     than invent a placeholder like `#0000` — `pdca publish --no-issue` drops the T4
-     tracker-id requirement (only that: every other contribution check still blocks the
-     push) and records the contribution `id_pending` for the human to fill the id in.
+     than invent a placeholder like `#0000` — `pdca publish --no-issue` runs T4 without
+     the tracker-id requirement (every other rule still blocks the push) and records the
+     contribution `id_pending` for the human to fill the id in.
 
 2. **`pr-description.md`** — the PR body (see `templates/pr-description.md.tpl`).
    Write for the PR's **actual audience** — a maintainer triaging, a reviewer of the
@@ -73,8 +73,8 @@ not push, branch, or open a PR yourself.**
 - Resolve the branch target per INTEGRATION §2. One logical fix per PR; do not invent
   scope the brief didn't accept.
 - The contribution branches from the brief's **target branch** (per INTEGRATION §2),
-  the PR is **draft-only** and the human marks it ready, and the deterministic `pdca
-  publish` performs the push. Write the commit-msg/PR prose to match the target; do not
+  the PR is **draft-only** and the human marks it ready, and the deterministic
+  `pdca publish` performs the push. Write the commit-msg/PR prose to match the target; do not
   push or open the PR yourself.
 
 

@@ -30,10 +30,47 @@ RESOLVED = "RESOLVED"  # briefless tracker bundle; notes.json records a terminal
 # States where the driver does nothing (human work, or done).
 HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
 
+# Terminal-FINISHED states (issue #317): the cycle is over and the bundle's files are
+# final — accepted (COMPLETE), deliberately abandoned (DISCONTINUED), or settled in the
+# tracker outside a cycle (RESOLVED). Deliberately NOT the whole HALTED set: UNPLANNED
+# and AWAITING_SIGNOFF are halted FOR a human — work is pending and the files still
+# change. Defined here, in the one module that owns the state names, so a consumer
+# (`record` selects on this) never re-enumerates states and drifts.
+TERMINAL = frozenset({COMPLETE, DISCONTINUED, RESOLVED})
+
 # Close-disposition fast path (issue #60): a bundle whose Plan concluded a close /
 # no-fix outcome never builds a patch. Its close marker is the Do artifact — the
 # symmetric stand-in for patch.diff — so the state machine reads it as "past Do".
 CLOSE_MARKER = "close-disposition"
+
+# Do-exit dependency adjudication record (issue #341): how the driver adjudicated a
+# builder-declared unmet external dependency at BUILT (confirmed ⇒ the beat rerouted to
+# the close fast path; refuted ⇒ full Check ran, the refutation lifted into §6). Named
+# here, like CLOSE_MARKER, so `dependency_halt` and the archive list share one spelling.
+DEPENDENCY_ADJUDICATION = "dependency-adjudication.json"
+
+# The sign-off session's live carry-forward (issue #331): the FULL multi-line rationale
+# the session wrote below its decision token, captured by the driver (flow) at the moment
+# the decision is consumed — §9's "Iteration delta" flattens it to one line and the
+# decision file itself is unlinked, so without this capture the only structured copy is
+# destroyed before the iterate transition reads it. Consumed (merged into the brief's
+# carry-forward block) by driver._carry_forward_into_brief, then archived with its
+# attempt via DOWNSTREAM_OF_BRIEF below.
+SESSION_CARRY = "session-carry-forward"
+
+# The reviewer leaf's captured-error tail (#138): written when the reviewer RAN AND
+# FAILED (retries exhausted), removed at the start of a successful run — which makes it
+# the discriminator (#369) between a reviewer that ran-and-failed and one that NEVER ran
+# (an interrupted beat), since neither leaves a check-review.md. Named here (like
+# CLOSE_MARKER) so the writer (``leaves``), the CHECKED-resume check (``driver``) and
+# the §6 wording split (``assemble``) share one spelling.
+REVIEW_ERROR_LOG = "check-review.error.log"
+
+# The per-rule gate evidence logs (issue #370): ``gate-logs/<rule_id>.log`` — the full
+# combined output behind each ``check-gates.json`` row, written by a bundle-scoped
+# ``gates.run_gates``. Named here (like CLOSE_MARKER / SESSION_CARRY) so ``gates`` (the
+# writer) and the archive list below share one spelling.
+GATE_LOGS_DIR = "gate-logs"
 
 # Everything Do and Check write, i.e. everything downstream of brief.md. Includes the
 # close marker (issue #60) so an iterate archives it too — reopening a close bundle to a
@@ -61,6 +98,19 @@ DOWNSTREAM_OF_BRIEF = [
     # the very numbers that justified rejecting it. Not in CYCLE_EVIDENCE_ONLY: unlike the
     # auto-iterate budget it does not accumulate, it is rewritten wholesale each Check.
     "size-signal.json",
+    # The Do-exit dependency adjudication (#341). A Do/Check-era verdict about THIS
+    # attempt's build-notes.md, so an iterate archives it with the attempt and the
+    # rebuild is adjudicated fresh — a stale record left behind would describe a
+    # declaration the new build-notes.md may no longer make.
+    DEPENDENCY_ADJUDICATION,
+    # The captured sign-off-session carry-forward (#331): written by flow when the
+    # decision is consumed, merged into the brief by _carry_forward_into_brief, and
+    # archived here WITH the attempt it describes — never left to leak into the next one.
+    SESSION_CARRY,
+    # The gate evidence logs (#370): a directory, one <rule_id>.log per configured check.
+    # Archived per round WITH the verdict they explain, so each iteration-v<N>/ keeps the
+    # full basis of its own gate run — the state-is-files doctrine applied to evidence.
+    GATE_LOGS_DIR,
 ]
 
 # Cycle artifacts matched by pattern rather than name. ONE definition, read by both
@@ -69,10 +119,6 @@ DOWNSTREAM_OF_BRIEF = [
 DOWNSTREAM_GLOBS = (
     "check-advisory-*.md",
     "*.error.log",
-    # Each gate's full captured output (eduralph/pdca-harness#370, instance #191) — the
-    # record behind the row's 120-char evidence line, and the only way a non-reproducing
-    # red can be diagnosed. Instance delta until #370 lands upstream.
-    "gate-logs/*.log",
 )
 
 # Cycle evidence that must NOT be archived — the one set where "what the archive moves"
