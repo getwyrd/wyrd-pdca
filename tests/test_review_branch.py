@@ -317,6 +317,18 @@ class InputCeiling(unittest.TestCase):
         self.assertEqual(chunks, [a + b])       # neighbours pack; order preserved
         self.assertEqual(oversize, [c])         # too large even ALONE — never dropped
 
+    def test_pack_chunks_measures_encoded_bytes_not_code_points(self):
+        # The ceiling is a BYTE bound on the encoded stdin payload (#220 review):
+        # 60 'é' are 60 code points but 120 UTF-8 bytes, so a code-point budget
+        # would pack this segment (85 ≤ 100) and the pass would still die on
+        # input_too_large — the exact error the planning exists to prevent.
+        seg = "diff --git a/u.rs b/u.rs\n" + "é" * 60
+        self.assertLessEqual(len(seg), 100)              # fits by code points…
+        self.assertGreater(rb.prompt_bytes(seg), 100)    # …not by bytes
+        chunks, oversize = rb.pack_chunks([seg], budget=100)
+        self.assertEqual(chunks, [])
+        self.assertEqual(oversize, [seg])
+
     def test_segment_file_reads_the_b_path(self):
         self.assertEqual(rb.segment_file("diff --git a/x/y.rs b/x/y.rs\n+1\n"),
                          "x/y.rs")
@@ -363,7 +375,7 @@ class CeilingIntegration(unittest.TestCase):
     def _run(self, scripted, diff, budget=160):
         """Patch the ceiling to (prompt overhead + budget) so `budget` is the
         exact diff budget, script the passes, capture prompts per pass."""
-        overhead = len(rb.PROMPT_TEMPLATE.format(n=3, rubric="RUBRIC", diff=""))
+        overhead = rb.prompt_bytes(rb.PROMPT_TEMPLATE.format(n=3, rubric="RUBRIC", diff=""))
         self.prompts_seen = []
 
         def fake_run_pass(idx, prompt, timeout, target):
@@ -414,6 +426,20 @@ class CeilingIntegration(unittest.TestCase):
         self.assertIn("Unreviewable", report)
         self.assertIn("boom", report)                # partial findings still surfaced
         self.assertEqual(len(self.prompts_seen), 3)  # only the fitting chunk ran
+
+    def test_unverifiable_survives_a_failed_fitting_pass(self):
+        # #220 review: oversize file + fitting chunk, and pass 2 over the fitting
+        # chunk fails BOTH rounds (a codex timeout). The thin-union refusal must
+        # not reach sys.exit first and record a hard failure — the oversize file
+        # can never be reviewed by a re-run, so the unverifiable verdict owns the
+        # row and the marker still names the file.
+        rc, out, _ = self._run(lambda i: (i != 2, [], "ok" if i != 2 else "boom"),
+                               diff=self.SEG_A + self.BIG)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)
+        last = [ln for ln in out.splitlines() if ln.strip()][-1]
+        self.assertTrue(last.startswith(rb.UNVERIFIABLE_MARKER), last)
+        self.assertIn("big.rs", last)
+        self.assertIn("2/3 passes", last)            # the thin union is named too
 
     def test_nothing_fits_no_pass_runs_unverifiable(self):
         rc, out, report = self._run(lambda i: (True, [], "clean"), diff=self.BIG)
