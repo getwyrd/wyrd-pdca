@@ -292,5 +292,163 @@ class GateIntegration(unittest.TestCase):
         self.assertIn("Auto-dropped", report)
 
 
+class InputCeiling(unittest.TestCase):
+    """#209 unit layer: the per-file split, the chunk packing, and the shared
+    unverifiable convention. A diff past the reviewer's input ceiling must never
+    read as a review VERDICT."""
+
+    def test_split_per_file_keeps_headers_and_preamble(self):
+        diff = ("preamble\n"
+                "diff --git a/a.rs b/a.rs\n+one\n"
+                "diff --git a/b.rs b/b.rs\n+two\n")
+        segs = rb.split_per_file(diff)
+        self.assertEqual(len(segs), 2)
+        self.assertTrue(segs[0].startswith("preamble\ndiff --git a/a.rs"))
+        self.assertTrue(segs[1].startswith("diff --git a/b.rs"))
+        self.assertEqual("".join(segs), diff)  # byte-preserving: nothing lost
+
+    def test_handmade_patch_without_headers_is_one_segment(self):
+        self.assertEqual(rb.split_per_file("--- a\n+++ b\n+x\n"),
+                         ["--- a\n+++ b\n+x\n"])
+
+    def test_pack_chunks_packs_in_order_and_isolates_oversize(self):
+        a, b, c = "a" * 40, "b" * 40, "c" * 120
+        chunks, oversize = rb.pack_chunks([a, c, b], budget=100)
+        self.assertEqual(chunks, [a + b])       # neighbours pack; order preserved
+        self.assertEqual(oversize, [c])         # too large even ALONE — never dropped
+
+    def test_pack_chunks_measures_encoded_bytes_not_code_points(self):
+        # The ceiling is a BYTE bound on the encoded stdin payload (#220 review):
+        # 60 'é' are 60 code points but 120 UTF-8 bytes, so a code-point budget
+        # would pack this segment (85 ≤ 100) and the pass would still die on
+        # input_too_large — the exact error the planning exists to prevent.
+        seg = "diff --git a/u.rs b/u.rs\n" + "é" * 60
+        self.assertLessEqual(len(seg), 100)              # fits by code points…
+        self.assertGreater(rb.prompt_bytes(seg), 100)    # …not by bytes
+        chunks, oversize = rb.pack_chunks([seg], budget=100)
+        self.assertEqual(chunks, [])
+        self.assertEqual(oversize, [seg])
+
+    def test_segment_file_reads_the_b_path(self):
+        self.assertEqual(rb.segment_file("diff --git a/x/y.rs b/x/y.rs\n+1\n"),
+                         "x/y.rs")
+
+    def test_unverifiable_convention_matches_the_harness(self):
+        # The script deliberately does not import the harness; these mirrored
+        # values are what make the gate row read `unverifiable` — pin them.
+        from pdca_harness import gates
+        self.assertEqual(rb.UNVERIFIABLE_RC, gates.UNVERIFIABLE_RC)
+        self.assertEqual(rb.UNVERIFIABLE_MARKER, gates.UNVERIFIABLE_MARKER)
+
+
+class CeilingIntegration(unittest.TestCase):
+    """#209 gate layer: main() under a small patched ceiling. A fitting diff is
+    reviewed whole (every other test in this file); an oversize one is chunked
+    per file and DECLARED degraded; a file too large even alone makes the run
+    `unverifiable` — the review never ran — instead of a red that reads like a
+    verdict (the issue_635 failure that cost a sign-off session)."""
+
+    SEG_A = "diff --git a/a.rs b/a.rs\n" + "+a\n" * 30
+    SEG_B = "diff --git a/b.rs b/b.rs\n" + "+b\n" * 30
+    BIG = "diff --git a/big.rs b/big.rs\n" + "+x\n" * 200
+
+    def setUp(self):
+        self.bundle = tempfile.mkdtemp()
+        self.target = Path(tempfile.mkdtemp())
+        self._env = mock.patch.dict(os.environ, {"PDCA_BUNDLE": self.bundle}, clear=False)
+        self._env.start()
+        self._argv = mock.patch.object(sys, "argv", ["review-branch", "--bundle"])
+        self._argv.start()
+        self.p = [
+            mock.patch.object(rb, "resolve_target", lambda repo: self.target),
+            mock.patch.object(rb, "load_rubric", lambda t: "RUBRIC"),
+        ]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self._argv.stop()
+        self._env.stop()
+
+    def _run(self, scripted, diff, budget=160):
+        """Patch the ceiling to (prompt overhead + budget) so `budget` is the
+        exact diff budget, script the passes, capture prompts per pass."""
+        overhead = rb.prompt_bytes(rb.PROMPT_TEMPLATE.format(n=3, rubric="RUBRIC", diff=""))
+        self.prompts_seen = []
+
+        def fake_run_pass(idx, prompt, timeout, target):
+            self.prompts_seen.append(prompt)
+            ok, findings, note = scripted(idx)
+            return idx, ok, findings, note
+        buf = io.StringIO()
+        with mock.patch.object(rb, "CODEX_INPUT_CEILING", overhead + budget), \
+                mock.patch.object(rb, "collect_diff", lambda a, t: diff), \
+                mock.patch.object(rb, "run_pass", fake_run_pass), \
+                contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = rb.main()
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+        report = Path(self.bundle) / "review-batch.md"
+        return rc, buf.getvalue(), (report.read_text() if report.is_file() else "")
+
+    def test_oversize_diff_runs_chunked_and_says_degraded(self):
+        rc, out, report = self._run(lambda i: (True, [], "clean"),
+                                    diff=self.SEG_A + self.SEG_B)
+        self.assertEqual(rc, 0)                      # a clean chunked run stays green…
+        self.assertEqual(len(self.prompts_seen), 6)  # 2 chunks × 3 passes
+        self.assertIn("Degraded run", report)        # …but says so where triage happens
+        self.assertIn("[chunked ×2]", out)
+        # Each chunk prompt carries the rubric and exactly one file's diff.
+        self.assertTrue(all("RUBRIC" in p for p in self.prompts_seen))
+        self.assertTrue(any("b/a.rs" in p and "b/b.rs" not in p
+                            for p in self.prompts_seen))
+        self.assertTrue(any("b/b.rs" in p and "b/a.rs" not in p
+                            for p in self.prompts_seen))
+
+    def test_chunked_findings_still_block(self):
+        rc, out, _ = self._run(lambda i: (True, [_f("a.rs:1", "BUG", "boom")], "1"),
+                               diff=self.SEG_A + self.SEG_B)
+        self.assertEqual(rc, 1)
+        self.assertIn("BLOCKING:", out)
+
+    def test_oversize_single_file_declares_unverifiable_not_fail(self):
+        rc, out, report = self._run(lambda i: (True, [_f("a.rs:1", "BUG", "boom")], "1"),
+                                    diff=self.SEG_A + self.BIG)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)     # not 1: this is no verdict
+        last = [ln for ln in out.splitlines() if ln.strip()][-1]
+        self.assertTrue(last.startswith(rb.UNVERIFIABLE_MARKER),
+                        f"the marker must be the LAST line (gate evidence): {last!r}")
+        self.assertIn("big.rs", last)                # the unreviewed file is NAMED
+        self.assertIn("Unreviewable", report)
+        self.assertIn("boom", report)                # partial findings still surfaced
+        self.assertEqual(len(self.prompts_seen), 3)  # only the fitting chunk ran
+
+    def test_unverifiable_survives_a_failed_fitting_pass(self):
+        # #220 review: oversize file + fitting chunk, and pass 2 over the fitting
+        # chunk fails BOTH rounds (a codex timeout). The thin-union refusal must
+        # not reach sys.exit first and record a hard failure — the oversize file
+        # can never be reviewed by a re-run, so the unverifiable verdict owns the
+        # row and the marker still names the file.
+        rc, out, _ = self._run(lambda i: (i != 2, [], "ok" if i != 2 else "boom"),
+                               diff=self.SEG_A + self.BIG)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)
+        last = [ln for ln in out.splitlines() if ln.strip()][-1]
+        self.assertTrue(last.startswith(rb.UNVERIFIABLE_MARKER), last)
+        self.assertIn("big.rs", last)
+        self.assertIn("2/3 passes", last)            # the thin union is named too
+
+    def test_nothing_fits_no_pass_runs_unverifiable(self):
+        rc, out, report = self._run(lambda i: (True, [], "clean"), diff=self.BIG)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)
+        self.assertEqual(self.prompts_seen, [])      # the review never ran at all
+        self.assertTrue(any(ln.startswith(rb.UNVERIFIABLE_MARKER)
+                            for ln in out.splitlines()))
+        self.assertEqual(report, "")                 # no report pretending otherwise
+
+
 if __name__ == "__main__":
     unittest.main()
