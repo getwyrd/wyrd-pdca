@@ -75,17 +75,18 @@ def run_with_heartbeat(
     exactly the 19h-hung-gate failure this bound exists to end.
 
     On POSIX, every child whose stdio the harness owns (``capture`` /
-    ``stream_json``) or whose wall-clock is bounded runs in its own session, and
-    whatever it leaves running in its process group when it exits — by any path:
-    normal return, timeout, Ctrl-C — is swept (SIGTERM, short grace, SIGKILL),
-    with one stderr note naming the command (issue #372). ``proc.wait`` returning
-    only proves the *direct* child exited; under ``shell=True`` (every gate) that
-    child is just the shell, so surviving work is the rule, not the edge case —
-    measured: a leaked test process burned ~100% of a core for 21 hours, and a
-    straggler still holds ports, locks and fixtures when the next cycle's gates
-    run in the same lane worktree. A child that exits leaving no survivors sees
-    no sweep and no note. The interactive leaves (no capture, no stream, no
-    bound) are never sessionized: they keep the terminal exactly as today.
+    ``stream_json`` / ``tee_stderr``) or whose wall-clock is bounded runs in its
+    own session, and whatever it leaves running in its process group when it
+    exits — by any path: normal return, timeout, Ctrl-C — is swept (SIGTERM,
+    short grace, SIGKILL), with one stderr note naming the command (issue #372).
+    ``proc.wait`` returning only proves the *direct* child exited; under
+    ``shell=True`` (every gate) that child is just the shell, so surviving work
+    is the rule, not the edge case — measured: a leaked test process burned
+    ~100% of a core for 21 hours, and a straggler still holds ports, locks and
+    fixtures when the next cycle's gates run in the same lane worktree. A child
+    that exits leaving no survivors sees no sweep and no note. The interactive
+    leaves (no capture, no stream, no tee, no bound) are never sessionized: they
+    keep the terminal exactly as today.
 
     ``status``, if given, is called on every tick to append a live snapshot of the
     child's work (e.g. which artifacts exist yet, time since the last write) — so the
@@ -117,14 +118,18 @@ def run_with_heartbeat(
         stdout, stderr = None, subprocess.PIPE  # stdout stays live; tee stderr only
     else:
         stdout, stderr = None, None
-    # Sessionize (POSIX only) every child whose stdio the harness owns — capture or
-    # stream_json — as well as any bounded child (#368's condition, widened by #372).
-    # A new session makes the child the leader of its own process group
-    # (pgid == proc.pid), the only handle that still reaches what a shell=True
-    # child spawned after the shell itself exits. The interactive leaves (no
-    # capture, no stream, no bound) are NOT sessionized, so they keep the
-    # terminal's foreground process group exactly as today.
-    sessionize = os.name == "posix" and (capture or stream_json or timeout is not None)
+    # Sessionize (POSIX only) every child whose stdio the harness owns — capture,
+    # stream_json, or the tee-only stderr pipe a stream-less family gets — as well
+    # as any bounded child (#368's condition, widened by #372; tee_stderr added by
+    # the #218 review: a tee-only child that leaves a descendant holding the piped
+    # stderr keeps the drain thread blocked and the close hangs, the very defect
+    # the sweep exists for). A new session makes the child the leader of its own
+    # process group (pgid == proc.pid), the only handle that still reaches what a
+    # shell=True child spawned after the shell itself exits. The interactive
+    # leaves (no capture, no stream, no tee, no bound) are NOT sessionized, so
+    # they keep the terminal's foreground process group exactly as today.
+    sessionize = os.name == "posix" and (
+        capture or stream_json or tee_stderr or timeout is not None)
     proc = subprocess.Popen(
         cmd, cwd=cwd, shell=shell, env=env, text=True,
         stdin=stdin, stdout=stdout, stderr=stderr,
@@ -243,15 +248,46 @@ def _terminate_group(proc: subprocess.Popen, grace: float = 2.0) -> None:
     id is ``proc.pid`` and ``os.killpg`` reaches every member. Best-effort on the
     signals (the group may already be gone); the final ``wait`` reaps the child so no
     zombie survives the timeout path.
+
+    The escalation is decided by GROUP liveness, not by ``proc.wait`` alone (#218
+    review): the shell dying promptly on SIGTERM proves nothing about a descendant
+    that ignores it, and judged only by the direct child that survivor would never
+    see the SIGKILL — outliving the very bound that exists to stop it. So when the
+    direct child exits early, survivors get the remainder of the grace and any
+    live member still standing brings SIGKILL down on the whole group.
+
+    Non-POSIX (Windows) has no process group to kill: ``proc.terminate()`` /
+    ``proc.kill()`` bound the direct child so an expired timeout still yields
+    :data:`TIMEOUT_RC` instead of an ``AttributeError`` escaping from the missing
+    ``os.killpg`` (#218 review). Descendants are out of reach there — a
+    documented gap, not a crash.
     """
+    if os.name != "posix":
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
+        return
+    # The direct child exited within the grace — which proves nothing about its
+    # descendants. Give survivors the rest of the grace, then SIGKILL whatever
+    # LIVE member (zombie-aware, like the sweep) is left.
+    while time.monotonic() < deadline and _group_alive(proc.pid):
+        time.sleep(0.05)
+    if _group_alive(proc.pid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 def _sweep_stragglers(pgid: int, cmd, grace: float = 2.0) -> None:

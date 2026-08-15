@@ -16,11 +16,13 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pdca_harness import gates, progress
 from pdca_harness.config import Config, LeafConfig
@@ -186,6 +188,28 @@ class CodexStream(unittest.TestCase):
         self.assertFalse(progress._is_session_event(json.dumps({"type": "item.started"})))
 
 
+def _pid_alive(pid: int) -> bool:
+    """Liveness, ZOMBIE-AWARE: reads the state field of /proc/<pid>/stat and
+    counts ``Z`` (unreaped under a non-reaping PID 1, e.g. a container where
+    the test runner is init) as gone — a bare ``kill(pid, 0)`` would read
+    that zombie as alive forever (#218 review: the timeout tests' killed
+    grandchild is exactly such an adoptee). Falls back to the signal-0 probe
+    only where /proc does not exist (non-Linux POSIX)."""
+    if Path("/proc").is_dir():
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii",
+                                                       errors="replace")
+        except OSError:
+            return False  # no /proc entry → gone
+        # `pid (comm) state …` — comm may hold spaces, split after the `)`.
+        return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 class HeartbeatTimeout(unittest.TestCase):
     """The wall-clock bound on ``run_with_heartbeat`` (issue #368).
 
@@ -199,12 +223,13 @@ class HeartbeatTimeout(unittest.TestCase):
 
     @staticmethod
     def _dies(pid: int, within: float = 5.0) -> bool:
-        """True once ``pid`` no longer exists (polled — signal delivery is async)."""
+        """True once ``pid`` is dead/zombie (polled — signal delivery is async).
+        Zombie-aware via :func:`_pid_alive` (#218 review): the group kill's
+        grandchild is adopted by PID 1, and under a non-reaping init it stays a
+        zombie that a bare ``kill(pid, 0)`` would count as alive forever."""
         end = time.monotonic() + within
         while time.monotonic() < end:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not _pid_alive(pid):
                 return True
             time.sleep(0.05)
         return False
@@ -231,11 +256,82 @@ class HeartbeatTimeout(unittest.TestCase):
         for pid in pids:
             self.assertTrue(self._dies(pid), f"pid {pid} survived the group kill")
 
+    def test_sigterm_ignoring_grandchild_is_still_killed(self) -> None:
+        # The shell dies on SIGTERM at once; its backgrounded child IGNORES
+        # SIGTERM. Escalation judged only by the direct child would then never
+        # send SIGKILL, and the survivor outlives the very bound that exists to
+        # stop it (#218 review). The group-liveness check must bring it down.
+        prog = ("import signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)")
+        cmd = f"{sys.executable} -c '{prog}' & echo $!; wait"
+        start = time.monotonic()
+        rc, out, _ = progress.run_with_heartbeat(cmd, shell=True, capture=True,
+                                                 timeout=1)
+        self.assertEqual(rc, progress.TIMEOUT_RC)
+        self.assertLess(time.monotonic() - start, 15.0)
+        pids = [int(tok) for tok in out.split() if tok.isdigit()]
+        self.assertEqual(len(pids), 1, f"expected the ignorer's pid: {out!r}")
+        def mop() -> None:  # a RED run must not leak the ignorer it is about
+            with contextlib.suppress(OSError):
+                os.kill(pids[0], signal.SIGKILL)
+        self.addCleanup(mop)
+        self.assertTrue(self._dies(pids[0]),
+                        f"SIGTERM-ignoring pid {pids[0]} survived the timeout")
+
     def test_unexpired_timeout_returns_the_real_exit_code(self) -> None:
         rc, out, _ = progress.run_with_heartbeat(
             [sys.executable, "-c", "print('ok')"], capture=True, timeout=30)
         self.assertEqual(rc, 0)  # a bound that never expires changes nothing
         self.assertIn("ok", out)
+
+
+class TerminateGroupNonPosix(unittest.TestCase):
+    """The non-POSIX termination path of ``_terminate_group`` (#218 review).
+
+    On Windows ``sessionize`` is always False, but an expired timeout still calls
+    ``_terminate_group`` — which reached the POSIX-only ``os.killpg``
+    unconditionally, so the ``AttributeError`` escaped the wait loop, a timed-out
+    gate recorded a hard failure instead of ``unverifiable``, and the child kept
+    running. The fallback must bound the direct child with ``terminate()`` /
+    ``kill()`` and never touch a process-group API. Exercised with a stub proc
+    and a patched ``os.name`` so the contract is held on every platform's run."""
+
+    class _Proc:
+        """Popen stand-in: ``wait(timeout=)`` times out until ``kill()``."""
+
+        def __init__(self, dies_on_terminate: bool) -> None:
+            self.dies_on_terminate = dies_on_terminate
+            self.calls: list[str] = []
+
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+
+        def wait(self, timeout=None) -> int:
+            self.calls.append("wait")
+            if self.dies_on_terminate or "kill" in self.calls:
+                return 1
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+            return 1
+
+    def _run(self, proc: "_Proc") -> None:
+        boom = mock.Mock(side_effect=AssertionError("os.killpg on non-POSIX"))
+        with mock.patch.object(progress.os, "name", "nt"), \
+                mock.patch.object(progress.os, "killpg", boom, create=True):
+            progress._terminate_group(proc, grace=0.01)
+
+    def test_terminates_then_kills_a_sigterm_survivor(self) -> None:
+        proc = self._Proc(dies_on_terminate=False)
+        self._run(proc)
+        self.assertEqual(proc.calls, ["terminate", "wait", "kill", "wait"])
+
+    def test_a_prompt_exit_needs_no_kill(self) -> None:
+        proc = self._Proc(dies_on_terminate=True)
+        self._run(proc)
+        self.assertEqual(proc.calls, ["terminate", "wait"])
 
 
 @unittest.skipUnless(os.name == "posix", "sessionization and the sweep are POSIX-only")
@@ -254,32 +350,13 @@ class StragglerSweep(unittest.TestCase):
     interactive-shaped call (no capture, no stream, no bound) is untouched.
     """
 
-    @staticmethod
-    def _alive(pid: int) -> bool:
-        """Liveness, ZOMBIE-AWARE: reads the state field of /proc/<pid>/stat and
-        counts ``Z`` (unreaped under a non-reaping PID 1, e.g. a container where
-        the test runner is init) as gone — a bare ``kill(pid, 0)`` would read
-        that zombie as alive forever. Falls back to the signal-0 probe only
-        where /proc does not exist (non-Linux POSIX)."""
-        if Path("/proc").is_dir():
-            try:
-                stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii",
-                                                           errors="replace")
-            except OSError:
-                return False  # no /proc entry → gone
-            # `pid (comm) state …` — comm may hold spaces, split after the `)`.
-            return stat.rpartition(")")[2].split()[0] not in ("Z", "X")
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-
     def _gone(self, pid: int, within: float = 8.0) -> bool:
-        """True once ``pid`` is dead/zombie (polled — signal delivery is async)."""
+        """True once ``pid`` is dead/zombie (polled — signal delivery is async).
+        Zombie-aware via the module-level :func:`_pid_alive` (hoisted there so
+        the timeout tests share it, #218 review)."""
         end = time.monotonic() + within
         while time.monotonic() < end:
-            if not self._alive(pid):
+            if not _pid_alive(pid):
                 return True
             time.sleep(0.05)
         return False
@@ -353,9 +430,38 @@ class StragglerSweep(unittest.TestCase):
                                                stream_json=True)
         self.assertEqual(rc, 0, "stream_json=True must sessionize the child")
 
+    def test_tee_stderr_only_child_is_sessionized(self) -> None:
+        # A stream-LESS leaf family (generic, gemini) reaches run_with_heartbeat
+        # as tee_stderr=True ALONE — no capture, no stream, no bound. The harness
+        # owns that child's stderr pipe, so it must be sessionized and swept like
+        # the capture/stream shapes (#218 review): unswept, a descendant that
+        # inherited the pipe keeps the drain thread blocked into later beats.
+        prog = "import os, sys; sys.exit(0 if os.getpid() == os.getpgrp() else 1)"
+        rc, _, _ = progress.run_with_heartbeat([sys.executable, "-c", prog],
+                                               tee_stderr=True)
+        self.assertEqual(rc, 0, "tee_stderr=True must sessionize the child")
+
+    def test_tee_stderr_straggler_is_swept_no_close_hang(self) -> None:
+        # The #218-review failure shape end to end: a tee-only leaf exits leaving
+        # a child that inherited the piped stderr. Unsessionized there is no
+        # sweep — the drain thread stays blocked mid-read and the stream close
+        # waits on it until the straggler dies (~10s here). Swept, the last
+        # writer dies, the drain sees EOF, and the call returns promptly.
+        buf = io.StringIO()
+        start = time.monotonic()
+        with contextlib.redirect_stderr(buf):
+            rc, out, _ = progress.run_with_heartbeat(
+                "sleep 10 & echo $! >&2", shell=True, tee_stderr=True)
+        elapsed = time.monotonic() - start
+        pid = self._straggler_pid(out)  # the tee tail carries the echoed $!
+        self.assertEqual(rc, 0)
+        self.assertLess(elapsed, 4.0, "call blocked on the straggler-held pipe")
+        self.assertTrue(self._gone(pid), f"straggler {pid} survived the tee-only exit")
+        self.assertIn("swept", buf.getvalue())
+
     def test_interactive_shaped_call_is_not_sessionized(self) -> None:
-        # No capture, no stream, no bound — the interactive leaves keep the
-        # terminal's process group exactly as today.
+        # No capture, no stream, no tee, no bound — the interactive leaves keep
+        # the terminal's process group exactly as today.
         prog = "import os, sys; sys.exit(0 if os.getpid() != os.getpgrp() else 1)"
         rc, _, _ = progress.run_with_heartbeat([sys.executable, "-c", prog])
         self.assertEqual(rc, 0, "an interactive-shaped call must NOT be sessionized")
