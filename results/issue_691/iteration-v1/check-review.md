@@ -1,0 +1,15 @@
+Reviewing issue #691: add the multipart protocol's canonical key grammar and validated identity types to `wyrd-core`.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The settled contract gives a complete decision surface—disjoint namespaces, strict token forms, and decode-time canonicality—so implementation can be judged without inventing policy (`docs/design/proposals/draft/0016-multipart-commit-protocol.md:333`). |
+| C2 Reproduction (red pre-fix) | PASS | With the patch stashed the base exits 101 because no `multipart_keys` target exists; after restoration both binding negations fail the intended assertions, demonstrating that the born-at-tier criterion is non-vacuous (`crates/core/tests/multipart_keys.rs:57`). |
+| C3 Change | PASS | The patch implements the scoped validated identities, disjoint constants, range constructors, and strict parsers without store I/O or an out-of-scope dependency change (`crates/core/src/multipart.rs:152`). |
+| C4 Verification (red→green) | PASS | Independent reruns produced absence-red, 16/16 patched tests green, both named negations red, and every `cargo xtask ci` leg green; the initial `cargo-deny` global-lock error disappeared with its home moved to scratch and was a host caveat (`crates/core/tests/multipart_keys.rs:14`). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Rebuild must add a digit-bearing `Digest::from_hex` round trip and cover `AttemptId::as_str`—five independently reproduced survivors show the claimed validated-identity evidence can miss broken numeric-nibble decoding and a broken public accessor (`crates/core/tests/multipart_keys.rs:110`). |
+| T1 Structure | PASS | The dependency direction and flat-module convention remain intact: one sibling module is exported from the existing crate root (`crates/core/src/lib.rs:13`). |
+| T2 Shape | PASS | The change is confined to the three authorized files and approximately 952 nonblank, non-comment added lines, below the 1,150 semantic-line ceiling (`crates/core/src/multipart.rs:1`). |
+| T3 Runtime | N/A | This slice deliberately has no production consumer, store access, async path, clock, service, or manual/visual runtime outcome to assess (`crates/core/src/multipart.rs:5`). |
+| T4 Contribution | NEEDS-HUMAN | Human must determine whether the unavailable `scripts/review-branch --bundle` blocker is the same as C5—the supplied gate summary reports one blocker but omits its report/tool, so a distinct contribution finding cannot be ruled out; affected-path prior art itself was mechanically clear. |
+| T5 Judgment | PASS | No additional architecture, scope, capability-probe, or external-dependency judgment remains beyond the concrete rebuild-routable C5 coverage defect (`crates/core/src/multipart.rs:474`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide whether this grammar is fit to freeze as the stored-format seam—later slices will persist these widths and prefixes, so an overlooked spelling or overlap becomes a migration and reclamation risk (`crates/core/src/multipart.rs:247`). |

@@ -12,7 +12,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import shlex
 import shutil
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -24,6 +27,22 @@ from pdca_harness import cli, flow, gates, leaves, publish, scratch, signoff, st
 from pdca_harness.config import Config, LeafConfig
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
+_SRC = Path(cli.__file__).resolve().parents[1]          # …/template/src — the tree under test
+
+
+def _shipped_t4_row_cmd() -> str:
+    """The registered `T4-contribution` checker invocation, exactly as shipped (#384):
+    the narrow --no-issue mode must reach an instance through the registered row, not
+    through hand-editing its config. Read from `pdca.toml.jinja` in the template tree
+    or the rendered `pdca.toml` when this suite runs inside a rendered instance (the
+    root render suite copies it there); the instance-specific leading cli token is
+    dropped so the caller can substitute the tree-under-test's own CLI."""
+    root = Path(publish.__file__).resolve().parents[2]
+    config = next(p for p in (root / "pdca.toml.jinja", root / "pdca.toml") if p.is_file())
+    row = next(line for line in config.read_text(encoding="utf-8").splitlines()
+               if '"T4-contribution"' in line)
+    cmd = re.search(r'cmd = "([^"]+)"', row).group(1)
+    return cmd[cmd.index("contribcheck"):]
 
 
 def _cfg(root: Path) -> Config:
@@ -388,7 +407,9 @@ class PublishSlice(unittest.TestCase):
         self.assertIn("minutes", err.getvalue())
         # Run through the heartbeat runner, still capturing for the failure report.
         self.assertTrue(beat.call_args.kwargs["capture"])
-        self.assertEqual(beat.call_args.kwargs["label"], "batched rubric review")
+        # `<id>: <label>` since v0.57.0 — upstream took the #181 announce as its #384 and
+        # standardised the label on the shape gates._run_one already used.
+        self.assertEqual(beat.call_args.kwargs["label"], "T4-x: batched rubric review")
         self.assertEqual(beat.call_args.kwargs["env"]["PDCA_BUNDLE"], str(d))
         # No bundle-activity probe: a T4 gate writes its report once, at the end, so
         # the probe would tick a `⚠ no writes <hours>` stall warning off Check's last
@@ -438,25 +459,12 @@ class PublishSlice(unittest.TestCase):
             self.assertFalse(publish._t4_passes(self.cfg, d))
         self.assertIn("2 blocking", err.getvalue())
 
-    def test_no_issue_declares_the_mode_to_the_gate_rather_than_excusing_it(self) -> None:
-        """Issue #7 item3 / PR #184 review: `--no-issue` (pending_id) is the 'no tracker
-        id yet' path, and the thing it excuses is the missing trailer — nothing else. It
-        used to be applied to the gate's VERDICT (any nonzero relaxed to a warning), which
-        also waved through a malformed PR body, since `contribcheck` keeps the user-impact
-        requirement under --no-issue. The mode goes INTO the gate now; what still fails is
-        a real defect, and a real defect blocks the push in either mode."""
-        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "exit 1", "scope": "bundle"}]
-        _bundle(self.cfg, "PEND", brief_body=_FIX_BRIEF, accepted=True)
-        # default: a failing T4 aborts the publish
-        self.assertEqual(publish.publish(self.cfg, "PEND", dry_run=True), 1)
-        # --no-issue: it aborts too — the gate already knew to skip the trailer check.
-        err = io.StringIO()
-        with redirect_stderr(err), redirect_stdout(io.StringIO()):
-            rc = publish.publish(self.cfg, "PEND", dry_run=True, pending_id=True)
-        self.assertEqual(rc, 1)
-        # And the refusal says why --no-issue did not save it, so the operator doesn't
-        # go looking for a tracker id to add.
-        self.assertIn("--no-issue", err.getvalue())
+    # DROPPED at the v0.57.0 update: this pinned the instance's #184 behaviour — a failing
+    # T4 aborts a --no-issue publish too — plus the refusal message naming `--no-issue`.
+    # Upstream absorbed the behaviour as #384 and covers it in
+    # `test_no_issue_no_longer_relaxes_a_failing_t4_to_a_flag`; the only unique part left was
+    # an assertion about wording upstream deliberately simplified, which is not worth a fork
+    # delta in publish.py's stderr text.
 
     def test_pending_id_is_exported_to_the_gate(self) -> None:
         """The mode reaches the checker as `$PDCA_PENDING_ID=1`, beside `$PDCA_BUNDLE`:
@@ -507,6 +515,76 @@ class PublishSlice(unittest.TestCase):
                 mock.patch.dict(os.environ, {"PDCA_BUNDLE": "/somewhere/else"}):
             publish._t4_passes(self.cfg, d)
         self.assertEqual(beat.call_args.kwargs["env"]["PDCA_BUNDLE"], str(d))
+    def _publish(self, iid: str, **kw) -> tuple[int, str]:
+        """Dry-run publish; return (rc, stderr text)."""
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            rc = publish.publish(self.cfg, iid, dry_run=True, **kw)
+        return rc, err.getvalue()
+
+    def test_no_issue_no_longer_relaxes_a_failing_t4_to_a_flag(self) -> None:
+        """Issue #384: `--no-issue` states one fact — the tracker id doesn't exist yet —
+        so it may relax exactly the tracker-id requirement (the checker's own narrow
+        mode, exercised below). A T4 failure for ANY other reason blocks the push in
+        either mode; the old branch that waved the WHOLE failed gate through as a
+        printed FLAGGED notice is gone."""
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "cmd": "exit 1", "scope": "bundle"}]
+        _bundle(self.cfg, "PEND", brief_body=_FIX_BRIEF, accepted=True)
+        self.assertEqual(self._publish("PEND")[0], 1)          # default: aborts, as before
+        rc, err = self._publish("PEND", pending_id=True)
+        self.assertEqual(rc, 1, "a failing T4 must abort a --no-issue publish too")
+        self.assertNotIn("FLAGGED", err)                        # the amnesty branch is gone
+        self.assertIn("FAILED", err)
+
+    def test_no_issue_mode_reaches_the_t4_gate_as_pdca_pending_id(self) -> None:
+        """#384: the gate is TOLD which mode it runs in — $PDCA_PENDING_ID is exported
+        under --no-issue and absent otherwise, derived from the flag on each run."""
+        _bundle(self.cfg, "PEND2", brief_body=_FIX_BRIEF, accepted=True)
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "scope": "bundle",
+                                  "cmd": 'test -n "$PDCA_PENDING_ID"'}]
+        rc, err = self._publish("PEND2", pending_id=True)
+        self.assertEqual((rc, "FLAGGED" in err), (0, False))    # exported → gate passes
+        self.assertEqual(self._publish("PEND2")[0], 1)          # default mode: not exported
+
+    def test_ambient_pdca_pending_id_is_scrubbed_not_honoured(self) -> None:
+        """#384: the mode comes from THIS run's flag, never the ambient environment — a
+        stray export from an earlier --no-issue run must not relax a ticketed publish
+        (mirrors gates._run_one deriving per-run env from driver state)."""
+        _bundle(self.cfg, "PEND3", brief_body=_FIX_BRIEF, accepted=True)
+        self.cfg.gates_checks = [{"id": "T4-x", "tier": "T4", "scope": "bundle",
+                                  "cmd": 'test -z "$PDCA_PENDING_ID"'}]
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            self.assertEqual(self._publish("PEND3")[0], 0)      # inherited value scrubbed
+
+    def test_shipped_row_gives_no_issue_only_the_tracker_id_amnesty(self) -> None:
+        """#384 end to end through the SHIPPED `T4-contribution` row and the PRODUCTION
+        checker: publish's derived $PDCA_PENDING_ID reaches `contribcheck` (which
+        honours it as `--no-issue`) through the registered cmd UNCHANGED — rewriting
+        that row line in place breaks `copier update` for instances that appended a row
+        beside it (tests/test_update_compat.py). A bundle whose only T4 problem is the
+        absent tracker id proceeds under --no-issue, the id-known mode still enforces
+        the id, and any OTHER defect is refused in both modes."""
+        row_cmd = _shipped_t4_row_cmd()
+        self.assertTrue(row_cmd.startswith("contribcheck"))
+        cli_cmd = (f"PYTHONPATH={shlex.quote(str(_SRC))} {shlex.quote(sys.executable)} "
+                   "-m pdca_harness.cli")
+        self.cfg.gates_checks = [{"id": "T4-contribution", "tier": "T4", "scope": "bundle",
+                                  "cmd": f"{cli_cmd} {row_cmd}"}]
+        (self.tmp / "pdca.toml").write_text("", encoding="utf-8")  # Config.load for the CLI
+        d = _bundle(self.cfg, "384", brief_body=_FIX_BRIEF, accepted=True)
+        (d / "pr-description.md").write_text(
+            "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n", encoding="utf-8")
+        (d / "commit-msg.txt").write_text("Fix\n\nNo trailer yet.\n", encoding="utf-8")
+        # Only defect = the not-yet-assigned tracker id: --no-issue proceeds…
+        rc, err = self._publish("384", pending_id=True)
+        self.assertEqual((rc, "FLAGGED" in err), (0, False))
+        # …while the default (id-known) mode still enforces the id.
+        self.assertEqual(self._publish("384")[0], 1)
+        # A NON-tracker-id defect (no user-impact opener) is refused even under --no-issue.
+        (d / "pr-description.md").write_text("## Summary\nno opener here.\n", encoding="utf-8")
+        rc, err = self._publish("384", pending_id=True)
+        self.assertEqual(rc, 1, "a malformed PR body must not be waved through as 'pending id'")
+        self.assertIn("User impact", err)
 
     def _stacked_dry_run(self, *, base_remote: str) -> str:
         # A `Stacks on:` dependent whose parent has a published branch — dry-run publish.
@@ -1083,6 +1161,19 @@ class ContribCheck(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("PDCA_PENDING_ID", err)
         self.assertIn("not a boolean", err)
+    def test_pdca_pending_id_env_is_the_no_issue_flag(self) -> None:
+        # #384: publish tells the gate its mode via $PDCA_PENDING_ID (derived per run,
+        # scrubbed when absent) rather than editing the shipped row's cmd line — an
+        # in-place edit of that registered line breaks `copier update` for any instance
+        # that appended a row beside it (tests/test_update_compat.py). The env form is
+        # exactly the --no-issue flag: trailer waved, opener still enforced.
+        self._bundle_with("266", "## Summary\n**User impact:** x.\n\n## Root cause\nx.\n",
+                          commit="Fix the crash\n\nNo trailer.\n")
+        self.assertEqual(self._run("266")[0], 1)                # id-known mode: enforced
+        with mock.patch.dict(os.environ, {"PDCA_PENDING_ID": "1"}):
+            self.assertEqual(self._run("266")[0], 0)            # pending-id via the env
+            self._bundle_with("267", "## Summary\nno opener.\n")
+            self.assertEqual(self._run("267")[0], 1)            # opener still enforced
 
     def test_slug_bundle_skips_the_trailer_requirement(self) -> None:
         # A non-numeric (slug) id has no real ticket number → only the opener is enforced.
@@ -1092,8 +1183,19 @@ class ContribCheck(unittest.TestCase):
 
     def test_default_open_before_artifacts_are_drafted(self) -> None:
         # Run as a Check-time bundle gate before publish: no PR body yet ⇒ nothing to lint.
+        # Exit code unchanged (0 — nothing failed), but the gate now DECLARES the deferral
+        # instead of exiting mute, so the Check matrix records `deferred` rather than a
+        # vacuous green (issue #401; the row's classification is pinned in
+        # tests/test_gate_deferred.py). Marker composed from the production constant so this
+        # module never emits it at a declaring position in its own captured output (#428).
         _bundle(self.cfg, "266", brief_body=_FIX_BRIEF, accepted=True)
-        self.assertEqual(self._run("266"), (0, ""))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self._run("266"), (0, ""))  # no problems on stderr
+        declared = [ln for ln in out.getvalue().splitlines()
+                    if ln.startswith(gates.DEFERRED_MARKER)]
+        self.assertEqual(len(declared), 1, out.getvalue())
+        self.assertIn("publish", declared[0])
 
     def test_close_disposition_bundle_passes(self) -> None:
         d = _bundle(self.cfg, "266", brief_body=_FIX_BRIEF, accepted=True)
@@ -1128,10 +1230,115 @@ class PublisherGuard(unittest.TestCase):
         return captured["env"]
 
     def test_codex_publisher_gets_the_gh_shim(self) -> None:
-        self.assertEqual(self._env_passed_to_invoke("codex"), {"PATH": "SHIMMED"})
+        env = self._env_passed_to_invoke("codex")
+        self.assertEqual(env.get("PATH"), "SHIMMED")
+        # The #331 exit-contract session env rides the same dict.
+        self.assertEqual(env.get("PDCA_HANDOFF_ROLE"), "publisher")
 
     def test_claude_publisher_is_not_shimmed(self) -> None:
-        self.assertIsNone(self._env_passed_to_invoke("claude"))
+        env = self._env_passed_to_invoke("claude")
+        # No gh shim for claude (native PreToolUse guard) — but the #331 exit-contract
+        # session env is present for every command-mode interactive publisher.
+        self.assertNotIn("PATH", env or {})
+        self.assertEqual((env or {}).get("PDCA_HANDOFF_ROLE"), "publisher")
+
+
+class MergeModeBaseGuard(unittest.TestCase):
+    """#411 — under `[driver].wave_mode = "merge"` the driver merges each accepted bundle's
+    PR "into its base" (merge.py), unattended and mid-flow, whatever base that PR carries.
+    So publish must REFUSE, fail-closed, to open a PR against a branch THIS run produced —
+    naming both the branch the PR would have targeted and the target base — by either route
+    that puts one there. The default `"stack"` mode is untouched: nothing merges for you
+    there, and chaining onto a predecessor is the point.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg = _cfg(self.tmp)
+        self.cfg.base_remote = "origin"        # own-repo — the only mode `merge` supports
+
+    def _publish(self, issue_id: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = publish.publish(self.cfg, issue_id, dry_run=True, by="T", today="2026-06-05")
+        return rc, out.getvalue(), err.getvalue()
+
+    def _published(self, issue_id: str, branch: str, **extra) -> Path:
+        """A sibling bundle that already published `branch` in this batch."""
+        p = self.cfg.bundle(issue_id)
+        p.mkdir(parents=True)
+        (p / "publish.json").write_text(json.dumps({"branch": branch, **extra}),
+                                        encoding="utf-8")
+        return p
+
+    def _assert_nothing_published(self, out: str, d: Path) -> None:
+        self.assertNotIn("gh pr create", out)                  # no PR
+        self.assertNotIn("push", out)                          # nothing pushed
+        self.assertFalse((d / "publish.json").exists())        # no recorded contribution
+
+    def test_merge_mode_refuses_a_pr_based_on_a_stacked_prereq_branch(self) -> None:
+        # Route 1: `Stacks on:` falls back to the prereq's own fix branch (_stack_base_branch),
+        # and merge mode never records an integration branch — so that fallback is what picks
+        # the base, and the merge would land the fix in the prereq's branch.
+        self._published("PARENT", "fix/PARENT-my-fix")
+        d = _bundle(self.cfg, "DEP", brief_body=_FIX_BRIEF + "- **Stacks on:** PARENT\n",
+                    accepted=True)
+        self.cfg.wave_mode = "merge"
+        rc, out, err = self._publish("DEP")
+        self.assertEqual(rc, 1)
+        self.assertIn("fix/PARENT-my-fix", err)     # the branch the PR would have targeted
+        self.assertIn("`main`", err)                # the target base it should have used
+        self._assert_nothing_published(out, d)
+
+    def test_merge_mode_refuses_a_target_base_another_bundle_produced(self) -> None:
+        # Route 2: the brief's own `Repo + branch target` names a predecessor's branch (the
+        # documented chained-brief practice for stack mode). pr_base then EQUALS the resolved
+        # target base, so comparing the two sees nothing wrong — the batch's publish.json
+        # records are what expose it, offline.
+        self._published("PRED", "fix/PRED-groundwork", mode="new-pr", base="main",
+                        repo="example-org/example-repo")
+        d = _bundle(self.cfg, "CHAIN", brief_body=(
+            "- **Slug:** my-fix\n"
+            "- **Repo + branch target:** example-org/example-repo @ fix/PRED-groundwork\n"),
+            accepted=True)
+        self.cfg.wave_mode = "merge"
+        rc, out, err = self._publish("CHAIN")
+        self.assertEqual(rc, 1)
+        self.assertIn("fix/PRED-groundwork", err)   # target == the branch PRED produced
+        self.assertIn("issue_PRED", err)            # …and which bundle produced it
+        self._assert_nothing_published(out, d)
+
+    def test_merge_mode_publishes_an_ordinary_bundle_against_the_shared_base(self) -> None:
+        # The guard is not a blanket stop: a bundle whose base is the shared target still
+        # publishes in merge mode, even with other bundles' branches recorded in the batch.
+        self._published("SIB", "fix/SIB-other", repo="example-org/example-repo")
+        _bundle(self.cfg, "OK", brief_body=_FIX_BRIEF, accepted=True)
+        self.cfg.wave_mode = "merge"
+        rc, out, err = self._publish("OK")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--base main", out)
+
+    def test_stack_mode_still_chains_and_still_accepts_a_branch_target(self) -> None:
+        # The default mode is untouched by the guard, in both of the shapes it refuses above:
+        # the stacked PR chains onto the parent branch (#123/#185), and a brief targeting a
+        # predecessor's branch publishes against it.
+        self._published("PARENT", "fix/PARENT-my-fix")
+        _bundle(self.cfg, "DEP", brief_body=_FIX_BRIEF + "- **Stacks on:** PARENT\n",
+                accepted=True)
+        self.assertEqual(self.cfg.wave_mode, "stack")           # the default
+        rc, out, err = self._publish("DEP")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--base fix/PARENT-my-fix", out)
+
+        self._published("PRED", "fix/PRED-groundwork", repo="example-org/example-repo")
+        _bundle(self.cfg, "CHAIN", brief_body=(
+            "- **Slug:** my-fix\n"
+            "- **Repo + branch target:** example-org/example-repo @ fix/PRED-groundwork\n"),
+            accepted=True)
+        rc, out, err = self._publish("CHAIN")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--base fix/PRED-groundwork", out)
 
 
 if __name__ == "__main__":

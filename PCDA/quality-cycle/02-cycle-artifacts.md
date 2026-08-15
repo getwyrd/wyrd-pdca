@@ -105,7 +105,7 @@ Correctness chain + conformance Tiers 1–4:
 | T3 runtime | pass / fail | find_spec / deps-absent run | log |
 | T4 contribution | pass / fail | commit-msg hook / branch-target / version-bump | path:line |
 
-A deterministic FAIL with auto-fixable cause (lint, format, genuinely-red test) may be auto-fixed and re-run; a deterministic FAIL that needs a decision stops and surfaces to NEEDS-HUMAN. A gate that genuinely *cannot run* its check (vs. running and failing) returns a third result, **`unverifiable`** — it does not fail `overall` but is routed to §6 NEEDS-HUMAN for the human to clear (see [04 - Validation Tooling](04-validation-tooling.md) §Gate result vocabulary and C5a/C6).
+A deterministic FAIL with auto-fixable cause (lint, format, genuinely-red test) may be auto-fixed and re-run; a deterministic FAIL that needs a decision stops and surfaces to NEEDS-HUMAN. A gate that genuinely *cannot run* its check (vs. running and failing) returns a third result, **`unverifiable`** — it does not fail `overall` but is routed to §6 NEEDS-HUMAN for the human to clear. A gate that *did* run but whose subject does not exist yet — the contribution check, before publish drafts the artifacts it lints — records a fourth result, **`deferred`**: also outside `overall`, and deliberately *not* routed to §6, because its verdict is owed to the later gate that re-runs it, not to the human (see [04 - Validation Tooling](04-validation-tooling.md) §Gate result vocabulary and C5a/C5b/C6).
 
 ### `check-review.md` — advisory reviewer (decorrelated)
 
@@ -305,7 +305,7 @@ process/
 ```
 
 The leaf instruction files Act also maintains live at `.claude/agents/*.md` (the
-six subagents: planner, builder, reviewer, signoff, publisher, act) plus `AGENTS.md`
-for the cross-vendor reviewer.
+eight subagents: planner, builder, reviewer, signoff, publisher, act, sizer,
+splitter) plus `AGENTS.md` for the cross-vendor reviewer.
 
 The minimal per-cycle bundle is `SUMMARY.md`, `patch.diff`, `pr-description.md`, `tracker-comment.md`, `MANUAL-VERIFICATION.md`. The operational layer above adds `brief.md` (names the Plan artifact explicitly), `build-notes.md` (separates builder rationale for the independence contract), and the two `check-*` artifacts (makes Check's product auditable rather than implicit), and reframes `SUMMARY.md` as ending in **Check sign-off** (§9), with §10 as a lightweight feeder to the *project-level* Act log.

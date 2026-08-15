@@ -246,9 +246,31 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
   retriggering converges slowly by construction — batch the depth up front instead.
   A finding deferred with "Deferred — tracked in #N" is settled (per the target
   AGENTS.md § Review rubric & protocol). When external findings do arrive on a
-  published PR, process them with `scripts/triage-pr-findings` so every one lands in
-  the Act ledger (bug → tracker/carry-forward; convention → gate or rubric delta;
-  noise → rubric-exclusion candidate).
+  published PR, process them with **`pdca triage <pr>`** so every one lands in the Act
+  ledger (bug → tracker/carry-forward; convention → gate or rubric delta; noise →
+  rubric-exclusion candidate; test-gap → a candidate test note). It pulls the PR's
+  reviews and review comments through `gh api`, following pagination to the last page,
+  and registers every finding as a `codex-pr:<class>` signal — so `pdca act index`
+  flags a class that **reappears after its process delta was applied**, which is the
+  question the ledger exists to answer. It proposes only: it never edits `pdca.toml`,
+  files a gate row, or touches the rubric.
+
+  *(Until v0.57.0 this was `scripts/triage-pr-findings`, an instance-local script. The
+  harness now ships the same job as `pdca triage`, so the script was retired with the
+  upgrade — the dated entries in `process/act-log.md` that name it are the historical
+  record of runs that really happened under that name, and are left as written.)*
+
+  **One boundary in the ledger, worth knowing before you read a recurrence.** Both the
+  retired script and `pdca triage` write `codex-pr:` signals, but they slug them
+  differently: the 18 pre-0.57 entries in `process/act-ledger.json` are topic slugs
+  (`codex-pr:docs-currency`, `codex-pr:vacuous-assertion`), while upstream's grammar puts
+  the CLASS first and the deciding keyword second (`codex-pr:convention-docstring`). So a
+  finding that reappears after the upgrade registers under a *new* name and will **not**
+  match its pre-0.57 entry — the first recurrence of an old class reads as a new signal.
+  The old entries were left as written rather than rewritten: their class is not
+  recoverable from the topic slug, and guessing it would put invented data in the record
+  the Act cadence trusts. Expect the recurrence signal to be blind across this one seam,
+  and check the pre-0.57 entries by hand when an old delta looks like it came back.
 
 ## 9. Repo-specific scripts and tooling
 | Role | Path | Invocation | Status |
@@ -259,6 +281,9 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 | Tracker read | `gh` CLI | `gh issue view <id>` (ad hoc; no scraper needed) | [host tool] |
 | Driver | `src/pdca_harness/` | `pdca run <id>` / `pdca flow <id>` | [built — stub leaves; wire `command` for real runs] |
 | Act tooling (L4) | `src/pdca_harness/act.py` | `pdca act index`, `pdca act log --date <d>` | [built] |
+| PR-review triage | `src/pdca_harness/triage.py` | `pdca triage <pr>` (gh-paginated ingest → 4-class routing → `codex-pr:` ledger signals) | [built — v0.57.0; replaced `scripts/triage-pr-findings`] |
+| Bundle recording | `src/pdca_harness/record.py` | `pdca record [<ids>…]` (terminal bundles only; publish triggers it) | [built — v0.57.0; `[records] mode = "commit"`] |
+| Leaf exit contract | `src/pdca_harness/handoff.py` + `.claude/hooks/handoff_guard.py` | `/handoff <issue_id>` in an interactive leaf; enforced by the `Stop` hook | [built — v0.57.0; replaced `scripts/handoff-check`] |
 | Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca gates [<id>] [--working-tree]` | [built — stub fallback; fill checks] |
 | Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex, `.claude/agents/reviewer.md` is the Claude packaging) | (model leaf) | [built — contract; wire command mode] |
 | Builder role prompt | `agents/builder.md` (canonical body); `.claude/agents/builder.md` (Claude wrapper) + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
@@ -314,10 +339,14 @@ to a human+model REPL and block there. That means the human has to be at the ter
 flow runs in, for the whole batch: a `pdca flow` over several bundles can park on one
 sign-off adjudication for hours because nobody is at that machine.
 
-Claude Code's `--remote-control` flag removes the constraint. Append it to an interactive
-leaf's `argv` in `pdca.toml` and that leaf becomes answerable from another enrolled device;
-nothing else changes — `signoff-decision`, the §6 ticks and the C6 accept-guard all run the
-same code path, and only the human's location differs.
+Claude Code's `--remote-control` flag removes the constraint. Add it to an interactive
+leaf's `argv` in `pdca.toml` — anywhere but last: the driver appends the seed prompt as a
+positional after the argv, and `--remote-control` takes an optional `[name]` value, so as
+the final token it would swallow the whole seed as the RC session name (issue #396; the
+claude-family spawn also inserts `--` before the seed as a backstop, but no flag with an
+optional value should ever sit last). With the flag in place that leaf becomes answerable
+from another enrolled device; nothing else changes — `signoff-decision`, the §6 ticks and
+the C6 accept-guard all run the same code path, and only the human's location differs.
 
 Enabling Remote Control in your own shell does **not** reach the leaves: each is a separate
 `claude` subprocess whose argv comes from `pdca.toml`. That is the whole reason this needs

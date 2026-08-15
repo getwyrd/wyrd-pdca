@@ -82,8 +82,11 @@ class OutputPersistence(GateRun):
         self.assertIn("# cmd: echo one; echo two; echo three", text)
 
     def test_the_row_records_its_duration(self) -> None:
+        # Upstream's #370 writer rounds to 2dp rather than whole seconds (v0.57.0), so a
+        # sub-second gate no longer records a bare 0 — assert a number, not an int.
         row, _, _ = self._run({**_GATE, "cmd": "true"})
-        self.assertIsInstance(row["duration_secs"], int)
+        self.assertIsInstance(row["duration_secs"], (int, float))
+        self.assertGreaterEqual(row["duration_secs"], 0)
 
     def test_a_failed_gate_keeps_the_output_that_named_the_failure(self) -> None:
         row, _, d = self._run(
@@ -109,20 +112,13 @@ class OutputPersistence(GateRun):
         self.assertEqual((d / row["log"]).read_text(encoding="utf-8"), frozen,
                          "revalidate overwrote the frozen Check's gate log")
 
-    def test_log_filenames_stay_distinct_when_sanitization_collides(self) -> None:
-        # "foo bar" and "foo_bar" both sanitize to "foo_bar" — two rows must never end
-        # up pointing at each other's evidence through one shared file.
-        a = gates._write_gate_log(
-            self.tmp, {"id": "foo bar"}, cmd="true", cwd=self.tmp, worktree_path=None,
-            attempts=[{"result": "pass", "note": "exit 0", "output": "A",
-                       "duration_secs": 0, "started": "t"}])
-        b = gates._write_gate_log(
-            self.tmp, {"id": "foo_bar"}, cmd="true", cwd=self.tmp, worktree_path=None,
-            attempts=[{"result": "pass", "note": "exit 0", "output": "B",
-                       "duration_secs": 0, "started": "t"}])
-        self.assertNotEqual(a, b)
-        self.assertIn("A", (self.tmp / a).read_text(encoding="utf-8"))
-        self.assertIn("B", (self.tmp / b).read_text(encoding="utf-8"))
+    # DROPPED at the v0.57.0 update: the instance's `_write_gate_log` suffixed a crc32 when
+    # sanitizing an id changed it, so "foo bar" and "foo_bar" could not collide on one log
+    # file. Upstream's #370 writer (now the only one) sanitizes with a plain re.sub and can.
+    # Not carried as a fork delta — none of this instance's configured ids sanitize
+    # (C4-ci, C4-verify, C5-mutants, T4-batch-review, T4-contribution), so the collision is
+    # unreachable here, and a delta for an unreachable case is how a rendered instance turns
+    # into a fork. Filed upstream instead.
 
     def test_the_iterate_archive_keeps_the_logs_where_the_frozen_rows_say(self) -> None:
         # The archived check-gates.json still says "gate-logs/<id>.log" — the archive
@@ -151,12 +147,16 @@ class ConfirmOnce(GateRun):
         self.assertEqual(result["overall"], "pass")
 
     def test_both_attempts_land_in_the_gate_log(self) -> None:
+        # A flip is only diagnosable from BOTH runs' output, so the confirm's capture is
+        # appended under its own banner rather than replacing the first run's. The banner
+        # is the instance's (#371 over upstream's single-run #370 writer); the header this
+        # sits under is upstream's, and reports the FINAL verdict.
         row, _, d = self._run({**_GATE, "cmd": self._flip_cmd()})
         text = (d / row["log"]).read_text(encoding="utf-8")
-        self.assertIn("attempt 1/2: fail", text)
-        self.assertIn("attempt 2/2: pass", text)
-        self.assertIn("transient", text)
-        self.assertIn("fine", text)
+        self.assertIn("# outcome: pass", text)
+        self.assertIn("confirm re-run (attempt 2/2): pass", text)
+        self.assertIn("transient", text)                    # first run's output, kept
+        self.assertIn("fine", text)                         # the confirm's, appended
 
     def test_a_reproducible_fail_stays_red(self) -> None:
         row, result, _ = self._run({**_GATE, "cmd": "echo still-red; false"})

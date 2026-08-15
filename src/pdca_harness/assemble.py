@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import NamedTuple
 
-from . import brief, doctor, size_signal
+from . import brief, doctor, size_signal, state
 from .config import Config
 from .gates import canonical_elements
 
@@ -273,7 +273,7 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
     gates_json = json.loads((d / "check-gates.json").read_text(encoding="utf-8"))
     review_path = d / "check-review.md"
     review_text = (review_path.read_text(encoding="utf-8")
-                   if review_path.exists() else _missing_review_text())
+                   if review_path.exists() else _missing_review_text(d))
     advisory_texts = [p.read_text(encoding="utf-8")
                       for p in sorted(d.glob("check-advisory-*.md"))]
 
@@ -292,6 +292,14 @@ def collect_needs_human(d: Path, cfg: Config) -> list[NeedsHumanItem]:
     if build_notes.exists():
         items += [NeedsHumanItem(t, HUMAN)
                   for t in _declared_external_deps(build_notes.read_text(encoding="utf-8"))]
+    # The Do-exit adjudication record (#341): a declaration the detect-cmd probe REFUTED
+    # proceeded to full Check, and the refutation must reach the human — and `pdca act
+    # index`, which reads §6 — rather than stay a bundle-local json only the driver saw.
+    # HUMAN, never IMPL: a rebuild cannot fix a mis-declaration. Local import, because
+    # dependency_halt delegates its marker parsing to `_declared_external_deps` above
+    # (one parser for "did the builder declare a dependency").
+    from . import dependency_halt
+    items += [NeedsHumanItem(t, HUMAN) for t in dependency_halt.refuted_items(d)]
     items += [NeedsHumanItem(t, HUMAN)
               for t in _unregistered_dependency_items(d / "brief.md", cfg)]
     # Plan-advisory findings (#301 + review): folded into §6 individually, exactly like
@@ -411,7 +419,7 @@ def assemble_summary(d: Path, cfg: Config) -> None:
     review_text = (
         review_path.read_text(encoding="utf-8")
         if review_path.exists()
-        else _missing_review_text()
+        else _missing_review_text(d)
     )
     # Optional advisory reviewers (issue #64): each check-advisory-<id>.md is folded into
     # §5 and its NEEDS-HUMAN findings into §6, exactly like the main reviewer.
@@ -513,7 +521,19 @@ def _gate_lines(gates: dict, *, prefix: str) -> str:
 
 def _unverifiable_items(gates: dict) -> list[str]:
     """Gate rows the mechanic couldn't run (``result == "unverifiable"``) → §6 items, so
-    the C6 accept-guard forces the human to clear them before accept (issue #46)."""
+    the C6 accept-guard forces the human to clear them before accept (issue #46).
+
+    ``unverifiable`` ONLY — a ``deferred`` row (issue #401) is deliberately NOT lifted, the
+    single difference between the two gate-declared, non-gating results. ``unverifiable``
+    means "nobody has an answer, so a human must decide"; ``deferred`` means "this row's
+    substantive audit runs later, at a gate that cannot be skipped"
+    (``gates._deferrable`` → ``publish.publish_gates``) — there is nothing for the human to
+    clear. Lifting it anyway is the defect this closes: the Check-time T4 contribution row is
+    default-open by design (its artifacts are drafted at publish), and its vacuous green fired
+    a §6 NEEDS-HUMAN on 9 of 9 frozen bundles, cleared unread every time — which trains the
+    human to tick §6 boxes, the very guard C6 depends on. The row stays visible in §5
+    evidence (:func:`_gate_lines`) with its reason, so what is owed at publish is still read.
+    """
     return [
         f"{r['check']} unverifiable — {r['path_line'] or r['oracle'] or 'no reason given'}"
         for r in gates["rows"]
@@ -564,13 +584,32 @@ def _flaky_gate_items(gates: dict) -> list[NeedsHumanItem]:
     return items
 
 
-def _missing_review_text() -> str:
+def _missing_review_text(d: Path) -> str:
     """Placeholder when ``check-review.md`` is absent — flags a §6 NEEDS-HUMAN so the
-    bundle assembles and reaches sign-off but cannot be accepted without a review."""
+    bundle assembles and reaches sign-off but cannot be accepted without a review.
+
+    Two wordings (#369), split on the error log — the engine's failed-leaf
+    discriminator (#138: a reviewer that ran and FAILED wrote
+    ``state.REVIEW_ERROR_LOG``; a successful run removed any stale one). Without the
+    split, a reviewer that NEVER RAN (the beat died between the gate write and the
+    leaf) read exactly like one that ran and failed, and the record could not
+    distinguish "not yet run" from "ran and yielded nothing".
+    """
+    if (d / state.REVIEW_ERROR_LOG).exists():
+        return (
+            "# Advisory review MISSING — the reviewer RAN AND FAILED\n\n"
+            "- NEEDS-HUMAN — no check-review.md was produced: the reviewer leaf ran "
+            f"and FAILED (see `{state.REVIEW_ERROR_LOG}` in this bundle for the "
+            "captured error). Fix the cause, then re-run the Check reviewer before "
+            "accepting.\n"
+        )
     return (
-        "# Advisory review MISSING\n\n"
-        "- NEEDS-HUMAN — no check-review.md was produced (the reviewer leaf failed or "
-        "its model connection dropped). Re-run the Check reviewer before accepting.\n"
+        "# Advisory review MISSING — the reviewer NEVER RAN\n\n"
+        "- NEEDS-HUMAN — no check-review.md was produced and no "
+        f"`{state.REVIEW_ERROR_LOG}` exists: the reviewer leaf NEVER RAN (the Check "
+        "beat was interrupted before it), it did not run-and-fail. The driver "
+        "recovers a never-ran reviewer on the next `advance` (#369); if this text "
+        "persists, re-run the Check reviewer before accepting.\n"
     )
 
 

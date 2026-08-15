@@ -26,6 +26,42 @@
 # real command uses (for `crates/dst`: RUSTFLAGS=--cfg madsim + MADSIM_TEST_NUM, as
 # xtask::run_dst does). $WYRD_VERIFY_MADSIM_SEEDS tunes the seed count.
 #
+# JUDGE EVERY LEG BY TWO FACTS: the runner's exit code AND how many tests actually ran.
+# (Upstream's canonical statement of the #434 rule, adopted verbatim at v0.57.0 so this
+# instance's implementation stays checkable against the harness's own wording tests.)
+# A test runner exits non-zero for two unrelated reasons — the test RAN and failed (the red
+# leg's proof), or NO test ran at all (it failed to compile/import/collect, the runner could
+# not find it, the runner itself died). An exit code cannot tell those apart, so a leg judged
+# on the exit code alone reports PASS for a bundle whose test never executed. That is an
+# everyday shape, not a corner case: reverting the fix also removes any symbol the fix
+# introduced, so a test that calls one cannot even build on the red leg.
+# Capture BOTH per run: the exit code, and a COUNT of executed tests parsed from the runner's
+# own machine-readable report (here: `cargo test`'s "running N tests" / libtest summary).
+# Never infer that count from the exit code.
+#
+#   exit code | tests ran | what it means -> what to report
+#   ----------+-----------+---------------------------------------------------------------
+#    0        |  0        | nothing ran -> PDCA-UNVERIFIABLE (77): no evidence either way
+#    0        | >0        | test PASSED -> green leg: OK; red leg: C4 FAIL (green without
+#             |           |                the fix — the test does not capture the defect)
+#    non-zero | >0        | test FAILED -> red leg: the red you want; green leg: C4 FAIL
+#    non-zero |  0        | nothing ran -> PDCA-UNVERIFIABLE (77), NEVER PASS: the runner
+#             |           |                died before/while collecting, so its non-zero
+#             |           |                exit proves nothing about the defect
+#
+# Keep the two "nothing ran" cases distinguishable in the reason printed — the human reading
+# §6 needs different things from each: `no test executed (runner exited 0: nothing was
+# selected — wrong test path or filter?)` vs `no test executed (runner exited <rc>: the test
+# did not build/import — e.g. it calls a symbol the reverted fix added)`.
+# THE RULE, for every leg you add here and for every other verification step: a step in
+# which no test ran is UNVERIFIABLE — exit 77 / `PDCA-UNVERIFIABLE: <reason>` (-> SUMMARY §6
+# NEEDS-HUMAN, non-gating) — never a pass and never a fail. A gate never turns "no evidence"
+# into a verdict.
+#
+# CLASSIFY THE PATCH FIRST (issue #165): where a patch's only non-test change is a
+# NON-BEHAVIORAL manifest the test cannot move, there is nothing to revert that would go red.
+# N/A for Wyrd — a pure-Rust workspace with no such manifests — see the third bullet below.
+#
 # UNVERIFIABLE (exit 77 -> §6 NEEDS-HUMAN, non-gating): the gate could not MEASURE the
 # bundle. Not a verdict on the fix — the absence of one.
 #   * Zero tests ran (#114). `cargo test` exits 0 on a target that compiled to nothing, so an
@@ -50,16 +86,24 @@
 # PR from), so C4-verify applies the patch on the same tree the PR opens against. Never the
 # live checkout or the cycle worktree. $WYRD_REPO / $WYRD_VERIFY / $WYRD_VERIFY_BASE override.
 #
-# Driver-named bases (harness v0.54.0): the driver exports AT MOST ONE of
+# Driver-named bases (harness v0.57.0): the driver exports EXACTLY ONE of these for every
+# bundle-scoped gate. Each is already a fully-qualified `<remote>/<branch>` ref — use it as
+# it comes, never `origin/$VAR`, which doubles the remote.
 #   * $PDCA_BASE        (#54)  — the brief's `Onto branch` (an existing PR head publish
-#                                commits onto), as a full `<remote>/<branch>` ref;
+#                                commits onto);
 #   * $PDCA_VERIFY_BASE (#273) — the wave's folded integration branch
 #                                (`origin/pdca-integration/<base>`) for a wave>0 bundle in a
 #                                dependency batch, so a dependent verifies against
 #                                base+prereqs instead of false-failing "patch does not
-#                                apply" on a file it shares with its prereq.
-# Either outranks every local resolution below — the test base must never diverge from the
-# base publish commits to. Neither is set for an ordinary wave-0 single bundle.
+#                                apply" on a file it shares with its prereq;
+#   * $PDCA_BRIEF_BASE  (#387) — the ordinary case: the brief's own `Repo + branch target`
+#                                base, resolved by the driver with the SAME parser publish
+#                                commits against. This replaced the `_brief_base()` shell
+#                                twin this script used to carry (see _resolve_base_ref).
+# They outrank every local resolution below — the test base must never diverge from the base
+# publish commits to.
+# Resolve as: $PDCA_BASE > $PDCA_VERIFY_BASE > your own override > $PDCA_BRIEF_BASE
+# ("your own override" here is $WYRD_VERIFY_BASE, for a hand-run outside the driver).
 #
 # Lane-safe (docs 09 §parallel lanes): under in-driver concurrency the driver pins each
 # worker to a slot and exports $PDCA_LANE (0..N-1); a serial run leaves it unset. The
@@ -196,53 +240,30 @@ _pkg_from_added_cargo() {
   ' "$2"
 }
 
-# The base branch named in the bundle's brief "Repo + branch target: <repo> @ <base>"
-# field, or "" if absent. Mirrors publish._clean_ref EXACTLY so C4-verify resolves the SAME
-# base publish cuts the PR from — a stacked milestone slice's integration branch, not a
-# hardcoded main (#91). Pure brief parse; ALWAYS returns 0 so `set -e`/pipefail never aborts
-# a bare `$(_brief_base)` (#88).
-#
-# The backtick span wins ONLY when it is the START of the field, never anywhere in it
-# (#204, mirroring the upstream #235/#262 anchoring of _clean_ref). `main (feature branch
-# `feat/x-slice`)` names the base **main**: the span is a parenthetical aside about a
-# DIFFERENT branch. This twin kept the pre-#235 rule for a while and inverted the parity it
-# exists to maintain — publish opened the PR against main while C4-verify validated against
-# feat/x-slice, and the shape a planner actually writes (`main (verified at Plan:
-# `origin/main` = `9120f7a`)`) yielded `origin/origin/main`, a ref resolving to nothing.
-_brief_base() {
-  local bp="${BUNDLE:-}/brief.md" line raw tok
-  { [ -n "${BUNDLE:-}" ] && [ -f "$bp" ]; } || return 0
-  line="$(grep -iE 'repo \+ branch' "$bp" | head -1 || true)"
-  raw="${line#*@}"; [ "$raw" = "$line" ] && return 0     # no '@' → no base named
-  raw="${raw#"${raw%%[![:space:]]*}"}"                   # lstrip, as _clean_ref's .strip()
-  tok=""
-  if [[ "$raw" == '`'*'`'* ]]; then                      # ANCHORED span: `<ref>`…
-    tok="${raw#\`}"; tok="${tok%%\`*}"
-  fi
-  # Empty span (an adjacent `` pair) matches no ref: _clean_ref's `[^`]+` needs content,
-  # so it falls through to the first token. Keep the twin agreeing on that edge too.
-  [ -n "$tok" ] || tok="${raw%%[[:space:]]*}"
-  # token.strip("`").rstrip(",.;:") — both strip REPEATEDLY, so loop rather than trim once.
-  while [ -n "$tok" ] && [ "${tok#\`}" != "$tok" ]; do tok="${tok#\`}"; done
-  while [ -n "$tok" ] && [ "${tok%\`}" != "$tok" ]; do tok="${tok%\`}"; done
-  while [ -n "$tok" ]; do
-    case "$tok" in *[,.\;:]) tok="${tok%?}";; *) break;; esac
-  done
-  printf '%s' "$tok"
-}
-
 # The remote-tracking base ref the patch must apply against, resolving the precedence the
-# driver documents (#54/#273):
-#   $PDCA_BASE > $PDCA_VERIFY_BASE (driver-named, full refs, at most one set — see header)
-#   > $WYRD_VERIFY_BASE (explicit override) > brief target base > origin/main (#91).
+# driver documents (#54/#273/#387):
+#   $PDCA_BASE > $PDCA_VERIFY_BASE > $WYRD_VERIFY_BASE (explicit override) > $PDCA_BRIEF_BASE
+# Each PDCA_* value is ALREADY fully qualified (`<remote>/<branch>`) — never compose
+# `origin/$VAR` over one, that doubles the remote.
+#
+# There is no local brief parse any more (harness v0.57.0 / eduralph/pdca-harness#387).
+# This script used to carry a `_brief_base()` twin of `publish._clean_ref`, and keeping two
+# implementations of a subtle parse in step is exactly the drift #387 removes: the anchored
+# backtick rule (`main (feature branch `feat/x-slice`)` names **main**, the span being a
+# parenthetical aside) was got wrong and fixed twice in Python — #235, #262 — and once more
+# here in #204, during which publish opened the PR against main while C4-verify validated
+# against feat/x-slice. The driver now resolves the brief's own base with the SAME parser
+# publish commits against and hands it over as $PDCA_BRIEF_BASE, so the two cannot disagree.
+#
 # No git access (existence is checked at the call site), so it doubles as the --print-base
-# unit hook.
+# unit hook. The origin/main tail is the last resort for a hand-run with no driver env at
+# all; under the driver, rung 4 is always set.
 _resolve_base_ref() {
   if [ -n "${PDCA_BASE:-}" ]; then printf '%s' "$PDCA_BASE"; return 0; fi
   if [ -n "${PDCA_VERIFY_BASE:-}" ]; then printf '%s' "$PDCA_VERIFY_BASE"; return 0; fi
   if [ -n "${WYRD_VERIFY_BASE:-}" ]; then printf '%s' "$WYRD_VERIFY_BASE"; return 0; fi
-  local b; b="$(_brief_base)"
-  if [ -n "$b" ]; then printf 'origin/%s' "$b"; else printf 'origin/main'; fi
+  if [ -n "${PDCA_BRIEF_BASE:-}" ]; then printf '%s' "$PDCA_BRIEF_BASE"; return 0; fi
+  printf 'origin/main'
 }
 
 # --classify <patch>: emit `ADDED_TEST <f>` per discriminator test and `CRATE <dir>`

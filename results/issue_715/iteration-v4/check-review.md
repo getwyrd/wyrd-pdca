@@ -1,0 +1,15 @@
+Reviewing issue #715's validated multipart admission-ledger values, derived budgets, typed decode failures, and boundary tests.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | NEEDS-HUMAN | Maintainers must accept the planner's removal of the previously advertised generic record envelope—this fixes the codec scope inherited by later multipart slices (`crates/core/src/multipart.rs:15`). |
+| C2 Reproduction (red pre-fix) | PASS | In an unpatched clone, the unconditional integration target's imports fail with 13 missing API/variant errors and zero tests run (`crates/core/tests/multipart_budget_admission.rs:34`). |
+| C3 Change | PASS | The implementation enforces the eight stored-field invariants through the two fallible conversions without adding configuration bounds or a capability probe, preserving the decode/operation boundary (`crates/core/src/multipart.rs:1183`, `crates/core/src/multipart.rs:1314`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | Humans must accept compile-only criterion absence as sufficient red evidence—zero tests run pre-fix, while the patched target ran 16/16 focused tests and every independently rerunnable CI component passed (`crates/core/tests/multipart_budget_admission.rs:91`). |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Rebuild must add a witness where the ceiling arm determines `U_ref`: replacing its addition with multiplication survives all tests, so wrong admission-memory arithmetic is not detected (`crates/core/src/multipart.rs:1046`, `crates/core/tests/multipart_budget_admission.rs:80`). |
+| T1 Structure | PASS | The patch is confined to the two briefed files and keeps the new surface pure, with no store call, writer, async path, manifest, or unrelated dependency change (`crates/core/src/multipart.rs:5`, `crates/core/tests/multipart_budget_admission.rs:31`). |
+| T2 Shape | PASS | Private validated fields, closed wire structs, distinct rule errors, and the typed per-record decoder make malformed values unrepresentable without duplicating the generic codec (`crates/core/src/multipart.rs:1077`, `crates/core/src/multipart.rs:1299`, `crates/core/src/multipart.rs:1347`). |
+| T3 Runtime | N/A | No production runtime path exists in this slice; the first writer/store consumers remain #656–#659 (`crates/core/src/multipart.rs:63`). |
+| T4 Contribution | NEEDS-HUMAN | Humans must clear closed/rejected prior art and contribution evidence—the bundle omits `scripts/review-branch`, `scripts/pdca contribcheck`, and archived iterations; the independently queried affected-path PR history found only merged #703. |
+| T5 Judgment | NEEDS-HUMAN | Maintainers must choose the closed `deny_unknown_fields` compatibility policy—it prevents silent whole-record CAS damage but requires versioning for any future additive field (`crates/core/src/multipart.rs:1065`, `crates/core/src/multipart.rs:1151`, `crates/core/src/multipart.rs:1299`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Maintainers must decide whether a decode-only record type with no live writer or consumer is useful to land independently before the persistence slices (`crates/core/src/multipart.rs:63`). |

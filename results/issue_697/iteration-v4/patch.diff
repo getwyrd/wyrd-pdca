@@ -1,0 +1,1333 @@
+diff --git a/crates/custodian/src/reconstruction.rs b/crates/custodian/src/reconstruction.rs
+index 9def117..a3de6d3 100644
+--- a/crates/custodian/src/reconstruction.rs
++++ b/crates/custodian/src/reconstruction.rs
+@@ -44,7 +44,10 @@
+ //! and the on-disk fragment format are all borrowed from `core`, so `custodian` gains
+ //! no backend and no on-disk-format knowledge of its own.
+ 
+-use std::collections::HashMap;
++use std::collections::hash_map::Entry;
++use std::collections::{HashMap, HashSet};
++use std::fmt::Display;
++use std::sync::Arc;
+ 
+ use wyrd_core::metadata::{
+     self, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState,
+@@ -111,8 +114,14 @@ pub fn repair_priority(survivors: usize, k: usize) -> i64 {
+ /// missing fragments an assessment pass found — enough to both **prioritize** the
+ /// drain and **execute** the rebuild without re-fetching.
+ struct RepairPlan {
+-    inode_id: InodeId,
+-    prior: InodeRecord,
++    /// The record's `inode:` key **exactly as the store spelled it** — CAS'd on and written back
++    /// under, never re-derived from a parsed id (`"inode:007"` parses to the same id as
++    /// `"inode:7"`; `gc.rs:280-294` keys attribution by the raw bytes for this reason).
++    inode_key: Arc<[u8]>,
++    /// The **stored** bytes of the generation this repoint CASes on, shared by every obligation
++    /// inside the object and decoded one object at a time in [`repair_chunk`]. Bytes rather than the
++    /// decoded map: the only honest CAS precondition, and memory proportional to the work held.
++    prior_bytes: Arc<[u8]>,
+     chunk_index: usize,
+     chunk_id: ChunkId,
+     k: usize,
+@@ -132,7 +141,8 @@ struct RepairPlan {
+ /// One reconstruction reconciliation pass over `ctx` at logical time `now_millis`.
+ /// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
+ /// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
+-/// repointed, [`Reconciled::Satisfied`] otherwise.
++/// repointed, [`Reconciled::Blocked`] if it **refused** work it may not perform or read less than
++/// the store, [`Reconciled::Satisfied`] otherwise.
+ pub(crate) async fn reconcile(
+     ctx: &ReconstructionContext<'_>,
+     now_millis: u64,
+@@ -143,6 +153,24 @@ pub(crate) async fn reconcile(
+     let queue = repair::queued_repairs(ctx.meta).await?;
+     emit_queue_depth(queue.len());
+ 
++    // ONE reading of the committed namespace per pass, indexed by chunk id — never one scan per
++    // obligation: a pass costs its obligations PLUS the namespace, never their product, and a Q×N
++    // repair loop stops converging as a store grows (`docs/principles.md` §5 C-1, reached through
++    // the scheduler — the permanence C-1 forbids). An EMPTY queue reads nothing and certifies over
++    // exactly that — `rebalance.rs:115-117` answers `Satisfied` unread when no server is draining,
++    // for the same reason.
++    let index = if queue.is_empty() {
++        CommittedIndex::default()
++    } else {
++        locate_queued_chunks(ctx.meta, &queue).await?
++    };
++    // Obligations this pass kept because its reading had a hole in it — reported once per PASS
++    // below, since they are a property of the reading and not of any one object.
++    let mut withheld = 0usize;
++    // Obligations found in an object this slice may not write to. Kept, never drained, and — like
++    // an incomplete reading — a reason this pass may not certify.
++    let mut refused = 0usize;
++
+     // Assess each obligation (resolve the chunk, gather + verify survivors) so the
+     // drain can be ordered by repair priority before any rebuild commits.
+     let mut plans = Vec::new();
+@@ -181,8 +209,8 @@ pub(crate) async fn reconcile(
+     // rebuild this pass — off the repairable-backlog gauge so a never-completable repair does
+     // not floor the day-one "returns to zero" signal.
+     let mut repair_blocked = 0usize;
+-    for chunk in queue {
+-        match assess(ctx, &stores, chunk).await? {
++    for &chunk in &queue {
++        match assess(ctx, &stores, chunk, &index).await? {
+             Assessment::Repairable(plan) => {
+                 under_replicated += 1;
+                 plans.push(plan);
+@@ -190,7 +218,16 @@ pub(crate) async fn reconcile(
+             // The obligation refers to a chunk no longer referenced (deleted), or one
+             // already at full redundancy (a duplicate / transient finding): nothing to
+             // rebuild, so just drain the obligation. NOT under-replicated.
+-            Assessment::Drain => drain_only.push(chunk),
++            //
++            // Only over a reading with NO hole in it. A drain discards the last record saying
++            // live data is under-replicated (§5 C-1), and EITHER route to "nothing to do" rests
++            // on having read every committed object: "no map references this chunk" is the
++            // reading itself, and "this chunk is already whole" is only whole at the placement
++            // the readable maps gave — a record this pass could not read may reference the same
++            // id at another placement, which is the ambiguity below that repairs neither.
++            // "I could not read the map" is a different fact, and it permits no drain at all.
++            Assessment::Drain if index.complete() => drain_only.push(chunk),
++            Assessment::Drain => withheld += 1,
+             // Below `k` only because a placed server is transiently unreachable this pass:
+             // NOT data loss (it recovers when the server returns). Raise the distinct
+             // lower-severity signal and leave the obligation queued for re-assessment — do
+@@ -221,6 +258,10 @@ pub(crate) async fn reconcile(
+             // BLOCKING #1). `emit_needs_human` carries the `reconstruction_malformed_placement`
+             // counter so the corruption is not lost.
+             Assessment::Malformed => emit_needs_human(chunk),
++            // Found, and this pass may not act on it. The obligation is KEPT, never drained. Its
++            // report was already made ONCE for the object it was found in (rule D), where it was
++            // read — so nothing is emitted per chunk here. Off the backlog gauge, non-certifying.
++            Assessment::Refused => refused += 1,
+         }
+     }
+ 
+@@ -236,11 +277,12 @@ pub(crate) async fn reconcile(
+     // and, per chunk the pass is reconstructing, the dispatched-repair counter and the
+     // time-to-repair sample. Every non-success is offset on its own counter so the
+     // up-front count nets back to true successes: a repair that loses the CAS race is
+-    // recorded on `reconstruction_conflict`, and one that cannot proceed (the selector
++    // recorded on `reconstruction_conflict`, one that cannot proceed (the selector
+     // chose a server outside the fleet view, so nothing is committed) on
+-    // `reconstruction_aborted` — so successful repairs are
+-    // `reconstruction_repaired − conflict − aborted`. Both offsets leave the obligation
+-    // queued, to be re-assessed next pass.
++    // `reconstruction_aborted`, and one that would have landed rebuilt bytes over bytes this
++    // pass never read on `reconstruction_would_overwrite` — so successful repairs are
++    // `reconstruction_repaired − conflict − aborted − would_overwrite`. Every offset leaves the
++    // obligation queued, to be re-assessed next pass.
+     //
+     // The under-replicated count is the *repairable backlog* level (the `Repairable` set,
+     // which equals `plans.len()` this pass): it deliberately EXCLUDES both `Unrepairable`
+@@ -253,16 +295,35 @@ pub(crate) async fn reconcile(
+     // and return to zero when it clears — the same gauge discipline as the backlog count.
+     emit_unreachable(unreachable_degraded);
+     emit_repair_blocked(repair_blocked);
++    // ONE report for every obligation the incomplete reading withheld a drain from — the objects
++    // that made it incomplete are already named, each exactly once, by `locate_queued_chunks`.
++    if withheld > 0 {
++        emit_withheld(withheld);
++    }
+     for plan in &plans {
+         emit_repaired(plan.chunk_id, plan.missing.len(), now_millis);
+     }
+ 
++    // The planned repairs run even when the reading could not account for every object — that
++    // containment is the point: one damaged record may not cost every healthy object its repair
++    // (§5 C-1), which is exactly what the base's `?` did. An incomplete reading changes what the
++    // pass may CLAIM (the `Blocked` below) and what it may DISCARD (never an obligation — the
++    // withheld drain above) — never the work. Nor can a repair made under one strand a hidden
++    // reference's bytes: the fragment it DISPLACES is orphan-MARKED, not deleted, and GC reclaims a
++    // marked fragment only over a COMPLETE reference set (`gc.rs:306-316` —
++    // `incomplete-reference-set` withholds every fragment in the fleet, and one any readable
++    // committed map still places is withheld as `referenced`) — while the fragment it LANDS goes
++    // only where nothing this pass failed to read can stand (`may_land`, the one write no backstop
++    // downstream could take back).
+     let mut changed = false;
+     for plan in &plans {
+         match repair_chunk(ctx, &stores, plan, now_millis).await? {
+             RepairOutcome::Committed => changed = true,
+             RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
+             RepairOutcome::Aborted => emit_aborted(plan.chunk_id),
++            // Reported where the slot was READ, naming it — so nothing is emitted per plan here.
++            // Kept, never drained, off the backlog gauge, and non-certifying like any refusal.
++            RepairOutcome::Refused => refused += 1,
+         }
+     }
+ 
+@@ -275,7 +336,12 @@ pub(crate) async fn reconcile(
+         ctx.meta.commit(batch).await?;
+     }
+ 
+-    Ok(if changed {
++    Ok(if !index.complete() || refused > 0 {
++        // Refuse to certify. Whatever this pass repaired is durable either way; what `Changed` /
++        // `Satisfied` would destroy is the only signal that redundancy was NOT restored everywhere
++        // it was owed — an operator reading `Satisfied` is told the store is whole (§5 C-1).
++        Reconciled::Blocked
++    } else if changed {
+         Reconciled::Changed
+     } else {
+         Reconciled::Satisfied
+@@ -310,29 +376,45 @@ enum Assessment {
+     /// over its fabricated identity tail is forbidden (ADR-0040 decision 4). Skip the
+     /// chunk and flag it NEEDS-HUMAN; the obligation stays queued.
+     Malformed,
++    /// This pass may not act on the obligation, and may not discharge it either: its reference
++    /// lives in a shape this slice writes nothing to, or two committed maps claim it. It stays
++    /// queued and the pass does not certify. Carries NOTHING: the refusal was already reported
++    /// where the object was READ — **rule D, once per object, never once per chunk** — so a
++    /// multipart object holding `q` obligations gives the operator one row and one increment, not
++    /// `q` copies of one fact ([`emit_refused`], [`emit_ambiguous`]).
++    Refused,
+ }
+ 
+-/// Resolve `chunk` to its committed chunk map, then gather and **verify** its surviving
+-/// fragments — classifying it into an [`Assessment`].
++/// The generation this reading READ holds the chunk in a **segmented** map. This slice reads one
++/// but writes nothing to one (`repoint_chunk` + the record ceilings are #682's), so it is refused.
++const REFUSED_SEGMENTED: &str = "segmented-chunk-map";
++/// A drain this pass withheld: it could not read every committed object, so "referenced by nothing"
++/// — the only fact that permits discarding an obligation — is exactly what it failed to establish.
++const REFUSED_INCOMPLETE: &str = "incomplete-reading";
++
++/// Classify one queued obligation against **the pass's one reading** of the committed namespace
++/// (`index`), gathering and **verifying** its surviving fragments — into an [`Assessment`].
+ async fn assess(
+     ctx: &ReconstructionContext<'_>,
+     stores: &HashMap<DServerId, &dyn ChunkStore>,
+     chunk: ChunkId,
++    index: &CommittedIndex,
+ ) -> Result<Assessment> {
+-    let Some((inode_id, prior, chunk_index)) = find_chunk(ctx.meta, chunk).await? else {
+-        // The chunk is referenced by no committed chunk map — it was deleted out from
+-        // under the obligation. Nothing to repair.
+-        return Ok(Assessment::Drain);
++    let site = match index.sites.get(&chunk) {
++        Some(Site::Flat(site)) => site,
++        // Found, and refused where it was read (a `seg:` record, an ambiguous id) — which is also
++        // where it was REPORTED, once for the object however many of its chunks are queued (rule
++        // D). Here it is only kept: never drained, never acted on, and never certified over.
++        Some(Site::Refused(_)) => return Ok(Assessment::Refused),
++        // No committed map this reading could read references the chunk. Over a COMPLETE reading
++        // that is a deletion out from under the obligation and there is nothing to repair; over an
++        // incomplete one it is precisely what the reading failed to establish, and [`reconcile`]
++        // withholds the drain rather than discarding the obligation on it.
++        None => return Ok(Assessment::Drain),
+     };
+-    // `find_chunk` above already proved `prior.chunk_map` is flat (or this `assess` call
+-    // never happened) — `find_chunk` is the only producer of a `prior`/`chunk_index` pair.
+-    let chunk_ref = prior
+-        .chunk_map
+-        .as_flat()
+-        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+-            operation: "reconstruction::assess",
+-        })?[chunk_index]
+-        .clone();
++    // A [`Site::Flat`] carries ONE `ChunkRef` per obligation, never the object's whole decoded map.
++    let chunk_index = site.chunk_index;
++    let chunk_ref = site.chunk_ref.clone();
+ 
+     // Classify the committed placement BEFORE any scheme-specific handling
+     // (ADR-0040 decision 4, "strict maintenance"). A MALFORMED vector (non-empty,
+@@ -448,8 +530,8 @@ async fn assess(
+     }
+ 
+     Ok(Assessment::Repairable(Box::new(RepairPlan {
+-        inode_id,
+-        prior,
++        inode_key: Arc::clone(&site.inode_key),
++        prior_bytes: Arc::clone(&site.prior_bytes),
+         chunk_index,
+         chunk_id: chunk,
+         k,
+@@ -518,6 +600,13 @@ enum RepairOutcome {
+     /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
+     /// aborted plan is not mistaken for a success (see [`emit_aborted`]).
+     Aborted,
++    /// The re-placement would have LANDED rebuilt bytes over bytes this pass never read, so it
++    /// landed none: nothing was committed, the obligation stays queued, and the pass does not
++    /// certify. Offset on `reconstruction_would_overwrite` (see [`emit_would_overwrite`]). An
++    /// EARLIER missing index of the same chunk may already have landed — on a slot proved empty,
++    /// byte-identical or already unrecoverable, so it destroyed nothing and is collectable
++    /// garbage, exactly as the [`Aborted`](Self::Aborted) arm above already leaves.
++    Refused,
+ }
+ 
+ /// Rebuild `plan`'s missing fragment(s), re-place them in distinct failure domains, and
+@@ -563,10 +652,30 @@ async fn repair_chunk(
+             chunk: chunk_id,
+             index: index as u16,
+         };
++        let old = plan.placement[index];
++        // Whether this re-placement **claims** the slot or merely re-uses its own: the one fact
++        // both halves below turn on, so they can never disagree about which slot is whose.
++        let claimed = old != target;
++        // **Land bytes only where this reference already stands, or where nothing stands.**
++        // `put_fragment` OVERWRITES, it runs BEFORE the CAS, and GC's incomplete-reference-set
++        // backstop withholds DELETES (`gc.rs:306-316`) — so nothing downstream of here can undo
++        // it, and a destroyed byte is the permanent loss §5 C-1 forbids. A CLAIMED slot is one the
++        // pass never read as this reference's. While its reading of the namespace has a hole in
++        // it, an object it could NOT read may reference this very `FragmentId { chunk, index }` at
++        // this very server — ids are allocator-minted (`write.rs:170`), so a second claim on one
++        // is always an anomaly, and the one apparatus that catches it (`CommittedIndex::note`)
++        // sees only records the pass could read. Refuse rather than overwrite: nothing lands, the
++        // obligation stays queued, and the pass does not certify. The slot this reference's OWN
++        // committed placement names is re-used, not claimed — rebuilding a rotted fragment where
++        // the record already places it IS the repair.
++        if claimed && !may_land(*target_store, frag, &frag_bytes).await {
++            emit_would_overwrite(frag, target);
++            return Ok(RepairOutcome::Refused);
++        }
+         target_store.put_fragment(frag, frag_bytes).await?;
+ 
+-        let old = plan.placement[index];
+-        if old != target {
++        // The fragment a CLAIMED slot displaces is orphan-marked (never deleted) in the commit.
++        if claimed {
+             displaced.push((old, frag));
+         }
+         new_placement[index] = target;
+@@ -576,28 +685,38 @@ async fn repair_chunk(
+     // placement record, drains the obligation, and orphans the displaced fragments. The
+     // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
+     // racing writer / superseded custodian loses here rather than corrupting the record.
+-    let mut next_chunk_map = plan
+-        .prior
+-        .chunk_map
+-        .as_flat()
+-        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+-            operation: "reconstruction::repair_chunk",
+-        })?
+-        .to_vec();
+-    next_chunk_map[plan.chunk_index].placement = new_placement;
+-    let next = InodeRecord {
+-        size: plan.prior.size,
+-        chunk_map: next_chunk_map.into(),
+-        state: InodeState::Committed,
+-        version: plan.prior.version + 1,
+-        // Reconstruction rebuilds the SAME content, so it PRESERVES the object metadata
+-        // (ADR-0047): a repair commit must not move `Last-Modified` or drop the content
+-        // type.
+-        ..plan.prior.clone()
++    //
++    // Decoded HERE, one object at a time, from the STORED bytes the reading answered with — and the
++    // CAS requires those EXACT bytes back, never a re-encoding of what they decoded to: `decode →
++    // encode` is byte-identical only while every field round-trips to the stored spelling, so a
++    // record written by another build would lose this CAS forever, reported as an ordinary lost
++    // race (the rubric's *Serialization identity* class).
++    let prior: InodeRecord = metadata::decode(&plan.prior_bytes)?;
++    let Some(prior_chunks) = prior.chunk_map.as_flat() else {
++        // Unreachable: a plan is built only over a FLAT generation, and these are its own bytes.
++        // An abort — nothing committed, the obligation kept — never a `?` that ends the whole pass.
++        return Ok(RepairOutcome::Aborted);
+     };
+-    let inode_key = metadata::inode_key(plan.inode_id);
++    let mut next_chunk_map = prior_chunks.to_vec();
++    // The plan's index must still name the plan's CHUNK in these bytes — checked, not indexed:
++    // unchecked indexing would PANIC on a generation the reading did not answer from, inside the
++    // fenced control point, and an in-range index naming a DIFFERENT chunk would repoint the wrong
++    // one under a CAS that still succeeds. Rule A (`locate_queued_chunks` below) already rejects
++    // that generation, so this is the second guard on the same fact; an abort leaves the obligation
++    // queued for a pass that re-reads.
++    let repointed = next_chunk_map.get_mut(plan.chunk_index);
++    let Some(chunk_ref) = repointed.filter(|c| c.id == chunk_id) else {
++        return Ok(RepairOutcome::Aborted);
++    };
++    chunk_ref.placement = new_placement;
++    // Built FROM the prior record, so every field this pass does not own is preserved by
++    // construction (ADR-0047: a repair must not move `Last-Modified` or drop the content type).
++    let mut next = prior.clone();
++    next.chunk_map = next_chunk_map.into();
++    next.version += 1;
++    let inode_key = plan.inode_key.to_vec();
+     let mut batch = WriteBatch::new()
+-        .require(inode_key.clone(), metadata::encode(&plan.prior))
++        .require(inode_key.clone(), plan.prior_bytes.to_vec())
+         .put(inode_key, metadata::encode(&next))
+         .delete(repair::repair_key(chunk_id));
+     for (dserver, frag) in &displaced {
+@@ -615,34 +734,249 @@ async fn repair_chunk(
+     }
+ }
+ 
+-/// Find the committed inode whose chunk map references `chunk`, returning its id, the
+-/// full prior record (for the CAS), and the chunk's index within the map.
+-async fn find_chunk(
++/// Whether the rebuilt `bytes` may be landed in `frag`'s slot at `store` — asked only of a slot
++/// this repair CLAIMS, never of the one the reference's own committed placement already names.
++/// This is the last point at which a byte that is not this repair's to destroy can still be saved:
++/// the write is an overwrite, it precedes the CAS, and reclamation's backstop governs deletes.
++///
++/// One extra read per rebuilt fragment, so the pass's work stays proportional to the obligations it
++/// holds; the bound on this await is the STORE's, exactly as [`assess`]'s survivor reads are.
++async fn may_land(store: &dyn ChunkStore, frag: FragmentId, bytes: &[u8]) -> bool {
++    match store.get_fragment(frag).await {
++        // Nothing stands here, so the write destroys nothing.
++        Ok(None) => true,
++        // Byte-identical, so the write IS a no-op. Every BENIGN occupant of a slot addressed by
++        // this same chunk and index lands here — a re-placement whose CAS was lost, an orphan GC
++        // has not reclaimed — because `erasure::encode` + `encode_ec_fragment` are deterministic
++        // over the chunk's bytes; a SECOND committed reference minting different content under
++        // one id (the anomaly) does not.
++        Ok(Some(found)) => found.as_ref() == bytes,
++        // Already unrecoverable at the device — an integrity fault or `EIO`, by exactly the
++        // permanent-vs-transient split [`assess`] reads a placed fragment through
++        // ([`is_permanent_read_fault`]): those bytes are lost to whoever owns them, so the write
++        // takes nothing that was still there, and refusing would instead stall this repair for as
++        // long as the rot sits at the target. A TRANSIENT fault is no answer at all — unknown is
++        // not empty, and this is the fail-closed side of that.
++        Err(err) => is_permanent_read_fault(err.as_ref()),
++    }
++}
++
++/// Where **one** reading of the committed namespace found each queued obligation's chunk. The unit
++/// of retention is the *obligation*: an object holding none of this pass's queued chunks contributes
++/// nothing, and one holding several shares a single handle to its key and its generation — never a
++/// decoded chunk list per object. [`Default`] is the reading a pass with **no** obligations makes:
++/// empty, and complete.
++#[derive(Default)]
++struct CommittedIndex {
++    /// The committed site of each queued chunk the reading found a reference for. A chunk absent
++    /// here was referenced by nothing the reading COULD read — "referenced by nothing" only while
++    /// the reading is [`complete`](Self::complete).
++    sites: HashMap<ChunkId, Site>,
++    /// How many committed objects this reading could **not** account for.
++    unaccounted: usize,
++}
++
++impl CommittedIndex {
++    /// Whether this reading accounted for **every** committed object it met. While it did not, no
++    /// obligation may be drained on its evidence — a record it could not read may hold the very
++    /// reference the obligation protects — and the pass certifies nothing.
++    fn complete(&self) -> bool {
++        self.unaccounted == 0
++    }
++
++    /// NAME one object this reading could not account for on the audit seam, and count it — one
++    /// entry point for both, so a site can neither name without counting nor count without naming.
++    /// Emitted where the object is READ, before any repair runs (`gc.rs:159-166`), so a later fault
++    /// cannot cost the operator the name to repair.
++    fn cannot_account_for(&mut self, action: &'static str, key: &[u8], fault: &dyn Display) {
++        emit_unaccounted(action, &crate::gc::object_name(key), fault);
++        self.unaccounted += 1;
++    }
++
++    /// Record `site` as `chunk`'s committed site — or, when the reading already found one, as an
++    /// **ambiguity**: two references to one chunk id leave no way to tell which record a repoint
++    /// belongs to, so neither is repaired and BOTH are named.
++    fn note(&mut self, chunk: ChunkId, site: Site) {
++        match self.sites.entry(chunk) {
++            Entry::Vacant(slot) => {
++                slot.insert(site);
++            }
++            Entry::Occupied(mut slot) => {
++                // Reported per ambiguous ID, not per claim on it: the fact IS the pair, so a row
++                // per object would name half of it. Both objects are named in this one row.
++                emit_ambiguous(chunk, slot.get().key(), site.key());
++                slot.insert(Site::Refused(Arc::clone(site.key())));
++            }
++        }
++    }
++}
++
++/// One queued chunk's committed site — a record this pass may repoint, or the object it was
++/// refused in.
++enum Site {
++    /// A committed **flat** generation, with what a repoint of it needs.
++    Flat(FlatSite),
++    /// Found, but not actionable by this slice, in the named object. The obligation is kept,
++    /// nothing is written, and the pass refuses to certify. The reason was reported where the
++    /// object was read, once for the object (rule D) — it is not carried per chunk.
++    Refused(Arc<[u8]>),
++}
++
++impl Site {
++    /// The `inode:` key of the object this site was attributed to.
++    fn key(&self) -> &Arc<[u8]> {
++        match self {
++            Site::Flat(site) => &site.inode_key,
++            Site::Refused(key) => key,
++        }
++    }
++}
++
++/// A queued chunk's reference inside a committed **flat** generation.
++struct FlatSite {
++    /// The record's key as the store spelled it, shared by every obligation in this object.
++    inode_key: Arc<[u8]>,
++    /// The generation's STORED bytes — the CAS precondition, decoded one object at a time in the
++    /// commit. Shared, so an object holding `q` obligations costs one copy, not `q`.
++    prior_bytes: Arc<[u8]>,
++    /// The chunk's index within that generation's chunk list.
++    chunk_index: usize,
++    /// That chunk's own committed reference — ONE `ChunkRef` per obligation, which is what the
++    /// assessment reads; the object's remaining chunks are never retained.
++    chunk_ref: ChunkRef,
++}
++
++/// Read the committed namespace **once** and index every queued obligation's chunk against it,
++/// resolving each object through the ONE resolver every consumer shares
++/// ([`metadata::resolve_chunk_map`], 0016 decision 7(e)) — so a **segmented** object's chunks are
++/// found here like any other's, instead of one ending the walk and with it every repair.
++///
++/// **One damaged object does not end the walk** — `referenced_fragments`' containment rule
++/// (`gc.rs:360-455`), applied a second time by restore (`restore.rs:616-688`) and here a third: a
++/// record that will not decode, a key that is not an `inode:<id>` key, or a generation the resolver
++/// cannot read ([`ChunkMapError`]) is NAMED and the walk goes on, leaving the reading *incomplete*.
++/// A fault that is **not** this object's still propagates (`?`) — after naming the object it was
++/// met under, so ending the pass never costs the operator that name (rule E).
++async fn locate_queued_chunks(
+     meta: &dyn MetadataStore,
+-    chunk: ChunkId,
+-) -> Result<Option<(InodeId, InodeRecord, usize)>> {
++    queue: &[ChunkId],
++) -> Result<CommittedIndex> {
++    let wanted: HashSet<ChunkId> = queue.iter().copied().collect();
++    let mut index = CommittedIndex::default();
+     for (key, value) in meta.scan(b"inode:").await? {
+-        let record: InodeRecord = metadata::decode(&value)?;
++        // The record's own bytes are in hand, so a decode failure is THIS object's fault and no
++        // store's — contained as an unreadable generation is, and without reading `state` out of
++        // bytes that will not decode (ADR-0010: no lenient decoder here).
++        let record: InodeRecord = match metadata::decode(&value) {
++            Ok(record) => record,
++            Err(fault) => {
++                index.cannot_account_for("undecodable-inode-record", &key, &fault);
++                continue;
++            }
++        };
+         if record.state != InodeState::Committed {
+             continue;
+         }
+-        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+-        // scan exactly as an unreadable record already does via `decode(&value)?`
+-        // above.
+-        let flat_chunk_map =
+-            record
+-                .chunk_map
+-                .as_flat()
+-                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+-                    operation: "reconstruction::find_chunk",
+-                })?;
+-        if let Some(index) = flat_chunk_map.iter().position(|c: &ChunkRef| c.id == chunk) {
+-            if let Some(inode_id) = parse_inode_key(&key) {
+-                return Ok(Some((inode_id, record, index)));
++        // A record is read, CAS'd on and named under the KEY THE STORE GAVE IT: `"inode:007"` and
++        // `"inode:7"` parse alike, so re-deriving `inode_key(id)` for the CAS reads one record and
++        // commits over the other — a lost conflict at best, a clobber at worst. One the grammar
++        // refuses is named and contained, never silently skipped (the base drops it, and an
++        // obligation the dropped record referenced then drains as unreferenced).
++        if parse_inode_key(&key).is_none() {
++            index.cannot_account_for("unparsable-inode-key", &key, &"not an `inode:<id>` key");
++            continue;
++        }
++        // `Ok(None)`: no live committed generation under this key, so nothing left to reference —
++        // skipped as an uncommitted record is. The bound on this await is the STORE's (#508/#636).
++        let resolved = match metadata::resolve_chunk_map(meta, &key, &record).await {
++            Ok(Some(resolved)) => resolved,
++            Ok(None) => continue,
++            Err(err) => match err.downcast::<ChunkMapError>() {
++                // The resolver's own typed verdict that THIS generation cannot be read, recovered
++                // by downcast because the trait seam boxes every error. Contained.
++                Ok(fault) => {
++                    index.cannot_account_for("unresolvable-chunk-map", &key, &fault);
++                    continue;
++                }
++                // A store fault under the read: not this object's, so never folded into it — the
++                // pass ends for every object rather than declaring this one unreadable. **Rule E**
++                // still applies to the name: this IS an object the pass could not read, and the
++                // operator gets it here, where the read happened, because nothing downstream of a
++                // propagated error will.
++                Err(err) => {
++                    index.cannot_account_for("store-fault-under-read", &key, &err);
++                    return Err(err);
++                }
++            },
++        };
++        // **Rule A — act only on a resolve that did not restart.** A snapshot superseded mid-resolve
++        // is dropped and the resolver answers the LIVE root instead (`metadata.rs:2338-2339`,
++        // decision 7(h)) — a generation this pass never scanned. Its chunk list may hold, drop or
++        // re-order the chunks the scanned bytes hold, so mixing the two is unsound twice over: a
++        // repoint would frame the live generation's chunk at the scanned generation's index
++        // (unchecked, a PANIC before the stale CAS can reject it), and — the quieter loss — an
++        // obligation absent from the live list would be DRAINED as unreferenced while the
++        // generation this pass actually read still references it. Compared by VALUE, which is the
++        // property that matters: equal records have the same chunk list, so no reading is mixed,
++        // whatever the resolver borrowed or cloned to answer with. Contained like any other object
++        // this pass could not account for — nothing written, the obligation kept, re-read next
++        // pass, when the scan sees the generation that superseded this one.
++        if resolved.record.as_ref() != &record {
++            let fault = "the resolve restarted onto a generation this pass did not read";
++            index.cannot_account_for("superseded-generation", &key, &fault);
++            continue;
++        }
++        // Retain NOTHING for an object none of this pass's obligations names.
++        let hits: Vec<usize> = resolved
++            .chunks
++            .iter()
++            .enumerate()
++            .filter(|(_, chunk)| wanted.contains(&chunk.id))
++            .map(|(chunk_index, _)| chunk_index)
++            .collect();
++        if hits.is_empty() {
++            continue;
++        }
++        let inode_key: Arc<[u8]> = Arc::from(key.as_slice());
++        // What this pass may WRITE: a **segmented** record is #682's to repoint, and its reference
++        // is REAL, so the obligation is refused, never drained. Read off the generation the pass
++        // scanned — which rule A above has just proved is the one the resolver answered from.
++        //
++        // **Rule D — reported ONCE for the object, here, however many of its chunks are queued.**
++        // A multipart object is exactly the shape that holds many: reporting per chunk would give
++        // the operator `q` copies of one fact and make `reconstruction_repair_refused` count
++        // obligations while reading as objects. The obligation count rides along as a field, so
++        // nothing is lost by counting the object.
++        if record.chunk_map.is_segmented() {
++            // A count of OBLIGATIONS, so DISTINCT ids: a record naming one queued chunk twice
++            // refuses ONE obligation (`repair:<chunk_id>` is keyed by chunk alone,
++            // `repair.rs:32`) and is separately an ambiguity, noted below. Counting references
++            // would tell the operator two repairs are held where one is.
++            let held: HashSet<ChunkId> = hits.iter().map(|&at| resolved.chunks[at].id).collect();
++            emit_refused(&inode_key, REFUSED_SEGMENTED, held.len());
++            for chunk_index in hits {
++                let chunk = resolved.chunks[chunk_index].id;
++                index.note(chunk, Site::Refused(Arc::clone(&inode_key)));
+             }
++            continue;
++        }
++        // The generation this reading READ, in its own STORED bytes: they both frame the repoint
++        // and are CAS'd on, with no re-encoding in between (see the commit in [`repair_chunk`]).
++        let prior_bytes: Arc<[u8]> = Arc::from(&value[..]);
++        for chunk_index in hits {
++            let chunk_ref = resolved.chunks[chunk_index].clone();
++            index.note(
++                chunk_ref.id,
++                Site::Flat(FlatSite {
++                    inode_key: Arc::clone(&inode_key),
++                    prior_bytes: Arc::clone(&prior_bytes),
++                    chunk_index,
++                    chunk_ref,
++                }),
++            );
+         }
+     }
+-    Ok(None)
++    Ok(index)
+ }
+ 
+ fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
+@@ -763,6 +1097,89 @@ fn emit_data_loss(chunk: ChunkId) {
+     );
+ }
+ 
++/// Emit an **unaccounted committed object**: this pass could not read that object's record, resolve
++/// its chunk map, or read it under an `inode:<id>` key — so its reading has a hole in it. No
++/// obligation is drained on what such a reading did NOT find. Named as GC names one
++/// (`gc.rs:563-573`), where the object is read and before any repair runs.
++fn emit_unaccounted(action: &'static str, object: &str, fault: &dyn Display) {
++    tracing::warn!(monotonic_counter.reconstruction_unaccounted_records = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action,
++        inode = %object,
++        fault = %fault,
++        "reconstruction could not account for a committed object; its reading of the namespace is incomplete, so it drains NO obligation on that evidence and certifies NOTHING — operator signal",
++    );
++}
++
++/// Emit an **ambiguous chunk id**, naming BOTH committed objects that claim it, where the second
++/// claim is read — so the operator holds the pair even if a later store fault ends the pass.
++fn emit_ambiguous(chunk: ChunkId, first: &[u8], second: &[u8]) {
++    tracing::warn!(monotonic_counter.reconstruction_ambiguous_chunk_id = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "ambiguous-chunk-id",
++        chunk = %wyrd_traits::chunk_hex(chunk),
++        inode = %crate::gc::object_name(first),
++        other = %crate::gc::object_name(second),
++        "two committed chunk maps reference one chunk id; neither is repaired (repointing one orphan-marks a fragment the other points at) and the obligation stays queued — NEEDS-HUMAN",
++    );
++}
++
++/// Emit a **refused object**: this pass read a committed object it may not write to, and `count` of
++/// the obligations it holds are therefore refused. NOTHING is written, they stay queued, and the
++/// pass answers [`Reconciled::Blocked`]; `Satisfied` would tell an operator the store is whole.
++///
++/// **Rule D — once per object, never once per chunk.** Emitted where the object is read, so the
++/// operator gets one row and one increment naming one record to act on; the obligation count is a
++/// field on it. A multipart object holding `q` queued chunks is one anomaly, not `q`, and a counter
++/// that ticked per chunk would measure the queue rather than the store.
++fn emit_refused(object: &[u8], reason: &'static str, count: usize) {
++    tracing::warn!(monotonic_counter.reconstruction_repair_refused = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "refused",
++        inode = %crate::gc::object_name(object),
++        reason,
++        obligations = count,
++        "reconstruction refused the queued repairs held by one committed object it may not write to; they stay queued and NOTHING was written — the pass does not certify",
++    );
++}
++
++/// Emit a re-placement this pass **refused to land**: the slot it would have claimed already holds
++/// bytes it never read, under this chunk's own `FragmentId`. `put_fragment` would have destroyed
++/// them before the CAS could reject the plan, and reclamation's backstop governs deletes, so this
++/// is the one write nothing downstream could take back. NEEDS-HUMAN: a second claim on an
++/// allocator-minted id (`write.rs:170`) is always an anomaly, and the fragment says which chunk.
++fn emit_would_overwrite(frag: FragmentId, dserver: DServerId) {
++    tracing::warn!(monotonic_counter.reconstruction_would_overwrite = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "would-overwrite",
++        dserver,
++        chunk = %wyrd_traits::chunk_hex(frag.chunk),
++        index = frag.index,
++        "reconstruction refused to re-place a rebuilt fragment over bytes it never read; the repair landed nothing, the obligation stays queued — the pass does not certify, NEEDS-HUMAN",
++    );
++}
++
++/// Emit the obligations an **incomplete reading** withheld a drain from: this pass could not prove
++/// they are referenced by nothing, which is the only fact that permits a drain, so it kept them.
++/// One row per PASS — the objects that made the reading incomplete are each named exactly once by
++/// [`emit_unaccounted`], and this count is a property of the reading, not of any one of them.
++fn emit_withheld(count: usize) {
++    // A count of OBLIGATIONS, in ONE row: `reconstruction_repair_refused` stays a count of the
++    // objects rule D reports, so the two never have to be told apart after the fact.
++    tracing::warn!(monotonic_counter.reconstruction_repairs_withheld = count as u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "withheld",
++        reason = REFUSED_INCOMPLETE,
++        obligations = count,
++        "reconstruction kept queued repairs it could not show to be unreferenced; its reading of the namespace has a hole in it, so NOTHING was drained on that evidence — the pass does not certify",
++    );
++}
++
+ /// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the
+ /// rebuilt fragments are now collectable garbage.
+ fn emit_conflict(chunk: ChunkId) {
+diff --git a/crates/custodian/tests/segmented_map_reconstruction.rs b/crates/custodian/tests/segmented_map_reconstruction.rs
+new file mode 100644
+index 0000000..24e9c29
+--- /dev/null
++++ b/crates/custodian/tests/segmented_map_reconstruction.rs
+@@ -0,0 +1,614 @@
++// Issue #697 (child 3 of the #681 split, 0016 decision 7(e)): **reconstruction reads each committed
++// object's map ONCE per pass through the shared resolver, assesses its queued obligations against
++// that one reading, contains per object what it cannot read, and REFUSES — rather than aborts or
++// silently drains — the repair it does not own.** The base reads the map inline out of the record
++// (`as_flat().ok_or(SegmentedMapUnsupported)?`, `reconstruction.rs:332`/`:583`/`:636`), so ONE
++// segmented object turns repair into an `Err` for EVERY object, and it walks the namespace once per
++// QUEUED OBLIGATION (`:322`/`:620`) — a Q×N loop that stops converging. Nine legs over ONE
++// fixture, each driving `reconcile_step`, the real fenced control point; **none names a symbol this
++// patch introduces** (the red leg reverts production, so one would fail to COMPILE and score no red
++// at all). Legs 1-6 and 9 go red on the base; leg 7 passes before and after, and so does leg 8's
++// containment half — only the rule E attribution leg 8 also asserts is new. Leg 9 is the one leg
++// beyond the eight the brief enumerates (and the reason this file measures over its 380-semantic
++// budget): continuing the walk past an object the pass could not read is what lets a re-placement
++// land bytes over a hidden duplicate reference's, which `put_fragment` destroys for good.
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_coordination_mem::MemCoordination;
++#[rustfmt::skip]
++use wyrd_core::metadata::{self, ChunkMap, ChunkRef, EcScheme, InodeRecord, InodeState,
++    SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap};
++use wyrd_core::{erasure, placement::Topology, repair, write::encode_ec_fragment};
++use wyrd_custodian::{reconcile_step, Custodian, FencedZone, Reconciled, ReconstructionContext};
++#[rustfmt::skip]
++use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health,
++    MetadataStore, Result, ScanPage, WriteBatch};
++
++/// ONE metadata double for every role these legs need — the counters legs 6 and 7 read, the `get`
++/// fault leg 8 injects, the retired snapshot leg 4 hands the scan. `BTreeMap`, not `HashMap`: the
++/// DAMAGED records must be met FIRST, or "the healthy object was still repaired" proves nothing.
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
++    /// `(namespace readings, `seg:` range reads)` — an O(N) pass told from an O(Q×N) one.
++    reads: Mutex<(usize, usize)>,
++    /// Armed: every `get` fails with a plain, non-`metadata::ChunkMapError` fault — a backend
++    /// outage under a read, not an anomaly the resolver describes and a pass downcasts. Its text is
++    /// distinctive so a store's fault is never mistaken for one of the fixture's own.
++    failing_gets: Mutex<bool>,
++    /// Set: `scan` answers this row with the scripted bytes while `get` and every CAS still see the
++    /// live ones — a generation RETIRED under the scan, which is what restarts a resolve (7(h)).
++    stale: Mutex<Option<(Vec<u8>, Bytes)>>,
++}
++
++#[async_trait]
++#[rustfmt::skip]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        if *self.failing_gets.lock().unwrap() { return Err("simulated store outage".into()); }
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        if prefix.starts_with(b"inode:") { self.reads.lock().unwrap().0 += 1; }
++        let kv = self.kv.lock().unwrap();
++        let rows = (kv.range(prefix.to_vec()..)).take_while(|(k, _)| k.starts_with(prefix));
++        let mut rows: Vec<_> = rows.map(|(k, v)| (k.clone(), v.clone())).collect();
++        if let Some((at, retired)) = self.stale.lock().unwrap().clone() {
++            for row in rows.iter_mut().filter(|(k, _)| *k == at) { row.1 = retired.clone(); }
++        }
++        Ok(rows)
++    }
++    async fn scan_page(&self, prefix: &[u8], after: Option<&[u8]>, n: usize) -> Result<ScanPage> {
++        if prefix.starts_with(b"seg:") { self.reads.lock().unwrap().1 += 1; }
++        wyrd_testkit::test_double_scan_page(self, prefix, after, n).await
++    }
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        let lost = |p: &wyrd_traits::Precondition| kv.get(&p.key).cloned() != p.expected;
++        if batch.preconditions.iter().any(lost) { return Ok(CommitOutcome::Conflict); }
++        kv.extend(batch.puts);
++        for key in batch.deletes { kv.remove(&key); }
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++/// One D server. `list_fragments` / `delete_fragment` are the reclamation surface GC drives; this
++/// fixture runs reconstruction ALONE, so reaching either would mean the pass did something it has
++/// no business doing — it says so rather than answering. `rot`, when armed, is the one address
++/// whose read faults at the DEVICE (`EIO`) — bytes unrecoverable rather than absent.
++#[derive(Default)]
++#[rustfmt::skip]
++struct MemDServer { frags: Mutex<HashMap<FragmentId, Bytes>>, rot: Mutex<Option<FragmentId>> }
++#[async_trait]
++#[rustfmt::skip]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, b: Bytes) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, b); Ok(())
++    }
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        if *self.rot.lock().unwrap() == Some(id) { return Err(dead_sector()); }
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> { unimplemented!("no fleet walk") }
++    async fn delete_fragment(&self, _: FragmentId) -> Result<()> { unimplemented!("no delete") }
++    async fn health(&self) -> Result<Health> { Ok(Health::Healthy) }
++}
++
++// ---- the audit seam, captured: WHAT was said, HOW MANY times (rule D), in WHAT ORDER (rule E) ----
++
++type Capture = Arc<Sink>;
++#[derive(Default)]
++struct Sink(Mutex<Vec<u8>>);
++#[rustfmt::skip]
++impl std::io::Write for &Sink {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.0.lock().unwrap().extend_from_slice(buf); Ok(buf.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++}
++
++/// Reconstruction's OWN audit seam — never another loop's, never a bare `tracing` line.
++const SEAM: &str = r#""target":"wyrd.custodian.reconstruction.audit""#;
++/// A drain the pass withheld, or a refusal: told from a silent skip only by the reason it states.
++const INCOMPLETE: &str = r#""reason":"incomplete-reading""#;
++/// Both the refusal row (rule D) and the withheld row (once per pass) carry their obligation count.
++const BOTH: &str = r#""obligations":2"#;
++
++/// The fixture's own small vocabulary. ONE `rustfmt::skip` for the block: every one of these is a
++/// single expression that the formatter would otherwise spread over four lines apiece.
++#[rustfmt::skip]
++mod fx {
++    use super::*;
++    pub fn logged(a: &Capture) -> String { String::from_utf8(a.0.lock().unwrap().clone()).unwrap() }
++    /// The rows on the audit seam carrying `says`, by line index.
++    pub fn seam(audit: &Capture, says: &str) -> Vec<usize> {
++        let text = logged(audit);
++        let rows = text.lines().enumerate();
++        rows.filter(|(_, l)| l.contains(SEAM) && l.contains(says)).map(|(at, _)| at).collect()
++    }
++    /// WHERE it was first said — a leg comparing two of these is asserting rule E's ordering.
++    pub fn said(audit: &Capture, says: &str) -> usize {
++        let rows = seam(audit, says);
++        *rows.first().unwrap_or_else(|| panic!("never said {says}. got: {}", logged(audit)))
++    }
++    /// How a record is NAMED on that seam — `gc::object_name`'s escaping (fixture keys are
++    /// printable ASCII, so unchanged) as a JSON string VALUE, under whichever field carries it:
++    /// `inode` for the object a row is about, `other` for an ambiguous id's second claimant.
++    pub fn named(key: &[u8]) -> String { format!(r#":"{}""#, String::from_utf8_lossy(key)) }
++    /// One committed chunk to seed: id, the placement its record commits, the fragments written.
++    pub fn seeded(id: ChunkId, at: &[DServerId], h: &[u16]) -> Seeded { (id, at.to_vec(), h.to_vec()) }
++    pub fn one(id: ChunkId, at: &[DServerId], h: &[u16]) -> Vec<Seeded> { vec![seeded(id, at, h)] }
++    pub fn frag(chunk: ChunkId, index: u16) -> FragmentId { FragmentId { chunk, index } }
++    /// A block-layer read fault (`EIO`), the shape `chunkstore-fs` surfaces from a dead sector:
++    /// the device could not return those bytes, so they are lost to whoever owns them.
++    pub fn dead_sector() -> wyrd_traits::BoxError { std::io::Error::from_raw_os_error(5).into() }
++    pub fn chunk_ref(id: ChunkId, placement: Vec<DServerId>) -> ChunkRef {
++        let scheme = EcScheme::ReedSolomon { k: K, m: M };
++        ChunkRef { id, scheme, len: CHUNK_LEN, placement }
++    }
++    pub fn committed(map: ChunkMap, count: usize) -> InodeRecord {
++        let (size, state) = (count as u64 * CHUNK_LEN, InodeState::Committed);
++        InodeRecord { size, chunk_map: map, state, version: 1, ..Default::default() }
++    }
++    /// The **stored spelling** of a record: valid, but not what `metadata::encode` produces — one
++    /// space after the brace. EVERY root is seeded so, which is what makes the CAS binding: a pass
++    /// requiring a RE-ENCODING of what it decoded would lose it forever.
++    pub fn stored(record: &InodeRecord) -> Bytes {
++        let mut bytes = metadata::encode(record).to_vec();
++        bytes.insert(1, b' ');
++        assert_eq!(&metadata::decode::<InodeRecord>(&bytes).unwrap(), record, "fixture: same");
++        Bytes::from(bytes)
++    }
++}
++use fx::*;
++
++// ---- fixture: raw `seg:` + root seeding (#653 owns the real committer). Domains A..E on servers
++// 0..4, one free beyond any chunk's three fragments; every chunk is RS(2,1). ----
++const DOMAINS: [&str; 5] = ["A", "B", "C", "D", "E"];
++const K: u8 = 2;
++const M: u8 = 1;
++const PAYLOAD: &[u8] = b"twelve bytes";
++const CHUNK_LEN: u64 = PAYLOAD.len() as u64;
++const EPOCH: u64 = 7;
++// In the byte order the `BTreeMap` answers in — `inode:0` < `inode:00` < `inode:006` < `inode:007`
++// < `inode:7` — so every damaged record and the segmented object is met BEFORE the healthy work.
++// `inode:007` parses to the id `inode:7` already spells: the WORK object is keyed that way (rule C).
++const DAMAGED_RECORD: &[u8] = b"inode:0";
++const DAMAGED_SEG: &[u8] = b"inode:00";
++const SEG: &[u8] = b"inode:006";
++const F_WORK: &[u8] = b"inode:007";
++const CANON_KEY: &[u8] = b"inode:7";
++/// The under-replicated flat chunk every leg's positive half rests on: fragment 2 is gone.
++const C_REPAIR: ChunkId = 0xA1;
++/// A second under-replicated flat chunk, referenced by no other object — the other half of the
++/// decision leg 9 makes at one re-placement target.
++const C_DEAD: ChunkId = 0xA7;
++/// A chunk owing NO work — whole at every fragment — under the CANONICAL spelling of the work
++/// object's id (rule C). Queued, it is the OTHER route to a no-op drain (leg 3).
++const C_IDLE: ChunkId = 0xA4;
++/// Chunks inside a `seg:` record — real references this slice writes nothing to.
++const S_A: ChunkId = 0xB1;
++const S_B: ChunkId = 0xB2;
++/// A chunk no map this pass CAN read references — "referenced by nothing" established, or not.
++const C_UNSEEN: ChunkId = 0xD2;
++/// One record's SECOND claim on a single id (leg 5).
++const C_DUP: ChunkId = 0xD3;
++/// Segment-group nonces (32 lowercase hex, `0016:354`); a damaged object gets its own.
++const NONCE: &str = "0123456789abcdef0123456789abcdef";
++const OTHER_NONCE: &str = "fedcba9876543210fedcba9876543210";
++type Seeded = (ChunkId, Vec<DServerId>, Vec<u16>);
++
++#[rustfmt::skip]
++struct Store { meta: MemMeta, fleet: Vec<MemDServer>, topo: Topology }
++#[rustfmt::skip]
++impl Store {
++    fn new() -> Self {
++        // A permissive global `tracing` default, installed ONCE, so the audit callsites never latch
++        // `Interest::never` (#214).
++        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++        let mut topo = Topology::default();
++        for (id, at) in DOMAINS.iter().enumerate() { topo.register(id as DServerId, *at); }
++        Self { meta: Default::default(), fleet: DOMAINS.map(|_| MemDServer::default()).into(), topo }
++    }
++    fn holds(&self, at: DServerId, f: FragmentId) -> bool {
++        self.fleet[at as usize].frags.lock().unwrap().contains_key(&f)
++    }
++    /// The reads since the last call, zeroed: ONE pass's, never the seeding's.
++    fn take_reads(&self) -> (usize, usize) { std::mem::take(&mut *self.meta.reads.lock().unwrap()) }
++    fn rows(&self) -> BTreeMap<Vec<u8>, Bytes> { self.meta.kv.lock().unwrap().clone() }
++    async fn stored_at(&self, key: &[u8]) -> Option<Bytes> { self.meta.get(key).await.unwrap() }
++    async fn queued(&self) -> Vec<ChunkId> { repair::queued_repairs(&self.meta).await.unwrap() }
++    async fn enqueue(&self, chunk: ChunkId) {
++        repair::enqueue_repair(&self.meta, chunk, "scrub").await.unwrap();
++    }
++    async fn record(&self, key: &[u8]) -> InodeRecord {
++        metadata::decode(&self.stored_at(key).await.expect("present")).unwrap()
++    }
++    async fn placement(&self, key: &[u8], at: usize) -> Vec<DServerId> {
++        self.record(key).await.chunk_map.as_flat().unwrap()[at].placement.clone()
++    }
++    async fn put(&self, key: &[u8], value: Bytes) {
++        self.meta.commit(WriteBatch::new().put(key.to_vec(), value)).await.unwrap();
++    }
++    /// The fragments `have` names, where `at` puts them — REAL EC bytes, so `intact_shard` passes.
++    async fn place(&self, chunk: ChunkId, at: &[DServerId], have: &[u16]) {
++        let shards = erasure::encode(K as usize, M as usize, PAYLOAD).unwrap();
++        for &i in have {
++            let b = encode_ec_fragment(chunk, i, K, M, &shards[i as usize]);
++            self.fleet[at[i as usize] as usize].put_fragment(frag(chunk, i), b).await.unwrap();
++        }
++    }
++    /// One committed **flat** object under the raw key `key`, fragments where placement says.
++    async fn seed(&self, key: &[u8], chunks: Vec<Seeded>) {
++        for (id, at, have) in &chunks { self.place(*id, at, have).await; }
++        let refs = chunks.iter().map(|(id, at, _)| chunk_ref(*id, at.clone())).collect::<Vec<_>>();
++        self.root(key, refs.into(), chunks.len(), true).await;
++    }
++    /// A committed **segmented** object: a root over a table of which only the first `written`
++    /// `seg:` records exist — a smaller `written` is the gap containment exists for.
++    async fn seed_seg(&self, key: &[u8], nonce: &str, written: usize, chunks: Vec<Seeded>) {
++        let map = self.segmented(nonce, written, &chunks).await;
++        self.root(key, map, chunks.len(), written == chunks.len()).await;
++    }
++    /// The map itself: the `seg:` records written and the table naming every segment, through the
++    /// real validating constructors, put raw. Separate from the root, so leg 4 can hand the SCAN a
++    /// generation whose records are already drained.
++    async fn segmented(&self, nonce: &str, written: usize, chunks: &[Seeded]) -> ChunkMap {
++        let group = SegmentGroup::new(nonce, EPOCH).unwrap();
++        let mut table = Vec::new();
++        for (i, (id, at, have)) in chunks.iter().enumerate() {
++            self.place(*id, at, have).await;
++            let (index, byte_offset) = (i as u32, i as u64 * CHUNK_LEN);
++            table.push(SegmentRef { index, byte_offset, byte_len: CHUNK_LEN });
++            if i < written {
++                let seg = SegmentRecord::new(vec![chunk_ref(*id, at.clone())], byte_offset);
++                let key = metadata::seg_key(&group, index).unwrap();
++                self.put(&key, metadata::encode(&seg.unwrap())).await;
++            }
++        }
++        ChunkMap::Segmented(SegmentedMap::new(group, table).unwrap())
++    }
++    /// Commit the root under the key the store is given, in its STORED spelling — and **assert the
++    /// fixture's own fault is real**: a root seeded unreadable must really come back unreadable
++    /// from the shared resolver, or the leg over it proves nothing.
++    async fn root(&self, key: &[u8], map: ChunkMap, count: usize, readable: bool) {
++        let root = committed(map, count);
++        self.put(key, stored(&root)).await;
++        let got = metadata::resolve_chunk_map(&self.meta, key, &root).await;
++        assert_eq!(got.is_ok(), readable, "fixture: resolves");
++    }
++    /// Every leg's positive half: the under-replicated flat work object under a key that is NOT the
++    /// canonical spelling of its id, the record that IS (rule C) holding a chunk owed nothing, and
++    /// — asked — a healthy segmented object holding TWO chunks in its `seg:` records, one of them
++    /// named TWICE so **rule D's count is of obligations and not of references** (leg 2).
++    async fn seed_fixture(&self) {
++        let (a, b) = (seeded(S_A, &[0, 1, 4], &[0, 1]), seeded(S_B, &[0], &[]));
++        self.seed_seg(SEG, NONCE, 3, vec![a, b.clone(), b]).await;
++        self.seed(F_WORK, one(C_REPAIR, &[0, 1, 4], &[0, 1])).await;
++        self.seed(CANON_KEY, one(C_IDLE, &[0, 1, 4], &[0, 1, 2])).await;
++    }
++    /// Both shapes no pass can READ, FIRST in key order: a committed root naming a `seg:` record
++    /// never written — unreadable through the resolver (asserted in `root`), and the ONE shape whose
++    /// resolve re-reads the root and so reaches a `get` at all (`metadata.rs:2338-2339`, what leg 8
++    /// arms) — plus a committed record whose own bytes will not decode.
++    async fn seed_damaged(&self) {
++        self.seed_seg(DAMAGED_SEG, OTHER_NONCE, 0, one(C_UNSEEN, &[0, 1, 4], &[])).await;
++        self.put(DAMAGED_RECORD, Bytes::from_static(b"{not an inode record}")).await;
++    }
++    /// ONE step through the REAL fenced control point (`reconcile_step`), under an audit subscriber
++    /// — never a parallel entry, never an internal helper — answering with the seam it captured.
++    /// Reconstruction ALONE: the other loops walk `inode:` themselves, and sharing one walk is a
++    /// larger refactor (leg 6).
++    async fn drive(&self) -> (std::result::Result<Reconciled, String>, Capture) {
++        let (coord, mut zone) = (MemCoordination::new(), FencedZone::new());
++        let leader = Custodian::elect(&coord, "zone").await.unwrap();
++        zone.install(leader.leadership());
++        let view: Vec<(DServerId, &dyn ChunkStore)> = (self.fleet.iter().enumerate())
++            .map(|(id, store)| (id as DServerId, store as &dyn ChunkStore)).collect();
++        let ctx = ReconstructionContext {
++            meta: &self.meta, fleet: &view, topology: &self.topo, unreachable: &[] };
++        let audit = Capture::default();
++        let json = tracing_subscriber::fmt::layer().json().with_writer(Arc::clone(&audit));
++        let sub = tracing::Dispatch::new(tracing_subscriber::registry().with(json));
++        let step = reconcile_step(&zone, &leader, None, None, Some(&ctx), None, 5_000);
++        (step.with_subscriber(sub).await.map_err(|err| err.to_string()), audit)
++    }
++    /// The flat repair happened — the rebuilt bytes reached the server its record now names — UNDER
++    /// ITS OWN KEY (**rule C**): a pass re-deriving `inode_key(id)` from the parsed key would have
++    /// read `inode:007` and CAS'd over `inode:7`.
++    async fn assert_repair_landed(&self, before: &BTreeMap<Vec<u8>, Bytes>) {
++        assert_eq!(self.placement(F_WORK, 0).await, vec![0, 1, 2], "repaired");
++        assert!(self.holds(2, frag(C_REPAIR, 2)), "rebuilt bytes landed");
++        assert_eq!(self.stored_at(CANON_KEY).await.as_ref(), before.get(CANON_KEY), "untouched");
++    }
++}
++
++/// LEG 1. On the base one segmented object makes `reconcile` return `Err` for the whole store, so
++/// the flat repair beside it never happens. `Ok` alone would also come from a pass that stepped
++/// over every object, so the positive work is asserted with it.
++///
++/// Every leg from here down carries `rustfmt::skip` for the same reason the fixture above does:
++/// the formatter's call-argument heuristic spreads a 90-column assertion over five lines, and the
++/// budget this discriminator is held to is measured in non-comment LINES.
++#[tokio::test]
++#[rustfmt::skip]
++async fn a_segmented_object_ends_no_pass_and_the_flat_repair_still_happens() {
++    let store = Store::new();
++    store.seed_fixture().await;
++    let before = store.rows();
++    store.enqueue(C_REPAIR).await;
++    store.enqueue(C_UNSEEN).await;
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("a segmented object ends no pass"), Reconciled::Changed, "repaired");
++    store.assert_repair_landed(&before).await;
++    // Both discharged over a reading that COULD read every object: one repaired, one drained as
++    // referenced by nothing — which only a COMPLETE reading may answer (leg 3 is the other side),
++    // so nothing is withheld here and the pass says so.
++    assert!(store.queued().await.is_empty(), "both discharged");
++    assert!(seam(&audit, INCOMPLETE).is_empty(), "a whole reading withholds nothing");
++}
++
++/// LEG 2. The failure mode this slice must not introduce while removing the abort: an obligation
++/// whose chunk lives in a `seg:` record read as "referenced by no committed chunk map" and DRAINED
++/// as if deleted (`:322-325`). Refuse instead, write nothing, do not certify — and report it ONCE
++/// FOR THE OBJECT (**rule D**), which only a MULTI-obligation fixture tells from once per chunk:
++/// both of `inode:006`'s `seg:`-resident chunks are queued here.
++#[tokio::test]
++#[rustfmt::skip]
++async fn work_in_a_segmented_record_is_refused_per_object_never_discarded() {
++    let store = Store::new();
++    store.seed_fixture().await;
++    for chunk in [S_A, S_B] { store.enqueue(chunk).await; }
++    let seg_key = metadata::seg_key(&SegmentGroup::new(NONCE, EPOCH).unwrap(), 0).unwrap();
++    let before = store.rows();
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("a refusal is not a fault"), Reconciled::Blocked, "refused owed work");
++    assert_eq!(store.queued().await, vec![S_A, S_B], "both KEPT");
++    assert!(store.holds(0, frag(S_A, 0)), "fragments stay put");
++    // A refusal writes NOTHING AT ALL: neither the `seg:` record it may not repoint (#682's) nor
++    // the root — whose version would move under any repoint of it.
++    for key in [SEG, &seg_key[..]] {
++        assert_eq!(store.stored_at(key).await.as_ref(), before.get(key), "byte-identical");
++    }
++    said(&audit, &named(SEG));
++    said(&audit, r#""reason":"segmented-chunk-map""#);
++    // **Rule D.** TWO queued chunks inside ONE object: one row and one increment, naming the record
++    // to act on and carrying the obligation count as a field. Per chunk, a multipart object floods
++    // the seam and the counter measures the queue rather than the store. The count is of
++    // OBLIGATIONS, so the object's THIRD reference — its second to `S_B` — must not inflate it:
++    // one queued chunk is one repair held, however many times a record names it (`repair.rs:32`).
++    let counter = "monotonic_counter.reconstruction_repair_refused";
++    assert_eq!(seam(&audit, r#""action":"refused""#).len(), 1, "once per object");
++    assert_eq!(logged(&audit).lines().filter(|l| l.contains(counter)).count(), 1, "counted once");
++    assert!(logged(&audit).contains(BOTH), "both carried, and only both");
++}
++
++/// LEG 3. Containment is per object and the answer still gets made. Both unreadable shapes sit
++/// ahead of the healthy work in key order, so the walk must survive each AND carry every name out.
++/// Carries the rule C sub-assertion (`assert_repair_landed`) and rule E's placement.
++#[tokio::test]
++#[rustfmt::skip]
++async fn an_unreadable_object_is_named_and_the_walk_continues() {
++    let store = Store::new();
++    store.seed_damaged().await;
++    store.seed_fixture().await;
++    let before = store.rows();
++    for chunk in [C_REPAIR, C_IDLE, C_UNSEEN] { store.enqueue(chunk).await; }
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("one bad object ends no pass"), Reconciled::Blocked, "read less");
++    // The sharpest edge of C-1: "I could not read the map" and "no map references this chunk" are
++    // different facts, and only the second permits a drain. NEITHER route to a no-op drain may run
++    // over a reading with a hole in it — not the chunk no readable map references (`C_UNSEEN`), and
++    // not the one a readable map shows whole (`C_IDLE`), because the record this pass could not
++    // read may claim that same id at another placement. Nor may one bad record cost a repair.
++    assert_eq!(store.queued().await, vec![C_IDLE, C_UNSEEN], "never drained");
++    store.assert_repair_landed(&before).await;
++    // **Rule E** — a name is emitted where the object is READ, BEFORE the work loop, so a later
++    // store fault cannot cost the operator the record to find. It has no repair path (#694).
++    let repair = said(&audit, r#""action":"repair""#);
++    for key in [DAMAGED_SEG, DAMAGED_RECORD] {
++        assert_eq!(store.stored_at(key).await.as_ref(), before.get(key), "byte-identical");
++        assert!(said(&audit, &named(key)) < repair, "named first");
++    }
++    // The kept obligations are reported ONCE for the pass — they are a property of the reading,
++    // not of either damaged object, each of which is named above in its own row.
++    assert_eq!(seam(&audit, INCOMPLETE).len(), 1, "one row per pass");
++    assert!(logged(&audit).contains(BOTH), "both kept, counted");
++}
++
++/// LEG 4 — **rule A**. `resolve_chunk_map` drops a snapshot superseded mid-resolve and answers the
++/// LIVE root instead (`metadata.rs:2338-2339`, 7(h)) — a generation the pass never scanned. Acting
++/// on it indexes the live chunk list at the scanned index (a panic before the stale CAS can reject
++/// it) and drains an obligation the scanned generation still references.
++#[tokio::test]
++#[rustfmt::skip]
++async fn a_resolve_that_restarted_is_acted_on_by_nothing() {
++    let store = Store::new();
++    store.seed_fixture().await;
++    // The live generation — flat, and owed a repair. It is what `get` and every CAS answer.
++    let live = InodeRecord { version: 2, ..store.record(F_WORK).await };
++    store.put(F_WORK, stored(&live)).await;
++    // What the pass's SCAN answers with: the segmented generation the live root superseded.
++    let retired = committed(store.segmented(NONCE, 0, &one(C_UNSEEN, &[0], &[])).await, 1);
++    *store.meta.stale.lock().unwrap() = Some((F_WORK.to_vec(), stored(&retired)));
++    // The fixture's own fault is real: the resolver really restarts onto the LIVE generation.
++    let back = metadata::resolve_chunk_map(&store.meta, F_WORK, &retired).await.unwrap();
++    assert_eq!(back.unwrap().chunks.as_ref(), live.chunk_map.as_flat().unwrap(), "restarted");
++    store.enqueue(C_REPAIR).await;
++    let before = store.rows();
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("a restart ends no pass"), Reconciled::Blocked, "may not claim");
++    assert_eq!(store.rows(), before, "no write at all: the live generation is untouched");
++    assert!(!store.holds(2, frag(C_REPAIR, 2)), "nothing rebuilt");
++    assert_eq!(store.queued().await, vec![C_REPAIR], "kept");
++    // Contained as an object the reading could not ACCOUNT for: what it may not act on is the
++    // mixing of two generations, whatever shape either has.
++    said(&audit, &named(F_WORK));
++    said(&audit, INCOMPLETE);
++}
++
++/// LEG 5. Ids are allocator-minted (`write.rs:170`), never content-addressed, so two committed maps
++/// claiming one `ChunkId` is always an anomaly — in one record or two. Repairing "whichever the
++/// scan met first" (the base, `:639`) repoints one, orphan-marking a fragment the other points at.
++#[tokio::test]
++#[rustfmt::skip]
++async fn a_duplicate_committed_chunk_id_is_repaired_by_neither_reference() {
++    let store = Store::new();
++    for key in [&b"inode:40"[..], b"inode:41"] {
++        store.seed(key, one(C_REPAIR, &[0, 1, 4], &[0, 1])).await;
++    }
++    // The same id twice in ONE record at DISTINCT placements: neither can pass for the other.
++    let twice = vec![seeded(C_DUP, &[0, 1, 4], &[0, 1]), seeded(C_DUP, &[2, 3, 4], &[])];
++    store.seed(b"inode:42", twice).await;
++    for chunk in [C_REPAIR, C_DUP] { store.enqueue(chunk).await; }
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("an ambiguity ends no pass"), Reconciled::Blocked, "no repair");
++    assert_eq!(store.queued().await, vec![C_REPAIR, C_DUP], "neither");
++    for key in [&b"inode:40"[..], b"inode:41", b"inode:42"] {
++        assert_eq!(store.placement(key, 0).await, vec![0, 1, 4], "no repoint");
++        said(&audit, &named(key));
++    }
++    // The SECOND reference too: a repoint of one orphan-marks a fragment the other points at.
++    assert_eq!(store.placement(b"inode:42", 1).await, vec![2, 3, 4], "nor the duplicate");
++    assert!(!store.holds(2, frag(C_REPAIR, 2)), "nothing rebuilt");
++    said(&audit, r#""action":"ambiguous-chunk-id""#);
++}
++
++/// LEG 6. The deployed repair loop is Q namespace scans × N point reads (`assess` → `find_chunk`,
++/// which scans all of `inode:`); wire the resolver in naively and each of those N objects costs a
++/// `seg:` read too — Q×N *resolves*, which stops converging as a store grows (C-1). Closes #647.
++#[tokio::test]
++#[rustfmt::skip]
++async fn the_namespace_is_read_once_per_pass_not_once_per_obligation() {
++    let store = Store::new();
++    // N = 3 committed flat objects, each holding one repairable chunk; Q = 3 obligations.
++    let repairable = [C_REPAIR, S_A, S_B];
++    for (n, chunk) in repairable.iter().enumerate() {
++        store.seed(format!("inode:5{n}").as_bytes(), one(*chunk, &[0, 1, 4], &[0, 1])).await;
++        store.enqueue(*chunk).await;
++    }
++    // S = 2 segmented objects beside them, so the bounded `seg:` range reads are counted too.
++    store.seed_seg(b"inode:60", NONCE, 1, one(C_UNSEEN, &[0, 1, 4], &[])).await;
++    store.seed_seg(b"inode:61", OTHER_NONCE, 1, one(C_DUP, &[0, 1, 4], &[])).await;
++    store.take_reads();
++
++    let (got, _) = store.drive().await;
++
++    // FIRST, so #647's own property is what this leg goes red on, not a consequence of it.
++    let (namespace, segments) = store.take_reads();
++    assert_eq!(namespace, 1, "read ONCE, not once per obligation");
++    assert!(segments <= 2, "one `seg:` read per object, got {segments}");
++    // and a segmented object owed nothing refuses nothing:
++    assert_eq!(got.expect("the pass must run"), Reconciled::Changed, "none refused");
++    // The bound is worth nothing if the repairs stopped landing:
++    for n in 0..repairable.len() {
++        assert_eq!(store.placement(format!("inode:5{n}").as_bytes(), 0).await, vec![0, 1, 2]);
++    }
++    assert!(store.queued().await.is_empty(), "all discharged");
++}
++
++/// LEG 7 (**not base-red, and deliberate**). A pass certifies only over the reading it PERFORMED:
++/// with no obligations it reads no namespace and claims nothing about the objects in it. Leg 6
++/// moves the reading out of the per-obligation loop, and the obvious way to do that — read once at
++/// the top, unconditionally — breaks this silently. The base already passes (`for chunk in queue`
++/// scans nothing when empty): this leg is a REGRESSION guard on the restructure, not a
++/// discriminator.
++#[tokio::test]
++#[rustfmt::skip]
++async fn an_empty_queue_reads_nothing_and_certifies() {
++    let store = Store::new();
++    store.seed_damaged().await;
++    store.seed_fixture().await;
++    store.take_reads();
++
++    let (got, _) = store.drive().await;
++
++    assert_eq!(got.expect("an idle pass runs"), Reconciled::Satisfied, "claims over its reading");
++    assert_eq!(store.take_reads().0, 0, "an idle pass reads nothing");
++}
++
++/// LEG 8 — guards OVER-containment. A store failing underneath the resolver is not one object's
++/// fault and must NOT be folded into "this object is unreadable": a walk that cannot reach the
++/// store answers for NO object, and a pass containing EVERY error would pass all six discriminating
++/// legs above. The fault is armed on `get`, which ONLY a segmented generation's root re-read
++/// reaches (`metadata.rs:2338-2339`) — under the resolver, exactly where containment is decided.
++/// That half is **not base-red, and deliberate**: the base passes it for a related reason (it
++/// cannot reach a `get` at all, aborting at the first damaged record, having likewise written and
++/// discharged nothing). Contained, this pass would answer `Ok` and repair `C_REPAIR` off a reading
++/// it never completed. **Rule E** is the other half, and it IS new: a pass that ends still owes the
++/// operator every name it read a fault under, emitted where the read happened.
++#[tokio::test]
++#[rustfmt::skip]
++async fn a_fault_that_is_not_one_objects_map_still_ends_the_pass() {
++    let store = Store::new();
++    store.seed_damaged().await;
++    store.seed_fixture().await;
++    store.enqueue(C_REPAIR).await;
++    let before = store.rows();
++    *store.meta.failing_gets.lock().unwrap() = true;
++
++    let (got, audit) = store.drive().await;
++
++    got.expect_err("a store fault is contained as one object's by nothing");
++    assert_eq!(store.rows(), before, "a pass that ends writes nothing");
++    assert_eq!(store.queued().await, vec![C_REPAIR], "nothing gone");
++    // **Rule E**, where it matters most: the pass ends, and NOTHING downstream will name what it
++    // read. Both objects are already on the seam — the undecodable record met before the fault,
++    // and the object the store fault itself was met under (named, then propagated).
++    assert!(said(&audit, &named(DAMAGED_RECORD)) < said(&audit, &named(DAMAGED_SEG)), "in order");
++}
++
++/// LEG 9. The one write nothing downstream takes back: `put_fragment` OVERWRITES and runs BEFORE
++/// the CAS, while GC's incomplete-reference-set backstop governs DELETES and so reaches it not at
++/// all. A slot the re-placement CLAIMS (its own committed placement names another server for it)
++/// may already hold a second committed reference's bytes under this same
++/// `FragmentId { chunk, index }` — ids are allocator-minted (`write.rs:170`), so a second claim is
++/// always an anomaly, and an object holding one is exactly the object legs 2-4 show this pass may
++/// be unable to READ, which leaves `ambiguous-chunk-id` blind to it. Landing there destroys those
++/// bytes permanently (§5 C-1): refuse, land nothing, keep the obligation, do not certify.
++#[tokio::test]
++#[rustfmt::skip]
++async fn a_repair_never_lands_over_bytes_this_pass_did_not_read() {
++    let store = Store::new();
++    store.seed_fixture().await;
++    // A SECOND under-replicated flat object, so one pass decides both ways at one server.
++    store.seed(b"inode:8", one(C_DEAD, &[0, 1, 4], &[0, 1])).await;
++    // Server 2 is where a missing fragment 2 is re-placed — leg 1 asserts that exact move. For
++    // `C_REPAIR` something this pass never read already holds that address; for `C_DEAD` it
++    // holds bytes the DEVICE cannot return, which are lost to their owner whoever it is.
++    let foreign = Bytes::from_static(b"another committed reference's fragment, same id");
++    store.fleet[2].put_fragment(frag(C_REPAIR, 2), foreign.clone()).await.unwrap();
++    *store.fleet[2].rot.lock().unwrap() = Some(frag(C_DEAD, 2));
++    for chunk in [C_REPAIR, C_DEAD] { store.enqueue(chunk).await; }
++    let before = store.rows();
++
++    let (got, audit) = store.drive().await;
++
++    assert_eq!(got.expect("a refusal is not a fault"), Reconciled::Blocked, "may not claim");
++    let held = store.fleet[2].get_fragment(frag(C_REPAIR, 2)).await.unwrap();
++    assert_eq!(held, Some(foreign), "the bytes it never read are still there, unchanged");
++    assert_eq!(store.stored_at(F_WORK).await.as_ref(), before.get(F_WORK), "no repoint");
++    assert_eq!(store.queued().await, vec![C_REPAIR], "the obligation is KEPT, not discharged");
++    said(&audit, r#""action":"would-overwrite""#);
++    // Refusing a slot whose occupant is ALREADY unrecoverable would take nothing back and stall
++    // this repair for as long as the rot sits there — a permanence §5 C-1 forbids just as much.
++    assert_eq!(store.placement(b"inode:8", 0).await, vec![0, 1, 2], "a dead slot is claimed");
++}

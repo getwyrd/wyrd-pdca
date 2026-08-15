@@ -20,8 +20,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import (act, brief, cleanup, doctor, drift, driver, flow, gates, leaves, manual_test,
-               merged, publish, queue, registry, revalidate, revert, signoff, sizing, sources,
-               split, state, sweep, waves, worktree)
+               merged, publish, queue, record, registry, revalidate, revert, signoff, sizing,
+               split, state, sweep, triage, waves, worktree)
 # `_parse_opt_in` is config's strict boolean (#132: anything unrecognized fails CLOSED,
 # with a warning). Underscored but package-internal, and the one place these semantics are
 # written down — a second spelling of "is this env var true" is how PR #184 r3 happened.
@@ -374,6 +374,30 @@ def main(argv: list[str] | None = None) -> int:
     p_actres.add_argument("--location", default="", help="where the delta landed (path:line / rule)")
     p_actres.add_argument("--date", help="applied date (ISO; default today)")
 
+    # PR-review triage (issue #316): ingest a published PR's external review findings
+    # into the Act ledger — the outer loop's highest-value signal, otherwise invisible
+    # unless a human transcribes it.
+    p_triage = sub.add_parser(
+        "triage",
+        help="ingest a published PR's external review findings into the Act ledger (#316)",
+        description="Pull a published PR's reviews + review comments via `gh api`, "
+                    "classify each finding (BUG / CONVENTION / NOISE / TEST-GAP) by "
+                    "keyword heuristics (tunable from the instance rubric's class "
+                    "list), route by class — a BUG on a merged PR files a tracker "
+                    "issue whose body carries a carry-forward note; CONVENTION / "
+                    "NOISE / TEST-GAP append candidate gate-row, rubric-line and "
+                    "rubric-exclusion entries to process/act-log.md — and register "
+                    "every finding in the Act ledger under a class-keyed signal "
+                    "(codex-pr:<slug>), so `act` flags a class that recurs after its "
+                    "process delta was applied. Proposes only: it never edits "
+                    "pdca.toml or the rubric. Re-running the same PR ingests only "
+                    "findings that arrived since the last run.")
+    p_triage.add_argument("pr", help="the PR: a URL (https://github.com/OWNER/REPO/pull/N), "
+                                     "OWNER/REPO#N, or a bare number with --repo")
+    p_triage.add_argument("--repo", default="",
+                          help="the PR's repository (OWNER/REPO) when `pr` is a bare number")
+    p_triage.add_argument("--date", help="triage date (ISO; default today)")
+
     # Tracker reconciliation (issue #300): bundles and the issue tracker drift out of
     # sync; cleanup reports the discrepancies (dry-run default) and --apply acts.
     p_cleanup = sub.add_parser(
@@ -424,10 +448,24 @@ def main(argv: list[str] | None = None) -> int:
     p_publish.add_argument("--dry-run", action="store_true", help="print the git/gh commands without running them")
     p_publish.add_argument("--no-pr", action="store_true", help="push the branch but don't open the draft PR")
     p_publish.add_argument("--no-issue", action="store_true",
-                           help="no tracker id yet: drop the T4 tracker-id requirement AND NOTHING ELSE "
-                                "(every other T4 failure still blocks the push), record id_pending "
-                                "(vs a magic #0000)")
+                           help="no tracker id yet: T4 drops only the tracker-id rule "
+                                "(all else still blocks), record id_pending (vs a magic #0000)")
     p_publish.add_argument("--by", default="", help="who published (recorded in publish.json)")
+
+    # Result-bundle recording (issue #317): commit terminal-finished bundles to the
+    # instance repo (batch-by-default: one commit / one PR per invocation). Selection
+    # is state.state ∈ state.TERMINAL — never a bundle in motion or one halted for a
+    # human. Gated on [records] mode ("off" default: the verb refuses with a hint).
+    p_record = sub.add_parser(
+        "record",
+        help="commit terminal-finished result bundles (COMPLETE / DISCONTINUED / "
+             "RESOLVED) to the instance repo as one batch commit; [records] "
+             'mode = "pr" also opens one PR for the batch (#317)')
+    p_record.add_argument("issue_ids", nargs="*",
+                          help="bundle ids to record (default: every terminal-finished "
+                               "bundle; a non-terminal id is excluded, loudly)")
+    p_record.add_argument("--dry-run", action="store_true",
+                          help="print the git/gh commands without running them")
 
     p_doctor = sub.add_parser("doctor",
                               help="report every prerequisite (OK/MISSING/UNAUTH/WARN + fix hint); changes nothing")
@@ -502,11 +540,16 @@ def main(argv: list[str] | None = None) -> int:
         return _drift(cfg, args)
     if args.cmd == "act":
         return _act(cfg, args)
+    if args.cmd == "triage":
+        return triage.run(cfg, args.pr, repo=args.repo,
+                          date=args.date or datetime.date.today().isoformat())
     if args.cmd == "signoff":
         return _signoff(cfg, args)
     if args.cmd == "publish":
         return publish.publish(cfg, args.issue_id, dry_run=args.dry_run,
                                open_pr=not args.no_pr, by=args.by, pending_id=args.no_issue)
+    if args.cmd == "record":
+        return record.record(cfg, args.issue_ids, dry_run=args.dry_run)
     if args.cmd == "cleanup":
         return cleanup.run(cfg, args.issue_ids, apply=args.apply, repo=args.repo, by=args.by)
     if args.cmd == "doctor":
@@ -580,11 +623,13 @@ def _run(cfg: Config, issue_id: str) -> int:
 def _flow(cfg: Config, args: argparse.Namespace) -> int:
     """Run the whole cycle for one or more issues (the single ``flow`` verb, #86).
 
-    Arity selects the mode: **one id** is a single sequential cycle (Plan→Do→Check→
-    sign-off→publish→Act); **several ids** fan out across lanes with a cheap-first
-    sign-off queue; **zero ids + --from-csv** plans a batch the planner picks from the
-    export. Unbriefed ids are auto-planned (one shared interactive Plan session) — no
-    --plan flag. Act runs by default after COMPLETE (--no-act to skip).
+    Arity selects the PRESENTATION, not the machinery (issue #468): **one or more ids**
+    all drive through :func:`flow.flow_ids` and the ONE results map it returns — one id
+    reports as ``state<TAB>path`` (+ the §6 listing), several as the batch table — while
+    **zero ids + --from-csv** plans a batch the planner picks from the export. A single id
+    therefore runs a one-bundle wave (Plan→Do→Check→sign-off→publish→Act), not a second,
+    parallel implementation of the same cycle. Unbriefed ids are auto-planned (one shared
+    interactive Plan session) — no --plan flag. Act runs by default (--no-act to skip).
     """
     if getattr(args, "lanes", None) is not None:
         cfg.lanes = max(1, args.lanes)
@@ -621,79 +666,113 @@ def _flow(cfg: Config, args: argparse.Namespace) -> int:
             print(f"flow: {exc}", file=sys.stderr)
             return 1
 
-    if len(ids) == 1:  # single sequential cycle (auto-plans if unbriefed)
-        iid = ids[0]
-        d = cfg.bundle(iid)
-        if d.exists() and state.state(d) == state.COMPLETE:
-            print(f"{state.COMPLETE}\t{d}", file=sys.stderr)
-            print(f"  already complete — nothing to run. To redo it: rm -rf {d}", file=sys.stderr)
-            return 0
-        if d.exists() and state.state(d) == state.RESOLVED:
-            # A settled tracker item is a successful no-op, like COMPLETE (#302 review
-            # round 3): the multi-id path skips it and exits 0 — automation must not
-            # read this terminal state as a failed flow on the single-id path either.
-            # But the marker is a CACHE (#302 review round 4): the tracker can have
-            # REOPENED the issue since it was written, and the seed never refreshes an
-            # existing notes.json — so revalidate against the live tracker first, and
-            # a reopened issue clears the marker and proceeds to a real flow.
-            if sources.tracker_issue_reopened(cfg, iid):
-                if not sources.clear_resolved_marker(d):
-                    # clear_resolved_marker printed the why (#302 review round 11):
-                    # claiming "planning it" over a still-resolved bundle would
-                    # silently suppress the reopened work — fail loudly instead.
-                    return 1
-                print(f"flow: issue_{iid} — the tracker issue is OPEN again; cleared "
-                      "the resolved marker and planning it.", file=sys.stderr)
-            else:
-                print(f"{state.RESOLVED}\t{d}", file=sys.stderr)
-                # The manual remediation names the WHOLE file (#302 review round 15):
-                # deleting only the `resolved` key would leave the closure-era
-                # notes.json in place, and ensure_notes refuses to re-fetch while it
-                # exists — Plan would brief from the pre-reopen thread.
-                print("  tracker item resolved outside a cycle — nothing to run. Reopen "
-                      "it in the tracker (a reachable GitHub tracker is then picked up "
-                      "here automatically; otherwise rename notes.json away — e.g. to "
-                      "notes.superseded-by-reopen.json — so the next Plan re-fetches "
-                      "the fresh thread) to plan it again.", file=sys.stderr)
-                return 0
-        if not d.exists():
-            d.mkdir(parents=True)
-        final = flow.flow(cfg, iid, csv=args.from_csv,
-                          do_publish=do_publish, do_act=do_act, by=args.by)
-        print(f"{final}\t{d}")
-        if final == state.AWAITING_SIGNOFF:
-            for it in signoff.open_needs_human(d / "SUMMARY.md"):
-                print(f"    {it}")
-        # RESOLVED counts as success too: the flow can DISCOVER the resolution mid-run
-        # (the Plan seed fetches notes that carry the terminal marker, #302) — a settled
-        # ticket correctly skipped is not a failed cycle.
-        return 0 if final in (state.COMPLETE, state.AWAITING_SIGNOFF, state.RESOLVED) else 1
-
-    # Several ids: batch — auto-plan unbriefed, drive concurrently, cheap-first sign-off.
+    # ONE routing path and ONE results map, for BOTH CLI shapes (issue #468). The single-id
+    # route used to be structurally different machinery — a pre-run short-circuit on raw disk
+    # state, then `flow.flow` returning a bare state string, with no `except PreflightError`
+    # — and five iterations of #449 broke "both shapes do the same thing to the same disk" by
+    # a new route each round. There is nothing left to keep in step: `flow_ids` revalidates a
+    # cached RESOLVED marker against the live tracker (`flow.py:1619-1633`), skips an
+    # already-terminal bundle with its recovery hint (`flow.py:1654-1660`), and reports a
+    # disposition for EVERY id it was given — so both decisions, and the map the answer comes
+    # from, live in exactly one place.
     try:
-        return _report_batch(flow.flow_ids(
-            cfg, ids, plan_missing=True, csv=args.from_csv,
-            do_publish=do_publish, do_act=do_act, by=args.by))
+        results = flow.flow_ids(cfg, ids, plan_missing=True, csv=args.from_csv,
+                                do_publish=do_publish, do_act=do_act, by=args.by)
     except flow.PreflightError as exc:
         print(f"flow: {exc}", file=sys.stderr)
         return 1
 
+    # Two PRESENTATIONS of that one map — never two drive paths, and never a second source
+    # of truth: both read only `results`, so neither can report what the other cannot see.
+    return _report_single(cfg, ids[0], results) if len(ids) == 1 else _report_batch(results)
+
+
+#: States a flow run counts as a SUCCESSFUL terminal: finished, or settled in the tracker
+#: outside the cycle (#302 review round 11) — a correctly skipped item is not a failed flow.
+_FLOW_OK = (state.COMPLETE, state.RESOLVED)
+
+
+def _results_rc(results: dict[str, str], ok: tuple[str, ...] = _FLOW_OK) -> int:
+    """The ONE exit-code rule over a flow results map (issue #468): 0 iff every bundle in it
+    reached a successful terminal. An EMPTY map — nothing was asked for, or nothing driven —
+    is 0: a no-op is not a failure. (Only ``flow_batch``, which is handed no ids, can produce
+    one: :func:`flow.flow_ids` answers for every id it is given.)
+
+    ``ok`` carries the single documented difference between the shapes, in one place instead
+    of as an emergent property of two drive paths: a SINGLE-id run adds AWAITING_SIGNOFF,
+    because stopping for the human who just typed the command is the intended end of that
+    run, not a failure. A multi-id set keeps the batch rule (rc 0 iff all COMPLETE/RESOLVED).
+    """
+    return 0 if all(s in ok for s in results.values()) else 1
+
+
+def _report_entry(cfg: Config, iid: str, st: str) -> None:
+    """One bundle's stdout report in the single-id shape: the documented ``state<TAB>path``
+    machine contract, plus the §6 listing when it stopped for the human.
+
+    One shape for every bundle the run answers for, named or adopted (#473) — so a caller
+    parsing stdout reads the same two fields for each, and the run cannot describe a child
+    it drove in a format it never described the named id in.
+    """
+    d = cfg.bundle(iid)
+    print(f"{st}\t{d}")
+    if st == state.AWAITING_SIGNOFF:
+        for it in signoff.open_needs_human(d / "SUMMARY.md"):
+            print(f"    {it}")
+
+
+def _report_single(cfg: Config, iid: str, results: dict[str, str]) -> int:
+    """The single-id presentation of the shared results map (issue #468).
+
+    Preserved from the pre-#468 single-id route, now DERIVED from the map the batch shape
+    also reports: the `state<TAB>path` line on stdout, the AWAITING_SIGNOFF listing of open
+    §6 items, and the rc-0 stop-for-the-human semantics.
+
+    Indexed, never ``.get``-with-a-fallback: :func:`flow.flow_ids` answers for every id it
+    was given, so a disk read here would be a SECOND authority — the one that let the two
+    shapes disagree about the same bundle. If the key is ever missing the map contract is
+    broken and the loud KeyError is the correct outcome, not a quietly divergent report.
+
+    The map can hold bundles the operator never typed — split adoption puts the children of
+    a bundle this run drove, or recovered, into it (#469, #473) — and the exit code is
+    derived from ALL of them. Reporting only ``iid`` then printed ``COMPLETE`` while exiting
+    1: a caller reading the machine contract saw a successful run, and the bundle that
+    actually failed it was named nowhere it was looking. The worst shape is the recovery
+    one, where ``iid``'s own ``COMPLETE`` was written by an EARLIER run, so stdout carried
+    nothing this run did at all. Every other entry therefore gets the SAME line, after the
+    named id's — the whole answer, in the one format, whatever the rc.
+
+    Printing them unconditionally rather than only on a failure is deliberate: a child left
+    AWAITING_SIGNOFF keeps the run at rc 0 (stopping for the human is this shape's intended
+    end, :func:`_results_rc`), so a failure-gated report would stay silent about the bundle
+    that is waiting for them. The terse one-line shape a non-adopting run prints is
+    untouched — ``flow_ids`` answers for exactly the ids it was given, so a second entry can
+    only come from an adoption (pinned by
+    ``test_a_single_id_run_that_adopts_nothing_still_prints_exactly_one_line``).
+    """
+    _report_entry(cfg, iid, results[iid])
+    for other in sorted(results):
+        if other != iid:
+            _report_entry(cfg, other, results[other])
+    return _results_rc(results, ok=(*_FLOW_OK, state.AWAITING_SIGNOFF))
+
 
 def _report_batch(results: dict[str, str]) -> int:
-    """Print a batch result map and return a process code (0 iff every bundle reached
-    a SUCCESSFUL terminal — COMPLETE, or RESOLVED (#302 review round 11): a tracker
-    item settled outside the cycle is a successful no-op on the batch path exactly as
-    it is on the single-id path; automation must not read it as a failed flow."""
+    """Print a batch result map and return a process code — :func:`_results_rc`'s rule
+    (0 iff every bundle reached a SUCCESSFUL terminal — COMPLETE, or RESOLVED (#302 review
+    round 11): a tracker item settled outside the cycle is a successful no-op, and
+    automation must not read it as a failed flow), which the single-id shape derives its
+    own exit code from too (issue #468)."""
     if not results:
         print("flow: nothing to drive — no in-flight briefs among the ids.", file=sys.stderr)
         return 0
     for iid, st in sorted(results.items()):
         print(f"{st}\t{iid}")
-    done = sum(1 for s in results.values() if s in (state.COMPLETE, state.RESOLVED))
+    done = sum(1 for s in results.values() if s in _FLOW_OK)
     resolved = sum(1 for s in results.values() if s == state.RESOLVED)
     tail = f" ({resolved} resolved in the tracker)" if resolved else ""
     print(f"flow: {done}/{len(results)} complete{tail}")
-    return 0 if done == len(results) else 1
+    return _results_rc(results)
 
 
 def _prog() -> str:
@@ -740,76 +819,80 @@ def _split(cfg: Config, args) -> int:
         if token:
             ids.append(token)
     filed = False
+    # Read the proposal and run `preflight` on BOTH shapes, before either does anything
+    # irreversible (issue #459). It carries the checks that do not need the ids — a second
+    # acceptance filed a whole second set of real sub-issues before discovering the parent
+    # was already split; a cyclic proposal filed its children before `validate` refused
+    # them — and now also the CONVERGENCE REPORT, the one statement of whether this split
+    # actually makes the children smaller. `--ids` reached neither: it went straight to
+    # `accept`, and it is the path the docs call *required* for a tracker this cannot reach
+    # — the operator who has already paid for the issues by hand, and so most needs the
+    # verdict. Tracker issues cannot be withdrawn and a materialised bundle is barely
+    # better, so this order is the whole guarantee.
+    try:
+        children = split.parse((d / split.PROPOSAL).read_text(encoding="utf-8"))
+        split.preflight(d, children, cfg)
+    except OSError:
+        split.advisory(f"split: {d.name} has no {split.PROPOSAL} — run "
+                       f"`{_prog()} split {args.issue_id}` first")
+        return 1
+    except split.SplitError as exc:
+        split.advisory(f"split: {exc}")
+        return 1
     if not ids:
-        # No ids given: file one issue per child, parented to this bundle's issue. Reading
-        # the proposal here rather than inside `accept` so a malformed one is refused
-        # BEFORE anything is filed — a tracker issue cannot be rolled back, and creating
-        # three of them for a proposal that then fails to parse is the worst order.
-        try:
-            children = split.parse((d / split.PROPOSAL).read_text(encoding="utf-8"))
-            # Every reason acceptance would fail that does not need the ids — run BEFORE a
-            # single issue is filed. Without it, a second `--accept` filed a whole second
-            # set of real sub-issues and only then discovered the parent was already
-            # split; a cyclic proposal filed its children before `validate` refused them.
-            # Tracker issues cannot be withdrawn, so the order is the whole guarantee.
-            split.preflight(d, children, cfg)
-        except OSError:
-            print(f"split: {d.name} has no {split.PROPOSAL} — run "
-                  f"`{_prog()} split {args.issue_id}` first", file=sys.stderr)
-            return 1
-        except split.SplitError as exc:
-            print(f"split: {exc}", file=sys.stderr)
-            return 1
+        # No ids given: file one issue per child, parented to this bundle's issue.
         try:
             ids = split.file_children(d, children, cfg, prog=_prog())
         except split.TrackerUnavailable as exc:
             # Never a silent skip: name the reason AND the way forward. A split that
             # filed nothing and materialised nothing would otherwise look like a no-op.
-            print(f"split: {exc}. File one issue per child yourself and pass them in "
-                  f"proposal order:\n  {_prog()} split {args.issue_id} --accept --ids "
-                  + ",".join(f"<id-{n}>" for n in range(1, len(children) + 1)),
-                  file=sys.stderr)
+            split.advisory(f"split: {exc}. File one issue per child yourself and pass them "
+                           f"in proposal order:\n  {_prog()} split {args.issue_id} "
+                           "--accept --ids "
+                           + ",".join(f"<id-{n}>" for n in range(1, len(children) + 1)))
             return 1
         except split.SplitError as exc:
-            print(f"split: {exc}", file=sys.stderr)
+            split.advisory(f"split: {exc}")
             return 1
         filed = True
-        try:
-            print(f"filed {len(ids)} child issue(s): "
-                  + ", ".join("#" + i for i in ids), file=sys.stderr)
-        except OSError:
-            # A closed or full stderr must not abort the run HERE: the issues exist, and
-            # stopping between filing and accepting is the one state with no artifact
-            # naming them. Carry on; the failure paths below re-print the numbers.
-            pass
+        # A closed or full stderr must not abort the run HERE: the issues exist, and
+        # stopping between filing and accepting is the one state with no artifact naming
+        # them. `split.advisory` absorbs it; the failure paths below re-print the numbers.
+        split.advisory(f"filed {len(ids)} child issue(s): "
+                       + ", ".join("#" + i for i in ids))
     try:
         created = split.accept(d, ids, cfg)
     except split.SplitError as exc:
-        print(f"split: {exc}", file=sys.stderr)
+        split.advisory(f"split: {exc}")
         if filed:
             # The issues are real and cannot be withdrawn. Say so explicitly and give the
             # command that resumes against them, or they are orphaned with nothing on
             # screen naming them — the one failure this feature must not have.
-            print("split: the child issues were already filed and CANNOT be rolled back: "
-                  + ", ".join("#" + i for i in ids) + ".", file=sys.stderr)
+            split.advisory("split: the child issues were already filed and CANNOT be "
+                           "rolled back: " + ", ".join("#" + i for i in ids) + ".")
             if "already marked" in str(exc):
                 # `preflight` passed and `accept` then found the parent terminal, so
                 # ANOTHER acceptance won the race between them. Printing the ordinary
                 # retry here would be a false instruction: it cannot succeed against an
                 # already-split parent, and following it would file a third set.
-                print("split: the parent was marked split by another run while these were "
-                      "being filed, so its children already exist. Do NOT re-run --accept: "
-                      "close the issues above as duplicates, or reopen the parent if this "
-                      "run's split is the one you want.", file=sys.stderr)
+                split.advisory(
+                    "split: the parent was marked split by another run while these were "
+                    "being filed, so its children already exist. Do NOT re-run --accept: "
+                    "close the issues above as duplicates, or reopen the parent if this "
+                    "run's split is the one you want.")
             else:
-                print("Fix the problem above, then re-run against them:\n"
-                      f"  {_prog()} split {args.issue_id} --accept --ids {','.join(ids)}",
-                      file=sys.stderr)
+                split.advisory("Fix the problem above, then re-run against them:\n"
+                               f"  {_prog()} split {args.issue_id} --accept --ids "
+                               f"{','.join(ids)}")
         return 1
+    # Everything below is advisory in the strongest sense: the bundles are on disk and the
+    # issues are filed, so no write here can change the outcome — but an unguarded one
+    # could still change the EXIT CODE. `pdca split 500 --accept 2>&1 | head` breaks both
+    # streams part-way and, before #459, turned a completed acceptance into a traceback.
     for child in created:
-        print(child)
-    print(f"{d.name} marked split; run `{_prog()} flow {' '.join(ids)}` to drive the "
-          "children", file=sys.stderr)
+        split.advisory(str(child), file=sys.stdout)
+    split.advisory(f"{d.name} marked split; run `{_prog()} flow {' '.join(ids)}` to drive "
+                   "the children")
     return 0
 
 
@@ -844,7 +927,7 @@ def _size(cfg: Config, issue_ids: list[str]) -> int:
         # read-only and must stay safe to run against a live queue. Without this the one
         # deliberate way to ask "how big is this?" showed only the structural bands and
         # never the decomposability answer the instance had already paid a model for.
-        est = sizing.combine(sizing.estimate(d / "brief.md", cfg), leaves.current_sizing(d, cfg))
+        est = sizing.combine(sizing.estimate(d / "brief.md", cfg), leaves.current_sizing(d, cfg), cfg)
         print(f"{est.band}\t{d.name}\tscore={est.score} "
               f"churn={est.churn_band} patch={est.patch_band}"
               + (f" sizer={est.model_band}" if est.model_band else ""))
@@ -884,7 +967,7 @@ def _status(cfg: Config, issue_id: str | None) -> int:
         # queue, which is where a human is actually looking.
         oversized = (d / "brief.md").exists() and sizing.combine(
             sizing.estimate(d / "brief.md", cfg),
-            leaves.current_sizing(d, cfg)).band == sizing.OVERSIZED
+            leaves.current_sizing(d, cfg), cfg).band == sizing.OVERSIZED
         if s == state.AWAITING_SIGNOFF:
             n = len(signoff.open_needs_human(d / "SUMMARY.md"))
             flag = "  [cheap: confirm]" if n == 0 else f"  [{n} NEEDS-HUMAN]"
@@ -1101,7 +1184,17 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
     from ``publish --no-issue`` — which cannot pass a flag, since the gate's command line
     is the project's to write (``pdca.toml``), not publish's (PR #184 review). The
     variable takes a real boolean (``1/true/yes/on``); anything else — including
-    ``false`` — leaves the gate strict, and an unrecognized value warns."""
+    ``false`` — leaves the gate strict, and an unrecognized value warns.
+
+    **Artifacts not drafted yet ⇒ a declared deferral, not a bare pass** (issue #401). This
+    row is registered for Check *and* re-run by ``publish`` (``publish.publish_gates``), and
+    at Check time the two artifacts it lints do not exist — publish drafts them later. The
+    exit code stays 0 (nothing failed), but the gate now DECLARES that its substantive audit
+    has no subject yet (``gates.DEFERRED_MARKER``), so the matrix records ``deferred`` with
+    the reason instead of a green the reviewer cannot reproduce — the artifacts the row names
+    are not among its inputs, which is why every cycle escalated this by-design condition to
+    SUMMARY §6 NEEDS-HUMAN. The substantive verdict is unchanged and still hard-gates the
+    push (``publish._t4_passes``)."""
     if args.issue_id:
         d = cfg.bundle(args.issue_id)
     elif os.environ.get("PDCA_BUNDLE"):
@@ -1112,12 +1205,46 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
     patch = d / "patch.diff"
     if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
         return 0  # close / no-fix bundle: nothing contributed
-    pr_path = d / publish.PR_BODY
-    if not pr_path.is_file():
-        return 0  # artifacts not drafted yet (Check-time gate, pre-publish) — nothing to lint
+    if not (d / publish.PR_BODY).is_file():
+        # Artifacts not drafted yet (Check-time gate, pre-publish): the gate ran and found
+        # its subject absent BY DESIGN. Declare the deferral (#401) rather than exit 0 mute,
+        # so the row records `deferred — re-gated at publish` instead of a vacuous green.
+        print(f"{gates.DEFERRED_MARKER} {publish.PR_BODY} not drafted yet — the substantive "
+              "T4 audit of the contribution artifacts runs at publish")
+        return 0
+    # `--no-issue` also arrives as $PDCA_PENDING_ID (#384): `publish._t4_passes` derives it
+    # from the `publish --no-issue` flag on each run (scrubbing any inherited value), so the
+    # SHIPPED gate row relaxes exactly the tracker-id requirement in pending-id mode without
+    # its registered cmd line ever changing — an in-place edit of that line breaks `copier
+    # update` for any instance that appended a row beside it (tests/test_update_compat.py).
+    #
+    # The environment half goes through the project's strict boolean, not upstream's
+    # truthiness test (PR #184 review r3, kept through the v0.57.0 update). `bool(...)`
+    # makes `PDCA_PENDING_ID=false` ENABLE pending-id mode — the fail-OPEN direction, on a
+    # knob whose only job is to switch a gate off, and #132 already wrote this exact lesson
+    # down for `auto_iterate` (`bool("false") is True`). Upstream scrubs an inherited value
+    # on the publish path, which narrows the exposure but does not close it: a hand-run gate
+    # or a stale export still reaches here. Reuse config's parser rather than grow a second
+    # dialect of boolean — real spellings only, anything unrecognized is OFF *and* warns.
+    no_issue = args.no_issue or _parse_opt_in(os.environ.get("PDCA_PENDING_ID", ""),
+                                              "PDCA_PENDING_ID")
+    problems = contribution_problems(d, no_issue=no_issue)
+    for p in problems:
+        print(f"contribcheck: {p}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def contribution_problems(d: Path, *, no_issue: bool = False) -> list[str]:
+    """The T4 lint core, as a problem list — the single source of the contribution rules.
+
+    Extracted from :func:`_contribcheck` (issue #331) so the publisher's exit-contract
+    check (``handoff.check_publisher``) reuses the instance's own deterministic lint
+    rather than re-declaring it; the gate and the /handoff verdict cannot drift apart.
+    """
     issue_id = d.name.removeprefix("issue_")
+    pr_path = d / publish.PR_BODY
     commit_path = d / publish.COMMIT_MSG
-    pr_text = pr_path.read_text(encoding="utf-8")
+    pr_text = pr_path.read_text(encoding="utf-8") if pr_path.is_file() else ""
     problems: list[str] = []
     # 1) A non-empty `**User impact:**` opener that PRECEDES Root cause — the user-visible
     #    effect must lead (what a weak model tends to drop).
@@ -1131,26 +1258,14 @@ def _contribcheck(cfg: Config, args: argparse.Namespace) -> int:
             problems.append("`**User impact:**` must come BEFORE `## Root cause`")
     # 2) The tracker id in BOTH artifacts — only for a real numeric ticket; a slug /
     #    --no-issue (pending-id) bundle legitimately carries no trailer.
-    #
-    #    The environment half goes through the project's strict boolean, not a truthiness
-    #    test (PR #184 review r3). `not in ("", "0")` made `PDCA_PENDING_ID=false` ENABLE
-    #    pending-id mode — the fail-OPEN direction, on a knob whose only job is to switch
-    #    a gate off, and #132 already wrote this exact lesson down for `auto_iterate`
-    #    (`bool("false") is True`). Reuse that parser rather than grow a second dialect of
-    #    boolean: real spellings only, anything unrecognized is OFF *and* warns, so a typo
-    #    leaves the gate strict and visible instead of quietly disarmed.
-    pending = args.no_issue or _parse_opt_in(os.environ.get("PDCA_PENDING_ID", ""),
-                                             "PDCA_PENDING_ID")
-    if issue_id.isdigit() and not pending:
+    if issue_id.isdigit() and not no_issue:
         needle = re.compile(r"#" + re.escape(issue_id) + r"\b")
         commit_text = commit_path.read_text(encoding="utf-8") if commit_path.is_file() else ""
         if not needle.search(pr_text):
             problems.append(f"{publish.PR_BODY} does not reference the tracker id #{issue_id}")
         if not needle.search(commit_text):
             problems.append(f"{publish.COMMIT_MSG} does not reference the tracker id #{issue_id}")
-    for p in problems:
-        print(f"contribcheck: {p}", file=sys.stderr)
-    return 1 if problems else 0
+    return problems
 
 
 def _revalidate(cfg: Config, args: argparse.Namespace) -> int:

@@ -303,6 +303,15 @@ def _expand_checks(specs: list[dict], lanes: int) -> list[dict]:
     return rows
 
 
+def probe(cmd: str, cfg) -> int:
+    """Run ONE detect ``cmd`` exactly the way :func:`run` runs a ``[[doctor.checks]]``
+    row — shell, project root, exit 0 ⇒ present. The single probe implementation every
+    consumer shares (:func:`run`, the Plan-exit guard's :func:`failing_dependencies`
+    (#340), the Do-exit adjudication in :mod:`~pdca_harness.dependency_halt` (#341)),
+    so "what it means to probe a row" cannot drift apart."""
+    return subprocess.run(cmd, shell=True, capture_output=True, cwd=cfg.root).returncode
+
+
 def registered_ids(cfg: Config) -> set[str]:
     """Lower-cased ids of ``[[doctor.checks]]`` rows that would actually **run** (issue #263).
 
@@ -351,6 +360,53 @@ def unregistered_dependencies(brief_path, cfg) -> list[str]:
         for token in _brief.external_dependency_tokens(brief_path)
         if token.strip().lower() not in registered
     ]
+
+
+def failing_dependencies(brief_path, cfg) -> list[str]:
+    """Brief-named registered dependencies whose detect ``cmd`` exits non-zero (#340).
+
+    #333 forces *registration* — every checkable token must name a ``[[doctor.checks]]``
+    row — but nothing executed the row: :func:`registered_ids` only requires a non-empty
+    ``cmd``, so a planner could discharge every check on a machine where the dependency
+    is absent, and the only remaining detector was the builder's own mid-cycle
+    self-report — the actor most tempted to work around the gap silently. This runs the
+    detect ``cmd`` of **exactly the rows the brief's backticked tokens name** — a
+    registered row the brief does not name is never executed, so an instance's wider
+    doctor inventory is not a tax on every bundle — and reports each non-zero exit
+    together with the row's own ``hint``.
+
+    Same sharing rationale as :func:`unregistered_dependencies`: the Plan-exit probe and
+    any later consumer (#341 reuses it at Do exit) must not drift apart. Rows come from
+    :meth:`~pdca_harness.config.Config.current_doctor_checks` — ``pdca.toml`` as it is on
+    disk NOW, not the run's snapshot — so a row registered during the Plan beat is probed
+    in the same pass, and each ``cmd`` runs exactly the way :func:`run` runs a row
+    (shell, project root, exit 0 ⇒ present). Matching mirrors :func:`registered_ids`:
+    the raw row's ``id`` (default: its ``cmd``), case-insensitive.
+
+    Detect cmds therefore run on every beat the pre-dispatch policy is consulted, not
+    just on an explicit ``pdca doctor`` — they must stay cheap and side-effect-free (the
+    ``[[doctor.checks]]`` config comment carries that expectation). Probing is
+    machine-scoped by design, and that is the correct scope, not a compromise: the
+    builder runs on this same host.
+    """
+    from . import brief as _brief  # local: brief has no dependency on doctor
+    wanted = {t.strip().lower() for t in _brief.external_dependency_tokens(brief_path)}
+    if not wanted:
+        return []
+    failed: list[str] = []
+    for row in cfg.current_doctor_checks():
+        cmd = str(row.get("cmd") or "").strip()
+        if not cmd:
+            continue  # not registered — `registered_ids` skips it for the same reason
+        rid = str(row.get("id") or cmd).strip()
+        if rid.lower() not in wanted:
+            continue  # ONLY the rows the brief names run (#340's definition of done)
+        rc = probe(cmd, cfg)
+        if rc != 0:
+            hint = str(row.get("hint") or "").strip() or "the row has no hint — add one"
+            failed.append(f"external dependency `{rid}` is registered but absent on this "
+                          f"host — its detect cmd (`{cmd}`) exited {rc}; hint: {hint}")
+    return failed
 
 
 def run(cfg: Config, *, strict: bool = False) -> int:
@@ -404,9 +460,9 @@ def run(cfg: Config, *, strict: bool = False) -> int:
         if not _have(binary):
             r.row(MISSING, label, f"install '{binary}' — [leaves.{role}] runs it")
             continue
-        probe = _auth_probe(leaf.family)
-        if probe:
-            r.row(probe[0], label, probe[1])
+        auth = _auth_probe(leaf.family)  # not `probe` — that name is the row-cmd runner
+        if auth:
+            r.row(auth[0], label, auth[1])
         else:
             r.row(OK, label)
 
@@ -489,8 +545,7 @@ def run(cfg: Config, *, strict: bool = False) -> int:
                 print()
                 print(f"== {group} ==")
                 last_group = group
-            rc = subprocess.run(row["cmd"], shell=True, capture_output=True,
-                                cwd=cfg.root).returncode
+            rc = probe(row["cmd"], cfg)
             fail_status = row.get("level", MISSING)  # WARN for optional rows
             r.row(OK if rc == 0 else fail_status, row["id"],
                   "" if rc == 0 else row.get("hint", ""),

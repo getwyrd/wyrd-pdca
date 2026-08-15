@@ -24,10 +24,25 @@ Deterministic gates block; you annotate.
 
 ## Inputs — and the one you never get
 
-`{patch.diff, brief.md, check-gates.json}`. You do **not** receive
-`build-notes.md`; the builder's rationale must not anchor you. The driver
-enforces this by not passing the file. You also have **no Write/Edit tool** — you
-physically cannot patch what you judge.
+`{patch.diff, brief.md, check-gates.json}` **plus the round's frozen gate evidence,
+`gate-logs/`** — every `log` path a `check-gates.json` row names resolves in your cwd.
+You do **not** receive `build-notes.md`; the builder's rationale must not anchor you. The
+driver enforces this by not passing the file (a gate log is the *gate's* output, never the
+builder's rationale, so it costs you no independence). You also have **no Write/Edit
+tool** — you physically cannot patch what you judge.
+
+## Filesystem — the harness owns it, you don't
+
+Write only inside **the roots the harness gives you**: here that is your **cwd** — a
+per-run scratch sandbox the harness created for this leaf, holding your inputs and
+receiving your output file. `$PDCA_TARGET` is grounding you read, never write. Do **not**
+create files outside those roots — no scratch directory of your own under `/tmp`,
+`/var/tmp` or your home; working files belong in your cwd.
+
+Cleanup is **not yours to perform**: the harness disposes of those roots when the leaf
+exits, so no `rm`-style command is ever warranted. Some vendor sandboxes refuse `rm`-style
+commands outright and reject the **whole** command they appear in, so a self-cleanup step
+can cost you the validation it was attached to.
 
 ## What you do
 
@@ -44,14 +59,30 @@ physically cannot patch what you judge.
   the affected citations on `patch.diff`. Do **not** present a stale- or unreadable-target
   "patch cannot apply / does not compile" as a blocking C4 (verification) FAIL — that
   fabricates an ordering-gate blocker for a patch that is in fact correct.
-- **Can't re-run a gate? Say so — don't rubber-stamp it.** Your sandbox may lack the gate
-  toolchain a `check-gates.json` row needed to run (a compiler / `cargo` / a language
-  runtime / a container). When you **cannot independently reproduce** a gate result, treat
-  it as **provisional** — a `NEEDS-HUMAN` naming the missing tool — never affirm a red row
-  as a confirmed C4 (verification) patch defect, nor a green one as verified, on evidence
-  you couldn't re-run. A gate red that is plausibly an **environment fault** (a shimmed
-  `cc`, a missing CLI, a sandbox without the toolchain) is a *host caveat*, not the patch's
-  fault: flag it for the human, don't propagate it as a defect (issue #236).
+- **Can't re-run a gate? Read its log — then say what the log shows.** Your sandbox may
+  lack the gate toolchain a `check-gates.json` row needed (a compiler / `cargo` / a
+  language runtime / a container), and the wrappers a row's `oracle` names
+  (`./engine/scripts/run-*.sh`) are **instance-root / `$PDCA_WORKTREE`-scoped by design** —
+  they are *not* runnable from `$PDCA_TARGET`, and their absence from the target checkout
+  is expected, not a finding. Before escalating, open the row's `log` —
+  `gate-logs/<rule_id>.log`, in your cwd: it holds the gate's **full captured output**
+  plus a header giving the exact `cmd`, `cwd` and `PDCA_WORKTREE` it ran under. Adjudicate
+  the row from that evidence and cite it. Reserve the **`NEEDS-HUMAN`** for a row you can
+  neither re-run **nor** read: no `log` key, a `log_error`, or a log file that isn't
+  there — name what is missing. Even with a log, never affirm a red row as a confirmed C4
+  (verification) patch defect, nor a green one as verified, on evidence the log does not
+  actually show. A gate red that is plausibly an **environment fault** (a shimmed `cc`, a
+  missing CLI, a sandbox without the toolchain — the log's header and output usually say
+  which) is a *host caveat*, not the patch's fault: flag it for the human, don't propagate
+  it as a defect (issue #236).
+- **A `deferred` row is not a green to reproduce, and not a finding.** That result means
+  the gate *ran* and found its subject **absent by design** — the artifacts it audits
+  (`commit-msg.txt` / `pr-description.md`) are drafted after Check, so they are not among
+  your inputs — and its substantive verdict is owed to the gate that **re-runs the row at
+  publish**, which cannot be skipped; the row's evidence line says so. Record it **`N/A`**
+  with that reason. Do **not** escalate it to `NEEDS-HUMAN`: there is nothing for the human
+  to clear, and a §6 item that fires on every cycle is what trains a reader to tick §6
+  boxes unread (issue #401).
 - Emit per item `PASS / FAIL / NEEDS-HUMAN` + one-line rationale + path:line.
 - **Apply the target's standing rubric.** If the target repo's root `AGENTS.md` (at
   `$PDCA_TARGET`) carries a `## Review rubric & protocol` section, judge against it: its
