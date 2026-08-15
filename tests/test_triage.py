@@ -64,7 +64,9 @@ def _api_map(number: int = 7, merged: bool = True, reviews=None, comments=None) 
     base = f"repos/{_REPO}/pulls/{number}"
     return {base: _meta(number, merged),
             f"{base}/reviews": _REVIEWS if reviews is None else reviews,
-            f"{base}/comments": _COMMENTS if comments is None else comments}
+            f"{base}/comments": _COMMENTS if comments is None else comments,
+            # the pre-create idempotency scan (#218 review): empty = nothing filed
+            f"repos/{_REPO}/issues": []}
 
 
 class TriageSlice(unittest.TestCase):
@@ -241,6 +243,33 @@ class TriageSlice(unittest.TestCase):
         self.assertIn("codex-pr:convention-style", log)
         self.assertIn("candidate rubric-exclusion entry", log)   # NOISE routing
         self.assertIn("codex-pr:noise-nit", log)
+
+    def test_interrupted_prerecord_run_recovers_the_filed_issue(self) -> None:
+        # The #218-review window: `gh issue create` succeeded and the run died
+        # BEFORE the record write. The issue exists, the record does not — a
+        # blind re-run would file a duplicate against a tracker that cannot
+        # undo it. The exact-title scan recovers the number instead.
+        self._run()
+        creates = self._issue_creates()
+        self.assertEqual(len(creates), 1)
+        title = creates[0][creates[0].index("--title") + 1]
+        shutil.rmtree(self.cfg.process_dir)      # the crash: nothing durable but the issue
+        api = _api_map()
+        api[f"repos/{_REPO}/issues"] = [{"number": 901, "title": title}]
+        rc, _, _ = self._run(api_map=api, date="2026-06-21")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._issue_creates()), 1)      # across BOTH runs
+        self.assertIn("filed tracker issue #901", self._act_log())  # credited
+
+    def test_unscannable_tracker_files_nothing(self) -> None:
+        # The scan fails CLOSED (#218 review): an unreadable tracker must not
+        # trigger a blind create — the duplicate direction cannot be undone.
+        api = _api_map()
+        del api[f"repos/{_REPO}/issues"]
+        rc, _, _ = self._run(api_map=api)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._issue_creates(), [])
+        self.assertIn("NOT filed", self._act_log())          # candidate kept, loudly
 
     def test_rerun_ingests_only_new_findings_and_never_refiles(self) -> None:
         self._run()

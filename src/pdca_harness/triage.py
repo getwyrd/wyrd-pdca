@@ -389,6 +389,29 @@ def _excerpt(text: str, n: int = 90) -> str:
     return one if len(one) <= n else one[: n - 1].rstrip() + "…"
 
 
+def _existing_issue(repo: str, title: str) -> str | None:
+    """The number of a tracker issue titled EXACTLY ``title``, ``""`` when none
+    is, ``None`` when the tracker could not be read.
+
+    The idempotency net for the pre-record window (#218 review): filing is
+    irreversible and deliberately precedes the record write, so an interrupt
+    between ``gh issue create`` and the record leaves a filed issue no record
+    remembers — and a blind re-run would file its duplicate against a tracker
+    that cannot undo either. Triage titles are deterministic per finding (PR +
+    excerpt), so an exact-title scan recovers the number instead. Bounded to the
+    newest 100 (``state=all`` — the window is crash-to-rerun, not history; the
+    issues endpoint lists newest first). ``None`` makes the caller fail CLOSED:
+    the same never-retry-blind rule as :class:`split.UncertainFiling`."""
+    data = _api(f"repos/{repo}/issues?state=all&per_page=100")
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if (isinstance(item, dict) and "pull_request" not in item  # PRs ride along
+                and str(item.get("title") or "") == title and item.get("number")):
+            return str(item["number"])
+    return ""
+
+
 def _entry_text(repo_spec: str, number: str, pr_url: str, merged: bool, date: str,
                 batch: list[tuple[Finding, str]], recovered: int, bug_note: str,
                 added: list[str], recs: list[dict]) -> str:
@@ -526,11 +549,21 @@ def run(cfg: Config, pr: str, *, repo: str = "", date: str = "") -> int:
             bug_note = repo_or_why  # degrade loudly to a logged candidate, exit 0
         else:
             for i in bugs:
+                title = (f"[pr-triage] BUG finding on {repo_spec}#{number}: "
+                         + _excerpt(new[i].text, 60))
                 try:
-                    filed[i] = split._create_issue(
-                        repo_or_why,
-                        f"[pr-triage] BUG finding on {repo_spec}#{number}: "
-                        + _excerpt(new[i].text, 60),
+                    # An interrupted earlier run may have filed this finding and
+                    # died before the record write (#218 review) — recover the
+                    # number by exact title rather than create a duplicate; an
+                    # unscannable tracker fails closed, never a blind create.
+                    twin = _existing_issue(repo_or_why, title)
+                    if twin is None:
+                        raise split.SplitError(
+                            "the tracker could not be scanned for an already-"
+                            "filed issue, and creating blind risks a duplicate "
+                            "(the pre-record window) — fix gh/auth and re-run")
+                    filed[i] = twin or split._create_issue(
+                        repo_or_why, title,
                         _issue_body(new[i], repo_spec, number, pr_url, date),
                         "", cfg.root)
                 except split.SplitError as exc:
