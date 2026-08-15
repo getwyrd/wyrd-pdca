@@ -63,6 +63,7 @@ _AUTHORED_BRIEF = (
     "- **Success criterion:** the observable condition that\n"
     "  means it is fixed, wrapped onto a continuation line.\n"
     "- **Repo + branch target:** example-org/example-repo @ main\n"
+    "- **Scope:** one logical fix, nothing else.\n"
     "- **External dependencies:** none\n"
     # NO `Falsifiability`, NO `Test file` value: both are legitimately absent in the
     # measured corpus (52/85 and 7 bundles respectively) and must NOT be required.
@@ -184,6 +185,28 @@ class PlannerContract(Base):
         # absent Falsifiability / Test file must NOT fail the contract.
         d = self.bundle()
         (d / "brief.md").write_text(_AUTHORED_BRIEF, encoding="utf-8")
+        self.assertEqual(handoff.check_planner(d, self.cfg), [])
+
+    def test_defect_and_scope_are_required_under_every_spelling(self) -> None:
+        # Issue #214: the gate covered neither field — which is exactly why 30
+        # corpus briefs shipped with an unresolvable defect (label drift, caught
+        # nowhere) while scope drift was at least caught by the old script. Both
+        # are mandated now, looked up under the shared synonym tuples, so a
+        # splitter/pointer-authored brief (long labels) passes and a brief with
+        # the field genuinely missing fails.
+        d = self.bundle()
+        (d / "brief.md").write_text(_AUTHORED_BRIEF.replace(
+            "- **Defect:** something observable is wrong.\n", ""), encoding="utf-8")
+        problems = handoff.check_planner(d, self.cfg)
+        self.assertTrue(any("'defect'" in p for p in problems), problems)
+        (d / "brief.md").write_text(_AUTHORED_BRIEF.replace(
+            "- **Scope:** one logical fix, nothing else.\n", ""), encoding="utf-8")
+        problems = handoff.check_planner(d, self.cfg)
+        self.assertTrue(any("'scope'" in p for p in problems), problems)
+        long_labels = _AUTHORED_BRIEF.replace(
+            "- **Defect:**", "- **Defect / goal:**").replace(
+            "- **Scope:**", "- **Scope (one logical fix) / out of scope:**")
+        (d / "brief.md").write_text(long_labels, encoding="utf-8")
         self.assertEqual(handoff.check_planner(d, self.cfg), [])
 
     def test_absent_brief_allowed_only_for_the_batch_wrinkle(self) -> None:

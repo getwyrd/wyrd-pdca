@@ -24,11 +24,11 @@
 
 <!-- pdca:child child-1 -->
 - **Slug:** <kebab-case>
-- **Defect / goal:** <what is broken / what should exist>
+- **Defect:** <what is broken / what should exist>
 - **Success criterion:** <the observable condition that means it is fixed>
 - **Repo + branch target:** <owner/repo> @ <branch>
 - **Reproduction:** <how to see it fail today, or `n/a` for new functionality>
-- **Scope (one logical fix) / out of scope:** <what this child touches, and what it does not>
+- **Scope:** <one logical fix — what this child touches, and what it does not>
 - **External dependencies:** <backticked tokens matching [[doctor.checks]] ids, or `none`>
 - **Test file:** <path the regression ships at>
 - **Difficulty:** <low | medium | high>
@@ -38,11 +38,11 @@
 
 <!-- pdca:child child-2 -->
 - **Slug:** <kebab-case>
-- **Defect / goal:** <what is broken / what should exist>
+- **Defect:** <what is broken / what should exist>
 - **Success criterion:** <the observable condition that means it is fixed>
 - **Repo + branch target:** <owner/repo> @ <branch>
 - **Reproduction:** <how to see it fail today, or `n/a` for new functionality>
-- **Scope (one logical fix) / out of scope:** <what this child touches, and what it does not>
+- **Scope:** <one logical fix — what this child touches, and what it does not>
 - **External dependencies:** <backticked tokens matching [[doctor.checks]] ids, or `none`>
 - **Test file:** <path the regression ships at>
 - **Difficulty:** <low | medium | high>

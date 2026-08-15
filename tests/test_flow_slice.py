@@ -756,7 +756,7 @@ class DesignProposalBrief(unittest.TestCase):
         # Do (stub) + Check (stub gates + reviewer) run normally — there IS code.
         self.assertEqual(driver.run_issue(self.d, self.cfg), state.AWAITING_SIGNOFF)
         summary = (self.d / "SUMMARY.md").read_text(encoding="utf-8")
-        self.assertIn("Defect / goal:", summary)               # assemble fallback rendered
+        self.assertIn("- Defect: ", summary)                   # assemble fallback rendered
         self.assertIn("the capability this adds", summary)     # the Goal value, not blank
 
 

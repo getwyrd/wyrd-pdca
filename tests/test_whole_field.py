@@ -168,6 +168,48 @@ class SummarySpecFields(unittest.TestCase):
         self.assertIn("## 6.", text)
         self.assertIsInstance(signoff.open_needs_human(d / "SUMMARY.md"), list)
 
+    def test_split_child_labels_reach_summary(self) -> None:
+        # Issue #214: the splitter/pointer templates spelled the fields
+        # `Defect / goal:` and `Scope (one logical fix) / out of scope:`, and the
+        # exact label lookup resolved both to "" — §1's defect line rendered EMPTY
+        # on 30 of 112 corpus briefs, so Check adjudicated those cycles against a
+        # spec block with no defect statement. Every spelling the corpus authors
+        # must reach §1.
+        text = self._summary(
+            "- **Slug:** child\n"
+            "- **Defect / goal:** the observable problem\n"
+            "- **Success criterion:** it works\n"
+            "- **Scope (one logical fix) / out of scope:** this child only\n"
+        )
+        self.assertIn("- Defect: the observable problem", text)
+        self.assertIn("- Scope: this child only", text)
+
+
+class TemplateVocabulary(unittest.TestCase):
+    """The forward half of #214: the READERS accept every historical spelling, but the
+    templates converge on brief.md.tpl's short labels — otherwise the vocabulary keeps
+    drifting and the next synonym silently empties §1 again."""
+
+    def test_no_template_authors_a_synonym_label(self) -> None:
+        templates = Path(__file__).resolve().parent.parent / "templates"
+        for tpl in sorted(templates.glob("*.tpl")):
+            text = tpl.read_text(encoding="utf-8")
+            for bad in ("Defect / goal", "Scope (one logical fix) / out of scope"):
+                self.assertNotIn(
+                    bad, text,
+                    f"{tpl.name} authors the synonym label '{bad}' — templates "
+                    "write brief.md.tpl's vocabulary (`Defect:` / `Scope:`); the "
+                    "synonyms live only in brief.DEFECT_LABELS / SCOPE_LABELS "
+                    "for the historical corpus")
+
+    def test_reader_tuples_carry_the_historical_spellings(self) -> None:
+        # The back-compat half must not be "simplified" away while 30+ frozen
+        # bundles still author the long labels.
+        self.assertIn("defect / goal", brief.DEFECT_LABELS)
+        self.assertIn("scope (one logical fix) / out of scope", brief.SCOPE_LABELS)
+        self.assertEqual(brief.DEFECT_LABELS[0], "defect")
+        self.assertEqual(brief.SCOPE_LABELS[0], "scope")
+
 
 
 
