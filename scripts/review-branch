@@ -26,6 +26,18 @@ retry each), and treats a pass whose output is neither a parseable finding nor
 the explicit `NO FINDINGS` sentinel as a failed pass, so a garbled or partial
 review is never read as clean.
 
+A diff past the reviewer's input ceiling is handled BEFORE any pass runs (#209
+— issue_635's ~1 MB diff burned three passes plus retries on identical
+`input_too_large` errors, and the gate went red with what read like a review
+verdict): the diff is split per file into chunks that each fit the budget, the
+passes run per chunk, and the union is reported with the run marked as a
+DEGRADED chunked review (cross-file findings are lost — stated in the report,
+never presented as equivalent). A file too large even as its own chunk was
+never reviewed at all, so the run declares itself `unverifiable` (gates.py's
+exit-77 / `PDCA-UNVERIFIABLE:` convention) instead of failing: the gate row
+routes to SUMMARY §6 as "the review did not run", not "the review found
+nothing it could certify".
+
 Wired two ways:
   * bundle gate row (pdca.toml [[gates.checks]] tier="T4" scope="bundle"
     cmd="scripts/review-branch --bundle"): reviews $PDCA_BUNDLE/patch.diff
@@ -85,6 +97,23 @@ FINDING_RE = re.compile(
 # clean — model output is not guaranteed to obey the format, and a silent
 # zero-parse from prose/JSON must never certify a diff.
 NO_FINDINGS_RE = re.compile(r"^\s*NO FINDINGS\.?\s*$", re.IGNORECASE | re.MULTILINE)
+
+# codex `exec -` rejects a prompt past this hard input ceiling. Measured on
+# issue_635 (#209): its ~1 MB / 22K-line diff produced a 1,077,300-char prompt,
+# and all three passes AND their retries failed identically with
+# input_too_large — not flakiness, a hard bound. A diff past it must never be
+# reported as a review VERDICT: the review never ran.
+CODEX_INPUT_CEILING = 1_048_576
+
+# gates.py's convention (gates.UNVERIFIABLE_RC / UNVERIFIABLE_MARKER), mirrored
+# literally because this instance-owned script deliberately does not import the
+# harness: a gate that cannot RUN its check declares so with exit 77 or a line
+# STARTING with the marker, and the row records `unverifiable` — routed to
+# SUMMARY §6 NEEDS-HUMAN, not `fail` (which reads as "the review found
+# something" / "certified nothing"). A tests/test_review_branch.py case pins
+# these two values against the harness's, so they cannot drift apart.
+UNVERIFIABLE_RC = 77
+UNVERIFIABLE_MARKER = "PDCA-UNVERIFIABLE:"
 
 PROMPT_TEMPLATE = """\
 You are one of {n} independent review passes over the same diff; be thorough —
@@ -155,6 +184,64 @@ def collect_diff(args: argparse.Namespace, target: Path) -> str:
     cmd += ["--staged"] if args.staged else [args.range]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return out.stdout
+
+
+def split_per_file(diff: str) -> list[str]:
+    """The diff's per-file segments, each with its ``diff --git`` header; any
+    preamble before the first header rides with the first segment. A diff with
+    no ``diff --git`` line at all (a hand-made patch) is one segment."""
+    parts: list[list[str]] = []
+    cur: list[str] = []
+    cur_has_header = False  # preamble before the first header must not split off alone
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if cur_has_header:
+                parts.append(cur)
+                cur = []
+            cur_has_header = True
+        cur.append(line)
+    if cur:
+        parts.append(cur)
+    return ["".join(p) for p in parts]
+
+
+def pack_chunks(segments: list[str], budget: int) -> tuple[list[str], list[str]]:
+    """Greedily pack per-file segments into chunks of at most ``budget`` chars.
+
+    Returns ``(chunks, oversize)`` — ``oversize`` holds the segments that exceed
+    the budget even ALONE. Those cannot be reviewed at any chunking, so the
+    caller must declare them (unverifiable), never silently drop them. Order is
+    preserved: related files tend to be adjacent in a diff, and keeping
+    neighbours in one chunk preserves what little cross-file context a chunked
+    run still has."""
+    chunks, oversize = [], []
+    cur: list[str] = []
+    cur_len = 0
+    for seg in segments:
+        if len(seg) > budget:
+            oversize.append(seg)
+            continue
+        if cur and cur_len + len(seg) > budget:
+            chunks.append("".join(cur))
+            cur, cur_len = [], 0
+        cur.append(seg)
+        cur_len += len(seg)
+    if cur:
+        chunks.append("".join(cur))
+    return chunks, oversize
+
+
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(?:.+?) b/(.+)$", re.MULTILINE)
+
+
+def segment_file(segment: str) -> str:
+    """The file a per-file segment describes (its ``b/`` path), for naming an
+    unreviewable file in the verdict; falls back to the first line."""
+    m = _DIFF_GIT_RE.search(segment)
+    if m:
+        return m.group(1).strip()
+    first = segment.strip().splitlines()
+    return (first[0][:80] if first else "(empty segment)")
 
 
 def run_pass(idx: int, prompt: str, timeout: int, target) -> tuple[int, bool, list, str]:
@@ -282,29 +369,69 @@ def main() -> int:
         print("review-branch: empty diff — nothing to review")
         return 0
 
-    prompt = PROMPT_TEMPLATE.format(n=args.passes, rubric=rubric, diff=diff)
+    # The input ceiling is checked BEFORE any pass runs (#209): issue_635 spent
+    # three passes plus retries discovering it, and the gate then went red with a
+    # message that read like a review verdict — the human had to establish by
+    # hand that the tool never read the diff. A diff past the whole-prompt budget
+    # is split per file into chunks that each fit; a chunked run is a DEGRADATION
+    # (cross-file findings are lost), declared in the report and the summary,
+    # never presented as equivalent. A file too large even alone cannot be
+    # reviewed at all and makes the row `unverifiable`, not `fail`.
+    budget = CODEX_INPUT_CEILING - len(
+        PROMPT_TEMPLATE.format(n=args.passes, rubric=rubric, diff=""))
+    unreviewable: list[str] = []
+    if len(diff) <= budget:
+        chunk_diffs = [diff]
+    else:
+        chunk_diffs, oversize = pack_chunks(split_per_file(diff), budget)
+        unreviewable = [segment_file(s) for s in oversize]
+        print(f"review-branch: diff ({len(diff)} chars) exceeds the reviewer input "
+              f"budget ({budget} of the {CODEX_INPUT_CEILING} ceiling after prompt "
+              f"overhead) — split into {len(chunk_diffs)} per-file chunk(s)"
+              + (f"; {len(unreviewable)} file(s) too large even alone" if unreviewable
+                 else ""), file=sys.stderr)
+        if not chunk_diffs:
+            print(f"{UNVERIFIABLE_MARKER} the review never ran — every changed file "
+                  f"exceeds the reviewer input budget alone "
+                  f"({', '.join(unreviewable)}); no chunking can fit this diff")
+            return UNVERIFIABLE_RC
+    chunked = len(chunk_diffs) > 1 or bool(unreviewable)
 
-    def run(indices):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(indices))) as pool:
-            return list(pool.map(lambda i: run_pass(i, prompt, args.timeout, target), indices))
+    prompts = [PROMPT_TEMPLATE.format(n=args.passes, rubric=rubric, diff=cd)
+               for cd in chunk_diffs]
+    jobs = [(c, i) for c in range(len(prompts)) for i in range(1, args.passes + 1)]
 
-    # N passes, then ONE retry for any that did not produce a usable result — a
-    # gating review must not silently certify a thinner union than requested
-    # when the reviewer is transiently failing.
-    usable: dict[int, list] = {}
-    for idx, ok, findings, note in run(list(range(1, args.passes + 1))):
-        (usable.__setitem__(idx, findings) if ok
+    def run(pairs):
+        # Concurrency stays at N (today's level) regardless of chunk count: a
+        # chunked run queues chunks behind the same worker pool rather than
+        # multiplying parallel codex processes.
+        def one(job):
+            c, i = job
+            idx, ok, findings, note = run_pass(i, prompts[c], args.timeout, target)
+            if len(prompts) > 1:
+                note = f"chunk {c + 1}/{len(prompts)} {note}"
+            return job, ok, findings, note
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(len(pairs), args.passes))) as pool:
+            return list(pool.map(one, pairs))
+
+    # All chunk-passes, then ONE retry for any that did not produce a usable
+    # result — a gating review must not silently certify a thinner union than
+    # requested when the reviewer is transiently failing.
+    usable: dict[tuple, list] = {}
+    for job, ok, findings, note in run(jobs):
+        (usable.__setitem__(job, findings) if ok
          else print(f"review-branch: {note}", file=sys.stderr))
-    missing = [i for i in range(1, args.passes + 1) if i not in usable]
+    missing = [j for j in jobs if j not in usable]
     if missing:
         print(f"review-branch: retrying {len(missing)} pass(es) once", file=sys.stderr)
-        for idx, ok, findings, note in run(missing):
+        for job, ok, findings, note in run(missing):
             if ok:
-                usable[idx] = findings
+                usable[job] = findings
             else:
                 print(f"review-branch: retry {note}", file=sys.stderr)
-    if len(usable) < args.passes:
-        sys.exit(f"review-branch: only {len(usable)}/{args.passes} passes produced a "
+    if len(usable) < len(jobs):
+        sys.exit(f"review-branch: only {len(usable)}/{len(jobs)} passes produced a "
                  f"usable result after one retry — refusing to certify a thinner union. "
                  f"Re-run when the reviewer clears; do NOT treat this as a clean review.")
 
@@ -343,7 +470,23 @@ def main() -> int:
     out_path = Path(args.out) if args.out else (
         Path(os.environ["PDCA_BUNDLE"]) / "review-batch.md"
         if args.bundle and os.environ.get("PDCA_BUNDLE") else Path("review-batch.md"))
-    lines = [f"# Batched review — {len(usable)} passes, union of findings", ""]
+    head = (f"# Batched review — {args.passes} passes × {len(prompts)} chunks, "
+            "union of findings" if chunked else
+            f"# Batched review — {len(usable)} passes, union of findings")
+    lines = [head, ""]
+    if chunked:
+        # A chunked run is a degradation, not an equivalent review — each pass saw
+        # one chunk, so a defect visible only across two files' changes is lost.
+        # Said HERE, in the artifact the human triages from, not only on stderr.
+        lines += [f"> **Degraded run:** the diff exceeded the reviewer's input ceiling "
+                  f"and was split into {len(prompts)} per-file chunk(s) reviewed "
+                  "independently. Findings that need two files' changes seen together "
+                  "may be missed; this is NOT equivalent to a whole-diff review.", ""]
+    if unreviewable:
+        lines += ["> **Unreviewable (never reviewed):** "
+                  + ", ".join(f"`{f}`" for f in unreviewable)
+                  + " — each exceeds the reviewer input budget even as its own chunk.",
+                  ""]
     if not blocking:
         lines.append("No untriaged findings survive (all either absent, noise-dropped, "
                      "or recorded-rejected).")
@@ -369,14 +512,25 @@ def main() -> int:
     # line-per-finding would forward only the last blocker to the auto_iterate
     # carry-forward brief — and the builder, brief-restricted, cannot read
     # review-batch.md. All blockers therefore go on a single closing line.
-    summary = (f"review-branch: {len(blocking)} blocking, {len(accepted)} recorded-rejected, "
-               f"{len(noise)} noise-dropped -> {out_path}")
+    mode = f"[chunked ×{len(prompts)}] " if chunked else ""
+    summary = (f"review-branch: {mode}{len(blocking)} blocking, {len(accepted)} "
+               f"recorded-rejected, {len(noise)} noise-dropped -> {out_path}")
     if blocking:
         detail = " ;; ".join(f"{f['loc']} [{f['cls']}] {f['why']}" for f in blocking)
         print(f"{summary} || BLOCKING: {detail}")
     else:
         print(summary)
 
+    if unreviewable:
+        # The verdict, not a footnote: part of the diff was NEVER reviewed, so this
+        # run cannot certify (pass) OR indict (fail) the bundle — the row must read
+        # `unverifiable` and route to SUMMARY §6 for the human. Printed LAST so the
+        # harness (gates._classify keeps the marker line) files it as the reason.
+        print(f"{UNVERIFIABLE_MARKER} {len(unreviewable)} changed file(s) exceed the "
+              f"reviewer input budget even as single-file chunks "
+              f"({', '.join(unreviewable)}) — the review never ran for them; "
+              f"{len(blocking)} finding(s) from the reviewed chunks are in {out_path}")
+        return UNVERIFIABLE_RC
     return 1 if blocking else 0
 
 
