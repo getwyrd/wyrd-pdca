@@ -65,6 +65,19 @@ def field(brief_path: Path, *labels: str, default: str = "") -> str:
     return default
 
 
+# The label synonyms ONE field has been authored under across the brief-shaped
+# templates (issue #214): `templates/brief.md.tpl` says `Defect:` / `Scope:`, but the
+# splitter and plan-pointer templates spelled the same fields `Defect / goal:` and
+# `Scope (one logical fix) / out of scope:` — and a label lookup is exact, so a third
+# of the corpus (30/112 briefs, measured 2026-08-15) resolved `defect` to "" and
+# SUMMARY §1 adjudicated those cycles against a spec block with no defect statement.
+# The templates are converged on the short spellings going forward; these tuples are
+# the BACK-COMPAT read side, shared by every reader (assemble §1, the /handoff
+# planner contract) so the two verdicts cannot drift apart. Order matters: the
+# canonical spelling first, the historical ones after.
+DEFECT_LABELS = ("defect", "goal", "defect / goal")
+SCOPE_LABELS = ("scope", "scope (one logical fix) / out of scope")
+
 # What ends a field's value: the NEXT top-level field, at column 0. Deliberately not
 # `_FIELD_RE`, which tolerates leading whitespace — a brief's value routinely continues as an
 # INDENTED sub-bullet (`  - **BINDING (demonstrable at Check):** …`, the shape every pointer

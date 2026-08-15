@@ -113,9 +113,15 @@ def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False) -> list[s
     problems: list[str] = []
     # The fields EVERY brief template mandates and the measured corpus satisfies —
     # read via whole_field (multi-line values, #336), never line-based parse_fields.
-    for label in ("slug", "success criterion", "repo + branch target"):
-        if _unfilled(_brief.whole_field(bp, label)):
-            problems.append(f"brief.md field '{label}' is empty or an unfilled "
+    # `defect` and `scope` joined the set with #214: they were only ever missing
+    # because the splitter/pointer templates spelled their labels differently and
+    # the exact lookup read "" — under the shared synonym tuples the whole corpus
+    # (112/112 briefs, measured 2026-08-15) resolves both, and the gate now covers
+    # the very fields whose silent absence Check adjudicated against.
+    for labels in (("slug",), _brief.DEFECT_LABELS, ("success criterion",),
+                   ("repo + branch target",), _brief.SCOPE_LABELS):
+        if _unfilled(_brief.whole_field(bp, *labels)):
+            problems.append(f"brief.md field '{labels[0]}' is empty or an unfilled "
                             "placeholder — it is required by every brief template")
     # The dependency clause (#331 layer over #333/#340): every backticked token must
     # name a registered [[doctor.checks]] row whose detect cmd exits 0; an annotated

@@ -10,7 +10,7 @@
 - Defect:
 - Success criterion:
 - Repo + branch target:
-- Scope (one logical fix) / out of scope:
+- Scope:
 
 ## 2. Disposition claimed               ← sign-off confirms or overrides
 - Outcome: Fixed | Already-fixed | Can't-repro | Wontfix | By-design | External

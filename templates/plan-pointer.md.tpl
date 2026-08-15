@@ -14,7 +14,7 @@
 - **Planning artifact:** <path or URL to the host's ADR / proposal / spec that IS the
   plan — e.g. `docs/adr/0042-thing.md`, or a permalinked spec section. Do treats this
   as authoritative; cite it.>
-- **Defect / goal:** <one line: what this realizes — the observable problem or capability>
+- **Defect:** <one line: what this realizes — the observable problem or capability>
 - **Success criterion:** <the observable condition that means it works — what the shipped test asserts>
 - **Falsifiability:** <WHERE the binding success criterion can be made to go RED, and on
   WHICH harness/topology Do is pointed at. If no available environment can currently produce

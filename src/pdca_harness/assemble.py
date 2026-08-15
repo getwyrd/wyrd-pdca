@@ -450,10 +450,16 @@ def assemble_summary(d: Path, cfg: Config) -> None:
             f"# Result — issue {issue} / {_one_line(spec('slug') or fields.get('defect', '')[:40])}",
             "",
             "## 1. Spec (from brief.md)              ← Check verifies against THIS",
-            f"- Defect / goal: {_item(spec('defect', 'goal'))}",
+            # Labels are looked up under EVERY spelling the corpus authors (#214: the
+            # splitter/pointer templates wrote `Defect / goal:` and the long scope
+            # label, and the exact lookup rendered §1's defect line empty on a third
+            # of all bundles — Check adjudicated those against a defect-less spec).
+            # The rendered labels use brief.md.tpl's short vocabulary, mirrored in
+            # SUMMARY.md.tpl (keep the two in step).
+            f"- Defect: {_item(spec(*brief.DEFECT_LABELS))}",
             f"- Success criterion: {_item(spec('success criterion'))}",
             f"- Repo + branch target: {_item(spec('repo + branch target', 'branch target'))}",
-            f"- Scope (one logical fix) / out of scope: {_item(spec('scope'))}",
+            f"- Scope: {_item(spec(*brief.SCOPE_LABELS))}",
             "",
             "## 2. Disposition claimed               ← sign-off confirms or overrides",
             f"- Outcome: {_item(spec('disposition hint', default='Fixed'))}",
