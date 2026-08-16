@@ -514,7 +514,7 @@ def do_plan(d: Path, cfg: Config, csv: str | None = None) -> None:
         return
     if cfg.planner.mode == "command":
         # The session's exit contract (#331): register the bundle + role so /handoff
-        # and the Stop hook can verify the brief (structure + dependency probe).
+        # and the driver's reap can verify the brief (structure + dependency probe).
         with handoff.session(cfg, "planner", [d]) as henv:
             _invoke(cfg.planner, cfg.root, _plan_prompt(cfg, csv, d), cfg=cfg,
                     env=henv or None)
@@ -628,7 +628,7 @@ def _plan_prompt(cfg: Config, csv: str | None, d: Path) -> str:
         "fewer, larger children: each costs a full cycle. Before ending the session, "
         f"verify the Plan exit contract with `/handoff {d.name}` — brief structure plus "
         "every backticked External-dependencies token registered in [[doctor.checks]] "
-        "with its detect cmd passing; the Stop hook enforces it."
+        "with its detect cmd passing; the driver re-checks it when it reaps the session."
     )
 
 
@@ -882,8 +882,8 @@ def _plan_batch_prompt(cfg: Config, csv: str | None, ids: list[str] | None = Non
             "defect), leave it UNPLANNED (write no brief.md) and say why. One id = one "
             "`issue_<id>/brief.md`. Plan only — do not implement. After each brief is "
             "written, verify it with `/handoff issue_<id>` (ids required, one bundle per "
-            "invocation); the Stop hook re-checks every briefed bundle before the "
-            "session may end."
+            "invocation); the driver re-checks every briefed bundle when it reaps the "
+            "session."
         )
     tracker_csv = csv or cfg.tracker_export_csv
     src = f"the tracker export at '{tracker_csv}'" if tracker_csv \
@@ -899,7 +899,7 @@ def _plan_batch_prompt(cfg: Config, csv: str | None, ids: list[str] | None = Non
         "tracker id. One issue = one `issue_<id>/brief.md`. Plan only — do not implement. "
         "After EACH brief is written, verify it with `/handoff issue_<id>` (ids required "
         "— the driver cannot know mid-session choices, so the passing /handoff runs are "
-        "how the session names its work; the Stop hook requires them)."
+        "how the session names its work; the driver's reap requires them)."
     )
 
 
@@ -3041,8 +3041,8 @@ def run_plan_advisory(d: Path, cfg: Config) -> None:
 # ----------------------------------------------------------------------------
 def run_signoff(d: Path, cfg: Config) -> None:
     if cfg.signoff.mode == "command":
-        # Exit contract (#331): the Stop hook verifies the bundle's decision token
-        # (+ rationale for iterate-*/discontinue) before the session may end.
+        # Exit contract (#331): the driver verifies the bundle's decision token
+        # (+ rationale for iterate-*/discontinue) when it reaps the session (#534).
         with handoff.session(cfg, "signoff", [d]) as henv:
             _invoke(cfg.signoff, cfg.root, _signoff_prompt(d), cfg=cfg, env=henv or None)
         return
@@ -3062,7 +3062,9 @@ def _signoff_prompt(d: Path) -> str:
         "driver records it under a deterministic guard. When the decision is written, "
         f"verify this leaf's exit contract with `/handoff {d.name}` — the rationale "
         "lines are the carry-forward the driver folds into the next attempt's brief, "
-        "and the Stop hook blocks the session ending on a missing/malformed decision."
+        "and the driver re-checks the decision when it reaps the session. Write that "
+        "token ONLY from the human's stated decision: an unanswered session is one you "
+        "end without a decision file, never one you decide yourself."
     )
 
 
@@ -3249,7 +3251,7 @@ def run_publish(d: Path, cfg: Config) -> None:
         # bundle sweep — which only knows about `issue_<id>` dirs — can never reclaim it.
         scratch_env = scratch.env_for(cfg, d)
         env = scratch_env or None if profile.native_guard else guard.shim_env(cfg, scratch_env)
-        # Exit contract (#331), merged over the scratch + gh-shim env: the Stop hook
+        # Exit contract (#331), merged over the scratch + gh-shim env: the driver's reap
         # verifies both contribution artifacts (existence + the instance's deterministic lint).
         with handoff.session(cfg, "publisher", [d]) as henv:
             merged = {**(env or {}), **henv}

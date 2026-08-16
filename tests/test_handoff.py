@@ -27,12 +27,15 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from pdca_harness import driver, flow, handoff, leaves, state
 from pdca_harness.config import Config, LeafConfig
@@ -321,13 +324,14 @@ class ActContract(Base):
 class SessionRegistration(Base):
     def test_session_registers_env_and_cleans_up(self) -> None:
         d = self.bundle()
-        with handoff.session(self.cfg, "signoff", [d]) as env:
-            self.assertEqual(env[handoff.ENV_ROLE], "signoff")
-            spath = Path(env[handoff.ENV_STATE])
-            self.assertTrue(spath.name.startswith(handoff.STATE_PREFIX))
-            self.assertEqual(spath.parent, self.tmp)  # project root, NOT the bundle
-            data = json.loads(spath.read_text(encoding="utf-8"))
-            self.assertEqual(data["bundles"], [str(d)])
+        with redirect_stderr(io.StringIO()):  # the reap reports the undischarged contract
+            with handoff.session(self.cfg, "signoff", [d]) as env:
+                self.assertEqual(env[handoff.ENV_ROLE], "signoff")
+                spath = Path(env[handoff.ENV_STATE])
+                self.assertTrue(spath.name.startswith(handoff.STATE_PREFIX))
+                self.assertEqual(spath.parent, self.tmp)  # project root, NOT the bundle
+                data = json.loads(spath.read_text(encoding="utf-8"))
+                self.assertEqual(data["bundles"], [str(d)])
         self.assertFalse(spath.exists())  # reaped by the driver
 
     def test_non_interactive_leaf_gets_no_contract_env(self) -> None:
@@ -338,10 +342,12 @@ class SessionRegistration(Base):
     def test_act_session_carries_the_baseline(self) -> None:
         self.cfg.process_dir.mkdir(parents=True, exist_ok=True)
         (self.cfg.process_dir / "act-log.md").write_text("# Act log\n", encoding="utf-8")
-        with handoff.session(self.cfg, "act") as env:
-            data = json.loads(Path(env[handoff.ENV_STATE]).read_text(encoding="utf-8"))
-            self.assertEqual(data["baseline"]["act_log_len"], len("# Act log\n"))
-            self.assertIn("act_log_sha", data["baseline"])
+        with redirect_stderr(io.StringIO()):  # the reap reports the undischarged contract
+            with handoff.session(self.cfg, "act") as env:
+                data = json.loads(
+                    Path(env[handoff.ENV_STATE]).read_text(encoding="utf-8"))
+                self.assertEqual(data["baseline"]["act_log_len"], len("# Act log\n"))
+                self.assertIn("act_log_sha", data["baseline"])
 
     def test_abandon_reason_is_reported_when_the_driver_reaps(self) -> None:
         err = io.StringIO()
@@ -349,6 +355,135 @@ class SessionRegistration(Base):
             with handoff.session(self.cfg, "signoff", []) as env:
                 handoff.record_abandon(Path(env[handoff.ENV_STATE]), "human said stop")
         self.assertIn("human said stop", err.getvalue())
+
+
+class ReapEnforcement(Base):
+    """#534: enforcement lives at the driver's reap, not in the Stop hook.
+
+    `stop_problems` reads artifacts off disk, so the driver can check them after the
+    leaf exits — the one place where "the human is being asked a question" and "the leaf
+    is finishing" are already distinct events.
+    """
+
+    def test_reap_names_the_undischarged_contract(self) -> None:
+        d = self.bundle()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with handoff.session(self.cfg, "signoff", [d]):
+                pass  # the leaf ends without writing a decision
+        out = err.getvalue()
+        self.assertIn("UNDISCHARGED", out)
+        self.assertIn(d.name, out)
+
+    def test_reap_is_silent_on_a_discharged_contract(self) -> None:
+        d = self.bundle()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with handoff.session(self.cfg, "signoff", [d]):
+                (d / leaves.SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
+        self.assertNotIn("UNDISCHARGED", err.getvalue())
+
+    def test_abandon_suppresses_the_undischarged_report(self) -> None:
+        # The escape hatch stays one message, not two contradicting ones.
+        d = self.bundle()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with handoff.session(self.cfg, "signoff", [d]) as env:
+                handoff.record_abandon(Path(env[handoff.ENV_STATE]), "human left")
+        out = err.getvalue()
+        self.assertIn("human left", out)
+        self.assertNotIn("UNDISCHARGED", out)
+
+    def test_a_broken_check_never_masks_the_leafs_own_failure(self) -> None:
+        # A checked exit contract must never break the leaf it checks — and in a
+        # `finally`, a raising check would swallow the exception the leaf raised.
+        d = self.bundle()
+        boom = RuntimeError("the leaf itself failed")
+        with mock.patch.object(handoff, "stop_problems",
+                               side_effect=ValueError("check is broken")):
+            with self.assertRaises(RuntimeError) as caught, redirect_stderr(io.StringIO()):
+                with handoff.session(self.cfg, "signoff", [d]):
+                    raise boom
+        self.assertIs(caught.exception, boom)
+
+    def test_the_state_file_is_removed_even_when_the_check_raises(self) -> None:
+        d = self.bundle()
+        with mock.patch.object(handoff, "stop_problems",
+                               side_effect=ValueError("check is broken")):
+            with redirect_stderr(io.StringIO()):
+                with handoff.session(self.cfg, "signoff", [d]) as env:
+                    spath = Path(env[handoff.ENV_STATE])
+        self.assertFalse(spath.exists())
+
+
+class StopHookCap(Base):
+    """#534: the Stop hook blocks at most ONE turn.
+
+    `Stop` fires when the assistant finishes a turn, not when the session ends, so for
+    an interactive leaf every question to the human looks like an exit — and exit 2's
+    stderr goes to the MODEL, so the question never lands. Repeating the block is a
+    closed loop whose only model-side exits are `--abandon` or writing the human's own
+    decision artifact. `stop_hook_active` is the bound Claude Code provides.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("handoff_guard", HOOK)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def _verdict(self, event: dict, *, role: str = "signoff") -> int:
+        state = self.tmp / "state.json"
+        state.write_text(json.dumps(
+            {"role": role, "bundles": [str(self.bundle())]}), encoding="utf-8")
+        env = {handoff.ENV_ROLE: role, handoff.ENV_STATE: str(state)}
+        with mock.patch.object(self.mod, "_bootstrap", lambda: (handoff, self.cfg)), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(event))), \
+                redirect_stderr(io.StringIO()):
+            return self.mod._stop_verdict()
+
+    def test_first_stop_on_an_undischarged_contract_still_blocks(self) -> None:
+        self.assertEqual(self._verdict({"stop_hook_active": False}), 2)
+
+    def test_a_continuation_stop_is_allowed_however_undischarged(self) -> None:
+        # The regression: without this the same block repeats forever.
+        self.assertEqual(self._verdict({"stop_hook_active": True}), 0)
+
+    def test_the_one_block_tells_the_leaf_to_re_ask_not_to_decide(self) -> None:
+        # The pressure #534 documents is toward inventing the human's decision token,
+        # so the single block must name the alternative it wants instead.
+        state = self.tmp / "state.json"
+        state.write_text(json.dumps(
+            {"role": "signoff", "bundles": [str(self.bundle())]}), encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(self.mod, "_bootstrap", lambda: (handoff, self.cfg)), \
+                mock.patch.dict(os.environ, {handoff.ENV_ROLE: "signoff",
+                                             handoff.ENV_STATE: str(state)}), \
+                mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+                redirect_stderr(err):
+            self.mod._stop_verdict()
+        out = err.getvalue()
+        self.assertIn("Ask it again", out)
+        self.assertIn("will not repeat", out)
+
+    def test_a_malformed_envelope_does_not_lift_the_cap_into_a_loop(self) -> None:
+        # An unparseable event still blocks once (the contract is genuinely
+        # undischarged), which is the pre-existing fail-open behaviour.
+        state = self.tmp / "state.json"
+        state.write_text(json.dumps(
+            {"role": "signoff", "bundles": [str(self.bundle())]}), encoding="utf-8")
+        with mock.patch.object(self.mod, "_bootstrap", lambda: (handoff, self.cfg)), \
+                mock.patch.dict(os.environ, {handoff.ENV_ROLE: "signoff",
+                                             handoff.ENV_STATE: str(state)}), \
+                mock.patch.object(sys, "stdin", io.StringIO("not json")), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(self.mod._stop_verdict(), 2)
+
+    def test_outside_a_leaf_session_the_hook_stays_inert(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(sys, "stdin", io.StringIO("{}")):
+            self.assertEqual(self.mod._stop_verdict(), 0)
 
 
 class StopVerdict(Base):
