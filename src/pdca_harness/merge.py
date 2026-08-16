@@ -192,12 +192,35 @@ def _await_rollup(pr_url: str, budget_secs: int, *,
     refuses and still STOPs. A wait can only ever turn a refusal into a merge that a later,
     slower read would have permitted anyway.
 
-    ``budget_secs <= 0`` reproduces upstream exactly: one read, no wait.
+    A rollup that reads GREEN on the first look is CONFIRMED once, one interval later,
+    before it is believed (PR #224 review). ``gh pr ready`` can trigger ``ready_for_review``
+    CI, and a check that has been triggered but has not yet REGISTERED is not in the rollup
+    at all — so the first read can be a green belonging entirely to the draft's earlier
+    pushes while the checks that matter are seconds from appearing. Waiting for `pending` to
+    clear cannot catch that: the rollup never said pending. This is #462's own mistake
+    (believing a rollup read too early) one step further in, and the confirmation costs one
+    interval on the merge path only.
+
+    A green observed on the LAST poll is accepted even if the budget has just run out. The
+    budget bounds how long we wait for an answer, not how fresh the answer may be, and
+    refusing a genuinely-green rollup a second past the deadline would STOP a batch for
+    nothing.
+
+    ``budget_secs <= 0`` reproduces upstream exactly: one read, no wait, no confirmation.
     """
     verdict, detail = _check_rollup(pr_url)
-    if budget_secs <= 0 or verdict not in ("pending", "empty"):
-        return verdict, detail
+    if budget_secs <= 0 or verdict in ("failing", "unreadable"):
+        return verdict, detail                       # settled, or not ours to wait out
     deadline = now() + budget_secs
+    if verdict == "green":
+        # Confirm, don't trust: see above. If ready-triggered checks registered in the gap,
+        # this read returns `pending` and falls into the ordinary wait below.
+        print(f"   checks read green — re-reading in {_POLL_INTERVAL_SECS}s to catch any "
+              f"check triggered by the ready-mark that had not registered yet (#224 review)")
+        sleep(_POLL_INTERVAL_SECS)
+        verdict, detail = _check_rollup(pr_url)
+        if verdict in ("green", "failing", "unreadable"):
+            return verdict, detail
     print(f"   checks are {verdict} — waiting up to {budget_secs}s for them to settle "
           f"(#462; [driver].merge_wait_secs)")
     while now() < deadline:

@@ -373,10 +373,6 @@ class MergeWave(unittest.TestCase):
         self.assertIn("merge_requires", err.getvalue())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AwaitRollup(unittest.TestCase):
     """`_await_rollup` — the #462 instance delta: WAIT for an unsettled rollup rather than
     reading it the instant `gh pr ready` returns and STOPping the whole batch on "pending".
@@ -413,12 +409,43 @@ class AwaitRollup(unittest.TestCase):
         self.assertEqual(verdict, "pending")
         self.assertEqual(len(seen), 1)
 
-    def test_a_settled_verdict_never_waits(self):
-        for v in ("green", "failing", "unreadable"):
+    def test_a_settled_refusal_never_waits(self):
+        """A red is settled, and an unreadable rollup is an auth/`gh` problem waiting cannot
+        fix — both refuse on the first read, so the diagnostic stays prompt."""
+        for v in ("failing", "unreadable"):
             with self.subTest(v=v):
                 (verdict, _), seen = self._await([v], 600)
                 self.assertEqual(verdict, v)
-                self.assertEqual(len(seen), 1, "a settled rollup must not be polled again")
+                self.assertEqual(len(seen), 1, "a settled refusal must not be polled again")
+
+    def test_green_is_confirmed_once_before_it_is_believed(self):
+        """`gh pr ready` can trigger CI that has not REGISTERED yet, so the first read can be
+        a green belonging entirely to the draft's earlier pushes. Waiting for `pending` to
+        clear cannot catch that — the rollup never said pending — so a green is re-read once
+        (PR #224 review)."""
+        (verdict, _), seen = self._await(["green", "green"], 600)
+        self.assertEqual(verdict, "green")
+        self.assertEqual(seen, ["green", "green"], "green must be confirmed, not trusted")
+
+    def test_a_check_registering_after_the_ready_mark_is_caught(self):
+        """The case the confirmation exists for: green, then a ready-triggered check appears
+        and the rollup goes pending. It must fall into the ordinary wait, not merge."""
+        (verdict, _), seen = self._await(["green", "pending", "green"], 600)
+        self.assertEqual(verdict, "green")
+        self.assertEqual(seen[:2], ["green", "pending"])
+        self.assertGreater(len(seen), 2, "it must keep waiting once the rollup goes pending")
+
+    def test_a_check_registering_after_the_ready_mark_can_turn_it_red(self):
+        """And the same path must be able to refuse: green, then the real check registers
+        and fails. Believing the first read would have merged a red."""
+        (verdict, _), _ = self._await(["green", "failing"], 600)
+        self.assertEqual(verdict, "failing")
+
+    def test_zero_budget_does_not_confirm_either(self):
+        """budget 0 is upstream exactly — one read, including for green."""
+        (verdict, _), seen = self._await(["green"], 0)
+        self.assertEqual(verdict, "green")
+        self.assertEqual(len(seen), 1)
 
     def test_pending_then_green_merges(self):
         """The case the delta exists for: CI was still starting, then went green."""
@@ -450,3 +477,7 @@ class AwaitRollup(unittest.TestCase):
         (verdict, _), seen = self._await(["unreadable", "green"], 600)
         self.assertEqual(verdict, "unreadable")
         self.assertEqual(len(seen), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
