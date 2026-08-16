@@ -80,8 +80,12 @@
     context had reported; `gh pr merge` refused and the wave stopped with #703 readied and
     #704–706 untouched (getwyrd/pdca-harness#462, **still OPEN at v0.57.0**). Turning
     `auto_merge` back on by itself reproduces that one layer up: #413's rollup gate reads the
-    checks *immediately* after `gh pr ready`, finds them `pending` — the ready-mark having
-    just triggered them — and refuses. Same boundary stop, minus the draft.
+    checks once, immediately before the merge, when the PR is *seconds old* — publish opened
+    it just before this boundary — finds them still registering, and refuses. Same boundary
+    stop, minus the draft. (Upstream attributes the early rollup to `ready_for_review` CI
+    triggered by the ready-mark. That does **not** hold here: no `getwyrd/wyrd` workflow
+    lists `ready_for_review` and none guards on draft, so drafts already run CI and `gh pr
+    ready` triggers nothing — verified 2026-08-16. The PR's age is the cause.)
   - **What makes it safe: `merge_wait_secs = 1800`.** The rollup gate now decides on a
     **settled** rollup rather than an early one — `_await_rollup` polls while the rollup is
     `pending` or `empty`, up to the budget, then hands the result to the unchanged gate. A
@@ -98,10 +102,15 @@
   - **Act is deferred past any stop.** Act reviews a *finished* batch, so a run that STOPs at
     a boundary (now the exceptional case — a red, or a wait that timed out) defers it to the
     invocation that reaches the final wave.
-  - **Superseded by the above:** while `auto_merge` was off, `_runnable` gated *every* declared
-    `Depends on` on `merged.is_merged`, because the human's merge was the only thing that could
-    move a base. With the driver merging again that stricter check no longer applies; the
-    explicit `Depends on (merged)` form keeps its own rule.
+  - **A dependency gate genuinely relaxes here — know what you are trading.** While
+    `auto_merge` was off, `_runnable` gated *every* declared `Depends on` on
+    `merged.is_merged`; with it on, only the explicit `Depends on (merged)` form does.
+    The driver merges only **in-batch, non-final** waves, so this is not "the driver now
+    guarantees it" — a prerequisite that is COMPLETE with an OPEN PR (the end state of every
+    single-issue run, and of every batch's final wave) no longer holds its dependent back, and
+    a later out-of-batch run will build that dependent on a base lacking it. Reproduced in the
+    PR #224 adversarial review. Upstream's answer is to declare `Depends on (merged)` when the
+    dependency is on merged content; do that rather than relying on the old implicit gate.
   A single-wave batch is unaffected either way — the final wave never merges.
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).

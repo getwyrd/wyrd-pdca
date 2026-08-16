@@ -36,13 +36,21 @@ completed non-failures and do not block. ``[driver].merge_requires = "required"`
 (default ``"all"``) opts back into host-config-only semantics, skipping the gate.
 
 **INSTANCE DELTA — ``[driver].merge_wait_secs`` (eduralph/pdca-harness#462, OPEN at
-v0.57.0).** Reading the rollup *immediately* after ``gh pr ready`` is honest but early: the
-ready-mark can trigger ``ready_for_review`` CI, so the verdict at that instant is ``pending``
-and the run STOPs — making the wave-boundary stop the routine outcome of every multi-wave
-batch, which is what merge mode exists to avoid. :func:`_await_rollup` waits for the rollup
-to SETTLE (polling while ``pending``/``empty``, up to the budget) and then hands it to the
-same gate. The gate is unchanged: a red, an unreadable rollup, or an exhausted budget still
-refuses and still STOPs. ``merge_wait_secs = 0`` reproduces upstream exactly.
+v0.57.0).** Reading the rollup once, immediately before the merge, is honest but early: at
+that instant the PR is SECONDS OLD — publish opened it and the wave boundary follows
+straight on — so its checks are still registering, the verdict is ``pending``, and the run
+STOPs. That makes the wave-boundary stop the routine outcome of every multi-wave batch,
+which is what merge mode exists to avoid. :func:`_await_rollup` waits for the rollup to
+SETTLE and then hands it to the same gate, unchanged: a red, an unreadable rollup, or an
+exhausted budget still refuses and still STOPs. ``merge_wait_secs = 0`` reproduces upstream
+exactly.
+
+Note the paragraph above attributes the early rollup to ``ready_for_review`` CI triggered by
+the ready-mark. That is upstream's general case and it does NOT hold on this instance's
+target: no workflow in ``getwyrd/wyrd`` lists ``ready_for_review``, and none carries a draft
+guard, so drafts already run CI and ``gh pr ready`` triggers nothing (verified 2026-08-16,
+PR #224 adversarial review). The wait is still needed — the PR's age, not the ready-mark, is
+what makes the rollup incomplete — but do not reason from the trigger when tuning it here.
 """
 
 from __future__ import annotations
@@ -172,39 +180,31 @@ def _await_rollup(pr_url: str, budget_secs: int, *,
                   sleep=time.sleep, now=time.monotonic) -> tuple[str, str]:
     """:func:`_check_rollup`, but WAIT for an unsettled rollup to settle first.
 
-    INSTANCE DELTA (eduralph/pdca-harness#462, still OPEN at v0.57.0). ``merge_requires``
-    reads the rollup immediately after ``gh pr ready`` — and the ready-mark can itself
-    trigger ``ready_for_review`` CI, so at that instant the honest verdict is ``pending``,
-    the merge refuses, and the run STOPs. That is not wrong, it is just early: the checks
-    the gate wants to see are about to run. Upstream's answer makes the boundary stop the
-    ROUTINE outcome of every multi-wave batch, which is the one thing merge mode exists to
-    avoid — the operator merges by hand and re-runs, per wave, exactly as if merge mode
-    were off.
+    INSTANCE DELTA (eduralph/pdca-harness#462, still OPEN at v0.57.0). Upstream reads the
+    rollup once, immediately before the merge. At that instant the PR is seconds old — the
+    publisher opened it and the wave boundary follows straight on — so the checks are still
+    registering, the honest verdict is ``pending``, the merge refuses, and the run STOPs.
+    That makes the boundary stop the ROUTINE outcome of every multi-wave batch, which is
+    the one thing merge mode exists to avoid.
 
-    So: poll while the rollup is ``pending`` **or** ``empty``, up to ``budget_secs``, and
-    hand the SETTLED verdict to the same gate. Both transient states are worth waiting on —
-    a rollup is empty in the seconds before CI registers its first check, and treating that
-    as terminal is the same "too early" mistake one step further back.
+    So: poll while the rollup is ``pending`` or ``empty``, up to ``budget_secs``, and hand
+    the SETTLED verdict to the same gate.
+
+    **A GREEN IS ALWAYS CONFIRMED, wherever it appears.** This is the subtle half. During
+    the seconds in which a new PR's checks are registering, the rollup does not report
+    "incomplete" — it reports whatever has registered SO FAR. One fast workflow that has
+    already passed reads as a clean green while the slow one that matters (`gate` here) has
+    not created its check run yet. So a green is re-read one interval later and only
+    believed if it holds; if the remaining checks registered in the gap it goes ``pending``
+    and falls back into the wait, and if they registered RED it refuses. Confirming only
+    the first read — as the first cut of this did — left every green reached *through* the
+    loop unconfirmed, so `empty → green` merged what `budget = 0` would have refused
+    (PR #224 adversarial review).
 
     What this does NOT do is weaken the gate. ``failing`` and ``unreadable`` return at once
-    (a red is settled; an unreadable rollup is an auth/`gh` problem that waiting cannot
-    fix), and exhausting the budget returns the last unsettled verdict, which still
-    refuses and still STOPs. A wait can only ever turn a refusal into a merge that a later,
-    slower read would have permitted anyway.
-
-    A rollup that reads GREEN on the first look is CONFIRMED once, one interval later,
-    before it is believed (PR #224 review). ``gh pr ready`` can trigger ``ready_for_review``
-    CI, and a check that has been triggered but has not yet REGISTERED is not in the rollup
-    at all — so the first read can be a green belonging entirely to the draft's earlier
-    pushes while the checks that matter are seconds from appearing. Waiting for `pending` to
-    clear cannot catch that: the rollup never said pending. This is #462's own mistake
-    (believing a rollup read too early) one step further in, and the confirmation costs one
-    interval on the merge path only.
-
-    A green observed on the LAST poll is accepted even if the budget has just run out. The
-    budget bounds how long we wait for an answer, not how fresh the answer may be, and
-    refusing a genuinely-green rollup a second past the deadline would STOP a batch for
-    nothing.
+    (a red is settled; an unreadable rollup is an auth/`gh` problem waiting cannot fix), and
+    exhausting the budget returns the last unsettled verdict, which still refuses and still
+    STOPs.
 
     ``budget_secs <= 0`` reproduces upstream exactly: one read, no wait, no confirmation.
     """
@@ -212,23 +212,40 @@ def _await_rollup(pr_url: str, budget_secs: int, *,
     if budget_secs <= 0 or verdict in ("failing", "unreadable"):
         return verdict, detail                       # settled, or not ours to wait out
     deadline = now() + budget_secs
-    if verdict == "green":
-        # Confirm, don't trust: see above. If ready-triggered checks registered in the gap,
-        # this read returns `pending` and falls into the ordinary wait below.
-        print(f"   checks read green — re-reading in {_POLL_INTERVAL_SECS}s to catch any "
-              f"check triggered by the ready-mark that had not registered yet (#224 review)")
-        sleep(_POLL_INTERVAL_SECS)
+
+    def _nap() -> bool:
+        """Sleep one interval, clamped to what is left of the budget. False when spent.
+
+        Prints a heartbeat, because `progress` says why: "without a heartbeat the flow looks
+        hung and the human kills a job that is [working]". A 30-minute budget is 60 silent
+        polls otherwise (PR #224 review).
+        """
+        left = deadline - now()
+        if left <= 0:
+            return False
+        print(f"   … {int(left)}s of the check-wait budget left", flush=True)
+        sleep(min(_POLL_INTERVAL_SECS, max(1, int(left))))
+        return True
+
+    while True:
+        if verdict == "green":
+            # Confirm, don't trust. Charged to the budget like any other wait, so a small
+            # `merge_wait_secs` can no longer sleep longer than the operator allowed.
+            if not _nap():
+                return verdict, detail               # budget spent; the green stands
+            again, again_detail = _check_rollup(pr_url)
+            if again == "green":
+                return again, again_detail           # held across an interval — believe it
+            verdict, detail = again, again_detail
+            if verdict in ("failing", "unreadable"):
+                return verdict, detail
+            continue                                 # went pending/empty — keep waiting
+        if not _nap():
+            return verdict, detail                   # budget spent, still unsettled
         verdict, detail = _check_rollup(pr_url)
-        if verdict in ("green", "failing", "unreadable"):
+        if verdict in ("failing", "unreadable"):
             return verdict, detail
-    print(f"   checks are {verdict} — waiting up to {budget_secs}s for them to settle "
-          f"(#462; [driver].merge_wait_secs)")
-    while now() < deadline:
-        sleep(min(_POLL_INTERVAL_SECS, max(1, int(deadline - now()))))
-        verdict, detail = _check_rollup(pr_url)
-        if verdict not in ("pending", "empty"):
-            return verdict, detail
-    return verdict, detail
+
 
 
 def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,

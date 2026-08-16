@@ -84,6 +84,12 @@ def _parse_opt_in(value, name: str) -> bool:
 # LeafConfig
 #
 # ----------------------------------------------------------------------------
+#: Ceiling for ``[driver].merge_wait_secs`` (PR #224 review). Four hours is longer than any
+#: honest CI run on a target this harness drives; past that a batch is not waiting, it is
+#: stuck, and the STOP is the useful outcome.
+_MERGE_WAIT_CAP_SECS = 14400
+
+
 @dataclass
 class LeafConfig:
     """How one model leaf (planner, Do builder, Check reviewer, sign-off, Act) runs.
@@ -414,9 +420,12 @@ class Config:
     merge_requires: str = "all"
     # How long to WAIT for a non-final wave's PR checks to settle before the rollup gate
     # above decides (eduralph/pdca-harness#462 — INSTANCE DELTA, still OPEN at v0.57.0).
-    # `merge_requires` reads the rollup immediately after `gh pr ready`, and the ready-mark
-    # can itself trigger `ready_for_review` CI — so the honest reading of a rollup taken
-    # right then is "pending", the merge refuses, and the run STOPs. Correct, but it makes
+    # `merge_requires` reads the rollup once, immediately before the merge — at which point
+    # the PR is SECONDS old, publish having opened it just before the wave boundary — so its
+    # checks are still registering, the honest verdict is "pending", the merge refuses, and
+    # the run STOPs. (Upstream attributes this to `ready_for_review` CI triggered by the
+    # ready-mark; that does not hold on this target, where drafts already run CI and no
+    # workflow lists that event — PR #224 review. The PR's age is the real cause.) Correct, but it makes
     # the boundary stop the routine outcome of EVERY multi-wave batch, which is the very
     # thing merge mode exists to avoid. Wait instead: poll while the rollup is pending or
     # empty, up to this budget, then let the same gate decide on a SETTLED rollup. 0 (the
@@ -824,12 +833,30 @@ class Config:
         # Check-rollup policy for merge mode (issue #413). An unknown value falls back to
         # "all" with a note — the fail-safe direction is the STRICTER reading (verify the
         # rollup ourselves), never a typo silently buying host-config-only semantics.
+        # `OverflowError` alongside the obvious two, for the reason `size_signal` already
+        # wrote down: `int(float("inf"))` raises it, TOML writes `inf` as a bare literal, and
+        # `merge_wait_secs = inf` is the natural way to try to say "wait as long as it takes".
+        # Uncaught it aborted EVERY driver command, `pdca status` included (PR #224 review) —
+        # a config typo taking down the tool rather than falling back.
+        _raw_wait = driver_cfg.get("merge_wait_secs", 0)
         try:
-            merge_wait_secs = max(0, int(driver_cfg.get("merge_wait_secs", 0)))
-        except (TypeError, ValueError):
-            print("config: [driver].merge_wait_secs must be a non-negative integer — "
-                  "treating it as 0 (no wait).", file=sys.stderr)
+            merge_wait_secs = int(_raw_wait)
+        except (TypeError, ValueError, OverflowError):
+            print(f"config: [driver].merge_wait_secs '{_raw_wait}' is not a non-negative "
+                  "integer — treating it as 0 (no wait).", file=sys.stderr)
             merge_wait_secs = 0
+        if merge_wait_secs < 0:
+            # Say so rather than clamping in silence: the operator asked for something the
+            # message above calls invalid, and a silent 0 reads as "the knob did nothing".
+            print(f"config: [driver].merge_wait_secs '{_raw_wait}' is negative — treating it "
+                  "as 0 (no wait).", file=sys.stderr)
+            merge_wait_secs = 0
+        if merge_wait_secs > _MERGE_WAIT_CAP_SECS:
+            # An uncapped budget polls GitHub every 30s for as long as it is given; a batch
+            # left waiting a day has failed in a way no one is watching for.
+            print(f"config: [driver].merge_wait_secs {merge_wait_secs} exceeds the "
+                  f"{_MERGE_WAIT_CAP_SECS}s cap — using the cap.", file=sys.stderr)
+            merge_wait_secs = _MERGE_WAIT_CAP_SECS
         merge_requires = str(driver_cfg.get("merge_requires", "all")).strip().lower()
         if merge_requires not in ("all", "required"):
             print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
