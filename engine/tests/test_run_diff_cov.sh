@@ -331,6 +331,31 @@ check "verdict: the default floor admits 80%" \
 check "verdict: \$WYRD_DIFFCOV_MIN overrides the default floor" \
   "PASS" "$(WYRD_DIFFCOV_MIN=50 "$DC" --verdict 60 100)"
 
+# 13b. A test file in a NESTED tests/ subdirectory is test code (so it stays out of the
+#      denominator) but is NOT an auto-discovered cargo test target — `crates/x/tests/d/h.rs`
+#      is a module of some other target, and `--test h` asks cargo for something that does not
+#      exist. Since every run now shares one verdict, that error would take the whole
+#      measurement UNVERIFIABLE rather than just its own run (#197 adversarial review). The
+#      exclusion half is what this pure hook can pin; the target half is asserted by the run.
+cat > "$TMP/nested.diff" <<'EOF'
+diff --git a/crates/chunkstore-grpc/tests/dserver/helper.rs b/crates/chunkstore-grpc/tests/dserver/helper.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/chunkstore-grpc/tests/dserver/helper.rs
+@@ -0,0 +1,2 @@
++pub fn h() {}
++pub fn g() {}
+diff --git a/crates/chunkstore-grpc/src/lib.rs b/crates/chunkstore-grpc/src/lib.rs
+--- a/crates/chunkstore-grpc/src/lib.rs
++++ b/crates/chunkstore-grpc/src/lib.rs
+@@ -1 +1,2 @@
+ fn a() {}
++fn b() {}
+EOF
+check "a nested tests/ file stays out of the denominator" \
+  "crates/chunkstore-grpc/src/lib.rs:2" \
+  "$("$DC" --changed-lines "$TMP/nested.diff")"
+
 # ---------------------------------------------------------------------------------------
 # --print-isolation: lane safety.
 # ---------------------------------------------------------------------------------------

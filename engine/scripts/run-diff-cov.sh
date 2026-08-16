@@ -30,6 +30,21 @@
 #     a blank. The compiler generated no coverage region there, so it is not a line a test
 #     could execute, and counting it would be a false red (the `false-red` class, same Act
 #     pass). Measured, not assumed: see engine/tests/test_run_diff_cov.sh case 6.
+#   * …and CANNOT SEE the difference between that and real code the build compiled out behind
+#     a `#[cfg(...)]` your feature selection does not enable. Both are simply absent from the
+#     report. This is the gate's last blind spot and it is live in the target:
+#     crates/metadata-tikv (`feature = "tikv"`) and crates/metadata-fdb (`feature = "fdb"`)
+#     carry hundreds of such lines. Demonstrated in the #197 adversarial review: 19 of 23
+#     changed lines inside a gated block left the denominator and the run reported 100%.
+#     Three discriminators were tried and all failed — a ratio (a legitimate patch sat at 26%
+#     instrumentable, the gated one at 17%), a contiguous unscored run (78 lines of ordinary
+#     doc comment beat the 16-line gated block), and an added `#[cfg(` attribute (false both
+#     ways, since lines added INSIDE an existing gated block carry no attribute of their own).
+#     So the gate reports the gap rather than guessing at it: every run prints how many changed
+#     lines were instrumentable out of how many changed, `diff-cov.json` records `unscored`,
+#     and the judgement is the human's at sign-off. That is the honest shape for an advisory
+#     row, and it is the reason this row should not be promoted to gating without revisiting
+#     it — a patch can be 100% green here having measured a fraction of itself.
 #   * Measures under the patch's OWN test where there is one — the same `-p <pkg> --test <name>`
 #     C4-verify computes — PLUS `-p <pkg>` (the existing suite) for every other changed crate.
 #     Not only the test-owning crate: the denominator spans every changed crate, so a run that
@@ -50,25 +65,39 @@
 #
 # UNVERIFIABLE (exit 77 -> SUMMARY §6 NEEDS-HUMAN, non-gating): the gate could not MEASURE the
 # bundle. Not a verdict on the fix — the absence of one. `engine/README.md` states the rule the
-# whole engine follows: a gate never turns "no evidence" into a verdict. Six ways to get here:
-#   * a changed file's package never entered the run, so nothing about that file was measured
-#     and any percentage would describe only the part of the patch that was;
+# whole engine follows: a gate never turns "no evidence" into a verdict. Ten routes, and the
+# HOST ones matter as much as the measurement ones — `gates.py` decides pass/fail on the exit
+# code alone, so anything that merely exits non-zero files a red row against the patch and
+# resets the promote_after streak (#197 review found three doing exactly that):
+#   * the patch names .rs files but no changed line resolved — a diff shape or path layout this
+#     gate cannot read. NOT the same as having nothing to measure, which exits 0;
+#   * cargo is not on PATH at all (ensure_cargo's 127 is not propagated);
 #   * cargo-llvm-cov is not installed (see [[doctor.checks]] 'cargo-llvm-cov');
+#   * the target Wyrd checkout was not found;
 #   * the toolchain has no llvm-tools component. Checked UP FRONT and deliberately: without
 #     it `cargo llvm-cov` PROMPTS on stdin ("I will run `rustup component add
 #     llvm-tools-preview ...`. Proceed? [Y/n]") and a gate that blocks on a prompt hangs until
-#     the 7200s timeout. Every cargo call below also runs with stdin at /dev/null so no
+#     the 7200s timeout. Every cargo SUBCOMMAND call below runs with stdin at /dev/null so no
 #     future prompt can do the same. Installing a toolchain component is a networked side
 #     effect and is NOT this gate's to perform — it reports and stops.
-#   * zero tests ran. `--cfg`-gated targets are the live cause here: every crates/dst test is
-#     `#![cfg(madsim)]` and compiles to an EMPTY binary without the flag (#104). Measured
-#     during #197: cargo-llvm-cov's wrapper APPENDS its instrumentation to inherited
-#     RUSTFLAGS, so `--cfg madsim` does compose and the gated target does run — but the
-#     count is checked anyway, because that is a property of the tool, not of this script;
-#   * the shipped test did not PASS. Coverage of a failing fix measures nothing about the
-#     fix, and whether the test should pass is C4-verify's verdict to give, not this row's;
+#   * no cargo test target maps to the patch's crates;
+#   * any single run executed zero tests. `--cfg`-gated targets are the live cause: every
+#     crates/dst test is `#![cfg(madsim)]` and compiles to an EMPTY binary without the flag
+#     (#104). Measured during #197: cargo-llvm-cov's wrapper APPENDS its instrumentation to
+#     inherited RUSTFLAGS, so `--cfg madsim` does compose — but the count is checked anyway,
+#     because that is a property of the tool, not of this script. Checked PER RUN: a summed
+#     count would let an empty target hide behind another crate's passing suite;
+#   * a run did not PASS. Coverage of a failing fix measures nothing about the fix, and
+#     whether the test should pass is C4-verify's verdict to give, not this row's;
+#   * a changed file's package never entered the run, so nothing about that file was measured
+#     and any percentage would describe only the part of the patch that was;
 #   * NONE of the changed production lines carry a `DA:` record. The instrumentation never
 #     reached those files, which is a broken measurement, not 0% coverage.
+#
+# What is deliberately NOT on that list: a large share of changed lines carrying no coverage
+# region. That is reported (see the NOTE the run prints, and `unscored` in diff-cov.json) but
+# never gated on — see the last bullet of the coverage boundary above for why no mechanical
+# test separates a compiled-out region from a comment.
 #
 # Isolation: its own `../wyrd-cov` git worktree off the bundle's resolved base, on branch
 # `pdca-cov`. Separate from C4-verify's `../wyrd-verify` on purpose — llvm-cov builds under
@@ -98,7 +127,8 @@
 #
 #   run-diff-cov.sh --print-isolation          # the lane-scoped COV dir + branch (test hook)
 #   run-diff-cov.sh --changed-lines <patch>    # `path:line` per scored line (test hook)
-#   run-diff-cov.sh --score <lcov> <lines>     # MISS lines + `TOTAL <cov> <instr>` (test hook)
+#   run-diff-cov.sh --score <lcov> <lines>     # MISS + NOFILE + `TOTAL <cov> <instr>` (hook)
+#   run-diff-cov.sh --crate-measured <crate> <lcov>  # did the report measure that crate (hook)
 #   run-diff-cov.sh --verdict <cov> <instr> [min]   # PASS|FAIL|UNVERIFIABLE (test hook)
 #   run-diff-cov.sh --act-line <crate> <cov> <instr> # the recurring-signal line (test hook)
 set -euo pipefail
@@ -266,7 +296,11 @@ _score() { # <lcov> <lines-file> -> `MISS path:line`… `NOFILE path`… `TOTAL 
 # would describe only the part of the patch that did. Matched on a whole path component, like
 # the SF match above, so `crates/core` never answers for `vendor/notcore`.
 _crate_measured() { # <crate-dir> <lcov> -> yes | no
-  if grep -q -e "^SF:$1/" -e "^SF:.*/$1/" "$2" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
+  # BRE metacharacters in the crate dir are escaped: an unescaped `.` would match any character,
+  # and this answer decides whether a file's absence is benign — over-permissive here means a
+  # silent drop instead of the 77 (#197 review).
+  local q; q="$(printf '%s' "$1" | sed 's/[][\.*^$\\]/\\&/g')"
+  if grep -q -e "^SF:$q/" -e "^SF:.*/$q/" "$2" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
 }
 
 # --- the verdict, from the two counts -----------------------------------------------------
@@ -391,6 +425,10 @@ _json() { # <status> <reason> [covered] [instrumentable] [tests_ran] [base] [tes
     printf '  "covered": %s,\n' "$c"
     printf '  "instrumentable": %s,\n' "$n"
     printf '  "changed_lines": %s,\n' "${CHANGED_TOTAL:-0}"
+    # changed_lines - instrumentable: lines that scored on NEITHER side. Recorded because the
+    # percentage alone cannot show it, and a large share is the one signal that a #[cfg]-gated
+    # region left the measurement (see the NOTE the run prints).
+    printf '  "unscored": %s,\n' "$(( ${CHANGED_TOTAL:-0} - n ))"
     printf '  "tests_ran": %s,\n' "$ran"
     printf '  "base_ref": "%s",\n' "$base"
     printf '  "test_args": "%s",\n' "$targs"
@@ -412,6 +450,21 @@ CHANGED_TOTAL="$(wc -l < "$CHANGED" | tr -d ' ')"
 # not a missing measurement — and placed BEFORE ensure_cargo so a no-crate patch never needs a
 # toolchain, the same ordering run-verify.sh uses for its own docs-only exit.
 if [ "$CHANGED_TOTAL" -eq 0 ]; then
+  # "Scored nothing" has two causes and only one of them is a green. Cross-check against the raw
+  # patch: if it names a .rs file at all, the parser produced nothing from a patch that plainly
+  # touches Rust, and the honest answer is "could not measure", not "nothing to measure". Reached
+  # by any shape the walker cannot read — a combined/merge diff (`@@@`), or a Rust file under a
+  # path prefix `_crate_dir` does not know, which is every workspace member that is not
+  # `crates/*` or `xtask` (#197 review: today none, but the rule now has two consumers).
+  if grep -q '^+++ b/.*\.rs$' "$PATCH"; then
+    _json "unverifiable" "the patch touches Rust files but no changed line could be resolved"
+    echo "run-diff-cov.sh: UNVERIFIABLE — the patch names .rs files, but no changed line resolved to" >&2
+    echo "                 a scorable production line. The diff shape or the path layout is one this" >&2
+    echo "                 gate cannot read, so it measured nothing — which is not the same as" >&2
+    echo "                 having nothing to measure." >&2
+    echo "PDCA-UNVERIFIABLE: the patch touches Rust but no changed line could be resolved, so diff coverage was not measured" >&2
+    exit 77
+  fi
   _json "n/a" "patch changes no production Rust line under a cargo package"
   echo "run-diff-cov.sh: nothing to measure — the patch changes no production Rust line under a" >&2
   echo "                 cargo package (docs / CI / test-only). C4-ci and C4-verify cover it." >&2
@@ -422,7 +475,15 @@ fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/ensure-cargo.sh
 . "$here/../lib/ensure-cargo.sh"   # defines ensure_cargo; called below, before any cargo use
-ensure_cargo || exit $?
+# A host with no cargo cannot MEASURE this patch; it has not found a defect in it. Propagating
+# ensure_cargo's 127 would file a red row against the fix — and, because `gates.py` decides
+# pass/fail on the exit code alone, no amount of output would soften it. It also resets the
+# promote_after streak. Same reasoning as the missing-tool branch just below (#197 review).
+if ! ensure_cargo; then
+  _json "unverifiable" "cargo is not on PATH and no rustup env was found"
+  echo "PDCA-UNVERIFIABLE: cargo is not available on this host, so diff coverage was not measured" >&2
+  exit 77
+fi
 
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   _json "unverifiable" "cargo-llvm-cov is not installed"
@@ -437,8 +498,13 @@ COV="$(_cov_dir)"
 COV_BRANCH="$(_cov_branch)"
 
 if [ -z "$WYRD_REPO" ] || [ ! -f "$WYRD_REPO/Cargo.toml" ]; then
+  # An environment fault, not a verdict — the same call as the two branches above. run-verify.sh
+  # exits 2 here, which for IT is a red C4 row on a misconfigured host; this row does not repeat
+  # that (#197 review).
+  _json "unverifiable" "the target Wyrd checkout was not found"
   echo "run-diff-cov.sh: live Wyrd repo not found (set WYRD_REPO, or place this project beside ~/wyrd/wyrd)." >&2
-  exit 2
+  echo "PDCA-UNVERIFIABLE: the target Wyrd checkout was not found, so diff coverage was not measured" >&2
+  exit 77
 fi
 
 # --- a dedicated worktree, clean at the bundle's base every run ---------------------------
@@ -515,12 +581,19 @@ done < <("$RV" --classify "$PATCH")
 # attempt — the arg list looked right and measured one crate. cargo-llvm-cov's documented
 # multi-run form is used instead: `--no-report` per run, then one `report` to merge.
 declare -A SEEN_PKG=()
-RUN_SPECS=(); TEST_SRC_FILES=(); TEST_SRC_CRATES=(); PKGS=()
+RUN_SPECS=(); PKGS=()
 for t in "${ADDED_TESTS[@]+"${ADDED_TESTS[@]}"}"; do
   c="$("$RV" --crate-dir "$t")"; [ -n "$c" ] || continue
   pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
-  RUN_SPECS+=("$pkg"$'\t'"$(basename "$t" .rs)"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
-  TEST_SRC_FILES+=("$t")
+  # Only `<crate>/tests/<name>.rs` is an auto-discovered integration-test TARGET. `_is_test_file`
+  # deliberately matches deeper paths too (`tests/dserver/helper.rs` is still test code, and must
+  # stay out of the coverage denominator), but naming one with `--test helper` asks cargo for a
+  # target it does not have — and since every spec now shares one verdict, that error would take
+  # the whole measurement UNVERIFIABLE rather than just its own run.
+  case "$t" in
+    "$c"/tests/*/*) continue ;;
+  esac
+  RUN_SPECS+=("$pkg"$'\t'"$(basename "$t" .rs)"$'\t'"$c"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
 done
 # EVERY changed crate joins the run, not only the one that ships a test. The denominator spans
 # all of them, so the numerator has to as well — and a package that is never built produces no
@@ -533,8 +606,8 @@ WHOLE_SUITE=0
 for c in "${CRATES[@]+"${CRATES[@]}"}"; do
   pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
   [ -n "${SEEN_PKG[$pkg]:-}" ] && continue
-  RUN_SPECS+=("$pkg"$'\t'); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
-  TEST_SRC_CRATES+=("$c"); WHOLE_SUITE=1
+  RUN_SPECS+=("$pkg"$'\t'$'\t'"$c"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
+  WHOLE_SUITE=1
 done
 if [ "${#RUN_SPECS[@]}" -eq 0 ]; then
   # Changed production lines exist but no test target maps to them — nothing to measure them
@@ -547,34 +620,47 @@ if [ "${#RUN_SPECS[@]}" -eq 0 ]; then
   exit 77
 fi
 
-# The cfg gate the test sources sit behind (#104), read AFTER the patch is applied — an added
-# test does not exist in the worktree before that. RUSTFLAGS is APPENDED to, never clobbered;
-# cargo-llvm-cov then appends its own instrumentation on top (measured in #197).
-TEST_ENV=()
-_srcs=()
-for f in "${TEST_SRC_FILES[@]+"${TEST_SRC_FILES[@]}"}"; do [ -n "$f" ] && _srcs+=("$COV/$f"); done
-for c in "${TEST_SRC_CRATES[@]+"${TEST_SRC_CRATES[@]}"}"; do
-  [ -n "$c" ] || continue
-  for f in "$COV/$c"/tests/*.rs; do [ -f "$f" ] && _srcs+=("$f"); done
-done
-if [ "${#_srcs[@]}" -gt 0 ]; then
-  mapfile -t _cfgs < <("$RV" --cfgs "${_srcs[@]}")
-  if [ "${#_cfgs[@]}" -gt 0 ] && [ -n "${_cfgs[0]:-}" ]; then
-    _rf="${RUSTFLAGS:-}"
-    for c in "${_cfgs[@]}"; do _rf="${_rf:+$_rf }--cfg $c"; done
-    TEST_ENV+=("RUSTFLAGS=$_rf")
-    for c in "${_cfgs[@]}"; do
-      [ "$c" = "madsim" ] && TEST_ENV+=("MADSIM_TEST_NUM=${WYRD_VERIFY_MADSIM_SEEDS:-50}")
-    done
-    echo "run-diff-cov.sh: cfg-gated test target (${_cfgs[*]}) — running with ${TEST_ENV[*]} (#104)." >&2
+# The cfg gate a spec's OWN test sources sit behind (#104), read AFTER the patch is applied —
+# an added test does not exist in the worktree before that. RUSTFLAGS is APPENDED to, never
+# clobbered; cargo-llvm-cov then appends its own instrumentation on top (measured in #197).
+#
+# Computed PER SPEC, never once for the whole selection. A union would apply one crate's cfg to
+# every other crate's build: a patch touching crates/dst (whose tests are all `#![cfg(madsim)]`)
+# and crates/core would build wyrd-core under `--cfg madsim` too, swapping tokio for madsim-tokio
+# across the selection, invalidating the shared build cache every alternate cycle, and measuring
+# a tree that is not the one C4-verify runs — breaking this file's own "one answer for both C4
+# rows" premise. Caught by the #197 adversarial review after the multi-crate fix widened
+# TEST_SRC_CRATES to every changed crate.
+_spec_env() { # <test target|""> <crate dir> -> zero or more KEY=VALUE lines
+  local tn="$1" c="$2" srcs=() f cfgs=() rf
+  if [ -n "$tn" ]; then
+    srcs+=("$COV/$c/tests/$tn.rs")
+  else
+    for f in "$COV/$c"/tests/*.rs; do [ -f "$f" ] && srcs+=("$f"); done
   fi
-fi
+  [ "${#srcs[@]}" -gt 0 ] || return 0
+  mapfile -t cfgs < <("$RV" --cfgs "${srcs[@]}")
+  [ "${#cfgs[@]}" -gt 0 ] && [ -n "${cfgs[0]:-}" ] || return 0
+  rf="${RUSTFLAGS:-}"
+  for f in "${cfgs[@]}"; do rf="${rf:+$rf }--cfg $f"; done
+  printf 'RUSTFLAGS=%s\n' "$rf"
+  for f in "${cfgs[@]}"; do
+    [ "$f" = "madsim" ] && printf 'MADSIM_TEST_NUM=%s\n' "${WYRD_VERIFY_MADSIM_SEEDS:-50}"
+  done
+  echo "run-diff-cov.sh: cfg-gated test target (${cfgs[*]}) for $c — passing the flag (#104)." >&2
+}
 
 # --- measure -------------------------------------------------------------------------------
-# Profile data only: a .profraw left by a previous bundle would be merged into this bundle's
-# numbers. The BUILD cache is kept (that is the point of a durable worktree), so this is not
-# `clean --workspace`, which would also drop the workspace's build artifacts every run.
-(cd "$COV" && cargo llvm-cov clean --profraw-only) </dev/null >/dev/null 2>&1 || true
+# `--workspace`, not `--profraw-only`, and the difference is correctness rather than hygiene.
+# The final `report` step merges the current profile data against EVERY instrumented object it
+# finds in the target dir — including test binaries left by a PREVIOUS bundle's run. Those have
+# no profile data any more, so every line they touch is merged in at zero hits, in files this
+# patch did change. Measured: bundle 716 scored 99.0% (197/199) from a clean tree and 59.2%
+# (135/228) with three earlier fixtures' binaries lying around — a false RED of 40 points, from
+# stale state alone. `--profraw-only` cannot prevent it: the profraw is not what is stale, the
+# objects are. So the workspace's own artifacts go every run (dependencies, the bulk of the
+# cache, stay), which is also the multi-run form cargo-llvm-cov documents.
+(cd "$COV" && cargo llvm-cov clean --workspace) </dev/null >/dev/null 2>&1 || true
 
 if [ "$WHOLE_SUITE" = 1 ]; then
   echo "run-diff-cov.sh: at least one changed crate ships no test in this patch — it is scored" >&2
@@ -587,34 +673,57 @@ fi
 # `report` merges them. TEST_ARGS is kept only as the human-readable record of what ran.
 COV_RC=0
 TEST_ARGS=()
+TESTS_RAN=0
 : > "$TMPD/cargo-out"
 rm -f "$LCOV"
 for spec in "${RUN_SPECS[@]}"; do
-  _pkg="${spec%%$'\t'*}"; _tn="${spec#*$'\t'}"
+  # Split by hand, NOT `IFS=$'\t' read`: tab is whitespace, and `read` collapses runs of
+  # whitespace IFS into one delimiter — so a whole-suite spec's empty middle field disappeared
+  # and its crate dir was handed to cargo as `--test crates/telemetry`.
+  _pkg="${spec%%$'\t'*}"; _rest="${spec#*$'\t'}"
+  _tn="${_rest%%$'\t'*}"; _crate="${_rest#*$'\t'}"
   _args=("-p" "$_pkg"); [ -n "$_tn" ] && _args+=("--test" "$_tn")
   TEST_ARGS+=("${_args[@]}")
+  mapfile -t _env < <(_spec_env "$_tn" "$_crate")
   echo "run-diff-cov.sh: MEASURE — cargo llvm-cov test ${_args[*]} (fix applied)" >&2
   _rc=0
-  _out="$( ( cd "$COV" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" \
+  _out="$( ( cd "$COV" && env "${_env[@]+"${_env[@]}"}" \
       cargo llvm-cov test --no-report "${_args[@]}" </dev/null ) 2>&1 )" || _rc=$?
   printf '%s\n' "$_out" >&2
   printf '%s\n' "$_out" >> "$TMPD/cargo-out"
   [ "$_rc" -ne 0 ] && COV_RC="$_rc"
+  # Counted PER RUN, not only in aggregate: a summed total lets a run that executed nothing
+  # disappear behind another crate's passing suite, and the human reading the log should see
+  # WHICH crate contributed nothing.
+  #
+  # But a zero here is NOT escalated on its own, because it has two causes with opposite
+  # correct answers, and this count cannot separate them — only the report can:
+  #   * the crate genuinely has no tests. cargo still builds and instruments it, so its lines
+  #     DO get records, all with zero hits. "Nothing executes these changed lines" is then a
+  #     true and useful finding — the very thing this row exists to say — and refusing to give
+  #     it would let a test-less crate escape the gate entirely. Measured: the multi-crate
+  #     fixture's wyrd-telemetry runs 0 tests and correctly scores 6 real misses.
+  #   * the target compiled to nothing (the #104 cfg shape). Then there is no profile data at
+  #     all, the crate is absent from the report, and the UNMEASURED check below turns it into
+  #     the 77 it deserves.
+  # So the escalation lives with the evidence, and this stays a note.
+  printf '%s\n' "$_out" > "$TMPD/spec-out"
+  _ran="$("$RV" --tests-ran "$TMPD/spec-out")"
+  TESTS_RAN=$((TESTS_RAN + _ran))
+  # An `if`, not `[ … ] && echo … && echo …`: only the FIRST echo of such a chain is guarded,
+  # so the rest print unconditionally — a shape that already shipped one wrong message here.
+  if [ "$_ran" -eq 0 ]; then
+    echo "run-diff-cov.sh: NOTE — \`${_args[*]}\` executed 0 tests; its changed lines can only score" >&2
+    echo "                 as uncovered. If that crate HAS tests, they did not build or were" >&2
+    echo "                 filtered out — check the output above before reading the misses." >&2
+  fi
 done
 ( cd "$COV" && cargo llvm-cov report --lcov --output-path "$LCOV" </dev/null ) >/dev/null 2>&1 \
   || echo "run-diff-cov.sh: the coverage report step failed; see the verdict below." >&2
-TESTS_RAN="$("$RV" --tests-ran "$TMPD/cargo-out")"
 
 # Judge by BOTH facts, exactly as C4-verify's legs do: the runner's status AND how many tests
-# actually executed. Each of the three bad cells is a missing measurement, never a verdict.
-if [ "$TESTS_RAN" -eq 0 ]; then
-  _json "unverifiable" "the target ran 0 tests" 0 0 0 "$BASE_REF" "${TEST_ARGS[*]}"
-  echo "run-diff-cov.sh: UNVERIFIABLE — the target ran 0 tests, so no reach was measured." >&2
-  echo "                 The test is compiled out: a cfg the gate does not set (#104), a feature" >&2
-  echo "                 it does not enable, every test #[ignore]d, or a filter matching nothing." >&2
-  echo "PDCA-UNVERIFIABLE: the target ran 0 tests, so diff coverage was not measured" >&2
-  exit 77
-fi
+# actually executed. The tests-ran half is enforced per spec inside the loop above, where a
+# zero can still be attributed to the run that produced it; what is left here is the status.
 if [ "$COV_RC" -ne 0 ] || [ ! -s "$LCOV" ]; then
   _json "unverifiable" "the shipped test did not pass under llvm-cov (status $COV_RC)" \
         0 0 "$TESTS_RAN" "$BASE_REF" "${TEST_ARGS[*]}"
@@ -665,9 +774,20 @@ fi
 COVERED="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $2; exit}')"
 INSTR="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $3; exit}')"
 PCT="$(_pct "$COVERED" "$INSTR")"
-# NB the default has no apostrophe on purpose: inside ${var:-word} bash still processes quotes,
-# so a `'` here opens a string that never closes and the whole script fails to parse.
+UNSCORED=$((CHANGED_TOTAL - INSTR))
+# The crate the recurring-signal line should name is the one the MISSES are IN, not whichever
+# package happened to sort first. PKGS is filled test-owning-crates-first, so `${PKGS[0]}` filed
+# a telemetry-only miss under wyrd-core — and since act._norm keys on exactly `… in crate <pkg>
+# —`, that pools the signal under the innocent crate. Silently, which is why the shape is pinned
+# by a test. Falls back to the first package only when there is nothing missed to point at.
+# NB the defaults have no apostrophe on purpose: inside ${var:-word} bash still processes quotes,
+# so a `'` there opens a string that never closes and the whole script fails to parse.
 CRATE_LABEL="${PKGS[0]:-unknown}"
+if [ -s "$MISS_FILE" ]; then
+  _mc="$("$RV" --crate-dir "$(sed -n '1s/^MISS //p;1s/:[0-9]*$//p' "$MISS_FILE" | head -1)")"
+  [ -n "$_mc" ] && CRATE_LABEL="$(_pkg_name "$_mc")"
+  [ -n "$CRATE_LABEL" ] || CRATE_LABEL="${PKGS[0]:-unknown}"
+fi
 VERDICT="$(_verdict "$COVERED" "$INSTR" "$DIFFCOV_MIN")"
 
 if [ "$VERDICT" = "UNVERIFIABLE" ]; then
@@ -686,19 +806,41 @@ _json "$( [ "$VERDICT" = PASS ] && echo pass || echo fail )" \
 
 # Forward-compat with eduralph/pdca-harness#406 (gate metrics into the Act index). Nothing
 # consumes it yet; it is frozen in gate-logs/C4-diff-cov.log so the trend is reconstructable.
-echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR" >&2
+echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR unscored=$UNSCORED" >&2
+
+# THE DENOMINATOR IS NOT THE PATCH. Say so on every run, in the numbers, because the difference
+# is where this gate's last blind spot lives and the percentage alone hides it: a changed line
+# that carries no coverage region is EITHER non-executable (a comment, a `use`, a bare `}` — the
+# ordinary case) OR real code the build compiled out behind a `#[cfg(...)]`, and lcov cannot
+# tell the caller which. Both simply vanish from the score. Measured during the #197
+# adversarial review: 19 of 23 changed lines in a `#[cfg(feature = "tikv")]` block left the
+# denominator and the gate reported "100.0% (4/4 changed lines)" — true of what it measured,
+# deeply misleading about the patch. Three mechanical discriminators were tried and all failed
+# (a ratio: a legitimate patch sat at 26% instrumentable against the gated one's 17%; a
+# contiguous unscored run: 78 lines of ordinary doc comment beat the 16-line gated block; an
+# added `#[cfg(` attribute: false on both sides, since lines added INSIDE an existing gated
+# block carry no attribute of their own). So the gate does not guess — it reports the gap and
+# leaves the judgement to the human reading §6, which is what an advisory row is for.
+if [ "$UNSCORED" -gt 0 ]; then
+  echo "run-diff-cov.sh: NOTE — $INSTR of $CHANGED_TOTAL changed production lines carried a coverage" >&2
+  echo "                 region; the other $UNSCORED are not scored either way. Most are simply not" >&2
+  echo "                 executable (comments, \`use\`, declarations, bare delimiters). But code" >&2
+  echo "                 compiled out by a #[cfg(...)] your feature selection does not enable looks" >&2
+  echo "                 identical here, and this gate cannot tell the two apart — if that share" >&2
+  echo "                 looks high for the patch, the percentage below is not describing all of it." >&2
+fi
 
 if [ "$VERDICT" = "FAIL" ]; then
   echo "run-diff-cov.sh: $(_act_line "$CRATE_LABEL" "$COVERED" "$INSTR")" >&2
-  echo "run-diff-cov.sh: FAIL — the shipped test executes $PCT% of this patch's instrumentable" >&2
-  echo "                 changed lines, below the ${DIFFCOV_MIN}% floor. Each MISS above is a REACH" >&2
-  echo "                 gap: the line never ran. (A line that DID run may still be unasserted —" >&2
-  echo "                 that is C5-mutants' question, not this row's.)" >&2
-  echo "PDCA-EVIDENCE: diff coverage $PCT% ($COVERED/$INSTR changed lines, below the ${DIFFCOV_MIN}% floor)" >&2
+  echo "run-diff-cov.sh: FAIL — the patch's tests execute $PCT% of its instrumentable changed" >&2
+  echo "                 lines, below the ${DIFFCOV_MIN}% floor. Each MISS above is a REACH gap: the" >&2
+  echo "                 line never ran. (A line that DID run may still be unasserted — that is" >&2
+  echo "                 C5-mutants' question, not this row's.)" >&2
+  echo "PDCA-EVIDENCE: diff coverage $PCT% — $COVERED of $INSTR instrumentable changed lines executed (below the ${DIFFCOV_MIN}% floor); $INSTR of $CHANGED_TOTAL changed lines were instrumentable" >&2
   exit 1
 fi
 
-echo "run-diff-cov.sh: PASS — the shipped test executes $PCT% of this patch's $INSTR instrumentable" >&2
-echo "                 changed lines (floor ${DIFFCOV_MIN}%, $TESTS_RAN test(s) ran)." >&2
-echo "PDCA-EVIDENCE: diff coverage $PCT% ($COVERED/$INSTR changed lines, floor ${DIFFCOV_MIN}%)" >&2
+echo "run-diff-cov.sh: PASS — the patch's tests execute $PCT% of its $INSTR instrumentable changed" >&2
+echo "                 lines (floor ${DIFFCOV_MIN}%, $TESTS_RAN test(s) ran)." >&2
+echo "PDCA-EVIDENCE: diff coverage $PCT% — $COVERED of $INSTR instrumentable changed lines executed (floor ${DIFFCOV_MIN}%); $INSTR of $CHANGED_TOTAL changed lines were instrumentable" >&2
 exit 0
