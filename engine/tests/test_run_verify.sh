@@ -105,6 +105,32 @@ check "added .rs test is the discriminator, Dockerfile is not" \
   $'ADDED_TEST crates/chunkstore-grpc/tests/tier2.rs\nCRATE crates/chunkstore-grpc' \
   "$("$RV" --classify "$TMP/addnontest.diff")"
 
+# 4b. the two predicates published as hooks for run-diff-cov.sh (#197). --classify answers
+#     "is this a test file" only for files the patch ADDS; a gate scoring the whole diff has to
+#     ask it of MODIFIED files too, and it needs a file's crate dir to reach a package name.
+#     Pinned here rather than copied into the sibling script, because two spellings of the same
+#     layout rule drifting apart is what #387 removed from the base parse.
+check "--is-test: an integration test under a crate" \
+  "yes" "$("$RV" --is-test crates/server/tests/foo.rs)"
+check "--is-test: a root-level tests/ file" \
+  "yes" "$("$RV" --is-test tests/smoke.rs)"
+check "--is-test: production source is not a test" \
+  "no" "$("$RV" --is-test crates/server/src/cli.rs)"
+# A non-.rs file under tests/ is not a discriminator — the Dockerfile of case 4, asked directly.
+check "--is-test: a non-.rs file under tests/ is not a test" \
+  "no" "$("$RV" --is-test crates/chunkstore-grpc/tests/dserver/Dockerfile)"
+# A path whose FIRST segment is a crate named `tests` must not match the `tests/*.rs` arm by
+# accident; only a genuine root-level tests/ dir does.
+check "--is-test: src file of a crate, deep path" \
+  "no" "$("$RV" --is-test crates/core/src/multipart/record.rs)"
+
+check "--crate-dir: crates/<name>/... -> crates/<name>" \
+  "crates/server" "$("$RV" --crate-dir crates/server/src/cli.rs)"
+check "--crate-dir: xtask/... -> xtask" \
+  "xtask" "$("$RV" --crate-dir xtask/src/main.rs)"
+check "--crate-dir: a root-level docs file belongs to no crate" \
+  "" "$("$RV" --crate-dir README.md)"
+
 # 5. lane isolation — a serial run (no $PDCA_LANE) keeps the historical names.
 check "serial -> ../wyrd-verify on branch pdca-verify" \
   $'VERIFY wyrd-verify\nBRANCH pdca-verify' \
