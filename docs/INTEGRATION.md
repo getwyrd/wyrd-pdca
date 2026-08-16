@@ -59,6 +59,11 @@
   instruction — a brief naming that branch today names a ref that no longer exists, and
   `C4-verify` would warn and fall back to `origin/main`. Add another integration branch here
   when a future milestone needs the same.
+  **The "no maintenance branches" clause is narrowed 2026-08-16** by "Release branches" below:
+  it still forbids a standing `maintenance/*` line running parallel to `main`, but a
+  **per-release** branch is now the rule rather than an invention. The distinction that makes
+  both true at once: a release branch is cut **at** a release and maintains **that release**;
+  it is never a second trunk.
 - **Wave sequencing is `wave_mode = "merge"`** (changed from `"stack"`, 2026-08-02): for a
   dependent multi-issue batch, the driver `gh pr merge`s each **non-final** wave's PRs into
   the real base (`main`) before the next wave builds; the final wave's PRs stay the human's
@@ -132,11 +137,55 @@
   above): a wave≥1 bundle now builds on a genuinely merged `origin/<brief base>`, so the
   ref C4-verify resolves IS the base the PR opens against. The gap stays live upstream for
   `"stack"`-mode instances.
+- **Release branches — every release gets one, and it is how the release is maintained**
+  (maintainer decision, 2026-08-16). At each release point a branch is cut from `main` and
+  named `release/<version>` (e.g. `release/0.1-alpha`). It is the branch the **tag** is cut
+  from, the branch the release is **maintained on**, and the branch a release-gating job is
+  **run against** — so a week-long evidence run is not invalidated by `main` moving underneath
+  it. `main` keeps advancing throughout; no freeze.
+  - **Direction of flow: `main` first, then cherry-pick.** A fix lands on `main` and is
+    cherry-picked onto the release branch. Never the reverse — a fix that exists only on a
+    release branch is a regression waiting for the next release. This is what makes the
+    cherry-pick row below live rather than hypothetical.
+  - **Bundles targeting a release branch** put `getwyrd/wyrd @ release/<version>` in the
+    brief's **"Repo + branch target"**, exactly as the M4 pattern did with its integration
+    branch. `C4-verify` then resolves against that base by rule 2 of "How `C4-verify`
+    resolves the base" below — provided the branch **exists on `origin`**, or the gate warns
+    and silently falls back to `origin/main`, validating against the wrong tree.
+  - **Not a second trunk.** A release branch takes **cherry-picks only** — including for a
+    release-blocking defect, which is still authored against `main` and backported. There is no
+    "urgent enough to skip `main`" case; that is the reverse flow the rule above forbids, and
+    urgency is exactly when it gets skipped. Concretely: a bundle fixing a release blocker puts
+    **`@ main`** in its brief's "Repo + branch target", never `@ release/<version>`, because the
+    publisher "branches from the brief's **target branch**" (`agents/publisher.md:75-77`) — so a
+    brief naming the release branch produces a release-only PR and reintroduces the defect at the
+    next release. Only the backport commit targets `release/<version>`. Feature work targets
+    `main`. When a release line is done, the branch is left in place as the historical record of
+    what shipped, not deleted like an integration branch.
+  - **Open: mid-run cherry-picks.** A long-running release-gating job (the 0.1 Alpha endurance
+    run, getwyrd/wyrd#735) tests the branch as it stood when the job started. A cherry-pick
+    landing mid-run means the evidence describes a build that no longer exists. Decide the rule
+    **before** the first such run, not at hour 100 of 168.
+    **Path overlap is not the criterion** — an earlier draft proposed "touches the paths under
+    test", which fails for a manifest, build script, lockfile, config, generated input or
+    dependency bump that changes the tested binary while touching none of them. The sound
+    question is whether **the tested artifact or its runtime inputs changed**, which for a
+    compiled binary means: did this land alter the build. The conservative reading — restart on
+    **any** release-branch update during a gating run — needs no judgement call at hour 100 and
+    is the recommended default until someone has a reason to weaken it.
 - **Override convention:** a maintainer's explicit base-branch request on the PR wins
   (per `GOVERNANCE.md` decision-making); otherwise `main`.
-- **Cross-version cherry-pick rules:** none today (single line). If back-porting starts,
-  cherry-pick is a **correctness** check — "applies cleanly" ≠ "remains correct"; verify
-  against the target branch's related code, including files the patch doesn't touch.
+- **Cross-version cherry-pick rules — live as of 2026-08-16** (previously "none today (single
+  line)"; the release-branch rule above starts the back-porting this row was written to
+  anticipate). Cherry-pick is a **correctness** check, not a mechanical one — "applies
+  cleanly" ≠ "remains correct". Verify against the **target branch's** related code,
+  including files the patch does not touch: a patch whose correctness rests on a refactor
+  that landed on `main` after the branch point applies cleanly and is wrong. **Every**
+  cherry-pick therefore re-runs the bundle's own gates against the release branch; the `main`
+  run does not carry over. "Only when it looks non-trivial" is not a usable trigger — the
+  dangerous case *is* the one that looks trivial, since a clean apply is precisely what a
+  missing-refactor backport produces. The cost is one gate run per backport, which is the price
+  of the guarantee.
 - **Immutability rule (host-enforced):** Wyrd's `adr-immutability` gate forbids editing an
   Accepted ADR (`../wyrd/docs/design/adr/`, ADR-0001). A Plan that needs to change an
   accepted decision authors a **new** superseding ADR — never edits the old one.
