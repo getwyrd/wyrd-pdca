@@ -40,11 +40,17 @@
 #     instrumentable, the gated one at 17%), a contiguous unscored run (78 lines of ordinary
 #     doc comment beat the 16-line gated block), and an added `#[cfg(` attribute (false both
 #     ways, since lines added INSIDE an existing gated block carry no attribute of their own).
-#     So the gate reports the gap rather than guessing at it: every run prints how many changed
-#     lines were instrumentable out of how many changed, `diff-cov.json` records `unscored`,
-#     and the judgement is the human's at sign-off. That is the honest shape for an advisory
-#     row, and it is the reason this row should not be promoted to gating without revisiting
-#     it — a patch can be 100% green here having measured a fraction of itself.
+#     So the gate reports the gap rather than guessing at it, and reports it in a form a human
+#     can act on (#222): every run prints how many changed lines were instrumentable out of how
+#     many changed AND the largest unscored SPANS, with all of them in `diff-cov.json`. A bare
+#     count says nothing; `crates/metadata-tikv/src/lib.rs:1605-1620 (16 lines)` is recognised
+#     on sight as a gated block, where `crates/core/src/multipart.rs:1458-1570 (113 lines)` is
+#     as plainly a doc-comment run. The gate does not classify them — it shows them, and the
+#     judgement is the human's at sign-off.
+#     This is also why the row carries NO `promote_after` and is not on the promotion ladder
+#     (#222): a patch can be 100% green here having measured a fraction of itself, and passing
+#     three clean cycles cannot retire that — it is a property of the measurement, not of the
+#     streak. The row informs sign-off; it is not a candidate to block.
 #   * Measures under the patch's OWN test where there is one — the same `-p <pkg> --test <name>`
 #     C4-verify computes — PLUS `-p <pkg>` (the existing suite) for every other changed crate.
 #     Not only the test-owning crate: the denominator spans every changed crate, so a run that
@@ -60,15 +66,15 @@
 #     inline scores GENEROUSLY, by roughly the size of that block. Measured, not assumed: the
 #     same planted fixture scores 6/10 with the test in `tests/`, 9/13 with it inline.
 #     Excluding it would mean parsing Rust attribute scopes in awk, which is a worse trade than
-#     naming the bias — and it points the same way as the advisory default and the
-#     `promote_after` ladder: this row informs sign-off, it does not yet block on a number.
+#     naming the bias — and it points the same way as the advisory default: this row informs
+#     sign-off, it does not block on a number.
 #
 # UNVERIFIABLE (exit 77 -> SUMMARY §6 NEEDS-HUMAN, non-gating): the gate could not MEASURE the
 # bundle. Not a verdict on the fix — the absence of one. `engine/README.md` states the rule the
 # whole engine follows: a gate never turns "no evidence" into a verdict. Ten routes, and the
 # HOST ones matter as much as the measurement ones — `gates.py` decides pass/fail on the exit
-# code alone, so anything that merely exits non-zero files a red row against the patch and
-# resets the promote_after streak (#197 review found three doing exactly that):
+# code alone, so anything that merely exits non-zero files a red row against the patch
+# (#197 review found three doing exactly that):
 #   * the patch names .rs files but no changed line resolved — a diff shape or path layout this
 #     gate cannot read. NOT the same as having nothing to measure, which exits 0;
 #   * cargo is not on PATH at all (ensure_cargo's 127 is not propagated);
@@ -127,7 +133,10 @@
 #
 #   run-diff-cov.sh --print-isolation          # the lane-scoped COV dir + branch (test hook)
 #   run-diff-cov.sh --changed-lines <patch>    # `path:line` per scored line (test hook)
-#   run-diff-cov.sh --score <lcov> <lines>     # MISS + NOFILE + `TOTAL <cov> <instr>` (hook)
+#   run-diff-cov.sh --score <lcov> <lines>     # MISS + UNSCORED + NOFILE + TOTAL (test hook)
+#   run-diff-cov.sh --ranges                   # stdin path:line -> contiguous spans (hook)
+#   run-diff-cov.sh --json-escape <string>     # the string as a JSON literal (test hook)
+#   run-diff-cov.sh --unmapped-rs <patch>      # production .rs mapping to no package (hook)
 #   run-diff-cov.sh --crate-measured <crate> <lcov>  # did the report measure that crate (hook)
 #   run-diff-cov.sh --verdict <cov> <instr> [min]   # PASS|FAIL|UNVERIFIABLE (test hook)
 #   run-diff-cov.sh --act-line <crate> <cov> <instr> # the recurring-signal line (test hook)
@@ -137,11 +146,57 @@ case "${1:-}" in
   -h | --help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
 esac
 
+# Normalize an operator-supplied integer knob before it ever reaches `$(( ))`. Two traps, and
+# both end the run mid-verdict under `set -e`:
+#   * a zero-padded value (`08`) is DECIMAL to `[ … -gt … ]` but OCTAL to arithmetic expansion,
+#     which aborts with "value too great for base". The abort lands AFTER `_json` has written
+#     the artifact, so the bundle keeps a diff-cov.json claiming pass/fail while the gate exits
+#     non-zero and `gates.py` — which reads the exit code alone — files the opposite verdict;
+#   * a non-numeric value is a bare word in arithmetic context, i.e. a variable name, which
+#     `set -u` turns into "unbound variable".
+# A misconfigured knob is an operator error and must not become a verdict about the patch, so
+# it warns and falls back rather than failing (PR #223 review).
+_uint() { # <value> <default> <var name> <max> -> a plain decimal integer in 0..max
+  local v="$1" d="$2" name="$3" max="$4"
+  case "$v" in
+    '' | *[!0-9]*)
+      echo "run-diff-cov.sh: \$$name='$v' is not a non-negative integer — using $d." >&2
+      printf '%s' "$d"; return 0 ;;
+  esac
+  v="${v#"${v%%[!0]*}"}"          # strip leading zeros so `$(( ))` never reads it as octal
+  v="${v:-0}"
+  # RANGE-CHECK, and check it on the DIGIT STRING before any arithmetic touches it. Bash's
+  # arithmetic is 64-bit and WRAPS silently: `$((18446744073709551616))` is 0, so a floor of
+  # 18446744073709551616 became a floor of 0 and `_verdict 0 10` returned PASS — a false green
+  # in an evidence gate, produced by a knob rather than by the patch (PR #223 review). Comparing
+  # lengths first keeps the guard itself out of the range it is guarding against.
+  if [ "${#v}" -gt "${#max}" ] || { [ "${#v}" -eq "${#max}" ] && [ "$v" \> "$max" ]; }; then
+    echo "run-diff-cov.sh: \$$name='$1' is out of range (0..$max) — using $d." >&2
+    printf '%s' "$d"; return 0
+  fi
+  printf '%s' "$v"
+}
+
+# Escape a string for embedding in a JSON string literal. Paths reach the artifact straight from
+# the patch, and git quotes an odd filename in its diff header (`+++ b/"a\"b.rs"`), so a `"` or
+# `\\` in a path would otherwise emit a diff-cov.json that no parser can read — and the artifact
+# is the frozen record (PR #223 review). Backslash first, or it would double-escape the quotes
+# it just inserted.
+# ONE spelling of the escape program: the scalar helper and both array pipelines share it, so
+# they cannot drift apart the way two copies of a subtle rule always do.
+_JSON_ESC='s/\\/\\\\/g; s/"/\\"/g'
+_json_escape() { printf '%s' "$1" | sed "$_JSON_ESC"; }
+
 # The share of instrumentable changed lines that must be executed. 80 rather than a strict 100
 # because a real patch carries error branches a single regression test does not walk, and a
-# threshold no honest bundle can meet would never earn its promote_after promotion — it would
-# just train the human to skip the row.
-DIFFCOV_MIN="${WYRD_DIFFCOV_MIN:-80}"
+# threshold no honest bundle can meet would just train the human to skip the row.
+DIFFCOV_MIN="$(_uint "${WYRD_DIFFCOV_MIN:-80}" 80 WYRD_DIFFCOV_MIN 100)"
+
+# How many unscored spans the run prints before summarising the rest (#222). All of them land in
+# coverage/diff-cov.json regardless; this only bounds what a human reads in the gate log, and 6
+# is enough to show the block that matters without burying the verdict under a 700-line patch's
+# interleaved doc comments.
+UNSCORED_SPANS_SHOWN="$(_uint "${WYRD_DIFFCOV_SPANS:-6}" 6 WYRD_DIFFCOV_SPANS 999999)"
 
 # --- lane-scoped coverage worktree + branch (shared by the run and the test hook) ------
 # Mirrors run-verify.sh's _verify_dir/_verify_branch, including the deliberate asymmetry of
@@ -264,7 +319,7 @@ _changed_lines() { # <patch> -> `path:line` for every scored line
 #     dropping that is a false green: a two-crate patch whose test lives in crate A scored
 #     100% while crate B's uncovered function was never compiled (found by the #197 codex
 #     review; reproduced before this was written).
-_score() { # <lcov> <lines-file> -> `MISS path:line`… `NOFILE path`… `TOTAL <covered> <instr>`
+_score() { # <lcov> <lines> -> `MISS p:l`… `UNSCORED p:l`… `NOFILE p`… `TOTAL <cov> <instr>`
   awk '
     FNR == NR {                                   # pass 1: the changed lines
       split($0, p, /:/); f = p[1]; l = p[2]
@@ -298,9 +353,12 @@ _score() { # <lcov> <lines-file> -> `MISS path:line`… `NOFILE path`… `TOTAL 
       c = 0; n = 0
       for (i = 1; i <= nrec; i++) {
         k = order[i]
-        if (!(k in instr)) continue             # no region here — out of the denominator
         if (k in seenk) continue                # the same line twice in one patch
         seenk[k] = 1
+        if (!(k in instr)) {                    # no region here — out of the denominator…
+          split(k, s, /\t/); print "UNSCORED " s[1] ":" s[2]   # …but never out of sight (#222)
+          continue
+        }
         n++
         if (k in hit) { c++ } else { split(k, s, /\t/); print "MISS " s[1] ":" s[2] }
       }
@@ -308,6 +366,38 @@ _score() { # <lcov> <lines-file> -> `MISS path:line`… `NOFILE path`… `TOTAL 
       print "TOTAL " c " " n
     }
   ' "$2" "$1"
+}
+
+# Collapse `path:line` records into contiguous `path:start-end<TAB>count` ranges, largest first.
+#
+# This is what makes the unscored set usable (#222). The gate cannot tell a line with no coverage
+# region apart from real code the build compiled out behind a `#[cfg(...)]` — three mechanical
+# discriminators were tried and all failed — so it does not guess. What it CAN do is stop
+# reporting the gap as a bare number: `19 unscored` tells a human nothing, while
+# `crates/metadata-tikv/src/lib.rs:740-755 (16 lines)` is recognised on sight as the body of the
+# `feature = "tikv"` block. Ranges rather than lines because a real patch has hundreds — 716 has
+# 555 unscored lines, which is noise printed one per line and a short list printed as spans.
+# Sorted by size because the block you need to notice is the big one; the small runs are the
+# interleaved doc comments and delimiters that are genuinely uninteresting.
+# Splits on the LAST colon, not the first, and de-duplicates before grouping. Both matter and
+# both were found by the #222 adversarial review against the public hook: `awk -F:` read a path
+# CONTAINING a colon as `path=crates/a`, `line=b/src/lib.rs` → `0`, turning one 3-line span into
+# three bogus `crates/a:0-0` spans; and a repeated `path:line` broke the run-detection state
+# machine into overlapping spans that double-counted the line (`5,5,6` → `5-6` *and* `5-5`,
+# i.e. 2 distinct lines reported as 3). Neither is reachable through the gate today — `_score`
+# de-dups before emitting, and no wyrd path holds a colon — but a hook published for tests is
+# part of the contract, and "unreachable today" is how the layout assumptions in this file have
+# gone wrong twice already.
+_ranges() { # <path:line lines on stdin> -> `path:start-end\tcount`, largest run first
+  awk '{ i = match($0, /:[0-9]+$/); if (i == 0) next
+         printf "%s\t%s\n", substr($0, 1, i - 1), substr($0, i + 1) }' \
+    | sort -t$'\t' -k1,1 -k2,2n -u \
+    | awk -F'\t' '
+        function flush() { if (f != "") printf "%s:%d-%d\t%d\n", f, s, p, p - s + 1 }
+        { if ($1 != f || $2 != p + 1) { flush(); f = $1; s = $2 } ; p = $2 }
+        END { flush() }
+      ' \
+    | sort -t$'\t' -k2,2nr
 }
 
 # Did the report measure ANY file of that crate? This is the discriminator the caller needs to
@@ -376,10 +466,25 @@ if [ "${1:-}" = "--changed-lines" ]; then
   exit 0
 fi
 
-# --score <lcov> <lines-file>: MISS lines, NOFILE lines, and the TOTAL pair. No worktree, no
-# cargo — for engine/tests.
+# --score <lcov> <lines-file>: MISS lines, UNSCORED lines (changed but carrying no coverage
+# region), NOFILE lines, and the TOTAL pair. No worktree, no cargo — for engine/tests.
 if [ "${1:-}" = "--score" ]; then
   _score "${2:?--score needs an lcov path}" "${3:?--score needs a changed-lines file}"
+  exit 0
+fi
+
+# --json-escape <string>: the string as it is embedded in a JSON literal. No worktree, no
+# cargo — for engine/tests (PR #223 review).
+if [ "${1:-}" = "--json-escape" ]; then
+  _json_escape "${2-}"
+  echo
+  exit 0
+fi
+
+# --ranges: collapse `path:line` records on stdin into contiguous spans, largest first. No
+# worktree, no cargo — for engine/tests (#222).
+if [ "${1:-}" = "--ranges" ]; then
+  _ranges
   exit 0
 fi
 
@@ -444,6 +549,7 @@ TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 CHANGED="$TMPD/changed-lines.txt"
 MISS_FILE="$TMPD/missed"
+RANGES_FILE="$TMPD/unscored-ranges"
 
 # One JSON writer for every exit path. No jq: the harness does not depend on it, and a gate
 # that needs a tool to report its own verdict has one more way to give none.
@@ -453,23 +559,38 @@ _json() { # <status> <reason> [covered] [instrumentable] [tests_ran] [base] [tes
     printf '{\n'
     printf '  "gate": "C4-diff-cov",\n'
     printf '  "status": "%s",\n' "$status"
-    printf '  "reason": "%s",\n' "$reason"
+    printf '  "reason": "%s",\n' "$(_json_escape "$reason")"
     printf '  "min_pct": %s,\n' "$DIFFCOV_MIN"
     printf '  "diff_cov_pct": %s,\n' "$(_pct "$c" "$n")"
     printf '  "covered": %s,\n' "$c"
     printf '  "instrumentable": %s,\n' "$n"
     printf '  "changed_lines": %s,\n' "${CHANGED_TOTAL:-0}"
-    # changed_lines - instrumentable: lines that scored on NEITHER side. Recorded because the
-    # percentage alone cannot show it, and a large share is the one signal that a #[cfg]-gated
-    # region left the measurement (see the NOTE the run prints).
-    printf '  "unscored": %s,\n' "$(( ${CHANGED_TOTAL:-0} - n ))"
+    # Lines that scored on NEITHER side. Recorded because the percentage alone cannot show it,
+    # and a large share is the one signal that a #[cfg]-gated region left the measurement (see
+    # the NOTE the run prints).
+    #
+    # `null` before scoring has happened, NOT `changed_lines`. Deriving it here as
+    # `changed_lines - n` made every pre-score exit claim every changed line was unscored while
+    # `unscored_spans` sat empty — a number that reconciled with nothing, on an artifact whose
+    # whole job is to be the frozen record (#222 adversarial review found the pair disagreeing
+    # on two exit paths). After scoring, $UNSCORED is the measured value and the spans sum to
+    # it; before it, the honest answer is that we do not know.
+    printf '  "unscored": %s,\n' "${UNSCORED:-null}"
     printf '  "tests_ran": %s,\n' "$ran"
-    printf '  "base_ref": "%s",\n' "$base"
-    printf '  "test_args": "%s",\n' "$targs"
+    printf '  "base_ref": "%s",\n' "$(_json_escape "$base")"
+    printf '  "test_args": "%s",\n' "$(_json_escape "$targs")"
+    printf '  "unscored_spans": ['
+    if [ -s "${RANGES_FILE:-/dev/null}" ]; then
+      printf '\n'
+      cut -f1 "$RANGES_FILE" | sed "$_JSON_ESC" \
+        | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
+    fi
+    printf '],\n'
     printf '  "missed": ['
     if [ -s "${MISS_FILE:-/dev/null}" ]; then
       printf '\n'
-      sed 's/^MISS //' "$MISS_FILE" | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
+      sed -e 's/^MISS //' -e "$_JSON_ESC" "$MISS_FILE" \
+        | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
     fi
     printf ']\n'
     printf '}\n'
@@ -528,8 +649,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/../lib/ensure-cargo.sh"   # defines ensure_cargo; called below, before any cargo use
 # A host with no cargo cannot MEASURE this patch; it has not found a defect in it. Propagating
 # ensure_cargo's 127 would file a red row against the fix — and, because `gates.py` decides
-# pass/fail on the exit code alone, no amount of output would soften it. It also resets the
-# promote_after streak. Same reasoning as the missing-tool branch just below (#197 review).
+# pass/fail on the exit code alone, no amount of output would soften it. Same reasoning as the
+# missing-tool branch just below (#197 review).
 if ! ensure_cargo; then
   _json "unverifiable" "cargo is not on PATH and no rustup env was found"
   echo "PDCA-UNVERIFIABLE: cargo is not available on this host, so diff coverage was not measured" >&2
@@ -812,6 +933,57 @@ fi
 # --- score ---------------------------------------------------------------------------------
 SCORED="$(_score "$LCOV" "$CHANGED")"
 printf '%s\n' "$SCORED" | grep '^MISS ' > "$MISS_FILE" || true
+printf '%s\n' "$SCORED" | sed -n 's/^UNSCORED //p' | _ranges > "$RANGES_FILE" || true
+
+COVERED="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $2; exit}')"
+INSTR="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $3; exit}')"
+PCT="$(_pct "$COVERED" "$INSTR")"
+UNSCORED=$((CHANGED_TOTAL - INSTR))
+
+# THE DENOMINATOR IS NOT THE PATCH. Say so on every run, in the numbers, because the difference
+# is where this gate's last blind spot lives and the percentage alone hides it: a changed line
+# that carries no coverage region is EITHER non-executable (a comment, a `use`, a bare `}` — the
+# ordinary case) OR real code the build compiled out behind a `#[cfg(...)]`, and lcov cannot
+# tell the caller which. Both simply vanish from the score. Measured during the #197
+# adversarial review: 19 of 23 changed lines in a `#[cfg(feature = "tikv")]` block left the
+# denominator and the gate reported "100.0% (4/4 changed lines)" — true of what it measured,
+# deeply misleading about the patch. Three mechanical discriminators were tried and all failed
+# (a ratio: a legitimate patch sat at 26% instrumentable against the gated one's 17%; a
+# contiguous unscored run: 78 lines of ordinary doc comment beat the 16-line gated block; an
+# added `#[cfg(` attribute: false on both sides, since lines added INSIDE an existing gated
+# block carry no attribute of their own). So the gate does not guess — it reports the gap and
+# leaves the judgement to the human reading §6, which is what an advisory row is for.
+#
+# Printed BEFORE the verdict branches, deliberately (PR #223 review). The worst case for this
+# blind spot is a patch lying ENTIRELY inside a disabled `#[cfg]` block: nothing is
+# instrumentable, the verdict is UNVERIFIABLE, and that branch exits 77 immediately. With the
+# spans printed after it, the very scenario this reporting exists for was the one scenario the
+# gate log did not show them in — the locations reached diff-cov.json and nothing else.
+#
+# It sits above the UNMEASURED gate too, and that took two goes to get right (#222 adversarial
+# review). The first move cleared the zero-instrumentable exit and left the UNMEASURED one —
+# which fires EARLIER and had the same defect — so the commit claiming the class was fixed had
+# fixed one of its two members. "Before the verdict branches" is not the rule; "after `_score`,
+# before anything that can exit" is, and the counts are hoisted above this for the same reason.
+if [ "$UNSCORED" -gt 0 ]; then
+  echo "run-diff-cov.sh: NOTE — $INSTR of $CHANGED_TOTAL changed production lines carried a coverage" >&2
+  echo "                 region; the other $UNSCORED are not scored either way. Most are simply not" >&2
+  echo "                 executable (comments, \`use\`, declarations, bare delimiters). But code" >&2
+  echo "                 compiled out by a #[cfg(...)] your feature selection does not enable looks" >&2
+  echo "                 identical here, and this gate cannot tell the two apart (#222)." >&2
+  echo "                 The largest unscored spans, so you can tell at a glance which it is:" >&2
+  _shown=0
+  while IFS=$'\t' read -r span count; do
+    [ -n "$span" ] || continue
+    [ "$_shown" -ge "$UNSCORED_SPANS_SHOWN" ] && continue
+    printf 'run-diff-cov.sh:   UNSCORED %s (%s line%s)\n' "$span" "$count" \
+      "$( [ "$count" = 1 ] || printf s)" >&2
+    _shown=$((_shown + 1))
+  done < "$RANGES_FILE"
+  _total_spans="$(wc -l < "$RANGES_FILE" | tr -d ' ')"
+  [ "$_total_spans" -gt "$UNSCORED_SPANS_SHOWN" ] && \
+    echo "run-diff-cov.sh:   … and $((_total_spans - UNSCORED_SPANS_SHOWN)) further span(s), none larger; all of them are in coverage/diff-cov.json" >&2
+fi
 
 # A changed file the report never mentions is benign ONLY if its package was actually measured
 # — then it simply has no executable region (`pub mod x;`, a consts file). If its package was
@@ -845,10 +1017,6 @@ if [ "${#UNMEASURED[@]}" -gt 0 ]; then
   exit 77
 fi
 
-COVERED="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $2; exit}')"
-INSTR="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $3; exit}')"
-PCT="$(_pct "$COVERED" "$INSTR")"
-UNSCORED=$((CHANGED_TOTAL - INSTR))
 VERDICT="$(_verdict "$COVERED" "$INSTR" "$DIFFCOV_MIN")"
 
 # One recurring-signal line PER CRATE that has misses, each carrying that crate's OWN counts.
@@ -895,27 +1063,6 @@ _json "$( [ "$VERDICT" = PASS ] && echo pass || echo fail )" \
 # consumes it yet; it is frozen in gate-logs/C4-diff-cov.log so the trend is reconstructable.
 echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR unscored=$UNSCORED" >&2
 
-# THE DENOMINATOR IS NOT THE PATCH. Say so on every run, in the numbers, because the difference
-# is where this gate's last blind spot lives and the percentage alone hides it: a changed line
-# that carries no coverage region is EITHER non-executable (a comment, a `use`, a bare `}` — the
-# ordinary case) OR real code the build compiled out behind a `#[cfg(...)]`, and lcov cannot
-# tell the caller which. Both simply vanish from the score. Measured during the #197
-# adversarial review: 19 of 23 changed lines in a `#[cfg(feature = "tikv")]` block left the
-# denominator and the gate reported "100.0% (4/4 changed lines)" — true of what it measured,
-# deeply misleading about the patch. Three mechanical discriminators were tried and all failed
-# (a ratio: a legitimate patch sat at 26% instrumentable against the gated one's 17%; a
-# contiguous unscored run: 78 lines of ordinary doc comment beat the 16-line gated block; an
-# added `#[cfg(` attribute: false on both sides, since lines added INSIDE an existing gated
-# block carry no attribute of their own). So the gate does not guess — it reports the gap and
-# leaves the judgement to the human reading §6, which is what an advisory row is for.
-if [ "$UNSCORED" -gt 0 ]; then
-  echo "run-diff-cov.sh: NOTE — $INSTR of $CHANGED_TOTAL changed production lines carried a coverage" >&2
-  echo "                 region; the other $UNSCORED are not scored either way. Most are simply not" >&2
-  echo "                 executable (comments, \`use\`, declarations, bare delimiters). But code" >&2
-  echo "                 compiled out by a #[cfg(...)] your feature selection does not enable looks" >&2
-  echo "                 identical here, and this gate cannot tell the two apart — if that share" >&2
-  echo "                 looks high for the patch, the percentage below is not describing all of it." >&2
-fi
 
 if [ "$VERDICT" = "FAIL" ]; then
   _emit_act_lines

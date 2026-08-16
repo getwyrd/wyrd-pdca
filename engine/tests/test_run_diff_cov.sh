@@ -201,8 +201,8 @@ printf '%s\n' \
   'crates/core/src/lib.rs:5' \
   'crates/core/src/lib.rs:8' \
   'crates/core/src/lib.rs:10' > "$TMP/basic.lines"
-check "a changed line with no DA record leaves the denominator entirely" \
-  $'MISS crates/core/src/lib.rs:8\nTOTAL 3 4' \
+check "a changed line with no DA record leaves the denominator — and is named (#222)" \
+  $'UNSCORED crates/core/src/lib.rs:1\nMISS crates/core/src/lib.rs:8\nTOTAL 3 4' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/basic.lines")"
 
 # 10. The report's SF paths are ABSOLUTE (they point into whichever worktree built it) while
@@ -250,7 +250,7 @@ crates/other/src/lib.rs:1
 crates/other/src/lib.rs:2
 EOF
 check "a changed file absent from the report is named, not silently dropped" \
-  $'MISS crates/core/src/lib.rs:8\nNOFILE crates/other/src/lib.rs\nTOTAL 1 2' \
+  $'MISS crates/core/src/lib.rs:8\nUNSCORED crates/other/src/lib.rs:1\nUNSCORED crates/other/src/lib.rs:2\nNOFILE crates/other/src/lib.rs\nTOTAL 1 2' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/partial.lines")"
 
 # A file that IS in the report emits no NOFILE, even when none of its changed lines carry a
@@ -258,7 +258,7 @@ check "a changed file absent from the report is named, not silently dropped" \
 # and confusing it with the unmeasured shape would false-red nearly every patch adding a module.
 printf '%s\n' 'crates/core/src/lib.rs:1' > "$TMP/nolines.lines"
 check "a file present in the report never emits NOFILE, even scoring nothing" \
-  "TOTAL 0 0" \
+  $'UNSCORED crates/core/src/lib.rs:1\nTOTAL 0 0' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/nolines.lines")"
 
 # 11b. --crate-measured is what lets the caller READ a NOFILE line. A crate with records but
@@ -345,6 +345,47 @@ check "unmapped: production Rust outside crates/* is named, not silently dropped
   "libs/helper/src/lib.rs" \
   "$("$DC" --unmapped-rs "$TMP/offlayout.diff")"
 
+# 12b. --ranges: the span collapser. It shipped with NO tests (#222 adversarial review) — the
+#      most intricate new logic in that change, a two-stage sort around an awk state machine,
+#      and the only untested part. Both defects the review found lived exactly there, which is
+#      the argument for these cases rather than any individual case below.
+check "ranges: a single line is a one-line span" \
+  $'a.rs:5-5\t1' "$(printf 'a.rs:5\n' | "$DC" --ranges)"
+check "ranges: adjacent lines merge" \
+  $'a.rs:5-6\t2' "$(printf 'a.rs:5\na.rs:6\n' | "$DC" --ranges)"
+check "ranges: a gap of exactly one does NOT merge" \
+  $'a.rs:5-5\t1\na.rs:7-7\t1' "$(printf 'a.rs:5\na.rs:7\n' | "$DC" --ranges)"
+check "ranges: runs never merge across files, even when the numbers are contiguous" \
+  $'a.rs:5-5\t1\nb.rs:6-6\t1' "$(printf 'a.rs:5\nb.rs:6\n' | "$DC" --ranges)"
+check "ranges: unsorted input is grouped correctly" \
+  $'a.rs:1-3\t3' "$(printf 'a.rs:3\na.rs:1\na.rs:2\n' | "$DC" --ranges)"
+check "ranges: largest span first" \
+  $'a.rs:10-12\t3\na.rs:1-2\t2\na.rs:5-5\t1' \
+  "$(printf 'a.rs:1\na.rs:2\na.rs:5\na.rs:10\na.rs:11\na.rs:12\n' | "$DC" --ranges)"
+check "ranges: empty input is empty output, not an error" \
+  "" "$(printf '' | "$DC" --ranges)"
+
+# A REPEATED `path:line` used to break the run-detection state machine into overlapping spans
+# that double-counted the line — `5,5,6` became `5-6` AND `5-5`, reporting 2 distinct lines as
+# 3. `_score` de-dups before emitting, so the gate never fed it one; the hook is published for
+# tests and must hold on its own inputs.
+check "ranges: a duplicated line does not produce overlapping, double-counted spans" \
+  $'a.rs:5-6\t2' "$(printf 'a.rs:5\na.rs:5\na.rs:6\n' | "$DC" --ranges)"
+
+# `awk -F:` split on the FIRST colon, so a path CONTAINING one was read as path=`crates/a`,
+# line=`b/src/lib.rs` → 0, turning one 3-line span into three bogus `crates/a:0-0` spans. No
+# wyrd path holds a colon — but "unreachable today" is how this file's layout assumptions have
+# gone wrong twice already, and the split is now on the LAST colon.
+check "ranges: a path containing a colon still groups correctly" \
+  $'crates/a:b/src/lib.rs:5-7\t3' \
+  "$(printf 'crates/a:b/src/lib.rs:5\ncrates/a:b/src/lib.rs:6\ncrates/a:b/src/lib.rs:7\n' | "$DC" --ranges)"
+check "ranges: a path containing a space survives" \
+  $'crates/a b/src/lib.rs:1-2\t2' \
+  "$(printf 'crates/a b/src/lib.rs:1\ncrates/a b/src/lib.rs:2\n' | "$DC" --ranges)"
+check "ranges: a record with no line suffix is dropped, not mis-parsed" \
+  $'a.rs:1-1\t1' "$(printf 'a.rs:1\nnot-a-record\n' | "$DC" --ranges)"
+
+
 # ---------------------------------------------------------------------------------------
 # --verdict: the truth table.
 # ---------------------------------------------------------------------------------------
@@ -379,6 +420,53 @@ check "verdict: the default floor admits 80%" \
 check "verdict: \$WYRD_DIFFCOV_MIN overrides the default floor" \
   "PASS" "$(WYRD_DIFFCOV_MIN=50 "$DC" --verdict 60 100)"
 
+# 13c. An operator-supplied knob must never end the run mid-verdict. A ZERO-PADDED value is
+#      decimal to `[ … -ge … ]` but OCTAL to `$(( ))`, which aborts with "value too great for
+#      base" — and the abort lands AFTER `_json` has written the artifact, so the bundle keeps a
+#      diff-cov.json claiming one verdict while the non-zero exit files the opposite. A
+#      non-numeric value is a bare word in arithmetic context, which `set -u` turns into
+#      "unbound variable". Both are operator errors and must not become verdicts about the
+#      patch, so both warn and fall back (PR #223 review).
+check "knob: a zero-padded floor is read as decimal, not octal" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=08 "$DC" --verdict 9 10 2>/dev/null)"
+# `--verdict 0 10` does NOT discriminate — 0 covered fails against 8 and against 10 alike, so
+# that case passed against the un-normalized code too and proved nothing (#222 adversarial
+# review). 9 of 100 is the input that separates them: 9% clears an octal floor of 8 and misses
+# a decimal floor of 10.
+check "knob: 010 is ten, not eight" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=010 "$DC" --verdict 9 100 2>/dev/null)"
+check "knob: a non-numeric floor falls back to the default instead of aborting" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>/dev/null)"
+check "knob: the fallback is announced, not silent" \
+  "warned" \
+  "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>&1 >/dev/null | grep -q 'not a non-negative integer' && echo warned)"
+
+# 13d. A knob is range-checked on the DIGIT STRING, before arithmetic touches it. Bash's
+#      arithmetic is 64-bit and wraps SILENTLY — `$((18446744073709551616))` is 0 — so an
+#      out-of-range floor became a floor of 0 and `_verdict 0 10` returned PASS: a false green
+#      in an evidence gate, produced by a knob rather than by the patch (PR #223 review).
+check "knob: an out-of-range floor cannot wrap to zero and pass" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=18446744073709551616 "$DC" --verdict 0 10 2>/dev/null)"
+check "knob: the out-of-range fallback is announced" \
+  "warned" \
+  "$(WYRD_DIFFCOV_MIN=18446744073709551616 "$DC" --verdict 0 10 2>&1 >/dev/null | grep -q 'out of range' && echo warned)"
+check "knob: a floor above 100 is unsatisfiable, so it falls back" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=101 "$DC" --verdict 9 10 2>/dev/null)"
+check "knob: exactly 100 is a legitimate strict floor, not out of range" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=100 "$DC" --verdict 9 10 2>/dev/null)"
+
+# 13e. Paths reach diff-cov.json straight from the patch, and git quotes an odd filename in its
+#      own diff header, so a `"` or `\` in a path would emit an artifact no parser can read —
+#      and the artifact is the frozen record. One escape program is shared by the scalar fields
+#      and both array pipelines, so they cannot drift (PR #223 review).
+check "json-escape: a quote is escaped" \
+  'a\"b' "$("$DC" --json-escape 'a"b')"
+check "json-escape: a backslash is doubled" \
+  'a\\b' "$("$DC" --json-escape 'a\b')"
+check "json-escape: backslash first, so an escaped quote is not double-escaped" \
+  'a\\\"b' "$("$DC" --json-escape 'a\"b')"
+check "json-escape: an ordinary span is untouched" \
+  "crates/core/src/lib.rs:1-10" "$("$DC" --json-escape 'crates/core/src/lib.rs:1-10')"
 # 13b. A test file in a NESTED tests/ subdirectory is test code (so it stays out of the
 #      denominator) but is NOT an auto-discovered cargo test target — `crates/x/tests/d/h.rs`
 #      is a module of some other target, and `--test h` asks cargo for something that does not
