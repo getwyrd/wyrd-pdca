@@ -396,6 +396,32 @@ check "knob: the fallback is announced, not silent" \
   "warned" \
   "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>&1 >/dev/null | grep -q 'not a non-negative integer' && echo warned)"
 
+# 13d. A knob is range-checked on the DIGIT STRING, before arithmetic touches it. Bash's
+#      arithmetic is 64-bit and wraps SILENTLY — `$((18446744073709551616))` is 0 — so an
+#      out-of-range floor became a floor of 0 and `_verdict 0 10` returned PASS: a false green
+#      in an evidence gate, produced by a knob rather than by the patch (PR #223 review).
+check "knob: an out-of-range floor cannot wrap to zero and pass" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=18446744073709551616 "$DC" --verdict 0 10 2>/dev/null)"
+check "knob: the out-of-range fallback is announced" \
+  "warned" \
+  "$(WYRD_DIFFCOV_MIN=18446744073709551616 "$DC" --verdict 0 10 2>&1 >/dev/null | grep -q 'out of range' && echo warned)"
+check "knob: a floor above 100 is unsatisfiable, so it falls back" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=101 "$DC" --verdict 9 10 2>/dev/null)"
+check "knob: exactly 100 is a legitimate strict floor, not out of range" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=100 "$DC" --verdict 9 10 2>/dev/null)"
+
+# 13e. Paths reach diff-cov.json straight from the patch, and git quotes an odd filename in its
+#      own diff header, so a `"` or `\` in a path would emit an artifact no parser can read —
+#      and the artifact is the frozen record. One escape program is shared by the scalar fields
+#      and both array pipelines, so they cannot drift (PR #223 review).
+check "json-escape: a quote is escaped" \
+  'a\"b' "$("$DC" --json-escape 'a"b')"
+check "json-escape: a backslash is doubled" \
+  'a\\b' "$("$DC" --json-escape 'a\b')"
+check "json-escape: backslash first, so an escaped quote is not double-escaped" \
+  'a\\\"b' "$("$DC" --json-escape 'a\"b')"
+check "json-escape: an ordinary span is untouched" \
+  "crates/core/src/lib.rs:1-10" "$("$DC" --json-escape 'crates/core/src/lib.rs:1-10')"
 # 13b. A test file in a NESTED tests/ subdirectory is test code (so it stays out of the
 #      denominator) but is NOT an auto-discovered cargo test target — `crates/x/tests/d/h.rs`
 #      is a module of some other target, and `--test h` asks cargo for something that does not

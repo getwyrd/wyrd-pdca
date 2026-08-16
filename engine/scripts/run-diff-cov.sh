@@ -153,27 +153,47 @@ esac
 #     `set -u` turns into "unbound variable".
 # A misconfigured knob is an operator error and must not become a verdict about the patch, so
 # it warns and falls back rather than failing (PR #223 review).
-_uint() { # <value> <default> <var name> -> a plain decimal integer
-  local v="$1" d="$2" name="$3"
+_uint() { # <value> <default> <var name> <max> -> a plain decimal integer in 0..max
+  local v="$1" d="$2" name="$3" max="$4"
   case "$v" in
     '' | *[!0-9]*)
       echo "run-diff-cov.sh: \$$name='$v' is not a non-negative integer — using $d." >&2
       printf '%s' "$d"; return 0 ;;
   esac
   v="${v#"${v%%[!0]*}"}"          # strip leading zeros so `$(( ))` never reads it as octal
-  printf '%s' "${v:-0}"
+  v="${v:-0}"
+  # RANGE-CHECK, and check it on the DIGIT STRING before any arithmetic touches it. Bash's
+  # arithmetic is 64-bit and WRAPS silently: `$((18446744073709551616))` is 0, so a floor of
+  # 18446744073709551616 became a floor of 0 and `_verdict 0 10` returned PASS — a false green
+  # in an evidence gate, produced by a knob rather than by the patch (PR #223 review). Comparing
+  # lengths first keeps the guard itself out of the range it is guarding against.
+  if [ "${#v}" -gt "${#max}" ] || { [ "${#v}" -eq "${#max}" ] && [ "$v" \> "$max" ]; }; then
+    echo "run-diff-cov.sh: \$$name='$1' is out of range (0..$max) — using $d." >&2
+    printf '%s' "$d"; return 0
+  fi
+  printf '%s' "$v"
 }
+
+# Escape a string for embedding in a JSON string literal. Paths reach the artifact straight from
+# the patch, and git quotes an odd filename in its diff header (`+++ b/"a\"b.rs"`), so a `"` or
+# `\\` in a path would otherwise emit a diff-cov.json that no parser can read — and the artifact
+# is the frozen record (PR #223 review). Backslash first, or it would double-escape the quotes
+# it just inserted.
+# ONE spelling of the escape program: the scalar helper and both array pipelines share it, so
+# they cannot drift apart the way two copies of a subtle rule always do.
+_JSON_ESC='s/\\/\\\\/g; s/"/\\"/g'
+_json_escape() { printf '%s' "$1" | sed "$_JSON_ESC"; }
 
 # The share of instrumentable changed lines that must be executed. 80 rather than a strict 100
 # because a real patch carries error branches a single regression test does not walk, and a
 # threshold no honest bundle can meet would just train the human to skip the row.
-DIFFCOV_MIN="$(_uint "${WYRD_DIFFCOV_MIN:-80}" 80 WYRD_DIFFCOV_MIN)"
+DIFFCOV_MIN="$(_uint "${WYRD_DIFFCOV_MIN:-80}" 80 WYRD_DIFFCOV_MIN 100)"
 
 # How many unscored spans the run prints before summarising the rest (#222). All of them land in
 # coverage/diff-cov.json regardless; this only bounds what a human reads in the gate log, and 6
 # is enough to show the block that matters without burying the verdict under a 700-line patch's
 # interleaved doc comments.
-UNSCORED_SPANS_SHOWN="$(_uint "${WYRD_DIFFCOV_SPANS:-6}" 6 WYRD_DIFFCOV_SPANS)"
+UNSCORED_SPANS_SHOWN="$(_uint "${WYRD_DIFFCOV_SPANS:-6}" 6 WYRD_DIFFCOV_SPANS 999999)"
 
 # --- lane-scoped coverage worktree + branch (shared by the run and the test hook) ------
 # Mirrors run-verify.sh's _verify_dir/_verify_branch, including the deliberate asymmetry of
@@ -437,6 +457,14 @@ if [ "${1:-}" = "--score" ]; then
   exit 0
 fi
 
+# --json-escape <string>: the string as it is embedded in a JSON literal. No worktree, no
+# cargo — for engine/tests (PR #223 review).
+if [ "${1:-}" = "--json-escape" ]; then
+  _json_escape "${2-}"
+  echo
+  exit 0
+fi
+
 # --ranges: collapse `path:line` records on stdin into contiguous spans, largest first. No
 # worktree, no cargo — for engine/tests (#222).
 if [ "${1:-}" = "--ranges" ]; then
@@ -515,7 +543,7 @@ _json() { # <status> <reason> [covered] [instrumentable] [tests_ran] [base] [tes
     printf '{\n'
     printf '  "gate": "C4-diff-cov",\n'
     printf '  "status": "%s",\n' "$status"
-    printf '  "reason": "%s",\n' "$reason"
+    printf '  "reason": "%s",\n' "$(_json_escape "$reason")"
     printf '  "min_pct": %s,\n' "$DIFFCOV_MIN"
     printf '  "diff_cov_pct": %s,\n' "$(_pct "$c" "$n")"
     printf '  "covered": %s,\n' "$c"
@@ -526,18 +554,20 @@ _json() { # <status> <reason> [covered] [instrumentable] [tests_ran] [base] [tes
     # region left the measurement (see the NOTE the run prints).
     printf '  "unscored": %s,\n' "$(( ${CHANGED_TOTAL:-0} - n ))"
     printf '  "tests_ran": %s,\n' "$ran"
-    printf '  "base_ref": "%s",\n' "$base"
-    printf '  "test_args": "%s",\n' "$targs"
+    printf '  "base_ref": "%s",\n' "$(_json_escape "$base")"
+    printf '  "test_args": "%s",\n' "$(_json_escape "$targs")"
     printf '  "unscored_spans": ['
     if [ -s "${RANGES_FILE:-/dev/null}" ]; then
       printf '\n'
-      cut -f1 "$RANGES_FILE" | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
+      cut -f1 "$RANGES_FILE" | sed "$_JSON_ESC" \
+        | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
     fi
     printf '],\n'
     printf '  "missed": ['
     if [ -s "${MISS_FILE:-/dev/null}" ]; then
       printf '\n'
-      sed 's/^MISS //' "$MISS_FILE" | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
+      sed -e 's/^MISS //' -e "$_JSON_ESC" "$MISS_FILE" \
+        | awk '{ printf "%s    \"%s\"", (NR>1 ? ",\n" : ""), $0 } END { printf "\n  " }'
     fi
     printf ']\n'
     printf '}\n'
