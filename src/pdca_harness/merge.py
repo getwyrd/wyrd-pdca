@@ -68,6 +68,17 @@ which upstream neither reads nor documents as load-bearing; ``getwyrd/wyrd`` is
 host configuration: a PR found behind is brought up to date first, which empties its rollup
 and lets the *existing* wait-and-gate decide on checks for the tree it really merges into.
 
+Three things the PR #230 review corrected, each of which would have left the delta broken in
+a way its own tests did not see. The check **loops**: ``_await_rollup`` may wait up to
+``merge_wait_secs``, and a sibling landing during that wait leaves the head behind again with
+a green rollup for the pre-move tree — the original failure in a smaller window — so the base
+is re-read after every gate, bounded by :data:`_MAX_SYNC_ROUNDS`. The post-sync wait runs
+**even under** ``merge_requires = "required"``: that mode skips the rollup *gate*, but a sync
+invalidates the checks and ``gh pr merge`` refuses while required ones are pending, so
+skipping the wait would fail every wave at its second PR. And the compare **qualifies a fork
+head** as ``OWNER:BRANCH`` (as ``publish.py:301`` already does), since a bare name resolves
+against the base repo — where a fork's branch does not exist, so every merge would stop.
+
 Note this is not the same fix as turning on host strictness. ``strict: true`` alone would
 make ``gh pr merge`` refuse every wave member after the first, stopping the batch —
 upstream #462's shape, and the stop that ``auto_merge = true`` was turned back on to remove
@@ -270,6 +281,13 @@ def _await_rollup(pr_url: str, budget_secs: int, *,
 
 
 
+#: How many times :func:`_merge_one` will sync a PR onto a base that keeps moving before it
+#: gives up (PR #230 review). Not a retry budget — each round is a real sync plus a real gate,
+#: and a base that overtakes three of those is busy enough that a human should place the
+#: merge. Bounded because the loop is otherwise unbounded on a contended base.
+_MAX_SYNC_ROUNDS = 3
+
+
 def _behind_by(repo_spec: str, pr_url: str) -> int | None:
     """How many commits this PR's head is behind its base — ``None`` when that cannot be
     read, which the caller treats as fail-closed.
@@ -281,7 +299,8 @@ def _behind_by(repo_spec: str, pr_url: str) -> int | None:
     commit count is the same on either configuration.
     """
     view = subprocess.run(
-        ["gh", "pr", "view", str(pr_url), "--json", "baseRefName,headRefName"],
+        ["gh", "pr", "view", str(pr_url), "--json",
+         "baseRefName,headRefName,headRepositoryOwner"],
         capture_output=True, text=True)
     if view.returncode != 0:
         return None
@@ -290,6 +309,15 @@ def _behind_by(repo_spec: str, pr_url: str) -> int | None:
         base, head = refs["baseRefName"], refs["headRefName"]
     except (ValueError, KeyError, TypeError):
         return None
+    # A fork-based PR's head must be qualified OWNER:BRANCH, exactly as publish.py:301 does
+    # for `gh pr create --head`: a bare name resolves against the BASE repo, where the fork's
+    # branch does not exist. Unqualified, this compare would 404 (=> None => every merge
+    # stops) or, worse, silently compare a same-named base-repo branch — staleness measured
+    # against the wrong commit.
+    owner = (refs.get("headRepositoryOwner") or {})
+    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    if owner_login and owner_login != str(repo_spec).split("/")[0]:
+        head = f"{owner_login}:{head}"
     cmp_ = subprocess.run(
         ["gh", "api", f"repos/{repo_spec}/compare/{base}...{head}", "--jq", ".behind_by"],
         capture_output=True, text=True)
@@ -364,16 +392,25 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # below decides on checks that describe the tree this PR actually merges into.
     # Fail-closed on an unreadable behind-state, on the same principle the rollup gate uses:
     # absence of evidence is not green.
+    # LOOPS, deliberately. Checking once is not enough: `_await_rollup` below may wait for
+    # up to `merge_wait_secs` (1800 here), and a sibling landing on the base during that wait
+    # leaves the head behind again — with a green rollup for the pre-move tree, which
+    # non-strict protection will happily merge. That is the very failure this exists to
+    # prevent, in a smaller window (PR #230 review). So: re-read after every gate, and stop
+    # only when the base has not moved.
+    synced_and_gated = False
     if cfg.merge_sync_base and repo_spec:
-        behind = _behind_by(str(repo_spec), str(pr_url))
-        if behind is None:
-            print(f"\n!!! merge: {d.name} ({pr_url}) — could NOT determine whether the PR is "
-                  "behind its base, so whether its checks describe the tree it would merge "
-                  "into is unknown. STOP: later waves are NOT run; resolve at the PR, then "
-                  "re-run (or set [driver] merge_sync_base = false to merge without the "
-                  "check).\n", file=sys.stderr)
-            return 1
-        if behind:
+        for _round in range(_MAX_SYNC_ROUNDS):
+            behind = _behind_by(str(repo_spec), str(pr_url))
+            if behind is None:
+                print(f"\n!!! merge: {d.name} ({pr_url}) — could NOT determine whether the "
+                      "PR is behind its base, so whether its checks describe the tree it "
+                      "would merge into is unknown. STOP: later waves are NOT run; resolve "
+                      "at the PR, then re-run (or set [driver] merge_sync_base = false to "
+                      "merge without the check).\n", file=sys.stderr)
+                return 1
+            if not behind:
+                break
             print(f"   {behind} commit(s) behind base — syncing before the rollup gate")
             if not _sync_base(str(pr_url)):
                 print(f"\n!!! merge: {d.name} ({pr_url}) is {behind} commit(s) behind its "
@@ -382,6 +419,29 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                       "this PR is not merging into. STOP: later waves are NOT run; resolve "
                       "at the PR, then re-run.\n", file=sys.stderr)
                 return 1
+            # The sync invalidated whatever checks existed, so wait for the new head's —
+            # ALWAYS, including under `merge_requires = "required"`. That mode skips the
+            # rollup GATE below, but it cannot skip the wait: `gh pr merge` refuses while
+            # required checks are pending, so merging straight after a sync would fail every
+            # wave at its second PR (PR #230 review).
+            print(f"→ gh pr checks {pr_url}  (after sync)")
+            verdict, detail = _await_rollup(str(pr_url), cfg.merge_wait_secs)
+            if cfg.merge_requires != "required" and verdict != "green":
+                print(f"\n!!! merge: {d.name} ({pr_url}) was NOT merged — after syncing onto "
+                      f"its base the checks are {verdict} ({detail}). This is the combination "
+                      "check: each fix was green alone, and this is the first time they were "
+                      "verified together. STOP: later waves are NOT run.\n", file=sys.stderr)
+                return 1
+            if verdict == "green":
+                print(f"   post-sync rollup green ({detail})")
+            synced_and_gated = True
+        else:
+            print(f"\n!!! merge: {d.name} ({pr_url}) — the base moved under this PR "
+                  f"{_MAX_SYNC_ROUNDS} times running; each sync was overtaken before it could "
+                  "merge. Merging now would verify a tree it is not merging into. STOP: "
+                  "later waves are NOT run; merge by hand when the base is quiet, then "
+                  "re-run.\n", file=sys.stderr)
+            return 1
 
     # Full check-rollup gate (issue #413), read AFTER the ready-mark and immediately before
     # the merge: `gh pr ready` can itself trigger `ready_for_review` CI, so only a rollup
@@ -391,7 +451,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # `!= "required"` rather than `== "all"` so an unexpected value gates rather than
     # merging (Config.load already coerces one, but this module is the one that must not
     # merge past a red rollup).
-    if cfg.merge_requires != "required":
+    if cfg.merge_requires != "required" and not synced_and_gated:
         print(f"→ gh pr checks {pr_url}")
         verdict, detail = _await_rollup(str(pr_url), cfg.merge_wait_secs)
         if verdict != "green":
