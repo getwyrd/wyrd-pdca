@@ -10,14 +10,20 @@ cause. This module gives each interactive leaf a *checked* boundary:
   contract for ONE named id and report PASS/FAIL. Ids are REQUIRED — there is no scan
   mode (prototype finding, getwyrd/wyrd-pdca#166: a scan judges old bundles against a
   contract that postdates them; a named id only ever judges what this session worked).
-* :func:`stop_problems` — the ``Stop``-hook verdict (``.claude/hooks/handoff_guard.py``)
-  that makes the check non-optional: a session may not end with a missing or malformed
-  contract artifact unless it deliberately abandons (:func:`record_abandon`).
+* :func:`stop_problems` — the artifact verdict that makes the check non-optional: which
+  contract artifacts are missing or malformed, unless the session deliberately abandons
+  (:func:`record_abandon`). Read on disk, so it needs nothing from the live session.
+* :func:`_report_reap` — WHERE that verdict is enforced (issue #534): the driver, after
+  the leaf exits. The ``Stop`` hook (``.claude/hooks/handoff_guard.py``) also calls
+  :func:`stop_problems`, but only as a one-turn reminder — ``Stop`` fires at the end of
+  every assistant turn, so on an interactive leaf it cannot tell a question to the human
+  from a session ending, and its feedback goes to the model, not the human.
 * :func:`session` — the driver-side registration: env for the spawned leaf naming its
   role and a session-state scratch file (the act-log baseline where authorship must be
   distinguished, the abandon channel, the record of passed ``/handoff`` runs). The
   scratch file lives OUTSIDE the bundle: the gate's verdict is exit status + report,
-  never a bundle artifact (prototype finding — no ``handoff.json``).
+  never a bundle artifact (prototype finding — no ``handoff.json``). Its exit is the
+  reap above.
 
 Which contract applies is derived from the RENDER — the ``interactive = true`` leaves
 and their ``agent`` names in ``pdca.toml`` (:func:`contracts`) — not from a hardcoded
@@ -262,14 +268,32 @@ def record_pass(path: Path, ident: str) -> None:
 
 def record_abandon(path: Path, reason: str) -> None:
     """The deliberate-abandon escape hatch: a TYPED reason, recorded in the driver's
-    session channel (never the bundle). The Stop hook then allows the session to end,
-    and the driver reports the reason when it reaps the session."""
+    session channel (never the bundle). Both the Stop hook and the driver's reap then
+    treat the contract as settled, and the driver reports the reason."""
     _update_state(path, abandoned=reason.strip() or "(no reason given)")
+
+
+def record_reminded(path: Path) -> None:
+    """Cap the Stop hook's reminder at one per SESSION, not one per block (#534 review).
+
+    ``stop_hook_active`` bounds only the immediate model continuation of a block. After
+    the human replies, the next assistant turn arrives with a fresh envelope where the
+    flag is false again — so a multi-turn Plan or sign-off, held before its contract
+    artifact exists, would be blocked and re-reminded on EVERY turn. That is the same
+    closed loop the cap exists to prevent, and it would make the hook's own promise
+    ("this reminder will not repeat") false.
+
+    This marker lives in the driver's session channel, which outlives the turn, so the
+    reminder survives exactly once per spawned leaf. Best-effort, like every write here:
+    if it cannot be persisted the hook declines to block at all rather than risk the
+    loop — the driver's reap is the enforcement either way.
+    """
+    _update_state(path, reminded=True)
 
 
 @contextlib.contextmanager
 def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
-            require_artifact: bool = True):
+            require_artifact: bool = True, outcome: dict | None = None):
     """Driver-side registration for one interactive leaf session (issue #331 e).
 
     Yields the env to merge into the spawn: the role and a session-state scratch file
@@ -277,7 +301,17 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
     Captures the session-start act-log baseline for the act role. Yields ``{}`` — no
     contract — when the render does not mark the leaf interactive (criterion f), and on
     ANY setup failure (a checked exit contract must never break the leaf it checks).
+
+    ``outcome``, when a dict is passed, receives ``{"discharged": bool}`` at reap — for
+    the caller whose OWN side effect must not fire on an undischarged session (#534
+    review, P1). Most callers need nothing: their side effect is the artifact itself, so
+    a missing one already stops the state machine. Act is the exception —
+    ``mark_reviewed`` advances a global frontier that no artifact gates. It is ``True``
+    on every no-contract path (non-interactive leaf, setup failure, a broken check): a
+    contract that was never established must not withhold a caller's work.
     """
+    if outcome is not None:
+        outcome["discharged"] = True
     leaf = getattr(cfg, role, None)
     if not isinstance(leaf, LeafConfig) or not leaf.interactive:
         yield {}
@@ -310,15 +344,61 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
     try:
         yield env
     finally:
-        reason = str(_read_json(path).get("abandoned") or "").strip()
-        if reason:
-            print(f"handoff: the {role} session was deliberately abandoned — {reason}",
-                  file=sys.stderr)
+        try:
+            discharged = _report_reap(cfg, role, _read_json(path))
+        except Exception as exc:  # noqa: BLE001 — a broken check must not mask the leaf
+            print(f"handoff: contract check unavailable at reap ({exc}) — the {role} "
+                  "session's exit contract is unverified", file=sys.stderr)
+            discharged = True  # unverified is not "failed": never withhold on a crash
+        if outcome is not None:
+            outcome["discharged"] = discharged
         path.unlink(missing_ok=True)
 
 
+def _report_reap(cfg: Config, role: str, state: dict) -> bool:
+    """Report one interactive leaf's exit contract when the DRIVER reaps it (#534).
+
+    This is where enforcement lives. :func:`stop_problems` re-verifies artifacts on
+    disk and needs nothing from the live session, so the driver can check them here,
+    after the leaf exits — which is the only place the two events the Stop hook cannot
+    tell apart ("the human is being asked a question" / "the leaf is finishing") are
+    already distinct. The hook stays, capped, as an in-session reminder only.
+
+    Mostly reporting: for the artifact-backed roles an undischarged contract means the
+    artifact the state machine reads is missing or malformed, so the driver does not
+    advance on it anyway, and what this adds is that the human is TOLD, naming each item,
+    at the moment the session ends rather than at the next state read.
+
+    Returns True when the contract is SETTLED — discharged, or deliberately abandoned —
+    and False when the session ended undischarged. :func:`session` relays that through
+    its ``outcome`` argument, because one caller's side effect is NOT artifact-backed and
+    so is not self-gating: Act's ``mark_reviewed`` advances the review frontier and would
+    otherwise retire cycles a session never reviewed (#534 review, P1).
+
+    It deliberately does NOT claim "nothing was advanced" — that is the caller's fact to
+    report, not this function's to assert; the Act path says it for itself.
+    """
+    reason = str(state.get("abandoned") or "").strip()
+    if reason:
+        print(f"handoff: the {role} session was deliberately abandoned — {reason}",
+              file=sys.stderr)
+        return True
+    problems = stop_problems(cfg, role, state)
+    if not problems:
+        return True
+    print(f"handoff: the {role} session ended with its exit contract UNDISCHARGED:",
+          file=sys.stderr)
+    for p in problems:
+        print(f"  - {p}", file=sys.stderr)
+    print(f"handoff: re-run the {role} leaf, or record a deliberate abandon next time "
+          '(`python3 .claude/hooks/handoff_guard.py --abandon "<why>"`).',
+          file=sys.stderr)
+    return False
+
+
 # ----------------------------------------------------------------------------
-# The two verdicts: /handoff (ergonomics) and the Stop hook (enforcement).
+# The two verdicts: /handoff (ergonomics) and the artifact check (enforcement at the
+# driver's reap, a capped reminder in the Stop hook — #534).
 # ----------------------------------------------------------------------------
 def resolve_bundle(cfg: Config, ident: str) -> Path:
     """``issue_331`` / ``331`` → the bundle dir, matching ``cfg.bundle`` keying."""
@@ -369,7 +449,7 @@ def run_check(cfg: Config, ident: str, *, role: str | None = None,
 
 
 def stop_problems(cfg: Config, role: str, state: dict) -> list[str]:
-    """The Stop-hook verdict: why this session may NOT end yet (empty ⇒ it may).
+    """The artifact verdict: why this session's contract is not discharged (empty ⇒ it is).
 
     Re-verifies the ARTIFACTS for every bundle the driver registered at spawn — the
     contract is the artifacts, so a session that discharged them without ever typing

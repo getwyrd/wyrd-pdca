@@ -20,7 +20,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from pdca_harness import act, cli, signoff
+from pdca_harness import act, cli, handoff, signoff
 from pdca_harness.config import Config, LeafConfig
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
@@ -179,6 +179,62 @@ class MarkerFormat(unittest.TestCase):
         names = [d.name for d in act.unreviewed_bundles(self.cfg)]
         self.assertIn("issue_60", names)                # mid-session freeze not marked
         self.assertIn("issue_50", names)                # mid-session delta not re-hidden
+
+    def _command_act(self, cfg_invoke):
+        """Run one command-mode Act, with `cfg_invoke` standing in for the leaf session."""
+        from pdca_harness import leaves
+        from pdca_harness.config import LeafConfig
+        self.cfg.act = LeafConfig(mode="command", interactive=True, agent="act",
+                                  argv=["true"])
+        self.cfg.act_cadence = 1
+        self.cfg.templates_dir = self.cfg.root / "no-templates"
+        with mock.patch.object(leaves, "_invoke", side_effect=cfg_invoke), \
+                redirect_stderr(io.StringIO()) as err:
+            leaves.run_act(self.cfg, "2026-07-19")
+        return err.getvalue()
+
+    def test_undischarged_act_session_does_not_advance_the_frontier(self) -> None:
+        # #534 review P1: the capped Stop hook lets an undischarged session EXIT, and
+        # the reap only reported it — so `mark_reviewed` still ran and retired cycles
+        # nothing had reviewed. A frontier advance is irreversible in practice: those
+        # bundles never come back into Act's scope.
+        _freeze(self.cfg, "70")
+        _freeze(self.cfg, "80")
+
+        def never_wrote_the_entry(*_a, **_kw):
+            return None                      # the session ended having done nothing
+
+        err = self._command_act(never_wrote_the_entry)
+        names = [d.name for d in act.unreviewed_bundles(self.cfg)]
+        self.assertIn("issue_70", names)
+        self.assertIn("issue_80", names)
+        self.assertFalse(act.has_frontier(self.cfg))
+        self.assertIn("UNDISCHARGED", err)
+        self.assertIn("frontier is NOT advanced", err)
+
+    def test_discharged_act_session_still_advances_the_frontier(self) -> None:
+        # The other half: the gate must not withhold a review that DID happen.
+        _freeze(self.cfg, "90")
+
+        def wrote_and_verified(_leaf, _root, _prompt, cfg=None, env=None):
+            handoff.record_pass(Path(env[handoff.ENV_STATE]), "2026-07-19")
+
+        self._command_act(wrote_and_verified)
+        self.assertEqual([d.name for d in act.unreviewed_bundles(self.cfg)], [])
+        self.assertTrue(act.has_frontier(self.cfg))
+
+    def test_a_deliberate_abandon_is_settled_not_undischarged(self) -> None:
+        # `--abandon` is the recorded escape hatch, so it must not be punished as a
+        # failure — but it is still not a review, so the frontier stays put.
+        _freeze(self.cfg, "95")
+
+        def abandoned(_leaf, _root, _prompt, cfg=None, env=None):
+            handoff.record_abandon(Path(env[handoff.ENV_STATE]), "no maintainer time")
+
+        err = self._command_act(abandoned)
+        self.assertIn("deliberately abandoned", err)
+        self.assertNotIn("UNDISCHARGED", err)
+        self.assertTrue(act.has_frontier(self.cfg))
 
     def test_unmark_serializes_with_the_first_frontier_write(self) -> None:
         # #299 review round 9: with NO marker yet (the first-ever Act), unmark must

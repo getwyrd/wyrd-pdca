@@ -14,6 +14,6 @@ the report below.
 
 Relay the PASS/FAIL verdict above to the human verbatim. On FAIL, fix the listed items
 (write or repair the named contract artifact — never a stand-in), then run `/handoff $1`
-again before ending the session. The Stop hook enforces this same contract when the
-session ends; a deliberate abandonment is recorded with
-`python3 .claude/hooks/handoff_guard.py --abandon "<why>"`.
+again before ending the session. The driver re-checks this same contract when it reaps
+the session, and the Stop hook reminds you once in-session; a deliberate abandonment is
+recorded with `python3 .claude/hooks/handoff_guard.py --abandon "<why>"`.
