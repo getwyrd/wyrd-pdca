@@ -432,6 +432,19 @@ class Config:
     # default, and upstream's behaviour) does not wait at all. Waiting never weakens the
     # gate — a red or a timeout still refuses and STOPs. [driver].merge_wait_secs.
     merge_wait_secs: int = 0
+    # INSTANCE DELTA (eduralph/pdca-harness#531). In merge mode a wave's PRs are merged
+    # back to back, and nothing verifies the COMBINATION: each PR's rollup describes the
+    # base as it stood before its siblings landed. Whether that matters is decided entirely
+    # by the host's `required_status_checks.strict`, which the driver neither reads nor
+    # documents — and with strict:false GitHub does not re-run a PR's checks after a sibling
+    # merges, so the wave's second merge lands on a rollup for the pre-merge tree. Each fix
+    # was green alone; the combination was never verified. With this on, a PR found behind
+    # its base is brought up to date BEFORE the rollup gate, so the checks the gate reads
+    # describe the tree the PR actually merges into. It composes with `merge_wait_secs`
+    # rather than duplicating it: the sync makes the rollup empty for the new head, and
+    # `_await_rollup` already polls on empty. False reproduces upstream exactly.
+    # [driver].merge_sync_base.
+    merge_sync_base: bool = True
     # Optional integration re-gate (#wave-model): after each wave folds onto the
     # integration branch, run the repo-scoped gates over that tip before the next wave
     # builds on it, so a combination that is red though each fix was green alone STOPs the
@@ -857,6 +870,10 @@ class Config:
             print(f"config: [driver].merge_wait_secs {merge_wait_secs} exceeds the "
                   f"{_MERGE_WAIT_CAP_SECS}s cap — using the cap.", file=sys.stderr)
             merge_wait_secs = _MERGE_WAIT_CAP_SECS
+        # INSTANCE DELTA (eduralph/pdca-harness#531). Default ON: the failure it prevents is
+        # a silently-unverified combination landing on the real base, which is worse than the
+        # cost of a redundant no-op check per merge.
+        merge_sync_base = bool(driver_cfg.get("merge_sync_base", True))
         merge_requires = str(driver_cfg.get("merge_requires", "all")).strip().lower()
         if merge_requires not in ("all", "required"):
             print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
@@ -974,6 +991,7 @@ class Config:
             auto_merge=auto_merge,
             merge_requires=merge_requires,
             merge_wait_secs=merge_wait_secs,
+            merge_sync_base=merge_sync_base,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,
