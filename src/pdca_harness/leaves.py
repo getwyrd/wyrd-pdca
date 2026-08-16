@@ -3180,15 +3180,33 @@ def run_act(cfg: Config, date: str) -> None:
         covered = act_mod.frozen_bundles(cfg)
         snap_fps = {d.name: act_mod._fingerprint(d) for d in covered}
         started = time.time()
+        outcome: dict = {}
         if cfg.act.mode == "command":
             # Exit contract (#331): the driver supplies the session-start act-log
             # baseline (an end-of-session check structurally cannot take one), so
             # /handoff can distinguish the entry THIS session wrote from a prior one.
-            with handoff.session(cfg, "act") as henv:
+            with handoff.session(cfg, "act", outcome=outcome) as henv:
                 _invoke(cfg.act, cfg.root, _act_prompt(cfg, date, bundles=covered),
                         cfg=cfg, env=henv or None)
         else:
             _stub_act(cfg, date, bundles=covered)
+
+        # The frontier advance is IRREVERSIBLE in practice: a marked snapshot leaves
+        # Act's scope for good, so those cycles are never offered for review again.
+        # Withhold it when the session ended undischarged (#534 review, P1) — before
+        # this, the capped Stop hook let such a session exit and the frontier moved
+        # anyway, retiring cycles nothing had reviewed. `discharged` is True on every
+        # path where no contract was established (stub mode, a non-interactive render,
+        # a setup failure, a crashed check), so this only ever withholds on a real,
+        # observed failure. Note "no delta warranted" is NOT that case: the contract
+        # requires the dated act-log entry either way, so a genuine no-delta review
+        # discharges normally and still advances.
+        if not outcome.get("discharged", True):
+            print("leaves: the Act session ended with its exit contract undischarged — "
+                  "the review frontier is NOT advanced, so these cycles stay in scope "
+                  "for the next Act run. Re-run `pdca act log`, or record a deliberate "
+                  "abandon.", file=sys.stderr)
+            return
 
         # Advance the review frontier (issues #109/#299) whenever the Act beat
         # runs — even if a command-mode Act judged "no delta" and wrote no act-log

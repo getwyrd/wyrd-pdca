@@ -15,15 +15,18 @@ asked a question" from "the leaf is finishing" — and because a block's stderr 
 the model rather than the human, repeating the block is a closed loop that only the
 human's answer could break. Enforcement therefore lives where the two events are
 already distinct: ``pdca_harness.handoff._report_reap``, run by the driver after the
-leaf exits, off the same on-disk artifacts. This hook blocks at most ONE turn.
+leaf exits, off the same on-disk artifacts. This hook blocks at most ONE turn per
+SESSION — bounded by a ``reminded`` marker persisted in the driver's session channel,
+not by the envelope's ``stop_hook_active`` alone, which resets on every human reply.
 
 Protocols (mirroring ``builder_guard.py``, the mechanical-discipline peer):
 
 * **Stop hook** (Claude Code): the event arrives as JSON on stdin; exit 0 allows the
   stop, exit 2 blocks it (stderr is fed back to the model). Inert — exit 0 — outside a
   driver-spawned leaf session (no ``PDCA_HANDOFF_ROLE`` in the environment), so an
-  ad-hoc human session in the instance is never blocked, and inert again once the
-  envelope's ``stop_hook_active`` marks this stop as a continuation of a prior block.
+  ad-hoc human session in the instance is never blocked; inert again once the envelope's
+  ``stop_hook_active`` marks this stop as a continuation of a prior block, and inert for
+  the rest of the session once the ``reminded`` marker is recorded.
 * **``--check <id>``** (vendor-neutral CLI, used by the rendered ``/handoff`` command):
   verify the current leaf's contract for ONE required id; PASS ⇒ 0, FAIL ⇒ 1. There is
   no scan mode. The verdict is exit status + report — nothing is written to the bundle.
@@ -83,12 +86,30 @@ def _stop_verdict() -> int:
         return 0
     try:
         handoff, cfg = _bootstrap()
-        problems = handoff.stop_problems(cfg, role, handoff.load_state())
+        state = handoff.load_state()
+        # `stop_hook_active` caps only the block's IMMEDIATE continuation: once the human
+        # replies, the next assistant turn brings a fresh envelope with the flag false, so
+        # a multi-turn Plan or sign-off held before its artifact exists would be blocked
+        # again on every turn — the loop this cap exists to prevent, and it would make the
+        # "will not repeat" promise below a lie. The marker persists in the driver's
+        # session channel, which outlives the turn (#534 review, P2).
+        if state.get("reminded"):
+            return 0
+        problems = handoff.stop_problems(cfg, role, state)
     except Exception as exc:  # noqa: BLE001 — a broken check must not trap the session
         print(f"handoff_guard: contract check unavailable ({exc}) — allowing the stop",
               file=sys.stderr)
         return 0
     if not problems:
+        return 0
+    # Persist BEFORE blocking, and only block if it stuck: an unrecordable marker means
+    # the next turn cannot know this fired, and blocking on that would be the unbounded
+    # loop again. The driver's reap enforces regardless, so declining costs nothing.
+    raw = (os.environ.get(handoff.ENV_STATE) or "").strip()
+    if not raw:
+        return 0
+    handoff.record_reminded(Path(raw))
+    if not handoff.load_state().get("reminded"):
         return 0
     print(
         f"Reminder (once — the next stop is allowed either way): this {role} leaf's "

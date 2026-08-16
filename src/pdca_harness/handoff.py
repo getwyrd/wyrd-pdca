@@ -273,9 +273,27 @@ def record_abandon(path: Path, reason: str) -> None:
     _update_state(path, abandoned=reason.strip() or "(no reason given)")
 
 
+def record_reminded(path: Path) -> None:
+    """Cap the Stop hook's reminder at one per SESSION, not one per block (#534 review).
+
+    ``stop_hook_active`` bounds only the immediate model continuation of a block. After
+    the human replies, the next assistant turn arrives with a fresh envelope where the
+    flag is false again — so a multi-turn Plan or sign-off, held before its contract
+    artifact exists, would be blocked and re-reminded on EVERY turn. That is the same
+    closed loop the cap exists to prevent, and it would make the hook's own promise
+    ("this reminder will not repeat") false.
+
+    This marker lives in the driver's session channel, which outlives the turn, so the
+    reminder survives exactly once per spawned leaf. Best-effort, like every write here:
+    if it cannot be persisted the hook declines to block at all rather than risk the
+    loop — the driver's reap is the enforcement either way.
+    """
+    _update_state(path, reminded=True)
+
+
 @contextlib.contextmanager
 def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
-            require_artifact: bool = True):
+            require_artifact: bool = True, outcome: dict | None = None):
     """Driver-side registration for one interactive leaf session (issue #331 e).
 
     Yields the env to merge into the spawn: the role and a session-state scratch file
@@ -283,7 +301,17 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
     Captures the session-start act-log baseline for the act role. Yields ``{}`` — no
     contract — when the render does not mark the leaf interactive (criterion f), and on
     ANY setup failure (a checked exit contract must never break the leaf it checks).
+
+    ``outcome``, when a dict is passed, receives ``{"discharged": bool}`` at reap — for
+    the caller whose OWN side effect must not fire on an undischarged session (#534
+    review, P1). Most callers need nothing: their side effect is the artifact itself, so
+    a missing one already stops the state machine. Act is the exception —
+    ``mark_reviewed`` advances a global frontier that no artifact gates. It is ``True``
+    on every no-contract path (non-interactive leaf, setup failure, a broken check): a
+    contract that was never established must not withhold a caller's work.
     """
+    if outcome is not None:
+        outcome["discharged"] = True
     leaf = getattr(cfg, role, None)
     if not isinstance(leaf, LeafConfig) or not leaf.interactive:
         yield {}
@@ -317,14 +345,17 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
         yield env
     finally:
         try:
-            _report_reap(cfg, role, _read_json(path))
+            discharged = _report_reap(cfg, role, _read_json(path))
         except Exception as exc:  # noqa: BLE001 — a broken check must not mask the leaf
             print(f"handoff: contract check unavailable at reap ({exc}) — the {role} "
                   "session's exit contract is unverified", file=sys.stderr)
+            discharged = True  # unverified is not "failed": never withhold on a crash
+        if outcome is not None:
+            outcome["discharged"] = discharged
         path.unlink(missing_ok=True)
 
 
-def _report_reap(cfg: Config, role: str, state: dict) -> None:
+def _report_reap(cfg: Config, role: str, state: dict) -> bool:
     """Report one interactive leaf's exit contract when the DRIVER reaps it (#534).
 
     This is where enforcement lives. :func:`stop_problems` re-verifies artifacts on
@@ -333,27 +364,36 @@ def _report_reap(cfg: Config, role: str, state: dict) -> None:
     tell apart ("the human is being asked a question" / "the leaf is finishing") are
     already distinct. The hook stays, capped, as an in-session reminder only.
 
-    Reporting, not a new control path: an undischarged contract means the artifact the
-    state machine reads is missing or malformed, so the driver does not advance on it
-    anyway. What this adds is that the human is TOLD, naming each item, at the moment
-    the session ends rather than at the next state read.
+    Mostly reporting: for the artifact-backed roles an undischarged contract means the
+    artifact the state machine reads is missing or malformed, so the driver does not
+    advance on it anyway, and what this adds is that the human is TOLD, naming each item,
+    at the moment the session ends rather than at the next state read.
+
+    Returns True when the contract is SETTLED — discharged, or deliberately abandoned —
+    and False when the session ended undischarged. :func:`session` relays that through
+    its ``outcome`` argument, because one caller's side effect is NOT artifact-backed and
+    so is not self-gating: Act's ``mark_reviewed`` advances the review frontier and would
+    otherwise retire cycles a session never reviewed (#534 review, P1).
+
+    It deliberately does NOT claim "nothing was advanced" — that is the caller's fact to
+    report, not this function's to assert; the Act path says it for itself.
     """
     reason = str(state.get("abandoned") or "").strip()
     if reason:
         print(f"handoff: the {role} session was deliberately abandoned — {reason}",
               file=sys.stderr)
-        return
+        return True
     problems = stop_problems(cfg, role, state)
     if not problems:
-        return
+        return True
     print(f"handoff: the {role} session ended with its exit contract UNDISCHARGED:",
           file=sys.stderr)
     for p in problems:
         print(f"  - {p}", file=sys.stderr)
-    print(f"handoff: nothing was advanced on it — re-run the {role} leaf, or record a "
-          "deliberate abandon next time "
+    print(f"handoff: re-run the {role} leaf, or record a deliberate abandon next time "
           '(`python3 .claude/hooks/handoff_guard.py --abandon "<why>"`).',
           file=sys.stderr)
+    return False
 
 
 # ----------------------------------------------------------------------------

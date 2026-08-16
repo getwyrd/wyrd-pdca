@@ -485,6 +485,53 @@ class StopHookCap(Base):
                 mock.patch.object(sys, "stdin", io.StringIO("{}")):
             self.assertEqual(self.mod._stop_verdict(), 0)
 
+    def _verdict_on(self, state: Path, event: dict, *, role: str = "signoff") -> int:
+        """Like `_verdict`, but against a state file the CALLER owns across turns."""
+        env = {handoff.ENV_ROLE: role, handoff.ENV_STATE: str(state)}
+        with mock.patch.object(self.mod, "_bootstrap", lambda: (handoff, self.cfg)), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(event))), \
+                redirect_stderr(io.StringIO()):
+            return self.mod._stop_verdict()
+
+    def test_the_cap_survives_the_humans_reply(self) -> None:
+        # #534 review P2: `stop_hook_active` bounds only the block's IMMEDIATE model
+        # continuation. Once the human replies, the next assistant turn arrives with a
+        # fresh envelope (flag false) — so a multi-turn Plan or sign-off held before its
+        # artifact exists was blocked again on EVERY turn, and the block's own promise
+        # ("this reminder will not repeat") was false. The marker persists in the session
+        # state, so a second fresh-envelope turn is allowed.
+        state = self.tmp / "persist.json"
+        state.write_text(json.dumps(
+            {"role": "signoff", "bundles": [str(self.bundle())]}), encoding="utf-8")
+        self.assertEqual(self._verdict_on(state, {"stop_hook_active": False}), 2)
+        self.assertTrue(json.loads(state.read_text(encoding="utf-8"))["reminded"])
+        # The human answered; a brand-new turn ends, contract still undischarged.
+        self.assertEqual(self._verdict_on(state, {"stop_hook_active": False}), 0)
+        self.assertEqual(self._verdict_on(state, {"stop_hook_active": False}), 0)
+
+    def test_an_unrecordable_marker_declines_to_block(self) -> None:
+        # If the marker cannot be persisted, the next turn cannot know this fired —
+        # blocking anyway is the unbounded loop again. The driver's reap enforces
+        # regardless, so the hook declines. Here: no state file registered at all.
+        env = {handoff.ENV_ROLE: "signoff"}
+        with mock.patch.object(self.mod, "_bootstrap", lambda: (handoff, self.cfg)), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(self.mod._stop_verdict(), 0)
+
+    def test_a_discharged_contract_never_sets_the_marker(self) -> None:
+        # The cap must be spent only on a real block, or one legitimate question early
+        # in a session would burn it before the contract was ever at risk.
+        d = self.bundle()
+        (d / leaves.SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
+        state = self.tmp / "clean.json"
+        state.write_text(json.dumps(
+            {"role": "signoff", "bundles": [str(d)]}), encoding="utf-8")
+        self.assertEqual(self._verdict_on(state, {"stop_hook_active": False}), 0)
+        self.assertNotIn("reminded", json.loads(state.read_text(encoding="utf-8")))
+
 
 class StopVerdict(Base):
     def test_blocks_missing_decision_and_allows_after_discharge(self) -> None:
