@@ -297,6 +297,54 @@ check "--crate-measured: a workspace-relative SF counts" \
 check "--crate-measured: a missing report -> no, not an error" \
   "no" "$("$DC" --crate-measured crates/core "$TMP/definitely-absent.lcov")"
 
+# 11c. --unmapped-rs decides "cannot read this patch" from "nothing to score", and the two must
+#      not be confused: the first owes the human a §6 item, the second is a clean exit 0. An
+#      earlier cut asked `grep '^+++ b/.*\.rs$'` on the raw patch, which is far too broad — a
+#      TEST-ONLY patch (the commonest verify-first bundle shape) and a DELETION-ONLY Rust patch
+#      both name .rs files while legitimately scoring nothing, and both got a spurious
+#      UNVERIFIABLE that also reset the promotion streak (PR #221 review; both reproduced).
+cat > "$TMP/testonly.diff" <<'EOF'
+diff --git a/crates/core/tests/regression.rs b/crates/core/tests/regression.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/core/tests/regression.rs
+@@ -0,0 +1,2 @@
++#[test]
++fn t() {}
+EOF
+check "unmapped: a test-only patch is scorable-nothing, not unreadable" \
+  "" "$("$DC" --unmapped-rs "$TMP/testonly.diff")"
+
+cat > "$TMP/delonly.diff" <<'EOF'
+diff --git a/crates/core/src/dead.rs b/crates/core/src/dead.rs
+--- a/crates/core/src/dead.rs
++++ b/crates/core/src/dead.rs
+@@ -1,3 +1,1 @@
+ fn keep() {}
+-fn gone() {}
+-fn also_gone() {}
+EOF
+check "unmapped: a deletion-only Rust patch is scorable-nothing, not unreadable" \
+  "" "$("$DC" --unmapped-rs "$TMP/delonly.diff")"
+
+check "unmapped: ordinary production Rust under a crate maps fine" \
+  "" "$("$DC" --unmapped-rs "$TMP/modified.diff")"
+
+# The case that MUST be caught: production Rust outside the layout `_crate_dir` knows. No
+# workspace member sits outside `crates/*` / `xtask` today — which is exactly why this is
+# pinned, since the first one added elsewhere would otherwise score as a clean patch.
+cat > "$TMP/offlayout.diff" <<'EOF'
+diff --git a/libs/helper/src/lib.rs b/libs/helper/src/lib.rs
+--- a/libs/helper/src/lib.rs
++++ b/libs/helper/src/lib.rs
+@@ -1 +1,2 @@
+ fn a() {}
++fn b() {}
+EOF
+check "unmapped: production Rust outside crates/* is named, not silently dropped" \
+  "libs/helper/src/lib.rs" \
+  "$("$DC" --unmapped-rs "$TMP/offlayout.diff")"
+
 # ---------------------------------------------------------------------------------------
 # --verdict: the truth table.
 # ---------------------------------------------------------------------------------------
@@ -398,14 +446,22 @@ check "act-line: two DIFFERENT scores for one crate normalize to the same first 
 # matched prefix is a VARYING quantity — the counts and the percentage.
 check "act-line: no varying quantity appears in the first 8 words" \
   "clean" \
-  "$(_first8 "$_line_a" | grep -qE '(^| )(28|40|30\.0)($| )' && echo "a count leaked into the key" || echo clean)"
+  "$(_first8 "$_line_a" | grep -qE '(^| )(28|40|70\.0)($| )' && echo "a count leaked into the key" || echo clean)"
 check "act-line: a different crate is a DIFFERENT signal" \
   "differs" \
   "$([ "$(_first8 "$_line_a")" != "$(_first8 "$("$DC" --act-line wyrd-chunkstore 12 40)")" ] && echo differs)"
 # The numbers still have to be there — the line is the human's evidence at sign-off, not just
 # a matcher key. 40 instrumentable with 12 covered is 28 lines never executed.
-check "act-line: still carries the counts and the percentage" \
-  "C4-diff-cov: uncovered changed lines in crate wyrd-core — 28 of 40 not executed by the shipped test (30.0%)" \
+#
+# And the percentage must be the UNCOVERED share. Quoting the covered share beside "not
+# executed" was a flat self-contradiction — this case previously pinned "28 of 40 not executed
+# … (30.0%)" when 70% was not executed — and a frozen signal that understates the gap misleads
+# exactly the sign-off and recurrence triage that read it (PR #221 review).
+check "act-line: carries the counts, and the percentage is the UNCOVERED share" \
+  "C4-diff-cov: uncovered changed lines in crate wyrd-core — 28 of 40 not executed by the patch tests (70.0% uncovered)" \
   "$_line_a"
+check "act-line: a nearly-covered crate reports a small uncovered share, not a large one" \
+  "C4-diff-cov: uncovered changed lines in crate wyrd-core — 2 of 33 not executed by the patch tests (6.1% uncovered)" \
+  "$("$DC" --act-line wyrd-core 31 33)"
 
 [ "$fail" -eq 0 ] && { echo "test_run_diff_cov.sh: all passed"; exit 0; } || { echo "test_run_diff_cov.sh: FAILURES"; exit 1; }

@@ -203,6 +203,26 @@ _line_records() { # <patch> -> `path:line` for every + line, unfiltered
   ' "$1"
 }
 
+# Production .rs files the patch changes that map to NO crate dir — the one shape that means
+# "this gate cannot read the patch" rather than "this patch has nothing to score". Test files and
+# non-.rs files are excluded first, so a test-only or docs-only patch never appears here; a
+# deletion-only patch produces no records at all and likewise cannot. Reads the UNFILTERED
+# records on purpose: `_changed_lines` has already dropped exactly what we are looking for.
+_unmapped_production_rs() { # <patch> -> `<path>` per unmappable production Rust file
+  local rec path prev=""
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    path="${rec%:*}"
+    [ "$path" = "$prev" ] && continue
+    prev="$path"
+    case "$path" in *.rs) ;; *) continue ;; esac
+    [ "$("$RV" --is-test "$path")" = "no" ] || continue
+    [ -n "$("$RV" --crate-dir "$path")" ] && continue
+    printf '%s\n' "$path"
+  done < <(_line_records "$1")
+  return 0
+}
+
 # The scored subset: production Rust under a cargo package. The two predicates come from
 # run-verify.sh so there is one spelling of each; they are asked once per FILE, not per line.
 _changed_lines() { # <patch> -> `path:line` for every scored line
@@ -337,10 +357,16 @@ _pct() { # <covered> <instrumentable> -> the percentage, one decimal
 # and the harness is out of scope for this instance-side row. The line is printed into the
 # gate's own output (frozen at gate-logs/C4-diff-cov.log) for the human to lift at sign-off.
 # eduralph/pdca-harness#406 is the upstream issue that would carry the numbers instead.
+#
+# The percentage is the UNCOVERED share, because the sentence is about what did not execute.
+# Quoting the covered share beside "not executed" read as a flat contradiction — the pinned
+# 12-of-40 case said "28 of 40 not executed … (30.0%)" when 70% was not executed — and a frozen
+# signal that understates the gap is worse than none, since sign-off and recurrence triage both
+# read it as-is (PR #221 review).
 _act_line() { # <crate> <covered> <instrumentable> -> the normalized signal line
   local crate="$1" c="$2" n="$3"
-  printf 'C4-diff-cov: uncovered changed lines in crate %s — %s of %s not executed by the shipped test (%s%%)' \
-    "$crate" "$((n - c))" "$n" "$(_pct "$c" "$n")"
+  printf 'C4-diff-cov: uncovered changed lines in crate %s — %s of %s not executed by the patch tests (%s%% uncovered)' \
+    "$crate" "$((n - c))" "$n" "$(_pct "$((n - c))" "$n")"
 }
 
 # --changed-lines <patch>: the scored `path:line` set. Calls run-verify.sh's pure hooks only —
@@ -354,6 +380,14 @@ fi
 # cargo — for engine/tests.
 if [ "${1:-}" = "--score" ]; then
   _score "${2:?--score needs an lcov path}" "${3:?--score needs a changed-lines file}"
+  exit 0
+fi
+
+# --unmapped-rs <patch>: changed production .rs files that map to no cargo package — the one
+# shape that means "cannot read this patch" rather than "nothing to score". No worktree, no
+# cargo — for engine/tests (PR #221 review).
+if [ "${1:-}" = "--unmapped-rs" ]; then
+  _unmapped_production_rs "${2:?--unmapped-rs needs a patch path}"
   exit 0
 fi
 
@@ -450,19 +484,36 @@ CHANGED_TOTAL="$(wc -l < "$CHANGED" | tr -d ' ')"
 # not a missing measurement — and placed BEFORE ensure_cargo so a no-crate patch never needs a
 # toolchain, the same ordering run-verify.sh uses for its own docs-only exit.
 if [ "$CHANGED_TOTAL" -eq 0 ]; then
-  # "Scored nothing" has two causes and only one of them is a green. Cross-check against the raw
-  # patch: if it names a .rs file at all, the parser produced nothing from a patch that plainly
-  # touches Rust, and the honest answer is "could not measure", not "nothing to measure". Reached
-  # by any shape the walker cannot read — a combined/merge diff (`@@@`), or a Rust file under a
-  # path prefix `_crate_dir` does not know, which is every workspace member that is not
-  # `crates/*` or `xtask` (#197 review: today none, but the rule now has two consumers).
-  if grep -q '^+++ b/.*\.rs$' "$PATCH"; then
-    _json "unverifiable" "the patch touches Rust files but no changed line could be resolved"
-    echo "run-diff-cov.sh: UNVERIFIABLE — the patch names .rs files, but no changed line resolved to" >&2
-    echo "                 a scorable production line. The diff shape or the path layout is one this" >&2
-    echo "                 gate cannot read, so it measured nothing — which is not the same as" >&2
-    echo "                 having nothing to measure." >&2
-    echo "PDCA-UNVERIFIABLE: the patch touches Rust but no changed line could be resolved, so diff coverage was not measured" >&2
+  # "Scored nothing" has two causes and only one of them is a green, so the discriminator has to
+  # be precise about WHICH. An earlier cut cross-checked `grep '^+++ b/.*\.rs$'` on the raw patch
+  # — far too broad: a TEST-ONLY patch (the commonest verify-first bundle shape, shipping only a
+  # regression test) and a DELETION-ONLY Rust patch both name .rs files while legitimately having
+  # no production line to score, and both were answered with a spurious §6 item that also reset
+  # the promotion streak (PR #221 review; reproduced both shapes before this was written).
+  #
+  # What actually means "could not read" is narrower, and neither case touches it:
+  #   * a COMBINED/merge diff — `@@@ -1,3 -1,3 +1,4 @@@`, which the `/^@@ /` walker never matches,
+  #     so every line reads as out-of-body and the patch silently scores nothing;
+  #   * a production .rs file with changed lines that maps to NO crate dir — i.e. a workspace
+  #     member outside `crates/*` / `xtask`. None today, which is exactly why it must be caught
+  #     rather than assumed: `_crate_dir` now has two consumers and the first member added
+  #     elsewhere would otherwise land as a silent green.
+  if grep -q '^@@@ ' "$PATCH"; then
+    _json "unverifiable" "the patch is a combined/merge diff, which this walker cannot read"
+    echo "run-diff-cov.sh: UNVERIFIABLE — this is a combined (merge) diff; the hunk walker reads" >&2
+    echo "                 only ordinary unified diffs, so it resolved no changed line at all." >&2
+    echo "PDCA-UNVERIFIABLE: the patch is a combined/merge diff, so diff coverage was not measured" >&2
+    exit 77
+  fi
+  mapfile -t _unmapped < <(_unmapped_production_rs "$PATCH")
+  if [ "${#_unmapped[@]}" -gt 0 ] && [ -n "${_unmapped[0]:-}" ]; then
+    _json "unverifiable" "${#_unmapped[@]} changed production .rs file(s) map to no cargo package"
+    for f in "${_unmapped[@]}"; do echo "run-diff-cov.sh: UNMAPPED $f" >&2; done
+    echo "run-diff-cov.sh: UNVERIFIABLE — the file(s) above are changed production Rust outside the" >&2
+    echo "                 layout this gate knows (crates/*, xtask), so no package maps to them and" >&2
+    echo "                 nothing could be measured. Teach run-verify.sh's --crate-dir the new" >&2
+    echo "                 layout rather than reading this as a clean patch." >&2
+    echo "PDCA-UNVERIFIABLE: changed production Rust maps to no cargo package, so diff coverage was not measured" >&2
     exit 77
   fi
   _json "n/a" "patch changes no production Rust line under a cargo package"
@@ -712,10 +763,33 @@ for spec in "${RUN_SPECS[@]}"; do
   TESTS_RAN=$((TESTS_RAN + _ran))
   # An `if`, not `[ … ] && echo … && echo …`: only the FIRST echo of such a chain is guarded,
   # so the rest print unconditionally — a shape that already shipped one wrong message here.
+  if [ "$_ran" -eq 0 ] && [ -n "$_tn" ]; then
+    # An EXPLICIT test target that executed nothing is the #104 shape, and it is missing
+    # evidence rather than a finding: the patch named this test as its discriminator and the
+    # test did not run. Cargo still instruments the package library, so the crate DOES appear
+    # in the report and the crate-level backstop is satisfied — the changed lines would then
+    # score as zero-hit MISSes and the row would report a coverage FAIL for a test that never
+    # executed. A false red in the direction that blames the patch (PR #221 review).
+    # `_spec_env` closes the known cause (a bare `#![cfg(NAME)]` crate root) but cannot close
+    # `#![cfg(feature = "…")]`, which `_crate_cfgs` does not match by design.
+    _json "unverifiable" "the ${_args[*]} target executed 0 tests" 0 0 "$TESTS_RAN" \
+          "$BASE_REF" "${TEST_ARGS[*]}"
+    echo "run-diff-cov.sh: UNVERIFIABLE — \`${_args[*]}\` is the test this patch ships, and it" >&2
+    echo "                 executed 0 tests, so it measured nothing. Scoring on would report its" >&2
+    echo "                 crate's changed lines as uncovered — a failure attributed to the patch" >&2
+    echo "                 for a test that never ran. The target is compiled out: a cfg the gate" >&2
+    echo "                 does not set (#104, incl. \`#![cfg(feature = \"…\")]\`), a feature it does" >&2
+    echo "                 not enable, every test #[ignore]d, or a filter matching nothing." >&2
+    echo "PDCA-UNVERIFIABLE: the ${_args[*]} target executed 0 tests, so diff coverage was not measured" >&2
+    exit 77
+  fi
   if [ "$_ran" -eq 0 ]; then
-    echo "run-diff-cov.sh: NOTE — \`${_args[*]}\` executed 0 tests; its changed lines can only score" >&2
-    echo "                 as uncovered. If that crate HAS tests, they did not build or were" >&2
-    echo "                 filtered out — check the output above before reading the misses." >&2
+    # A WHOLE-SUITE spec is the opposite case and must not escalate: the crate simply has no
+    # tests, it is still built and instrumented, and "nothing executes these changed lines" is a
+    # true and useful finding — refusing to give it would let a test-less crate escape the row.
+    echo "run-diff-cov.sh: NOTE — \`${_args[*]}\` executed 0 tests; that crate ships none, so its" >&2
+    echo "                 changed lines can only score as uncovered. That is a finding, not a" >&2
+    echo "                 measurement failure — the crate is still built and instrumented." >&2
   fi
 done
 ( cd "$COV" && cargo llvm-cov report --lcov --output-path "$LCOV" </dev/null ) >/dev/null 2>&1 \
@@ -775,20 +849,33 @@ COVERED="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $2; exit}')"
 INSTR="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $3; exit}')"
 PCT="$(_pct "$COVERED" "$INSTR")"
 UNSCORED=$((CHANGED_TOTAL - INSTR))
-# The crate the recurring-signal line should name is the one the MISSES are IN, not whichever
-# package happened to sort first. PKGS is filled test-owning-crates-first, so `${PKGS[0]}` filed
-# a telemetry-only miss under wyrd-core — and since act._norm keys on exactly `… in crate <pkg>
-# —`, that pools the signal under the innocent crate. Silently, which is why the shape is pinned
-# by a test. Falls back to the first package only when there is nothing missed to point at.
-# NB the defaults have no apostrophe on purpose: inside ${var:-word} bash still processes quotes,
-# so a `'` there opens a string that never closes and the whole script fails to parse.
-CRATE_LABEL="${PKGS[0]:-unknown}"
-if [ -s "$MISS_FILE" ]; then
-  _mc="$("$RV" --crate-dir "$(sed -n '1s/^MISS //p;1s/:[0-9]*$//p' "$MISS_FILE" | head -1)")"
-  [ -n "$_mc" ] && CRATE_LABEL="$(_pkg_name "$_mc")"
-  [ -n "$CRATE_LABEL" ] || CRATE_LABEL="${PKGS[0]:-unknown}"
-fi
 VERDICT="$(_verdict "$COVERED" "$INSTR" "$DIFFCOV_MIN")"
+
+# One recurring-signal line PER CRATE that has misses, each carrying that crate's OWN counts.
+# Two defects forced this. Naming `${PKGS[0]}` filed a telemetry-only miss under wyrd-core, and
+# `act._norm` keys on exactly `… in crate <pkg> —`, so the signal pooled under the innocent
+# package. Naming the first MISSED crate fixed the attribution but not the arithmetic: COVERED
+# and INSTR are totals across the whole report, so a patch missing lines in two crates still
+# reported one crate's name against both crates' numbers, overstating that crate's gap and
+# hiding the other's entirely (PR #221 review). Per-crate counts come from re-scoring this
+# crate's own changed lines — `_score` is already the tested intersection, so this reuses it
+# rather than re-deriving the arithmetic.
+_emit_act_lines() {
+  local crate_dir pkg lines c n
+  [ -s "$MISS_FILE" ] || return 0
+  while IFS= read -r crate_dir; do
+    [ -n "$crate_dir" ] || continue
+    pkg="$(_pkg_name "$crate_dir")"; [ -n "$pkg" ] || pkg="$crate_dir"
+    lines="$TMPD/lines-$(printf '%s' "$crate_dir" | tr '/' '_')"
+    grep "^$crate_dir/" "$CHANGED" > "$lines" 2>/dev/null || true
+    [ -s "$lines" ] || continue
+    read -r c n < <(_score "$LCOV" "$lines" | awk '/^TOTAL /{print $2, $3; exit}')
+    [ "${n:-0}" -gt 0 ] || continue
+    [ "$c" -lt "$n" ] || continue          # this crate is fully covered — no signal to file
+    echo "run-diff-cov.sh: $(_act_line "$pkg" "$c" "$n")" >&2
+  done < <(sed 's/^MISS //; s/:[0-9]*$//' "$MISS_FILE" \
+             | while IFS= read -r f; do "$RV" --crate-dir "$f"; done | sort -u)
+}
 
 if [ "$VERDICT" = "UNVERIFIABLE" ]; then
   _json "unverifiable" "no changed line carries an lcov DA: record" 0 0 "$TESTS_RAN" \
@@ -831,7 +918,7 @@ if [ "$UNSCORED" -gt 0 ]; then
 fi
 
 if [ "$VERDICT" = "FAIL" ]; then
-  echo "run-diff-cov.sh: $(_act_line "$CRATE_LABEL" "$COVERED" "$INSTR")" >&2
+  _emit_act_lines
   echo "run-diff-cov.sh: FAIL — the patch's tests execute $PCT% of its instrumentable changed" >&2
   echo "                 lines, below the ${DIFFCOV_MIN}% floor. Each MISS above is a REACH gap: the" >&2
   echo "                 line never ran. (A line that DID run may still be unasserted — that is" >&2
