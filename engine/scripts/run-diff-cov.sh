@@ -143,16 +143,37 @@ case "${1:-}" in
   -h | --help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
 esac
 
+# Normalize an operator-supplied integer knob before it ever reaches `$(( ))`. Two traps, and
+# both end the run mid-verdict under `set -e`:
+#   * a zero-padded value (`08`) is DECIMAL to `[ … -gt … ]` but OCTAL to arithmetic expansion,
+#     which aborts with "value too great for base". The abort lands AFTER `_json` has written
+#     the artifact, so the bundle keeps a diff-cov.json claiming pass/fail while the gate exits
+#     non-zero and `gates.py` — which reads the exit code alone — files the opposite verdict;
+#   * a non-numeric value is a bare word in arithmetic context, i.e. a variable name, which
+#     `set -u` turns into "unbound variable".
+# A misconfigured knob is an operator error and must not become a verdict about the patch, so
+# it warns and falls back rather than failing (PR #223 review).
+_uint() { # <value> <default> <var name> -> a plain decimal integer
+  local v="$1" d="$2" name="$3"
+  case "$v" in
+    '' | *[!0-9]*)
+      echo "run-diff-cov.sh: \$$name='$v' is not a non-negative integer — using $d." >&2
+      printf '%s' "$d"; return 0 ;;
+  esac
+  v="${v#"${v%%[!0]*}"}"          # strip leading zeros so `$(( ))` never reads it as octal
+  printf '%s' "${v:-0}"
+}
+
 # The share of instrumentable changed lines that must be executed. 80 rather than a strict 100
 # because a real patch carries error branches a single regression test does not walk, and a
 # threshold no honest bundle can meet would just train the human to skip the row.
-DIFFCOV_MIN="${WYRD_DIFFCOV_MIN:-80}"
+DIFFCOV_MIN="$(_uint "${WYRD_DIFFCOV_MIN:-80}" 80 WYRD_DIFFCOV_MIN)"
 
 # How many unscored spans the run prints before summarising the rest (#222). All of them land in
 # coverage/diff-cov.json regardless; this only bounds what a human reads in the gate log, and 6
 # is enough to show the block that matters without burying the verdict under a 700-line patch's
 # interleaved doc comments.
-UNSCORED_SPANS_SHOWN="${WYRD_DIFFCOV_SPANS:-6}"
+UNSCORED_SPANS_SHOWN="$(_uint "${WYRD_DIFFCOV_SPANS:-6}" 6 WYRD_DIFFCOV_SPANS)"
 
 # --- lane-scoped coverage worktree + branch (shared by the run and the test hook) ------
 # Mirrors run-verify.sh's _verify_dir/_verify_branch, including the deliberate asymmetry of
@@ -925,24 +946,6 @@ _emit_act_lines() {
              | while IFS= read -r f; do "$RV" --crate-dir "$f"; done | sort -u)
 }
 
-if [ "$VERDICT" = "UNVERIFIABLE" ]; then
-  _json "unverifiable" "no changed line carries an lcov DA: record" 0 0 "$TESTS_RAN" \
-        "$BASE_REF" "${TEST_ARGS[*]}"
-  echo "run-diff-cov.sh: UNVERIFIABLE — none of the $CHANGED_TOTAL changed production lines carry" >&2
-  echo "                 a coverage record, so the instrumentation never reached those files. That" >&2
-  echo "                 is a broken measurement, not 0% coverage." >&2
-  echo "PDCA-UNVERIFIABLE: no changed line carries an lcov record, so diff coverage was not measured" >&2
-  exit 77
-fi
-
-sed 's/^MISS /run-diff-cov.sh: MISS /' "$MISS_FILE" >&2
-_json "$( [ "$VERDICT" = PASS ] && echo pass || echo fail )" \
-      "$VERDICT at min ${DIFFCOV_MIN}%" "$COVERED" "$INSTR" "$TESTS_RAN" "$BASE_REF" "${TEST_ARGS[*]}"
-
-# Forward-compat with eduralph/pdca-harness#406 (gate metrics into the Act index). Nothing
-# consumes it yet; it is frozen in gate-logs/C4-diff-cov.log so the trend is reconstructable.
-echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR unscored=$UNSCORED" >&2
-
 # THE DENOMINATOR IS NOT THE PATCH. Say so on every run, in the numbers, because the difference
 # is where this gate's last blind spot lives and the percentage alone hides it: a changed line
 # that carries no coverage region is EITHER non-executable (a comment, a `use`, a bare `}` — the
@@ -956,6 +959,12 @@ echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR unscored=$UNSC
 # added `#[cfg(` attribute: false on both sides, since lines added INSIDE an existing gated
 # block carry no attribute of their own). So the gate does not guess — it reports the gap and
 # leaves the judgement to the human reading §6, which is what an advisory row is for.
+#
+# Printed BEFORE the verdict branches, deliberately (PR #223 review). The worst case for this
+# blind spot is a patch lying ENTIRELY inside a disabled `#[cfg]` block: nothing is
+# instrumentable, the verdict is UNVERIFIABLE, and that branch exits 77 immediately. With the
+# spans printed after it, the very scenario this reporting exists for was the one scenario the
+# gate log did not show them in — the locations reached diff-cov.json and nothing else.
 if [ "$UNSCORED" -gt 0 ]; then
   echo "run-diff-cov.sh: NOTE — $INSTR of $CHANGED_TOTAL changed production lines carried a coverage" >&2
   echo "                 region; the other $UNSCORED are not scored either way. Most are simply not" >&2
@@ -975,6 +984,25 @@ if [ "$UNSCORED" -gt 0 ]; then
   [ "$_total_spans" -gt "$UNSCORED_SPANS_SHOWN" ] && \
     echo "run-diff-cov.sh:   … and $((_total_spans - UNSCORED_SPANS_SHOWN)) smaller span(s); all of them are in coverage/diff-cov.json" >&2
 fi
+
+if [ "$VERDICT" = "UNVERIFIABLE" ]; then
+  _json "unverifiable" "no changed line carries an lcov DA: record" 0 0 "$TESTS_RAN" \
+        "$BASE_REF" "${TEST_ARGS[*]}"
+  echo "run-diff-cov.sh: UNVERIFIABLE — none of the $CHANGED_TOTAL changed production lines carry" >&2
+  echo "                 a coverage record, so the instrumentation never reached those files. That" >&2
+  echo "                 is a broken measurement, not 0% coverage." >&2
+  echo "PDCA-UNVERIFIABLE: no changed line carries an lcov record, so diff coverage was not measured" >&2
+  exit 77
+fi
+
+sed 's/^MISS /run-diff-cov.sh: MISS /' "$MISS_FILE" >&2
+_json "$( [ "$VERDICT" = PASS ] && echo pass || echo fail )" \
+      "$VERDICT at min ${DIFFCOV_MIN}%" "$COVERED" "$INSTR" "$TESTS_RAN" "$BASE_REF" "${TEST_ARGS[*]}"
+
+# Forward-compat with eduralph/pdca-harness#406 (gate metrics into the Act index). Nothing
+# consumes it yet; it is frozen in gate-logs/C4-diff-cov.log so the trend is reconstructable.
+echo "METRIC diff_cov=$PCT covered=$COVERED instrumentable=$INSTR unscored=$UNSCORED" >&2
+
 
 if [ "$VERDICT" = "FAIL" ]; then
   _emit_act_lines

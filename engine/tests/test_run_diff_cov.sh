@@ -379,6 +379,23 @@ check "verdict: the default floor admits 80%" \
 check "verdict: \$WYRD_DIFFCOV_MIN overrides the default floor" \
   "PASS" "$(WYRD_DIFFCOV_MIN=50 "$DC" --verdict 60 100)"
 
+# 13c. An operator-supplied knob must never end the run mid-verdict. A ZERO-PADDED value is
+#      decimal to `[ … -ge … ]` but OCTAL to `$(( ))`, which aborts with "value too great for
+#      base" — and the abort lands AFTER `_json` has written the artifact, so the bundle keeps a
+#      diff-cov.json claiming one verdict while the non-zero exit files the opposite. A
+#      non-numeric value is a bare word in arithmetic context, which `set -u` turns into
+#      "unbound variable". Both are operator errors and must not become verdicts about the
+#      patch, so both warn and fall back (PR #223 review).
+check "knob: a zero-padded floor is read as decimal, not octal" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=08 "$DC" --verdict 9 10 2>/dev/null)"
+check "knob: 010 is ten, not eight" \
+  "FAIL" "$(WYRD_DIFFCOV_MIN=010 "$DC" --verdict 0 10 2>/dev/null)"
+check "knob: a non-numeric floor falls back to the default instead of aborting" \
+  "PASS" "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>/dev/null)"
+check "knob: the fallback is announced, not silent" \
+  "warned" \
+  "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>&1 >/dev/null | grep -q 'not a non-negative integer' && echo warned)"
+
 # 13b. A test file in a NESTED tests/ subdirectory is test code (so it stays out of the
 #      denominator) but is NOT an auto-discovered cargo test target — `crates/x/tests/d/h.rs`
 #      is a module of some other target, and `--test h` asks cargo for something that does not
