@@ -165,6 +165,12 @@ Gating policy: the whole-tree `cargo xtask ci` is the one **gating** check (`C4-
 finer per-tier rows below are the same checks `ci` already runs, listed for *auditability*;
 ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 
+Not every registered check fits this table. The **per-fix** C4 rows — `C4-verify` (red→green)
+and `C4-diff-cov` (diff coverage) — are engine-owned scripts under `engine/scripts/`, not
+`cargo xtask` delegations, because their subject is one bundle's `patch.diff` rather than the
+tree Wyrd's own gate audits. They are listed in §9 with the other repo-specific tooling, and
+declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`.
+
 | Tier | Written ruleset (normative source) | Home | Single-sourced command | Status |
 |---|---|---|---|---|
 | C4 correctness | the change + Wyrd's whole gate (wyrd#598 moved the **prose gates** — `typos` + docs lint/render, previously host-CI-only and the one gate class published PRs kept failing — into `cargo xtask ci`; **merged in wyrd PR#599 on 2026-07-18**, so `C4-ci` now inherits them — **conditionally closed**: the prose gates warn-and-skip when their tools (`typos-cli`, the pinned doc renderer) are absent on the PDCA host, so `C4-ci` closes the blind spot only where those tools are installed; otherwise it goes locally green and the host CI can still open the PR red on these (see §3)) | `cargo xtask` (`../wyrd/xtask/`) | `./engine/xtask.sh ci` (delegates `cargo xtask ci`) | [built — **gating**, scope=repo] |
@@ -277,6 +283,7 @@ ship them advisory (and commented in `pdca.toml`) so they don't double-run.
 |---|---|---|---|
 | **Gate runner (delegated)** | `engine/xtask.sh` → `$PDCA_WORKTREE` `cargo xtask` | `./engine/xtask.sh <ci\|conformance\|dst>` (cd's to the per-cycle worktree, execs `cargo xtask`) | [built — wholesale delegation; **Wyrd owns the gate defs**, ADR-0016] |
 | Per-fix verify | `engine/scripts/run-verify.sh` | `C4-verify` gate (red→green in a `../wyrd-verify` worktree) | [built — bundle-scoped, advisory] |
+| Per-fix diff coverage | `engine/scripts/run-diff-cov.sh` | `C4-diff-cov` gate (`cargo llvm-cov` over the patch's changed lines in a `../wyrd-cov` worktree; floor `$WYRD_DIFFCOV_MIN`, default 80) | [built — bundle-scoped, advisory, `promote_after = 3`] |
 | Gates (single-sourced) | `pdca.toml` `[gates] runner` + `checks` | `pdca gates [<id>] [--working-tree]` | [built — `C4-ci` gating; T1/T3 rows optional/advisory] |
 | Tracker read | `gh` CLI | `gh issue view <id>` (ad hoc; no scraper needed) | [host tool] |
 | Driver | `src/pdca_harness/` | `pdca run <id>` / `pdca flow <id>` | [built — stub leaves; wire `command` for real runs] |

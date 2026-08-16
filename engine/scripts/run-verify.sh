@@ -115,6 +115,8 @@
 #
 #   run-verify.sh --classify <patch>     # print the file classification + exit (test hook)
 #   run-verify.sh --print-isolation      # print the lane-scoped VERIFY dir + branch (test hook)
+#   run-verify.sh --is-test <path>       # yes/no: is that a discriminator test file (#197)
+#   run-verify.sh --crate-dir <path>     # the crate dir that file belongs to (#197)
 set -euo pipefail
 
 case "${1:-}" in
@@ -277,6 +279,24 @@ if [ "${1:-}" = "--classify" ]; then
     [ -n "${_seen[$c]:-}" ] && continue
     echo "CRATE $c"; _seen["$c"]=1
   done < <(_all_files "$cp")
+  exit 0
+fi
+
+# --is-test <path>: `yes` if that path is a discriminator test file, else `no`. --classify
+# answers this only for files the patch ADDS; a sibling gate scoring the diff has to ask it of
+# every changed file, added or modified. Published as a hook rather than copied, because two
+# spellings of "which files are tests" drifting apart is the failure #387 removed from the base
+# parse. No worktree, no cargo — for engine/tests and engine/scripts/run-diff-cov.sh (#197).
+if [ "${1:-}" = "--is-test" ]; then
+  if _is_test_file "${2:?--is-test needs a path}"; then echo "yes"; else echo "no"; fi
+  exit 0
+fi
+
+# --crate-dir <path>: the crate dir a file belongs to (empty for a root-level docs/CI file) —
+# the Wyrd layout rule `_crate_dir` encodes, published for the same single-spelling reason as
+# --is-test above. No worktree, no cargo — for engine/tests and run-diff-cov.sh (#197).
+if [ "${1:-}" = "--crate-dir" ]; then
+  _crate_dir "${2:?--crate-dir needs a path}"
   exit 0
 fi
 
