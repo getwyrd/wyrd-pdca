@@ -201,8 +201,8 @@ printf '%s\n' \
   'crates/core/src/lib.rs:5' \
   'crates/core/src/lib.rs:8' \
   'crates/core/src/lib.rs:10' > "$TMP/basic.lines"
-check "a changed line with no DA record leaves the denominator entirely" \
-  $'MISS crates/core/src/lib.rs:8\nTOTAL 3 4' \
+check "a changed line with no DA record leaves the denominator — and is named (#222)" \
+  $'UNSCORED crates/core/src/lib.rs:1\nMISS crates/core/src/lib.rs:8\nTOTAL 3 4' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/basic.lines")"
 
 # 10. The report's SF paths are ABSOLUTE (they point into whichever worktree built it) while
@@ -250,7 +250,7 @@ crates/other/src/lib.rs:1
 crates/other/src/lib.rs:2
 EOF
 check "a changed file absent from the report is named, not silently dropped" \
-  $'MISS crates/core/src/lib.rs:8\nNOFILE crates/other/src/lib.rs\nTOTAL 1 2' \
+  $'MISS crates/core/src/lib.rs:8\nUNSCORED crates/other/src/lib.rs:1\nUNSCORED crates/other/src/lib.rs:2\nNOFILE crates/other/src/lib.rs\nTOTAL 1 2' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/partial.lines")"
 
 # A file that IS in the report emits no NOFILE, even when none of its changed lines carry a
@@ -258,7 +258,7 @@ check "a changed file absent from the report is named, not silently dropped" \
 # and confusing it with the unmeasured shape would false-red nearly every patch adding a module.
 printf '%s\n' 'crates/core/src/lib.rs:1' > "$TMP/nolines.lines"
 check "a file present in the report never emits NOFILE, even scoring nothing" \
-  "TOTAL 0 0" \
+  $'UNSCORED crates/core/src/lib.rs:1\nTOTAL 0 0' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/nolines.lines")"
 
 # 11b. --crate-measured is what lets the caller READ a NOFILE line. A crate with records but

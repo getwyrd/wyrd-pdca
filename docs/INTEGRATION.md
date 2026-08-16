@@ -283,7 +283,7 @@ declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`
 |---|---|---|---|
 | **Gate runner (delegated)** | `engine/xtask.sh` → `$PDCA_WORKTREE` `cargo xtask` | `./engine/xtask.sh <ci\|conformance\|dst>` (cd's to the per-cycle worktree, execs `cargo xtask`) | [built — wholesale delegation; **Wyrd owns the gate defs**, ADR-0016] |
 | Per-fix verify | `engine/scripts/run-verify.sh` | `C4-verify` gate (red→green in a `../wyrd-verify` worktree) | [built — bundle-scoped, advisory] |
-| Per-fix diff coverage | `engine/scripts/run-diff-cov.sh` | `C4-diff-cov` gate (`cargo llvm-cov` over the patch's changed lines in a `../wyrd-cov` worktree; floor `$WYRD_DIFFCOV_MIN`, default 80) | [built — bundle-scoped, advisory, `promote_after = 3`] |
+| Per-fix diff coverage | `engine/scripts/run-diff-cov.sh` | `C4-diff-cov` gate (`cargo llvm-cov` over the patch's changed lines in a `../wyrd-cov` worktree; floor `$WYRD_DIFFCOV_MIN`, default 80) | [built — bundle-scoped, **permanently advisory**: no `promote_after`, because a `#[cfg]`-gated line is indistinguishable from a comment in lcov, so the row can read 100% green over a fraction of a patch (#222)] |
 | Gates (single-sourced) | `pdca.toml` `[gates] runner` + `checks` | `pdca gates [<id>] [--working-tree]` | [built — `C4-ci` gating; T1/T3 rows optional/advisory] |
 | Tracker read | `gh` CLI | `gh issue view <id>` (ad hoc; no scraper needed) | [host tool] |
 | Driver | `src/pdca_harness/` | `pdca run <id>` / `pdca flow <id>` | [built — stub leaves; wire `command` for real runs] |
