@@ -345,6 +345,47 @@ check "unmapped: production Rust outside crates/* is named, not silently dropped
   "libs/helper/src/lib.rs" \
   "$("$DC" --unmapped-rs "$TMP/offlayout.diff")"
 
+# 12b. --ranges: the span collapser. It shipped with NO tests (#222 adversarial review) — the
+#      most intricate new logic in that change, a two-stage sort around an awk state machine,
+#      and the only untested part. Both defects the review found lived exactly there, which is
+#      the argument for these cases rather than any individual case below.
+check "ranges: a single line is a one-line span" \
+  $'a.rs:5-5\t1' "$(printf 'a.rs:5\n' | "$DC" --ranges)"
+check "ranges: adjacent lines merge" \
+  $'a.rs:5-6\t2' "$(printf 'a.rs:5\na.rs:6\n' | "$DC" --ranges)"
+check "ranges: a gap of exactly one does NOT merge" \
+  $'a.rs:5-5\t1\na.rs:7-7\t1' "$(printf 'a.rs:5\na.rs:7\n' | "$DC" --ranges)"
+check "ranges: runs never merge across files, even when the numbers are contiguous" \
+  $'a.rs:5-5\t1\nb.rs:6-6\t1' "$(printf 'a.rs:5\nb.rs:6\n' | "$DC" --ranges)"
+check "ranges: unsorted input is grouped correctly" \
+  $'a.rs:1-3\t3' "$(printf 'a.rs:3\na.rs:1\na.rs:2\n' | "$DC" --ranges)"
+check "ranges: largest span first" \
+  $'a.rs:10-12\t3\na.rs:1-2\t2\na.rs:5-5\t1' \
+  "$(printf 'a.rs:1\na.rs:2\na.rs:5\na.rs:10\na.rs:11\na.rs:12\n' | "$DC" --ranges)"
+check "ranges: empty input is empty output, not an error" \
+  "" "$(printf '' | "$DC" --ranges)"
+
+# A REPEATED `path:line` used to break the run-detection state machine into overlapping spans
+# that double-counted the line — `5,5,6` became `5-6` AND `5-5`, reporting 2 distinct lines as
+# 3. `_score` de-dups before emitting, so the gate never fed it one; the hook is published for
+# tests and must hold on its own inputs.
+check "ranges: a duplicated line does not produce overlapping, double-counted spans" \
+  $'a.rs:5-6\t2' "$(printf 'a.rs:5\na.rs:5\na.rs:6\n' | "$DC" --ranges)"
+
+# `awk -F:` split on the FIRST colon, so a path CONTAINING one was read as path=`crates/a`,
+# line=`b/src/lib.rs` → 0, turning one 3-line span into three bogus `crates/a:0-0` spans. No
+# wyrd path holds a colon — but "unreachable today" is how this file's layout assumptions have
+# gone wrong twice already, and the split is now on the LAST colon.
+check "ranges: a path containing a colon still groups correctly" \
+  $'crates/a:b/src/lib.rs:5-7\t3' \
+  "$(printf 'crates/a:b/src/lib.rs:5\ncrates/a:b/src/lib.rs:6\ncrates/a:b/src/lib.rs:7\n' | "$DC" --ranges)"
+check "ranges: a path containing a space survives" \
+  $'crates/a b/src/lib.rs:1-2\t2' \
+  "$(printf 'crates/a b/src/lib.rs:1\ncrates/a b/src/lib.rs:2\n' | "$DC" --ranges)"
+check "ranges: a record with no line suffix is dropped, not mis-parsed" \
+  $'a.rs:1-1\t1' "$(printf 'a.rs:1\nnot-a-record\n' | "$DC" --ranges)"
+
+
 # ---------------------------------------------------------------------------------------
 # --verdict: the truth table.
 # ---------------------------------------------------------------------------------------
@@ -388,8 +429,12 @@ check "verdict: \$WYRD_DIFFCOV_MIN overrides the default floor" \
 #      patch, so both warn and fall back (PR #223 review).
 check "knob: a zero-padded floor is read as decimal, not octal" \
   "PASS" "$(WYRD_DIFFCOV_MIN=08 "$DC" --verdict 9 10 2>/dev/null)"
+# `--verdict 0 10` does NOT discriminate — 0 covered fails against 8 and against 10 alike, so
+# that case passed against the un-normalized code too and proved nothing (#222 adversarial
+# review). 9 of 100 is the input that separates them: 9% clears an octal floor of 8 and misses
+# a decimal floor of 10.
 check "knob: 010 is ten, not eight" \
-  "FAIL" "$(WYRD_DIFFCOV_MIN=010 "$DC" --verdict 0 10 2>/dev/null)"
+  "FAIL" "$(WYRD_DIFFCOV_MIN=010 "$DC" --verdict 9 100 2>/dev/null)"
 check "knob: a non-numeric floor falls back to the default instead of aborting" \
   "PASS" "$(WYRD_DIFFCOV_MIN=abc "$DC" --verdict 9 10 2>/dev/null)"
 check "knob: the fallback is announced, not silent" \
