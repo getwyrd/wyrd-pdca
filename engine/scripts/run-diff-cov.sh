@@ -30,9 +30,15 @@
 #     a blank. The compiler generated no coverage region there, so it is not a line a test
 #     could execute, and counting it would be a false red (the `false-red` class, same Act
 #     pass). Measured, not assumed: see engine/tests/test_run_diff_cov.sh case 6.
-#   * Measures under the SHIPPED TEST ALONE (the same `-p <pkg> --test <name>` C4-verify
-#     computes). A co-located test has no separate target, so the run degrades to `-p <pkg>`
-#     — the package's whole test suite — which is a weaker claim and is reported as such.
+#   * Measures under the patch's OWN test where there is one — the same `-p <pkg> --test <name>`
+#     C4-verify computes — PLUS `-p <pkg>` (the existing suite) for every other changed crate.
+#     Not only the test-owning crate: the denominator spans every changed crate, so a run that
+#     built one of them and dropped the rest reports part of a patch as though it were all of
+#     it. That was a real false green here — a two-crate patch scored 100% (5/5) while the
+#     second crate's uncovered new function was never compiled (#197 codex review) — and it is
+#     why a changed file whose package never entered the run is UNVERIFIABLE, not a silent
+#     omission. A co-located test has no separate target either, so its crate also degrades to
+#     `-p <pkg>`. Both degradations are a weaker claim and are reported as such.
 #   * Does NOT exclude a co-located `#[cfg(test)] mod tests` block. Its lines sit in a
 #     production FILE, so the file-level exclusion above cannot see them, and they are covered
 #     by definition (they are the code doing the covering) — so a patch shipping its test
@@ -44,7 +50,9 @@
 #
 # UNVERIFIABLE (exit 77 -> SUMMARY §6 NEEDS-HUMAN, non-gating): the gate could not MEASURE the
 # bundle. Not a verdict on the fix — the absence of one. `engine/README.md` states the rule the
-# whole engine follows: a gate never turns "no evidence" into a verdict. Five ways to get here:
+# whole engine follows: a gate never turns "no evidence" into a verdict. Six ways to get here:
+#   * a changed file's package never entered the run, so nothing about that file was measured
+#     and any percentage would describe only the part of the patch that was;
 #   * cargo-llvm-cov is not installed (see [[doctor.checks]] 'cargo-llvm-cov');
 #   * the toolchain has no llvm-tools component. Checked UP FRONT and deliberately: without
 #     it `cargo llvm-cov` PROMPTS on stdin ("I will run `rustup component add
@@ -194,7 +202,19 @@ _changed_lines() { # <patch> -> `path:line` for every scored line
 #   * A changed line with NO `DA:` record is NOT instrumentable and leaves the DENOMINATOR.
 #     Comments, `use` lines, blanks and bare delimiters have no coverage region; scoring them
 #     as uncovered would red a patch for lines no test could ever execute.
-_score() { # <lcov> <lines-file> -> `MISS path:line`... then `TOTAL <covered> <instrumentable>`
+#
+# A file the report never mentions AT ALL is a third case, and it is reported separately as
+# `NOFILE <path>` rather than folded into either count. It has two very different causes and
+# `_score` cannot tell them apart — only the caller, which knows which packages it measured,
+# can (see the UNMEASURED handling at the call site):
+#   * the file has no executable region anywhere (a `pub mod x;` re-export, a consts file).
+#     Measured: adding one `pub mod planted;` line to crates/core/src/lib.rs leaves lib.rs
+#     out of the report entirely. Benign — nothing to score.
+#   * the file's CRATE was never built or run, so nothing about it was measured. Silently
+#     dropping that is a false green: a two-crate patch whose test lives in crate A scored
+#     100% while crate B's uncovered function was never compiled (found by the #197 codex
+#     review; reproduced before this was written).
+_score() { # <lcov> <lines-file> -> `MISS path:line`… `NOFILE path`… `TOTAL <covered> <instr>`
   awk '
     FNR == NR {                                   # pass 1: the changed lines
       split($0, p, /:/); f = p[1]; l = p[2]
@@ -210,6 +230,7 @@ _score() { # <lcov> <lines-file> -> `MISS path:line`... then `TOTAL <covered> <i
         f = files[i]
         if (sf == f || index(sf, "/" f) == length(sf) - length(f)) { cur = f; break }
       }
+      if (cur != "") present[cur] = 1
       next
     }
     /^DA:/ {
@@ -233,9 +254,19 @@ _score() { # <lcov> <lines-file> -> `MISS path:line`... then `TOTAL <covered> <i
         n++
         if (k in hit) { c++ } else { split(k, s, /\t/); print "MISS " s[1] ":" s[2] }
       }
+      for (i = 1; i <= nf; i++) if (!(files[i] in present)) print "NOFILE " files[i]
       print "TOTAL " c " " n
     }
   ' "$2" "$1"
+}
+
+# Did the report measure ANY file of that crate? This is the discriminator the caller needs to
+# read a `NOFILE` line: a crate with records but not this file means the file has no executable
+# region (benign); a crate with no records at all means nothing about it ran, and any score
+# would describe only the part of the patch that did. Matched on a whole path component, like
+# the SF match above, so `crates/core` never answers for `vendor/notcore`.
+_crate_measured() { # <crate-dir> <lcov> -> yes | no
+  if grep -q -e "^SF:$1/" -e "^SF:.*/$1/" "$2" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
 }
 
 # --- the verdict, from the two counts -----------------------------------------------------
@@ -285,10 +316,18 @@ if [ "${1:-}" = "--changed-lines" ]; then
   exit 0
 fi
 
-# --score <lcov> <lines-file>: MISS lines + the TOTAL pair. No worktree, no cargo — for
-# engine/tests.
+# --score <lcov> <lines-file>: MISS lines, NOFILE lines, and the TOTAL pair. No worktree, no
+# cargo — for engine/tests.
 if [ "${1:-}" = "--score" ]; then
   _score "${2:?--score needs an lcov path}" "${3:?--score needs a changed-lines file}"
+  exit 0
+fi
+
+# --crate-measured <crate-dir> <lcov>: did the report measure any file of that crate? No
+# worktree, no cargo — for engine/tests (#197).
+if [ "${1:-}" = "--crate-measured" ]; then
+  _crate_measured "${2:?--crate-measured needs a crate dir}" "${3:?--crate-measured needs an lcov path}"
+  echo
   exit 0
 fi
 
@@ -469,25 +508,35 @@ while IFS= read -r line; do
   esac
 done < <("$RV" --classify "$PATCH")
 
+# One RUN SPEC per cargo invocation, as `<pkg>\t<test target>` (empty target = the package's
+# whole suite). Deliberately NOT one combined arg list: `--test <name>` filters test targets
+# across EVERY selected package, so `-p a --test t -p b` runs nothing at all for b and llvm-cov
+# reports not one line of it. That is precisely how the false green survived the first fix
+# attempt — the arg list looked right and measured one crate. cargo-llvm-cov's documented
+# multi-run form is used instead: `--no-report` per run, then one `report` to merge.
 declare -A SEEN_PKG=()
-TEST_ARGS=(); TEST_SRC_FILES=(); TEST_SRC_CRATES=(); PKGS=()
+RUN_SPECS=(); TEST_SRC_FILES=(); TEST_SRC_CRATES=(); PKGS=()
 for t in "${ADDED_TESTS[@]+"${ADDED_TESTS[@]}"}"; do
   c="$("$RV" --crate-dir "$t")"; [ -n "$c" ] || continue
   pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
-  TEST_ARGS+=("-p" "$pkg" "--test" "$(basename "$t" .rs)"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
+  RUN_SPECS+=("$pkg"$'\t'"$(basename "$t" .rs)"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
   TEST_SRC_FILES+=("$t")
 done
+# EVERY changed crate joins the run, not only the one that ships a test. The denominator spans
+# all of them, so the numerator has to as well — and a package that is never built produces no
+# coverage record, which `_score` would otherwise drop silently. That is a false green, and it
+# was real: a two-crate patch whose only added test lives in crate A reported 100% (5/5) while
+# crate B's brand-new uncovered function was never compiled (#197 codex review, reproduced).
+# A crate with no added test contributes `-p <pkg>` — its existing suite — which is the honest
+# answer to "does anything that ships today reach these lines".
 WHOLE_SUITE=0
-if [ "${#TEST_ARGS[@]}" -eq 0 ]; then
-  WHOLE_SUITE=1
-  for c in "${CRATES[@]+"${CRATES[@]}"}"; do
-    pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
-    [ -n "${SEEN_PKG[$pkg]:-}" ] && continue
-    TEST_ARGS+=("-p" "$pkg"); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
-    TEST_SRC_CRATES+=("$c")
-  done
-fi
-if [ "${#TEST_ARGS[@]}" -eq 0 ]; then
+for c in "${CRATES[@]+"${CRATES[@]}"}"; do
+  pkg="$(_pkg_name "$c")"; [ -n "$pkg" ] || continue
+  [ -n "${SEEN_PKG[$pkg]:-}" ] && continue
+  RUN_SPECS+=("$pkg"$'\t'); SEEN_PKG["$pkg"]=1; PKGS+=("$pkg")
+  TEST_SRC_CRATES+=("$c"); WHOLE_SUITE=1
+done
+if [ "${#RUN_SPECS[@]}" -eq 0 ]; then
   # Changed production lines exist but no test target maps to them — nothing to measure them
   # WITH. Not a 0% score: no test ran, so nothing was measured.
   _json "unverifiable" "no cargo test target maps to the patch's crates" 0 0 0 "$BASE_REF"
@@ -527,16 +576,33 @@ fi
 # `clean --workspace`, which would also drop the workspace's build artifacts every run.
 (cd "$COV" && cargo llvm-cov clean --profraw-only) </dev/null >/dev/null 2>&1 || true
 
-echo "run-diff-cov.sh: MEASURE — cargo llvm-cov test ${TEST_ARGS[*]} (fix applied)" >&2
-[ "$WHOLE_SUITE" = 1 ] && \
-  echo "                 (no separate test file in this patch — scoring against the package's whole" >&2
-  echo "                 suite, and any co-located #[cfg(test)] lines the patch adds count as" >&2
-  echo "                 covered, so this figure is the generous one; see the header's boundary)" >&2
+if [ "$WHOLE_SUITE" = 1 ]; then
+  echo "run-diff-cov.sh: at least one changed crate ships no test in this patch — it is scored" >&2
+  echo "                 against its EXISTING suite, and any co-located #[cfg(test)] lines the" >&2
+  echo "                 patch adds count as covered, so that part of the figure is the generous" >&2
+  echo "                 one; see the coverage boundary in this file's header." >&2
+fi
+
+# One invocation per spec, each `--no-report` so the profile data accumulates, then a single
+# `report` merges them. TEST_ARGS is kept only as the human-readable record of what ran.
 COV_RC=0
-COV_OUTPUT="$( ( cd "$COV" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" \
-    cargo llvm-cov test --lcov --output-path "$LCOV" "${TEST_ARGS[@]}" </dev/null ) 2>&1 )" || COV_RC=$?
-printf '%s\n' "$COV_OUTPUT" >&2
-printf '%s' "$COV_OUTPUT" > "$TMPD/cargo-out"
+TEST_ARGS=()
+: > "$TMPD/cargo-out"
+rm -f "$LCOV"
+for spec in "${RUN_SPECS[@]}"; do
+  _pkg="${spec%%$'\t'*}"; _tn="${spec#*$'\t'}"
+  _args=("-p" "$_pkg"); [ -n "$_tn" ] && _args+=("--test" "$_tn")
+  TEST_ARGS+=("${_args[@]}")
+  echo "run-diff-cov.sh: MEASURE — cargo llvm-cov test ${_args[*]} (fix applied)" >&2
+  _rc=0
+  _out="$( ( cd "$COV" && env "${TEST_ENV[@]+"${TEST_ENV[@]}"}" \
+      cargo llvm-cov test --no-report "${_args[@]}" </dev/null ) 2>&1 )" || _rc=$?
+  printf '%s\n' "$_out" >&2
+  printf '%s\n' "$_out" >> "$TMPD/cargo-out"
+  [ "$_rc" -ne 0 ] && COV_RC="$_rc"
+done
+( cd "$COV" && cargo llvm-cov report --lcov --output-path "$LCOV" </dev/null ) >/dev/null 2>&1 \
+  || echo "run-diff-cov.sh: the coverage report step failed; see the verdict below." >&2
 TESTS_RAN="$("$RV" --tests-ran "$TMPD/cargo-out")"
 
 # Judge by BOTH facts, exactly as C4-verify's legs do: the runner's status AND how many tests
@@ -563,6 +629,39 @@ fi
 # --- score ---------------------------------------------------------------------------------
 SCORED="$(_score "$LCOV" "$CHANGED")"
 printf '%s\n' "$SCORED" | grep '^MISS ' > "$MISS_FILE" || true
+
+# A changed file the report never mentions is benign ONLY if its package was actually measured
+# — then it simply has no executable region (`pub mod x;`, a consts file). If its package was
+# never in the run, nothing about that file was measured and dropping it would report a score
+# for part of the patch as though it covered the whole. This is the backstop under the target
+# assembly above: that loop should now put every changed crate in the run, and this catches
+# whatever still slips through (a crate whose package name will not resolve, a package cargo
+# skipped). Incomplete measurement is UNVERIFIABLE, never a percentage.
+UNMEASURED=()
+while IFS= read -r nf; do
+  [ -n "$nf" ] || continue
+  _c="$("$RV" --crate-dir "$nf")"
+  # Ask the REPORT whether that crate was measured, never the request list. Asking what we
+  # ASKED cargo for is what let the false green through a second time: the run specs named
+  # wyrd-telemetry, so the file looked accounted for, while `--test` filtering meant cargo
+  # had run none of it and the report held not one telemetry line.
+  if [ -n "$_c" ] && [ "$(_crate_measured "$_c" "$LCOV")" = "yes" ]; then
+    continue                                  # crate measured; this file just has no regions
+  fi
+  UNMEASURED+=("$nf")
+done < <(printf '%s\n' "$SCORED" | sed -n 's/^NOFILE //p')
+if [ "${#UNMEASURED[@]}" -gt 0 ]; then
+  _json "unverifiable" "${#UNMEASURED[@]} changed file(s) were never measured" 0 0 "$TESTS_RAN" \
+        "$BASE_REF" "${TEST_ARGS[*]}"
+  for f in "${UNMEASURED[@]}"; do echo "run-diff-cov.sh: UNMEASURED $f" >&2; done
+  echo "run-diff-cov.sh: UNVERIFIABLE — the file(s) above changed production code but their" >&2
+  echo "                 package never entered the run, so nothing about them was measured." >&2
+  echo "                 Scoring the rest would report part of the patch as though it were all" >&2
+  echo "                 of it. Ran: ${TEST_ARGS[*]}" >&2
+  echo "PDCA-UNVERIFIABLE: ${#UNMEASURED[@]} changed file(s) were never measured, so diff coverage is incomplete" >&2
+  exit 77
+fi
+
 COVERED="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $2; exit}')"
 INSTR="$(printf '%s\n' "$SCORED" | awk '/^TOTAL /{print $3; exit}')"
 PCT="$(_pct "$COVERED" "$INSTR")"

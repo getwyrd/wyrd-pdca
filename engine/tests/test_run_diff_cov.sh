@@ -236,18 +236,66 @@ check "a workspace-relative SF matches by exact equality" \
   $'MISS crates/core/src/lib.rs:4\nTOTAL 1 2' \
   "$("$DC" --score "$TMP/relative.lcov" "$TMP/relative.lines")"
 
-# 11. A changed file the report never mentions contributes nothing to either side. It is not
-#     0% coverage of that file — it is no measurement of it, and the run-level verdict handles
-#     "nothing was measured at all" separately (case 13).
+# 11. A changed file the report never mentions must be REPORTED, not silently dropped. This
+#     case previously asserted the drop as correct, and that was a false green: the #197 codex
+#     review found — and a two-crate fixture reproduced — a patch scoring 100% (5/5) while the
+#     second crate's brand-new uncovered function was never compiled, because its package was
+#     never in the run and so had no record to intersect. `_score` cannot tell "no executable
+#     region" from "never measured" (only the caller knows which packages it built), so it
+#     names the file and lets the call site decide; the counts stay clean either way.
 cat > "$TMP/partial.lines" <<'EOF'
 crates/core/src/lib.rs:4
 crates/core/src/lib.rs:8
 crates/other/src/lib.rs:1
 crates/other/src/lib.rs:2
 EOF
-check "a changed file absent from the report scores on neither side" \
-  $'MISS crates/core/src/lib.rs:8\nTOTAL 1 2' \
+check "a changed file absent from the report is named, not silently dropped" \
+  $'MISS crates/core/src/lib.rs:8\nNOFILE crates/other/src/lib.rs\nTOTAL 1 2' \
   "$("$DC" --score "$TMP/basic.lcov" "$TMP/partial.lines")"
+
+# A file that IS in the report emits no NOFILE, even when none of its changed lines carry a
+# region — that is the benign shape (a `pub mod x;` line in an otherwise-instrumented file),
+# and confusing it with the unmeasured shape would false-red nearly every patch adding a module.
+printf '%s\n' 'crates/core/src/lib.rs:1' > "$TMP/nolines.lines"
+check "a file present in the report never emits NOFILE, even scoring nothing" \
+  "TOTAL 0 0" \
+  "$("$DC" --score "$TMP/basic.lcov" "$TMP/nolines.lines")"
+
+# 11b. --crate-measured is what lets the caller READ a NOFILE line. A crate with records but
+#      not this file means the file has no executable region (benign, and the common case —
+#      adding `pub mod x;` to a lib.rs leaves that lib.rs out of the report entirely). A crate
+#      with NO records means nothing about it ran, and scoring the rest would report part of a
+#      patch as though it were all of it. Keying this on what the RUN ASKED FOR instead of what
+#      the REPORT HOLDS is what let the #197 false green survive its first fix: the run specs
+#      named the crate, so its files looked accounted for, while `--test` filtering meant cargo
+#      had run none of it.
+cat > "$TMP/crates.lcov" <<'EOF'
+SF:/home/build/wyrd-cov/crates/core/src/probe.rs
+DA:2,1
+end_of_record
+SF:crates/xtask/src/main.rs
+DA:1,1
+end_of_record
+EOF
+check "--crate-measured: a crate with records -> yes" \
+  "yes" "$("$DC" --crate-measured crates/core "$TMP/crates.lcov")"
+check "--crate-measured: a crate with no records -> no" \
+  "no" "$("$DC" --crate-measured crates/telemetry "$TMP/crates.lcov")"
+# Whole path component again: `crates/core` must not be answered by `vendor/notcore`, and a
+# crate whose name is a suffix of a measured one must not inherit its answer.
+cat > "$TMP/notcore.lcov" <<'EOF'
+SF:/home/build/wyrd-cov/vendor/notcore/src/lib.rs
+DA:1,1
+end_of_record
+EOF
+check "--crate-measured: notcore does not answer for core" \
+  "no" "$("$DC" --crate-measured core "$TMP/notcore.lcov")"
+# A workspace-relative SF (no leading directory) counts too.
+check "--crate-measured: a workspace-relative SF counts" \
+  "yes" "$("$DC" --crate-measured crates/xtask "$TMP/crates.lcov")"
+# A report that does not exist is "not measured", never a crash mid-verdict.
+check "--crate-measured: a missing report -> no, not an error" \
+  "no" "$("$DC" --crate-measured crates/core "$TMP/definitely-absent.lcov")"
 
 # ---------------------------------------------------------------------------------------
 # --verdict: the truth table.
