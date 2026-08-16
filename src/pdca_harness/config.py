@@ -412,6 +412,17 @@ class Config:
     # merge`'s own enforcement (whatever branch protection marks required — possibly
     # nothing) decide, including merging with an empty rollup. [driver].merge_requires.
     merge_requires: str = "all"
+    # How long to WAIT for a non-final wave's PR checks to settle before the rollup gate
+    # above decides (eduralph/pdca-harness#462 — INSTANCE DELTA, still OPEN at v0.57.0).
+    # `merge_requires` reads the rollup immediately after `gh pr ready`, and the ready-mark
+    # can itself trigger `ready_for_review` CI — so the honest reading of a rollup taken
+    # right then is "pending", the merge refuses, and the run STOPs. Correct, but it makes
+    # the boundary stop the routine outcome of EVERY multi-wave batch, which is the very
+    # thing merge mode exists to avoid. Wait instead: poll while the rollup is pending or
+    # empty, up to this budget, then let the same gate decide on a SETTLED rollup. 0 (the
+    # default, and upstream's behaviour) does not wait at all. Waiting never weakens the
+    # gate — a red or a timeout still refuses and STOPs. [driver].merge_wait_secs.
+    merge_wait_secs: int = 0
     # Optional integration re-gate (#wave-model): after each wave folds onto the
     # integration branch, run the repo-scoped gates over that tip before the next wave
     # builds on it, so a combination that is red though each fix was green alone STOPs the
@@ -813,6 +824,12 @@ class Config:
         # Check-rollup policy for merge mode (issue #413). An unknown value falls back to
         # "all" with a note — the fail-safe direction is the STRICTER reading (verify the
         # rollup ourselves), never a typo silently buying host-config-only semantics.
+        try:
+            merge_wait_secs = max(0, int(driver_cfg.get("merge_wait_secs", 0)))
+        except (TypeError, ValueError):
+            print("config: [driver].merge_wait_secs must be a non-negative integer — "
+                  "treating it as 0 (no wait).", file=sys.stderr)
+            merge_wait_secs = 0
         merge_requires = str(driver_cfg.get("merge_requires", "all")).strip().lower()
         if merge_requires not in ("all", "required"):
             print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
@@ -929,6 +946,7 @@ class Config:
             merge_method=merge_method,
             auto_merge=auto_merge,
             merge_requires=merge_requires,
+            merge_wait_secs=merge_wait_secs,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,

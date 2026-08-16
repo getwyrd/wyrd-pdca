@@ -375,3 +375,78 @@ class MergeWave(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AwaitRollup(unittest.TestCase):
+    """`_await_rollup` — the #462 instance delta: WAIT for an unsettled rollup rather than
+    reading it the instant `gh pr ready` returns and STOPping the whole batch on "pending".
+
+    The gate itself is not under test here (that is `merge_requires`, issue #413) — what is
+    under test is that waiting never turns a refusal into a merge the settled rollup would
+    not have permitted, and that a budget of 0 reproduces upstream exactly.
+    """
+
+    def _await(self, verdicts, budget, *, ticks=None):
+        """Drive `_await_rollup` over a scripted sequence of rollup reads. Time and sleep
+        are injected, so a 30-minute budget costs nothing to test."""
+        seq = list(verdicts)
+        seen = []
+        clock = {"t": 0.0}
+        ticks = ticks if ticks is not None else 30.0
+
+        def fake_rollup(_url):
+            v = seq.pop(0) if seq else seen[-1]
+            seen.append(v)
+            return (v, f"detail:{v}")
+
+        with mock.patch.object(merge, "_check_rollup", side_effect=fake_rollup):
+            out = merge._await_rollup(
+                "https://example/pr/1", budget,
+                sleep=lambda s: clock.__setitem__("t", clock["t"] + (ticks or s)),
+                now=lambda: clock["t"],
+            )
+        return out, seen
+
+    def test_zero_budget_is_a_single_read(self):
+        """budget 0 == upstream: one read, no wait, whatever it says."""
+        (verdict, _), seen = self._await(["pending"], 0)
+        self.assertEqual(verdict, "pending")
+        self.assertEqual(len(seen), 1)
+
+    def test_a_settled_verdict_never_waits(self):
+        for v in ("green", "failing", "unreadable"):
+            with self.subTest(v=v):
+                (verdict, _), seen = self._await([v], 600)
+                self.assertEqual(verdict, v)
+                self.assertEqual(len(seen), 1, "a settled rollup must not be polled again")
+
+    def test_pending_then_green_merges(self):
+        """The case the delta exists for: CI was still starting, then went green."""
+        (verdict, _), seen = self._await(["pending", "pending", "green"], 600)
+        self.assertEqual(verdict, "green")
+        self.assertEqual(seen, ["pending", "pending", "green"])
+
+    def test_empty_is_transient_too(self):
+        """A rollup is empty in the seconds before CI registers its first check; treating
+        that as terminal is the same 'too early' mistake one step further back."""
+        (verdict, _), _ = self._await(["empty", "green"], 600)
+        self.assertEqual(verdict, "green")
+
+    def test_pending_then_failing_still_refuses(self):
+        """Waiting must never launder a red."""
+        (verdict, _), _ = self._await(["pending", "failing"], 600)
+        self.assertEqual(verdict, "failing")
+
+    def test_exhausted_budget_returns_the_unsettled_verdict(self):
+        """A timeout is not a pass: the last unsettled verdict goes to the gate, which
+        refuses and STOPs."""
+        (verdict, _), seen = self._await(["pending"] * 50, 60)
+        self.assertEqual(verdict, "pending")
+        self.assertLessEqual(len(seen), 5, "a 60s budget must not poll 50 times")
+
+    def test_unreadable_is_not_waited_out(self):
+        """An unreadable rollup is an auth/`gh` problem; waiting cannot fix it, and failing
+        fast keeps the diagnostic honest."""
+        (verdict, _), seen = self._await(["unreadable", "green"], 600)
+        self.assertEqual(verdict, "unreadable")
+        self.assertEqual(len(seen), 1)

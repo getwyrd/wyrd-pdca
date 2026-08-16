@@ -71,30 +71,38 @@
   serves as a PR base. This is distinct from the M4 pattern above: a *milestone's* durable
   `feat/*` integration branch remains the right shape for a planned PR sequence; `"merge"`
   governs the driver's own wave stacking within one batch run.
-- **But `auto_merge = false`** (2026-08-08): merge mode's *bases* are what this instance
-  wants — real `main`, no rebuilt-each-run branch under an open PR — not its merging. With
-  it off the driver readies and merges **nothing**: every accepted bundle stays the draft PR
-  publish opened, and a multi-wave batch STOPs after wave 0 with a message telling you to
-  merge that wave yourself and re-run (`compute_waves` levels by longest path, so wave *k*+1
-  always has a prerequisite in wave *k* — continuing would build it against a base that
-  prerequisite never reached). What forced this: on 2026-08-08 the driver merged wyrd #703
-  six seconds after opening it, before the required `gate` context had reported, so `gh pr
-  merge` refused it and the wave stopped with #703 readied and #704–706 untouched
-  (getwyrd/pdca-harness#462). Turn back on once #462's `--auto`/poll fix lands upstream. A
-  single-wave batch is unaffected either way — the final wave never merges.
-  Three consequences of the stop, all from the #462 review:
-  - **The re-run verifies your merge; it does not assume it.** With this off, `_runnable`
-    gates *every* declared `Depends on` on `merged.is_merged`, not just the stricter
-    `Depends on (merged)`. Nothing else can move a base here — the driver merges nothing,
-    and the wave fold is the `stack` path — so a prerequisite that is COMPLETE but unmerged
-    holds its dependent back, and the next run says `prerequisite(s) not ready` rather than
-    quietly rebuilding the very mistake the stop prevented.
+- **And `auto_merge = true` again** (2026-08-16), so a dependent batch runs to completion in
+  ONE invocation: the driver readies and `gh pr merge`s each **non-final** wave's PRs, and the
+  next wave builds on the genuinely merged base. The final wave's PRs still stay the human's —
+  that half of the STOP discipline never moved.
+  - **Why it was off, and why flipping the flag alone would not have fixed it.** On 2026-08-08
+    the driver merged wyrd #703 six seconds after opening it, before the required `gate`
+    context had reported; `gh pr merge` refused and the wave stopped with #703 readied and
+    #704–706 untouched (getwyrd/pdca-harness#462, **still OPEN at v0.57.0**). Turning
+    `auto_merge` back on by itself reproduces that one layer up: #413's rollup gate reads the
+    checks *immediately* after `gh pr ready`, finds them `pending` — the ready-mark having
+    just triggered them — and refuses. Same boundary stop, minus the draft.
+  - **What makes it safe: `merge_wait_secs = 1800`.** The rollup gate now decides on a
+    **settled** rollup rather than an early one — `_await_rollup` polls while the rollup is
+    `pending` or `empty`, up to the budget, then hands the result to the unchanged gate. A
+    red, an unreadable rollup, or an exhausted budget still refuses and still STOPs; waiting
+    can only turn a refusal into a merge a later read would have permitted anyway. This is an
+    **instance delta** in `src/pdca_harness/merge.py`, marked as such, on the same footing as
+    the #371 confirm-once delta in `gates.py` — it goes away when #462 lands upstream.
+  - **The host-side backstop is real**, and was the precondition recorded here in 2026-08-08:
+    `main`'s required contexts are `docs-check`, `require-issue`, `docs-immutability`,
+    **`gate`**, **`dco`** (verified 2026-08-16). So even if the rollup gate were bypassed,
+    branch protection covers the real gates.
   - **A wave with nothing to merge does not stop.** A close / no-fix bundle carries no patch
-    and gets no PR, so no base has to move; the run continues to the next wave in the same
-    invocation instead of telling you to merge PRs that do not exist.
+    and gets no PR, so no base has to move; the run continues to the next wave.
   - **Act is deferred past any stop.** Act reviews a *finished* batch, so a run that STOPs at
-    a boundary defers it to the invocation that reaches the final wave. Otherwise a
-    multi-wave batch would fire Act once per resume rather than once per batch.
+    a boundary (now the exceptional case — a red, or a wait that timed out) defers it to the
+    invocation that reaches the final wave.
+  - **Superseded by the above:** while `auto_merge` was off, `_runnable` gated *every* declared
+    `Depends on` on `merged.is_merged`, because the human's merge was the only thing that could
+    move a base. With the driver merging again that stricter check no longer applies; the
+    explicit `Depends on (merged)` form keeps its own rule.
+  A single-wave batch is unaffected either way — the final wave never merges.
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).
   `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:
@@ -311,11 +319,12 @@ declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`
   the real gates (`rust`, `gate`, `dco` — as of 2026-08-02 only `docs-check` /
   `require-issue` / `docs-immutability` are required, which would NOT stop a red auto-merge;
   tighten before the first merge-mode batch).
-  **Superseded 2026-08-08 by `auto_merge = false`** (see §2): the trade above is off, so the
-  ready-mark gate now holds for **every** PR the driver opens, non-final waves included —
-  nothing is readied or merged without a human. `gate` did become a required context by
-  2026-08-08 (`docs-check`, `require-issue`, `docs-immutability`, `gate`, `dco`), so the
-  host-side guardrail is in place should auto-merge be turned back on.
+  **Live again since 2026-08-16** (see §2): `auto_merge = true`, so the driver readies and
+  merges non-final waves, and the trade above is back in force. The guardrail it depended on is
+  in place and re-verified on 2026-08-16 — `main`'s required contexts are `docs-check`,
+  `require-issue`, `docs-immutability`, **`gate`**, **`dco`** — and the driver additionally
+  refuses to merge on anything but a settled-green FULL rollup (`merge_requires = "all"` plus
+  `merge_wait_secs`), which is stricter than branch protection alone.
 - **External-contribution flow:** standard GitHub PR against `main`, gated by
   `require-issue` / `dco` / `cargo xtask ci`.
 - **MAINTAINERS file:** `../wyrd/docs/governance/GOVERNANCE.md` is the authority (roles +

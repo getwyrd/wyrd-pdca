@@ -34,6 +34,15 @@ time. Refusing after the ready-mark is safe — a re-run resumes idempotently. A
 rollup refuses too (absence of evidence is not green); skipped/neutral checks are
 completed non-failures and do not block. ``[driver].merge_requires = "required"``
 (default ``"all"``) opts back into host-config-only semantics, skipping the gate.
+
+**INSTANCE DELTA — ``[driver].merge_wait_secs`` (eduralph/pdca-harness#462, OPEN at
+v0.57.0).** Reading the rollup *immediately* after ``gh pr ready`` is honest but early: the
+ready-mark can trigger ``ready_for_review`` CI, so the verdict at that instant is ``pending``
+and the run STOPs — making the wave-boundary stop the routine outcome of every multi-wave
+batch, which is what merge mode exists to avoid. :func:`_await_rollup` waits for the rollup
+to SETTLE (polling while ``pending``/``empty``, up to the budget) and then hands it to the
+same gate. The gate is unchanged: a red, an unreadable rollup, or an exhausted budget still
+refuses and still STOPs. ``merge_wait_secs = 0`` reproduces upstream exactly.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import merged, publish, state
@@ -152,6 +162,52 @@ def _names(checks: list) -> str:
         for c in checks)
 
 
+#: How often :func:`_await_rollup` re-reads the rollup while it is unsettled. Not configurable
+#: — the budget is (``[driver].merge_wait_secs``); a knob for the interval would only tune how
+#: hard we poll GitHub for the same answer.
+_POLL_INTERVAL_SECS = 30
+
+
+def _await_rollup(pr_url: str, budget_secs: int, *,
+                  sleep=time.sleep, now=time.monotonic) -> tuple[str, str]:
+    """:func:`_check_rollup`, but WAIT for an unsettled rollup to settle first.
+
+    INSTANCE DELTA (eduralph/pdca-harness#462, still OPEN at v0.57.0). ``merge_requires``
+    reads the rollup immediately after ``gh pr ready`` — and the ready-mark can itself
+    trigger ``ready_for_review`` CI, so at that instant the honest verdict is ``pending``,
+    the merge refuses, and the run STOPs. That is not wrong, it is just early: the checks
+    the gate wants to see are about to run. Upstream's answer makes the boundary stop the
+    ROUTINE outcome of every multi-wave batch, which is the one thing merge mode exists to
+    avoid — the operator merges by hand and re-runs, per wave, exactly as if merge mode
+    were off.
+
+    So: poll while the rollup is ``pending`` **or** ``empty``, up to ``budget_secs``, and
+    hand the SETTLED verdict to the same gate. Both transient states are worth waiting on —
+    a rollup is empty in the seconds before CI registers its first check, and treating that
+    as terminal is the same "too early" mistake one step further back.
+
+    What this does NOT do is weaken the gate. ``failing`` and ``unreadable`` return at once
+    (a red is settled; an unreadable rollup is an auth/`gh` problem that waiting cannot
+    fix), and exhausting the budget returns the last unsettled verdict, which still
+    refuses and still STOPs. A wait can only ever turn a refusal into a merge that a later,
+    slower read would have permitted anyway.
+
+    ``budget_secs <= 0`` reproduces upstream exactly: one read, no wait.
+    """
+    verdict, detail = _check_rollup(pr_url)
+    if budget_secs <= 0 or verdict not in ("pending", "empty"):
+        return verdict, detail
+    deadline = now() + budget_secs
+    print(f"   checks are {verdict} — waiting up to {budget_secs}s for them to settle "
+          f"(#462; [driver].merge_wait_secs)")
+    while now() < deadline:
+        sleep(min(_POLL_INTERVAL_SECS, max(1, int(deadline - now()))))
+        verdict, detail = _check_rollup(pr_url)
+        if verdict not in ("pending", "empty"):
+            return verdict, detail
+    return verdict, detail
+
+
 def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                fetched: set[str]) -> int:
     """Merge one bundle's recorded PR (idempotent, fail-closed). ``fetched`` dedupes the
@@ -201,7 +257,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # merge past a red rollup).
     if cfg.merge_requires != "required":
         print(f"→ gh pr checks {pr_url}")
-        verdict, detail = _check_rollup(str(pr_url))
+        verdict, detail = _await_rollup(str(pr_url), cfg.merge_wait_secs)
         if verdict != "green":
             why = {
                 "failing": f"a check is FAILING — {detail}",
