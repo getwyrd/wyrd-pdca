@@ -51,6 +51,28 @@ target: no workflow in ``getwyrd/wyrd`` lists ``ready_for_review``, and none car
 guard, so drafts already run CI and ``gh pr ready`` triggers nothing (verified 2026-08-16,
 PR #224 adversarial review). The wait is still needed — the PR's age, not the ready-mark, is
 what makes the rollup incomplete — but do not reason from the trigger when tuning it here.
+
+**INSTANCE DELTA — ``[driver].merge_sync_base`` (eduralph/pdca-harness#531, OPEN).** The
+rollup gate above is honest about whichever tree the PR's checks last ran on — which, for
+every wave member after the first, is the tree BEFORE its siblings merged. Upstream merges a
+wave's PRs back to back and verifies no combination: A and B are each green against
+``main@X``, A merges to ``main@Y``, and B then merges on a rollup describing ``X``. If A and
+B conflict semantically, ``main`` is red and the next wave builds on it. ``flow.py``'s
+``_audit_wave_overlap`` sees *file*-level overlap only and is explicitly advisory, and
+semantic conflicts need no shared files.
+
+Whether that happens is decided entirely by the host's ``required_status_checks.strict``,
+which upstream neither reads nor documents as load-bearing; ``getwyrd/wyrd`` is
+``strict: false``, so GitHub does not re-run a PR's checks after its base moves.
+:func:`_behind_by` + :func:`_sync_base` close it inside the driver instead of depending on
+host configuration: a PR found behind is brought up to date first, which empties its rollup
+and lets the *existing* wait-and-gate decide on checks for the tree it really merges into.
+
+Note this is not the same fix as turning on host strictness. ``strict: true`` alone would
+make ``gh pr merge`` refuse every wave member after the first, stopping the batch —
+upstream #462's shape, and the stop that ``auto_merge = true`` was turned back on to remove
+— because upstream has no ``update-branch`` path at all. ``merge_sync_base = false``
+reproduces upstream exactly.
 """
 
 from __future__ import annotations
@@ -248,6 +270,53 @@ def _await_rollup(pr_url: str, budget_secs: int, *,
 
 
 
+def _behind_by(repo_spec: str, pr_url: str) -> int | None:
+    """How many commits this PR's head is behind its base — ``None`` when that cannot be
+    read, which the caller treats as fail-closed.
+
+    INSTANCE DELTA (eduralph/pdca-harness#531, OPEN). Deliberately asks the compare API
+    rather than reading ``mergeStateStatus``: GitHub only reports ``BEHIND`` where the base
+    requires strictness, so on a ``strict: false`` base — which is exactly the case this
+    delta exists for — a behind PR reads ``CLEAN`` and the staleness is invisible. The
+    commit count is the same on either configuration.
+    """
+    view = subprocess.run(
+        ["gh", "pr", "view", str(pr_url), "--json", "baseRefName,headRefName"],
+        capture_output=True, text=True)
+    if view.returncode != 0:
+        return None
+    try:
+        refs = json.loads(view.stdout or "{}")
+        base, head = refs["baseRefName"], refs["headRefName"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    cmp_ = subprocess.run(
+        ["gh", "api", f"repos/{repo_spec}/compare/{base}...{head}", "--jq", ".behind_by"],
+        capture_output=True, text=True)
+    if cmp_.returncode != 0:
+        return None
+    try:
+        return int((cmp_.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def _sync_base(pr_url: str) -> bool:
+    """Bring a behind PR up to date with its base. INSTANCE DELTA (#531).
+
+    The push re-triggers CI, so the rollup for the new head is EMPTY — which is precisely
+    what :func:`_await_rollup` already polls on. The sync therefore needs no waiting of its
+    own; it hands the existing gate a rollup that describes the tree the PR merges into.
+    """
+    print(f"→ gh pr update-branch {pr_url}")
+    r = subprocess.run(["gh", "pr", "update-branch", str(pr_url)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print((r.stderr or r.stdout).strip(), file=sys.stderr)
+        return False
+    return True
+
+
 def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                fetched: set[str]) -> int:
     """Merge one bundle's recorded PR (idempotent, fail-closed). ``fetched`` dedupes the
@@ -286,6 +355,33 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
               "STOP: later waves are NOT run; resolve at the PR, then re-run.\n",
               file=sys.stderr)
         return 1
+
+    # INSTANCE DELTA — sync a behind PR onto its base BEFORE the rollup gate below
+    # (eduralph/pdca-harness#531, OPEN). Without this the gate is honest about the wrong
+    # tree: a wave's second merge reads a rollup computed before its sibling landed, so the
+    # combination is never verified. Ordering is the whole trick — the sync's push empties
+    # the rollup for the new head, and `_await_rollup` already polls on empty, so the gate
+    # below decides on checks that describe the tree this PR actually merges into.
+    # Fail-closed on an unreadable behind-state, on the same principle the rollup gate uses:
+    # absence of evidence is not green.
+    if cfg.merge_sync_base and repo_spec:
+        behind = _behind_by(str(repo_spec), str(pr_url))
+        if behind is None:
+            print(f"\n!!! merge: {d.name} ({pr_url}) — could NOT determine whether the PR is "
+                  "behind its base, so whether its checks describe the tree it would merge "
+                  "into is unknown. STOP: later waves are NOT run; resolve at the PR, then "
+                  "re-run (or set [driver] merge_sync_base = false to merge without the "
+                  "check).\n", file=sys.stderr)
+            return 1
+        if behind:
+            print(f"   {behind} commit(s) behind base — syncing before the rollup gate")
+            if not _sync_base(str(pr_url)):
+                print(f"\n!!! merge: {d.name} ({pr_url}) is {behind} commit(s) behind its "
+                      "base and could NOT be updated — a conflict with a sibling that "
+                      "already merged, or no write access. Merging now would verify a tree "
+                      "this PR is not merging into. STOP: later waves are NOT run; resolve "
+                      "at the PR, then re-run.\n", file=sys.stderr)
+                return 1
 
     # Full check-rollup gate (issue #413), read AFTER the ready-mark and immediately before
     # the merge: `gh pr ready` can itself trigger `ready_for_review` CI, so only a rollup

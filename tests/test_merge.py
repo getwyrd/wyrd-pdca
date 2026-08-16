@@ -56,9 +56,18 @@ def _gh(**by_verb: SimpleNamespace):
     rollup is green, so tests that are not about #413 reach `gh pr merge` exactly as they
     did before it."""
     default_checks = _rollup(("ci", "pass"))
+    # The #531 sync runs before the rollup gate, so the shared stub has to answer its two
+    # reads or every caller hits its fail-closed arm. Default: a PR that is UP TO DATE, so
+    # tests not about #531 reach `gh pr merge` exactly as they did before it.
+    default_view = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+        {"baseRefName": "main", "headRefName": "fix/x"}))
 
     def run(cmd, **kw):
+        if cmd[:2] == ["gh", "api"]:
+            return by_verb.get("api", SimpleNamespace(returncode=0, stdout="0\n", stderr=""))
         if cmd[:2] == ["gh", "pr"]:
+            if cmd[2] == "view" and "view" not in by_verb:
+                return default_view
             return by_verb.get(cmd[2], default_checks if cmd[2] == "checks"
                                else SimpleNamespace(returncode=0, stdout="", stderr=""))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -260,8 +269,11 @@ class MergeWave(unittest.TestCase):
         rc, calls, _ = self._drive("ME")
         self.assertEqual(rc, 0)
         gh = [c[:3] for c in calls if c[:2] == ["gh", "pr"]]
-        self.assertEqual(gh, [["gh", "pr", "ready"], ["gh", "pr", "checks"],
-                              ["gh", "pr", "merge"]])   # rollup read AFTER ready
+        # `view` is the #531 behind-check. Order is the contract: the rollup is read AFTER
+        # the ready-mark, and AFTER the sync read — so it describes the tree being merged
+        # into, not the one the branch was cut from.
+        self.assertEqual(gh, [["gh", "pr", "ready"], ["gh", "pr", "view"],
+                              ["gh", "pr", "checks"], ["gh", "pr", "merge"]])
 
     def test_empty_rollup_refuses_under_the_default(self) -> None:
         # Absence of evidence is not green: nothing reported ⇒ nothing verified.
@@ -310,6 +322,11 @@ class MergeWave(unittest.TestCase):
             elif cmd[:3] == ["gh", "pr", "checks"]:
                 return (_rollup(("e2e", "pending"), code=8) if readied
                         else _rollup(("e2e", "pass")))
+            elif cmd[:3] == ["gh", "pr", "view"]:      # #531 behind-check: up to date
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                    {"baseRefName": "main", "headRefName": "fix/x"}))
+            elif cmd[:2] == ["gh", "api"]:
+                return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch("pdca_harness.merge.subprocess.run", side_effect=fake_run), \
@@ -569,6 +586,107 @@ class MergeWaitIsWired(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             cfg = Config.load(tmp)
         self.assertEqual(cfg.merge_wait_secs, 777, "Config.load must read the key")
+
+
+class SyncBaseBeforeGate(unittest.TestCase):
+    """`merge_sync_base` — the #531 delta. A wave's second merge must not be gated on a
+    rollup computed before its sibling landed, so a behind PR is brought up to date BEFORE
+    the rollup gate reads anything."""
+
+    def _drive(self, name, *, behind, cfg_kw=None, update_rc=0, view_rc=0, cmp_rc=0):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = _cfg(tmp, **(cfg_kw or {}))
+        d = cfg.bundle(name)
+        d.mkdir(parents=True)
+        (d / "patch.diff").write_text("diff\n", encoding="utf-8")
+        (d / "publish.json").write_text(
+            json.dumps({"pr_url": "https://gh/pr/1", "repo": "org/repo"}), encoding="utf-8")
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return SimpleNamespace(returncode=view_rc, stderr="", stdout=json.dumps(
+                    {"baseRefName": "main", "headRefName": "fix/x"}))
+            if cmd[:2] == ["gh", "api"]:
+                return SimpleNamespace(returncode=cmp_rc, stderr="", stdout=f"{behind}\n")
+            if cmd[:3] == ["gh", "pr", "update-branch"]:
+                return SimpleNamespace(returncode=update_rc, stderr="update failed",
+                                       stdout="")
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return _rollup(("ci", "pass"))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        err = io.StringIO()
+        with mock.patch("pdca_harness.merge.subprocess.run", side_effect=run), \
+                mock.patch.object(merge.state, "state", return_value=state.COMPLETE), \
+                mock.patch.object(merge.merged, "is_merged", return_value=False), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = merge._merge_one(cfg, d, dry_run=False, method="merge", fetched=set())
+        return rc, calls, err.getvalue()
+
+    @staticmethod
+    def _verbs(calls, verb):
+        return [c for c in calls if c[:3] == ["gh", "pr", verb]]
+
+    def test_a_behind_pr_is_synced_before_the_rollup_is_read(self) -> None:
+        # Ordering is the whole point: a sync AFTER the gate would gate the stale tree.
+        rc, calls, _ = self._drive("S1", behind=2)
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._verbs(calls, "update-branch"), "a behind PR must be synced")
+        upd = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "update-branch"])
+        chk = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "checks"])
+        self.assertLess(upd, chk, "the sync must precede the rollup read, not follow it")
+
+    def test_an_up_to_date_pr_is_not_synced(self) -> None:
+        rc, calls, _ = self._drive("S2", behind=0)
+        self.assertEqual(rc, 0)
+        self.assertFalse(self._verbs(calls, "update-branch"),
+                         "a current PR must not be pushed for nothing")
+        self.assertTrue(self._verbs(calls, "merge"))
+
+    def test_a_failed_sync_stops_without_merging(self) -> None:
+        # A behind PR that cannot be updated conflicts with a sibling that already merged;
+        # merging it would verify a tree it is not merging into.
+        rc, calls, err = self._drive("S3", behind=1, update_rc=1)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._verbs(calls, "merge"))
+        self.assertIn("could NOT be updated", err)
+
+    def test_an_unreadable_behind_state_stops_without_merging(self) -> None:
+        # Fail-closed, on the rollup gate's own principle: absence of evidence is not green.
+        rc, calls, err = self._drive("S4", behind=0, cmp_rc=1)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._verbs(calls, "merge"))
+        self.assertIn("could NOT determine", err)
+
+    def test_the_knob_off_reproduces_upstream(self) -> None:
+        # merge_sync_base = false must skip the check entirely — including its fail-closed
+        # arm, so an instance opting out is not stopped by an API it never wanted called.
+        rc, calls, _ = self._drive("S5", behind=3, cfg_kw={"merge_sync_base": False})
+        self.assertEqual(rc, 0)
+        self.assertFalse(self._verbs(calls, "update-branch"))
+        self.assertTrue(self._verbs(calls, "merge"))
+
+    def test_config_reads_the_key(self) -> None:
+        # The mutation kill: hard-coding the default in Config.load would leave every test
+        # above green while the knob did nothing in production.
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "pdca.toml").write_text("[driver]\nmerge_sync_base = false\n",
+                                       encoding="utf-8")
+        with redirect_stderr(io.StringIO()):
+            cfg = Config.load(tmp)
+        self.assertFalse(cfg.merge_sync_base, "Config.load must read the key")
+
+    def test_default_is_on(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "pdca.toml").write_text("[driver]\n", encoding="utf-8")
+        with redirect_stderr(io.StringIO()):
+            cfg = Config.load(tmp)
+        self.assertTrue(cfg.merge_sync_base)
 
 
 if __name__ == "__main__":

@@ -98,10 +98,35 @@
     can only turn a refusal into a merge a later read would have permitted anyway. This is an
     **instance delta** in `src/pdca_harness/merge.py`, marked as such, on the same footing as
     the #371 confirm-once delta in `gates.py` — it goes away when #462 lands upstream.
+  - **What makes the *combination* safe: `merge_sync_base = true`** (2026-08-16, #228;
+    upstream eduralph/pdca-harness#531). The rollup gate above is honest about whichever tree
+    a PR's checks last ran on — which, for every wave member after the first, is the tree
+    **before its siblings merged**. A and B are each green against `main@X`; A merges to
+    `main@Y`; B then merges on a rollup describing `X`. If they conflict semantically `main`
+    is red and the next wave builds on it. `flow.py`'s `_audit_wave_overlap` sees *file*-level
+    overlap only and is explicitly advisory ("Loud, but never a stop"), and semantic conflicts
+    need no shared files. Note `regate_between_waves` does **not** cover this: `flow.py`
+    consults it in exactly one place, inside the `else: # stack` branch, so in merge mode it
+    is dead config.
+    With the knob on, a PR found behind its base is brought up to date **before** the rollup
+    gate — which empties its rollup and lets the existing `merge_wait_secs` wait do the rest,
+    so the gate decides on checks for the tree the PR actually merges into. Fail-closed: an
+    unreadable behind-state or a failed sync STOPs rather than merging on the older evidence.
+    An **instance delta** in `src/pdca_harness/merge.py`, on the same footing as the #462
+    wait above and the #371 confirm-once delta in `gates.py`; it goes away when #531 lands.
+    **Not** the same as host strictness — `strict = true` alone would make `gh pr merge`
+    refuse every wave member after the first and stop the batch, since upstream has no
+    `update-branch` path at all.
   - **The host-side backstop is real**, and was the precondition recorded here in 2026-08-08:
     `main`'s required contexts are `docs-check`, `require-issue`, `docs-immutability`,
     **`gate`**, **`dco`** (verified 2026-08-16). So even if the rollup gate were bypassed,
     branch protection covers the real gates.
+    Two gaps in that backstop, both verified 2026-08-16 and neither closed. **`rust` is still
+    not required** — the 2026-08-02 note above asked for it before the first merge-mode batch,
+    and `gate`/`dco` were added while `rust` was not, so a red `rust` check does not block a
+    merge. And **`strict` is `false`**, which is what makes the `merge_sync_base` delta above
+    necessary rather than belt-and-braces. Both are host-side, free, and worth closing now
+    that `auto_merge` is on.
   - **A wave with nothing to merge does not stop.** A close / no-fix bundle carries no patch
     and gets no PR, so no base has to move; the run continues to the next wave.
   - **Act is deferred past any stop.** Act reviews a *finished* batch, so a run that STOPs at
