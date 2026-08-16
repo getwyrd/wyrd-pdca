@@ -47,12 +47,37 @@ final wave's PRs still wait for you.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | Publish #638 | **Yours to run** — verified ready, command below |
-| 2 | Audit pre-written briefs for base / `Stacks on:` | **Done — clean, no changes needed** |
-| 3 | Reconcile stale bundle state (651/652, selftest) | **Nothing to do — already reconciled** |
-| 4 | #685 close-disposition brief | **Done — written, ready to run** |
+| 1 | Publish #638 | Done — **PR [#770](https://github.com/getwyrd/wyrd/pull/770) MERGED**, issue CLOSED. The bundle's `publish.json` was missing and has been written; see the note below. |
+| 2 | Audit pre-written briefs for base / `Stacks on:` | Done — clean, no changes needed |
+| 3 | Reconcile stale bundle state (651/652, selftest) | Nothing to do — already reconciled |
+| 4 | #685 close-disposition brief | **Brief written; the run is STILL OPEN.** Bundle holds only `brief.md` and reads PLANNED. |
+| 5 | Accept #717's split + its three edits | Done 2026-08-16 — children #771/#772, parent now BUILT |
+| 6 | Strip the stale `Depends on: 636` from #625/#633 | **STILL OPEN** — blocks batch 5 only, not batch 1 |
 
-### 1. Publish #638 — yours
+### 1. Publish #638 — done, PR #770 merged
+
+`enhancement/638-fragment-write-deadline` → `main`, **merged 2026-08-16**, issue #638 CLOSED.
+
+The bundle had no `publish.json` / `commit-msg.txt` / `pr-description.md`, so `pdca status` read
+`[unpublished]` and `merged.is_merged("638")` returned False for the wrong reason — *"accepted but
+no PR published yet"*. That state does **not** heal on merge: it is keyed on the bundle's own
+record, not on the PR, so every dependent would have stayed blocked after #770 landed.
+`publish.json` was written by hand (there is no adopt command; `pdca record` commits bundle
+evidence, a different job). Verified after the merge: `is_merged("638")` now returns **True**, so
+#661 is unblocked for batch 4.
+
+`commit-msg.txt` and `pr-description.md` are still absent — nothing reads them after the fact, so
+they are left alone rather than back-filled with invented content.
+
+**PR #770 is a superset of the reviewed patch.** All 54 files from `patch.diff` are present,
+plus 5 custodian test files: `gc.rs`, `gc_delete_backstop.rs`, `placement_ceiling.rs`,
+`segmented_map_{consumers,rebalance,reconstruction,restore}.rs`. Inspected — they are pure
+rebase adaptation, each implementing or calling the changed `put_fragment` signature
+(`_deadline_millis: Option<u64>` on the trait impl, `None` at call sites). They landed on `main`
+after the bundle's patch was generated on 2026-07-26. Nothing substantive was added, but Check
+gated the 54-file artifact, not the 59-file one.
+
+Original command, for reference:
 
 ```sh
 ./scripts/pdca publish 638
@@ -147,11 +172,26 @@ directions.
 Your line was `pdca flow 721 722 717 692 693 740 741 742 736 738`. **#717 cannot go in as an id** —
 see below. Run the split first, then the batch.
 
-### 1a. Accept #717's split — it is proposed but not accepted
+### 1a. Accept #717's split — DONE (2026-08-16)
 
 ```sh
-./scripts/pdca split 717 --accept
+./scripts/pdca split 717 --accept   # ran; children are #771 and #772
 ```
+
+Children filed as sub-issues of #717 and materialised as bundles:
+**#771** `multipart-retire-obligation` (wave 0) → **#772** `multipart-owned-staging-entry`
+(wave 1, terminal). All three post-accept edits are applied:
+
+- `- **Conflicts with:** 721, 722` added to `results/issue_772/brief.md:145`
+- #693 repointed `Depends on: 717` → `772` (`results/issue_693/brief.md:77`); #655 behind it
+  needed no change
+- parent brief written at `results/issue_717/brief.md`, which moved #717 **UNPLANNED → BUILT** —
+  it now reaches sign-off and freezes instead of re-entering interactive Plan every run (#481)
+
+**#771 and #772 were filed with no milestone**, while #717 is on `0.1 Alpha`. The driver never
+reads it, but two alpha slices are currently invisible to the milestone view.
+
+The original instructions, kept for reference:
 
 `results/issue_717/split-proposal.md` exists (authored 2026-08-14, after you answered
 `iterate-plan` on iteration-v3) but is **untracked and unaccepted**: #717 has no brief and **no
@@ -186,18 +226,23 @@ it cannot do for you**, two named in the proposal and one that follows from a kn
 ### 1b. Run the batch
 
 ```sh
-./scripts/pdca flow 721 722 <child-1> <child-2> 692 693 740 741 742 736 738
+./scripts/pdca flow 717 721 722 771 772 692 693 740 741 742 736 738
 ```
 
-Substitute the two issue numbers `split --accept` prints. Notes on what is already in flight:
+#717 is in the list as the split parent: it reads BUILT with `close-disposition: split`, so it
+costs no model leaves and just needs a sign-off to freeze. Drop it if you would rather settle it
+separately. Notes on what is already in flight:
 
 - **#692 is CHECKED**, not unstarted — it has been built and reviewed, so `flow` resumes it at
   sign-off rather than rebuilding. Nothing to do differently; do not expect a Do pass.
-- **#721 / #722 / #693 / #692 have briefs**; **#740, #741, #742, #736, #738 have none** and will
-  each open an interactive Plan.
-- Ordering is already declared and correct: `#722 Depends on: 721`; `#721` and `#722` both carry
-  `Conflicts with: 717`; `#692 Depends on: 691` (COMPLETE, PR #703 merged). With `auto_merge` back
-  on, the whole chain runs in one invocation.
+- **#717 / #721 / #722 / #771 / #772 / #693 / #692 have briefs**; **#740, #741, #742, #736, #738
+  have none** and will each open an interactive Plan.
+- Ordering is declared and correct: `#722 Depends on: 721`; `#772 Depends on: 771`;
+  `#772 Conflicts with: 721, 722`; `#693 Depends on: 772`; `#692 Depends on: 691` (COMPLETE, PR
+  #703 merged). With `auto_merge` back on, the whole chain runs in one invocation.
+- **`#721` and `#722` still declare `Conflicts with: 717`**, which is now the split parent and
+  ships nothing. Harmless — a conflict against a bundle that touches no file only over-separates
+  waves — but the real conflict is with **#772**, and that edge is declared from #772's side.
 
 ---
 

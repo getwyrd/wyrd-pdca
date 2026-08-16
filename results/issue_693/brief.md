@@ -74,9 +74,16 @@
   Exhaustive enums extend the same rule to time: a future outcome must be answered
   deliberately at every consumer, not defaulted.
 - **Repo + branch target:** getwyrd/wyrd @ main   (INTEGRATION §2; base verified `339da46`)
-- **Depends on:** 717
+- **Depends on:** 772
 - **Conflicts with:**
-- **Ordering note:** **Repointed 2026-08-09: was `Depends on: 692`.** #692 was SPLIT into
+- **Ordering note:** **Repointed again 2026-08-16: was `Depends on: 717`.** #717 was itself
+  SPLIT at its 2026-08-14 re-plan into **#771** (the `retire:` obligation value) → **#772**
+  (`sidx:` staging + the `PendingEntry` extension), so the terminal child of the chain is now
+  **#772**, not #717 — hence this second repoint, for exactly the reason recorded below: #717
+  is now a bundle marked `split`, which can never go COMPLETE, and `_runnable` gates every
+  `Depends on` on `merged.is_merged`. #772's own brief names this repoint as post-`--accept`
+  work the split tool could not do. #655 sits behind THIS child and needs no change.
+  **Repointed 2026-08-09: was `Depends on: 692`.** #692 was SPLIT into
   **#715** (`Budget`/`AdmissionRecord` + the record codec envelope) → **#716** (the `mpu:`/
   `slot:`/`part:`/`psum:` lifecycle records) → **#717** (`sidx:` staging, `retire:*`, the
   `PendingEntry` extension), so the record family this child builds on is complete only
