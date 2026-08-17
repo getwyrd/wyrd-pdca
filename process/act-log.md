@@ -1912,3 +1912,35 @@ residue, itself flagged for the model-pass upgrade).
 - Mechanism/scope-divergence NEEDS-HUMAN (the #152/#155 shape) should drop once briefs mark
   named mechanisms BINDING vs ILLUSTRATIVE.
 - §6 rows should read as decisions-owed (context + impact), not diff restatements.
+
+# PR-review triage — 2026-08-17 — getwyrd/wyrd-pdca#237 (open) — 9 finding(s)
+
+PR: https://github.com/getwyrd/wyrd-pdca/pull/237
+
+## Findings (class-keyed signals)
+- [UNCLASSIFIED] codex-pr:unclassified — ### 💡 Codex Review Here are some automated review suggestions for this pull request. **Re… (chatgpt-codex-connector[bot], review)
+- [CONVENTION] codex-pr:convention-style — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ha… (chatgpt-codex-connector[bot], review-comment)
+- [BUG] codex-pr:bug-silently — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ke… (chatgpt-codex-connector[bot], review-comment)
+- [CONVENTION] codex-pr:convention-style — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Bo… (chatgpt-codex-connector[bot], review-comment)
+- [BUG] codex-pr:bug-crashes — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ha… (chatgpt-codex-connector[bot], review-comment)
+- [BUG] codex-pr:bug-regression — Fixed in a2baa3c — the cache key now hashes path AND bytes for the base leaf and every es… (eduralph, review-comment)
+- [CONVENTION] codex-pr:convention-style — Fixed in da47bd6 — the style body now joins argv only AFTER `_mapped_argv`'s scan, so pro… (eduralph, review-comment)
+- [UNCLASSIFIED] codex-pr:unclassified — Fixed in a2baa3c (bounded, fail-open with a stderr note) and tightened in da47bd6: the bo… (eduralph, review-comment)
+- [BUG] codex-pr:bug-regression — Fixed in da47bd6 — `_resolve_style` catches RuntimeError alongside OSError/ValueError, wi… (eduralph, review-comment)
+
+## Routed  (candidates only — the human applies each; this command never edits pdca.toml or the rubric)
+- UNCLASSIFIED → needs a human (or set [triage].model_cmd): ### 💡 Codex Review Here are some automated review suggestions for this pull request. **Re…
+- CONVENTION → candidate gate row / rubric line: enforce "style" ([[gates.checks]] row or a rubric convention line) — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ha…
+- BUG → candidate tracker issue (NOT filed: PR not merged — the fix can still land on the open PR; candidate kept in the act log): **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ke…
+- CONVENTION → candidate gate row / rubric line: enforce "style" ([[gates.checks]] row or a rubric convention line) — **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Bo…
+- BUG → candidate tracker issue (NOT filed: PR not merged — the fix can still land on the open PR; candidate kept in the act log): **<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Ha…
+- BUG → candidate tracker issue (NOT filed: PR not merged — the fix can still land on the open PR; candidate kept in the act log): Fixed in a2baa3c — the cache key now hashes path AND bytes for the base leaf and every es…
+- CONVENTION → candidate gate row / rubric line: enforce "style" ([[gates.checks]] row or a rubric convention line) — Fixed in da47bd6 — the style body now joins argv only AFTER `_mapped_argv`'s scan, so pro…
+- UNCLASSIFIED → needs a human (or set [triage].model_cmd): Fixed in a2baa3c (bounded, fail-open with a stderr note) and tightened in da47bd6: the bo…
+- BUG → candidate tracker issue (NOT filed: PR not merged — the fix can still land on the open PR; candidate kept in the act log): Fixed in da47bd6 — `_resolve_style` catches RuntimeError alongside OSError/ValueError, wi…
+
+## Registered signals (act-ledger.json)
+- codex-pr:convention-style
+- codex-pr:bug-silently
+- codex-pr:bug-crashes
+- codex-pr:bug-regression
