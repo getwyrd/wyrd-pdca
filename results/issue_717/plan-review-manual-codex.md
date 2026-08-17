@@ -11,3 +11,17 @@
 - NEEDS-HUMAN — The citation hand-edit is incomplete. `brief.md:188-189` still labels `0016:512-527` as the serialization-identity and placement-length source; that target range is the segment-group-marker lifetime (`docs/design/proposals/draft/0016-multipart-commit-protocol.md:512-527`). Placement length is at `:416-429`, and the load-bearing `skip_serializing_if` rationale is at `:475-485`; `brief.md:57-58` points only to the field declarations at `:442-457`. Correct the mandatory source list before Do follows the wrong section.
 
 - NEEDS-HUMAN — The namespace-check deferral is named but not auditable. `brief.md:50-52` and `:173-174` assign it to #657 as the first `sidx:` writer, but #717 has no `notes.json`/`sources/`, and #692’s record only repeats that planning assertion without supplying #657’s tracker contract. The target says only that first writers are somewhere in #656–#659 (`crates/core/src/multipart.rs:55-64`). Quote or supply #657’s scope before calling this deferred defect “owned.”
+
+---
+
+## Dispositions (recorded 2026-08-18; all seven addressed in the 2026-08-09 brief revision, verified against `iteration-v3/brief.md`)
+
+1. **Byte-identity mechanism misattributed** → *fixed*: v3 leg 2 (`brief.md:89-102`) — "The MECHANISM was wrong here": `renew_pending`/`live_lease_guards` precondition on the **raw bytes** they read, not `require(key, encode(prior))`; the `encode(prior)` shape is the `inode:` path (`metadata.rs:1766`). Byte identity is kept as the compatibility criterion with the corrected attribution.
+2. **Typed-error criterion unachievable for the `pending:` reading in scope** → *fixed by narrowing*: v3 leg 1e (`brief.md:59-83`) — "Scope of 1e, narrowed deliberately": the torn-*shape* rejection lives in the manual `Deserialize`; Do MUST NOT widen 1e into the `pending:` readers, which call the generic `metadata::decode` and return boxed serde failures, not ADR-0045's `MetadataValidationError`.
+3. **Leg 1h missing `Records`-under-per-part-token** → *fixed*: v3 leg 1h carries the third case — "added 2026-08-09 from a plan-review finding … **all three** rejected", with its own negation demonstration in the binding list.
+4. **Generation both/neither reclamation sources dropped from the criterion** → *fixed*: v3 leg **1n** ("NEW 2026-08-09 — plan-review finding: binding checks the prior attempt HAD and this brief had dropped").
+5. **Nested `ChunkRef` in `RetirePayload` unvalidated** → *fixed*: v3 leg **1p** ("NEW 2026-08-09 — plan-review finding") — `Chunks` **and** `Generation` arms reject on `erasure::supported(k, m)`; explicitly does not assume #716 supplies it.
+6. **Citation hand-edit (`0016:512-527` mislabeled)** → *fixed*: v3 Citations section (`brief.md:241-244`) — identity argument re-cited to `0016:475-485`, placement-length boundary to `0016:416-429`, with the marker-lifetime range removed.
+7. **#657 namespace deferral not auditable** → *fixed by softening*: v3 (`brief.md:70-72`) — "owned by #657 is this Plan's EXPECTATION, not a verified contract", citing the target's own "somewhere in #656–#659" (`multipart.rs:55-64`) instead of an unsupplied scope document.
+
+The v3 patch built against this brief was abandoned at the #717 split (size overrun, deferred C3); findings 1–7 travel with the substance they bind, which the split children #771/#772 inherit — see `split-proposal.md` and `review-batch.md` for the batch findings' own routing.
