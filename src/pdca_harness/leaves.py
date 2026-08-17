@@ -151,6 +151,12 @@ def _role_injection(
     return [], ""
 
 
+# Bound for a style body riding a single argv element (INSTANCE DELTA,
+# eduralph/pdca-harness#535 — instance #235): safely under Linux's ~128 KiB
+# MAX_ARG_STRLEN, leaving headroom for the flag name and the rest of argv.
+_STYLE_ARGV_CAP = 100_000
+
+
 def _resolve_style(root: Path, rel: str) -> Path | None:
     """``root/rel``, or None when it escapes the project root.
 
@@ -206,6 +212,19 @@ def _style_injection(
         return [], ""
     if profile.name == "claude":
         if any(a.startswith("--append-system-prompt") for a in leaf.argv):
+            return [], ""
+        # ONE argv element carries the whole body, and Linux caps a single exec
+        # argument at MAX_ARG_STRLEN (~128 KiB) — past it, execve fails E2BIG and
+        # the leaf CRASHES instead of degrading. The interactive SEED is spilled to
+        # a file for exactly this class (#313); the style body cannot ride that
+        # spill, so bound it instead: a style that size is a config error, and
+        # fail-open with a loud note is the contract every other bad-style shape
+        # gets. The inline branch below is exempt — its body rides the prompt
+        # (stdin / seed), which has no per-argument bound.
+        if len(body.encode("utf-8")) > _STYLE_ARGV_CAP:
+            print(f"leaves: style file {path} is {len(body.encode('utf-8'))} bytes — "
+                  f"over the {_STYLE_ARGV_CAP}-byte argv bound (Linux MAX_ARG_STRLEN "
+                  "is ~128 KiB) — proceeding without it", file=sys.stderr)
             return [], ""
         return ["--append-system-prompt", body], ""
     return [], body + "\n\n---\n\n"
@@ -1238,17 +1257,22 @@ def _sizer_key(d: Path, cfg: Config, bp: Path) -> str:
     # The prose style is configuration too (INSTANCE DELTA, eduralph/pdca-harness#535 —
     # instance #235): wiring `style_file` onto the sizer, or editing the style's body,
     # changes the prompt the verdict answers, so it must earn a fresh pass rather than
-    # reuse the differently-shaped cached one. Key on the path AND the bytes; a style
-    # the injection would refuse or fail open on contributes nothing, matching the
-    # spawn's "no styling" behaviour. (The escalation specs above already hash any
-    # per-spec `style_file` through their item tuples.)
-    h.update(repr(cfg.sizer.style_file).encode("utf-8"))
-    if cfg.sizer.style_file:
-        sp = _resolve_style(cfg.root, cfg.sizer.style_file)
-        try:
-            h.update(sp.read_bytes() if sp is not None else b"")
-        except OSError:
-            pass
+    # reuse the differently-shaped cached one. Key on the path AND the bytes — for the
+    # base leaf and for every escalation spec alike: the spec item tuples above carry
+    # only the PATH string, so without hashing the bytes here an edited per-spec style
+    # would silently reuse the verdict produced under the old one. A style the
+    # injection would refuse or fail open on contributes nothing, matching the spawn's
+    # "no styling" behaviour.
+    for style_rel in [cfg.sizer.style_file,
+                      *(str(spec.get("style_file") or "")
+                        for spec in cfg.sizer_escalation)]:
+        h.update(repr(style_rel).encode("utf-8"))
+        if style_rel:
+            sp = _resolve_style(cfg.root, style_rel)
+            try:
+                h.update(sp.read_bytes() if sp is not None else b"")
+            except OSError:
+                pass
     artifact = brief.planning_artifact(bp)
     if not artifact:
         return h.hexdigest()[:16]

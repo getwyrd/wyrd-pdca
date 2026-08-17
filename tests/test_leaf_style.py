@@ -102,6 +102,25 @@ class StyleInjection(unittest.TestCase):
                 self.CLAUDE)
             self.assertEqual(empty, ([], ""))
 
+    def test_no_cfg_degrades_to_no_styling(self):
+        # The legacy `_invoke(cfg=None)` shape: a styled leaf without a config to
+        # resolve the root against must degrade, not raise on `cfg.root`.
+        got = leaves._style_injection(None, _leaf(family="claude"), self.CLAUDE)
+        self.assertEqual(got, ([], ""))
+
+    def test_a_body_over_the_argv_bound_degrades_instead_of_crashing_exec(self):
+        # One argv element carries the body; past MAX_ARG_STRLEN execve fails
+        # E2BIG — a crash, not a degrade. Bounded, loudly, on the argv branch;
+        # the inline branch has no per-argument limit and keeps the big body.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, text="x" * (leaves._STYLE_ARGV_CAP + 1))
+            claude = leaves._style_injection(cfg, _leaf(family="claude"), self.CLAUDE)
+            self.assertEqual(claude, ([], ""))
+            inline_argv, inline_prefix = leaves._style_injection(
+                cfg, _leaf(family="codex"), self.CODEX)
+            self.assertEqual(inline_argv, [])
+            self.assertTrue(inline_prefix)
+
     def test_undecodable_style_degrades_instead_of_crashing_the_leaf(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _cfg(tmp, text=None)
@@ -139,6 +158,10 @@ class StyleInjection(unittest.TestCase):
             {"mode": "command", "family": "claude", "argv": ["claude"],
              "style_file": ".claude/output-styles/s.md"}, "advisory", "x")
         self.assertEqual(leaf.style_file, ".claude/output-styles/s.md")
+        # …and a spec without the key defaults to unstyled, not to some phantom path.
+        bare = leaves._advisory_leaf(
+            {"mode": "command", "family": "claude", "argv": ["claude"]}, "advisory", "x")
+        self.assertEqual(bare.style_file, "")
 
     def test_the_sizer_cache_key_covers_the_style_path_and_body(self):
         # "The CONFIGURATION is an input too": wiring or editing the sizer's style
@@ -160,6 +183,25 @@ class StyleInjection(unittest.TestCase):
             self.assertNotEqual(unstyled, styled)
             style.write_text("Narrate chronologically.\n", encoding="utf-8")
             self.assertNotEqual(styled, key(".claude/output-styles/s.md"))
+
+    def test_the_sizer_cache_key_covers_escalation_spec_style_bodies_too(self):
+        # The spec item tuples carry only the PATH — the body must be hashed as
+        # well, or editing a per-spec style reuses the verdict produced under the
+        # old one (the exact staleness the key comment promises against).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "brief.md").write_text("# brief\n", encoding="utf-8")
+            spec_style = root / "s2.md"
+            spec_style.write_text("Conclusion first.\n", encoding="utf-8")
+            def key():
+                cfg = SimpleNamespace(
+                    root=root,
+                    sizer=LeafConfig(mode="command", family="claude", argv=["claude"]),
+                    sizer_escalation=[{"on_band": ["watch"], "style_file": "s2.md"}])
+                return leaves._sizer_key(root, cfg, root / "brief.md")
+            before = key()
+            spec_style.write_text("Narrate chronologically.\n", encoding="utf-8")
+            self.assertNotEqual(before, key())
 
 
 class LiveWiring(unittest.TestCase):
