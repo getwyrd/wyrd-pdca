@@ -151,12 +151,6 @@ def _role_injection(
     return [], ""
 
 
-# Bound for a style body riding a single argv element (INSTANCE DELTA,
-# eduralph/pdca-harness#535 — instance #235): safely under Linux's ~128 KiB
-# MAX_ARG_STRLEN, leaving headroom for the flag name and the rest of argv.
-_STYLE_ARGV_CAP = 100_000
-
-
 def _resolve_style(root: Path, rel: str) -> Path | None:
     """``root/rel``, or None when it escapes the project root.
 
@@ -171,7 +165,10 @@ def _resolve_style(root: Path, rel: str) -> Path | None:
     try:
         resolved = (root / rel).resolve()
         resolved.relative_to(Path(root).resolve())
-    except (OSError, ValueError):
+    # RuntimeError included (#237 PR review): on Python 3.11/3.12 a symlink LOOP
+    # raises it from resolve() — 3.13+ raises OSError (ELOOP) — and an uncaught
+    # loop would crash the leaf instead of degrading to no styling.
+    except (OSError, ValueError, RuntimeError):
         return None
     return resolved
 
@@ -213,18 +210,19 @@ def _style_injection(
     if profile.name == "claude":
         if any(a.startswith("--append-system-prompt") for a in leaf.argv):
             return [], ""
-        # ONE argv element carries the whole body, and Linux caps a single exec
-        # argument at MAX_ARG_STRLEN (~128 KiB) — past it, execve fails E2BIG and
-        # the leaf CRASHES instead of degrading. The interactive SEED is spilled to
-        # a file for exactly this class (#313); the style body cannot ride that
-        # spill, so bound it instead: a style that size is a config error, and
-        # fail-open with a loud note is the contract every other bad-style shape
-        # gets. The inline branch below is exempt — its body rides the prompt
-        # (stdin / seed), which has no per-argument bound.
-        if len(body.encode("utf-8")) > _STYLE_ARGV_CAP:
+        # ONE argv element carries the whole body, and the OS bounds it — Linux caps
+        # a single exec argument at MAX_ARG_STRLEN (~128 KiB), Windows the WHOLE
+        # command line at ~32,767 chars — past which the spawn itself fails and the
+        # leaf CRASHES instead of degrading. The interactive SEED is spilled to a
+        # file for exactly this class (#313); the style body cannot ride that spill,
+        # so bound it by the SAME per-platform budget the seed uses: a style that
+        # size is a config error, and fail-open with a loud note is the contract
+        # every other bad-style shape gets. The inline branch below is exempt — its
+        # body rides the prompt (stdin / seed), which has no per-argument bound.
+        if len(body.encode("utf-8")) > _SEED_ARG_BUDGET:
             print(f"leaves: style file {path} is {len(body.encode('utf-8'))} bytes — "
-                  f"over the {_STYLE_ARGV_CAP}-byte argv bound (Linux MAX_ARG_STRLEN "
-                  "is ~128 KiB) — proceeding without it", file=sys.stderr)
+                  f"over the {_SEED_ARG_BUDGET}-byte argv budget on this platform — "
+                  "proceeding without it", file=sys.stderr)
             return [], ""
         return ["--append-system-prompt", body], ""
     return [], body + "\n\n---\n\n"
@@ -445,8 +443,14 @@ def _invoke(
     # claude (system prompt), a prompt prefix for inline families — after the role body,
     # before the task, so the style governs the report the role prompt asks for.
     style_argv, style_prefix = _style_injection(cfg, leaf, profile)
-    argv = list(leaf.argv) + role_argv + style_argv
+    argv = list(leaf.argv) + role_argv
     argv += _mapped_argv(leaf, profile, argv)
+    # The style body joins argv only AFTER the model/effort mapping (#237 PR review):
+    # `_mapped_argv` dedups by a SUBSTRING scan over argv, so a body that merely
+    # mentions "--effort" or "--model" in prose would otherwise read as the flag
+    # being present and silently drop the leaf's pinned tier. The body is prompt
+    # payload, never an option — it must not take part in option-dedup decisions.
+    argv += style_argv
     argv += list(extra_argv or [])
     # Confine the spawn to its configured memory bound (#420). One decision for BOTH
     # branches below — a bound that covered only the headless leaves would be a lie for

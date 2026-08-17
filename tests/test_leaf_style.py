@@ -102,6 +102,48 @@ class StyleInjection(unittest.TestCase):
                 self.CLAUDE)
             self.assertEqual(empty, ([], ""))
 
+    def test_a_symlink_loop_degrades_to_no_styling(self):
+        # resolve() raises RuntimeError on a loop on Python 3.11/3.12 and OSError
+        # (ELOOP) on 3.13+ — both must degrade, never crash the leaf (#237 review).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            d = root / ".claude" / "output-styles"
+            d.mkdir(parents=True)
+            (d / "a.md").symlink_to(d / "b.md")
+            (d / "b.md").symlink_to(d / "a.md")
+            got = leaves._style_injection(
+                SimpleNamespace(root=root),
+                _leaf(family="claude", style_file=".claude/output-styles/a.md"),
+                self.CLAUDE)
+        self.assertEqual(got, ([], ""))
+
+    def test_mapped_flags_survive_a_style_body_that_mentions_them(self):
+        # `_mapped_argv` dedups by a substring scan over argv — the style body must
+        # join argv only AFTER that scan, or prose merely mentioning "--effort" /
+        # "--model" reads as the flag being present and the pinned tier is silently
+        # dropped to the vendor default (#237 review). Traced through the real
+        # `_invoke` composition with the spawn stubbed out.
+        captured = {}
+        def fake_heartbeat(argv, **kw):
+            captured["argv"] = list(argv)
+            return (0, "", True)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, text="Cite flags like `--effort` and `--model` verbatim.\n")
+            cfg.families = None
+            cfg.leaf_memory_max = ""
+            leaf = _leaf(family="claude", argv=["claude", "-p"],
+                         model="sonnet", effort="high", interactive=False)
+            from unittest import mock
+            with mock.patch.object(leaves.progress, "run_with_heartbeat",
+                                   fake_heartbeat):
+                leaves._invoke(leaf, Path(tmp), "task prompt", cfg=cfg)
+        argv = captured["argv"]
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertIn("--append-system-prompt", argv)
+
     def test_no_cfg_degrades_to_no_styling(self):
         # The legacy `_invoke(cfg=None)` shape: a styled leaf without a config to
         # resolve the root against must degrade, not raise on `cfg.root`.
@@ -109,11 +151,12 @@ class StyleInjection(unittest.TestCase):
         self.assertEqual(got, ([], ""))
 
     def test_a_body_over_the_argv_bound_degrades_instead_of_crashing_exec(self):
-        # One argv element carries the body; past MAX_ARG_STRLEN execve fails
-        # E2BIG — a crash, not a degrade. Bounded, loudly, on the argv branch;
-        # the inline branch has no per-argument limit and keeps the big body.
+        # One argv element carries the body; past the OS bound the spawn itself
+        # fails — a crash, not a degrade. Bounded, loudly, on the argv branch by
+        # the seed's own per-platform budget (#313); the inline branch has no
+        # per-argument limit and keeps the big body.
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(tmp, text="x" * (leaves._STYLE_ARGV_CAP + 1))
+            cfg = _cfg(tmp, text="x" * (leaves._SEED_ARG_BUDGET + 1))
             claude = leaves._style_injection(cfg, _leaf(family="claude"), self.CLAUDE)
             self.assertEqual(claude, ([], ""))
             inline_argv, inline_prefix = leaves._style_injection(
