@@ -162,9 +162,9 @@ Reviewing issue #652: keep gateway startup recovery available over unreadable in
 
 ## 9. Check sign-off                     ← human completes Check here
 - Disposition confirmed / overridden:
-- Outcome: merged-wider
+- Outcome: discontinued
 - Iteration delta (if iterating):
-- By / date: Eduard Ralph / 2026-08-02
+- By / date: unknown / 2026-08-16
 
 ## 10. Act candidates (hints for the next Act review)
 - (empty is the common case)

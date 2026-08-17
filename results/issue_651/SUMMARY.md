@@ -175,9 +175,9 @@ Reviewing issue #651: make restore and drain reconciliation contain and attribut
 
 ## 9. Check sign-off                     ← human completes Check here
 - Disposition confirmed / overridden:
-- Outcome: merged-wider
+- Outcome: discontinued
 - Iteration delta (if iterating):
-- By / date: Eduard Ralph / 2026-08-02
+- By / date: unknown / 2026-08-16
 
 ## 10. Act candidates (hints for the next Act review)
 - File a separate bug (0.1 Alpha milestone): `crates/custodian/src/restore.rs`'s `committed_chunks` silently skips a malformed committed placement with no report field and no effect on `is_clean()` — pre-existing base behavior (unchanged by this patch), out of scope for #651; T4 finding at `restore.rs:668` recorded-rejected on this basis rather than fixed here.
