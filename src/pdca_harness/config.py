@@ -112,6 +112,13 @@ class LeafConfig:
     driver-level bound (the same "explicit setting always wins" escape hatch as
     ``argv``). ``""`` (the default) inherits the driver-level bound, which is
     itself unset by default ⇒ today's unbounded spawn, unchanged.
+
+    ``style_file`` (optional; INSTANCE DELTA, eduralph/pdca-harness#535, OPEN —
+    instance #235) names a project-root-relative markdown file whose body governs
+    the SHAPE of the leaf's prose (the Minto Pyramid style: conclusion first, then
+    grouped support). How it reaches the model is family-mapped in
+    :func:`leaves._style_injection`; ``""`` (the default) styles nothing and leaves
+    every spawn byte-identical to before the key existed.
     """
 
     mode: str = "stub"
@@ -122,6 +129,7 @@ class LeafConfig:
     model: str = ""
     effort: str = ""
     memory_max: str = ""
+    style_file: str = ""
 
 
 # ----------------------------------------------------------------------------
@@ -729,6 +737,9 @@ class Config:
                 # this leaf; "off" opts it out entirely, "" inherits the driver bound.
                 memory_max=memory_max_value(
                     d.get("memory_max", ""), f"[leaves.{name}].memory_max"),
+                # Per-leaf prose style (INSTANCE DELTA, eduralph/pdca-harness#535 —
+                # instance #235): a root-relative markdown file, family-mapped at spawn.
+                style_file=d.get("style_file", ""),
             )
 
         # Advisory reviewer leaves (issue #64) — an open list under [[leaves.advisory]].

@@ -151,6 +151,83 @@ def _role_injection(
     return [], ""
 
 
+def _resolve_style(root: Path, rel: str) -> Path | None:
+    """``root/rel``, or None when it escapes the project root.
+
+    The same shapes the rubric loader and the sizer's artifact resolution refuse:
+    absolute paths, ``..`` traversal and symlink escapes — ``Path(root) / "/etc/passwd"``
+    returns ``/etc/passwd``, an absolute join silently discards the root. The value
+    comes from ``pdca.toml`` rather than from a model, so this is defence against a
+    mistake rather than an attack — but a style path silently reading an arbitrary host
+    file into a model prompt is a mistake worth refusing rather than obeying."""
+    if not rel or Path(rel).is_absolute():
+        return None
+    try:
+        resolved = (root / rel).resolve()
+        resolved.relative_to(Path(root).resolve())
+    # RuntimeError included (#237 PR review): on Python 3.11/3.12 a symlink LOOP
+    # raises it from resolve() — 3.13+ raises OSError (ELOOP) — and an uncaught
+    # loop would crash the leaf instead of degrading to no styling.
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return resolved
+
+
+def _style_injection(
+    cfg: Config | None, leaf: LeafConfig, profile: families.FamilyProfile,
+) -> tuple[list[str], str]:
+    """INSTANCE DELTA (eduralph/pdca-harness#535, OPEN — instance #235). How the leaf's
+    optional prose style (``leaf.style_file``, a project-root-relative markdown file,
+    frontmatter stripped) reaches the model: extra argv or a prompt prefix.
+
+    The claude family appends it to the SYSTEM prompt via ``--append-system-prompt`` —
+    inline text, not the ``-file`` variant, because the sizer/splitter spawn with cwd =
+    the bundle directory and a cwd-relative path is a hard CLI error there ("Append
+    system prompt file not found"); and argv rather than the prompt, so an interactive
+    leaf's REPL seed stays clean for the human. Every other family gets the body
+    prepended to the task prompt right after the role body — the same channel its role
+    prompt already rides (the codex reviewer). Best-effort like the role injection
+    above: an unreadable, undecodable, root-escaping or empty style file degrades to no
+    styling, never a crashed leaf. Explicit argv stays the escape hatch: a leaf whose
+    argv already carries ``--append-system-prompt``/``--append-system-prompt-file`` is
+    left alone.
+    """
+    if not leaf.style_file or cfg is None:
+        return [], ""
+    path = _resolve_style(cfg.root, leaf.style_file)
+    if path is None:
+        print(f"leaves: style file {leaf.style_file!r} escapes the project root — "
+              "proceeding without it", file=sys.stderr)
+        return [], ""
+    try:
+        body = families.strip_frontmatter(path.read_text(encoding="utf-8")).strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"leaves: style file {path} unreadable ({exc}) — proceeding without it",
+              file=sys.stderr)
+        return [], ""
+    if not body:
+        return [], ""
+    if profile.name == "claude":
+        if any(a.startswith("--append-system-prompt") for a in leaf.argv):
+            return [], ""
+        # ONE argv element carries the whole body, and the OS bounds it — Linux caps
+        # a single exec argument at MAX_ARG_STRLEN (~128 KiB), Windows the WHOLE
+        # command line at ~32,767 chars — past which the spawn itself fails and the
+        # leaf CRASHES instead of degrading. The interactive SEED is spilled to a
+        # file for exactly this class (#313); the style body cannot ride that spill,
+        # so bound it by the SAME per-platform budget the seed uses: a style that
+        # size is a config error, and fail-open with a loud note is the contract
+        # every other bad-style shape gets. The inline branch below is exempt — its
+        # body rides the prompt (stdin / seed), which has no per-argument bound.
+        if len(body.encode("utf-8")) > _SEED_ARG_BUDGET:
+            print(f"leaves: style file {path} is {len(body.encode('utf-8'))} bytes — "
+                  f"over the {_SEED_ARG_BUDGET}-byte argv budget on this platform — "
+                  "proceeding without it", file=sys.stderr)
+            return [], ""
+        return ["--append-system-prompt", body], ""
+    return [], body + "\n\n---\n\n"
+
+
 def _mapped_argv(leaf: LeafConfig, profile: families.FamilyProfile,
                  argv: list[str]) -> list[str]:
     """argv additions from the opt-in per-leaf ``model`` / ``effort`` keys, mapped
@@ -362,8 +439,18 @@ def _invoke(
     """
     profile = families.resolve(leaf.family, cfg.families if cfg else None)
     role_argv, prompt_prefix = _role_injection(cfg, leaf, profile)
+    # Prose style (INSTANCE DELTA, eduralph/pdca-harness#535 — instance #235): argv for
+    # claude (system prompt), a prompt prefix for inline families — after the role body,
+    # before the task, so the style governs the report the role prompt asks for.
+    style_argv, style_prefix = _style_injection(cfg, leaf, profile)
     argv = list(leaf.argv) + role_argv
     argv += _mapped_argv(leaf, profile, argv)
+    # The style body joins argv only AFTER the model/effort mapping (#237 PR review):
+    # `_mapped_argv` dedups by a SUBSTRING scan over argv, so a body that merely
+    # mentions "--effort" or "--model" in prose would otherwise read as the flag
+    # being present and silently drop the leaf's pinned tier. The body is prompt
+    # payload, never an option — it must not take part in option-dedup decisions.
+    argv += style_argv
     argv += list(extra_argv or [])
     # Confine the spawn to its configured memory bound (#420). One decision for BOTH
     # branches below — a bound that covered only the headless leaves would be a lie for
@@ -372,7 +459,7 @@ def _invoke(
     # per-branch tails (the stream flags, the interactive seed): everything after the
     # wrapper's `--` is the leaf's own command line, in its original order.
     argv = _memory_cap_prefix(leaf, cfg) + argv
-    prompt = prompt_prefix + prompt
+    prompt = prompt_prefix + style_prefix + prompt
     run_env = {**os.environ, **env} if env else None
     if leaf.interactive:
         # The seed may be spilled to a file when it would blow the OS single-argument
@@ -943,6 +1030,11 @@ def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
         memory_max=(memory_max_value(spec.get("memory_max", ""),
                                      "a [[leaves.*]] variant/escalation memory_max")
                     or default.memory_max),
+        # Prose style (INSTANCE DELTA, eduralph/pdca-harness#535 — instance #235): the
+        # spec's own `style_file` wins, else INHERIT the base leaf's — an escalation of
+        # a styled leaf must not silently lose its report shape, for the same reason it
+        # must not lose its memory cap above.
+        style_file=spec.get("style_file", default.style_file),
     )
 
 
@@ -1166,6 +1258,25 @@ def _sizer_key(d: Path, cfg: Config, bp: Path) -> str:
         tuple(tuple(sorted((k, repr(v)) for k, v in spec.items()))
               for spec in cfg.sizer_escalation),
     ]).encode("utf-8"))
+    # The prose style is configuration too (INSTANCE DELTA, eduralph/pdca-harness#535 —
+    # instance #235): wiring `style_file` onto the sizer, or editing the style's body,
+    # changes the prompt the verdict answers, so it must earn a fresh pass rather than
+    # reuse the differently-shaped cached one. Key on the path AND the bytes — for the
+    # base leaf and for every escalation spec alike: the spec item tuples above carry
+    # only the PATH string, so without hashing the bytes here an edited per-spec style
+    # would silently reuse the verdict produced under the old one. A style the
+    # injection would refuse or fail open on contributes nothing, matching the spawn's
+    # "no styling" behaviour.
+    for style_rel in [cfg.sizer.style_file,
+                      *(str(spec.get("style_file") or "")
+                        for spec in cfg.sizer_escalation)]:
+        h.update(repr(style_rel).encode("utf-8"))
+        if style_rel:
+            sp = _resolve_style(cfg.root, style_rel)
+            try:
+                h.update(sp.read_bytes() if sp is not None else b"")
+            except OSError:
+                pass
     artifact = brief.planning_artifact(bp)
     if not artifact:
         return h.hexdigest()[:16]
@@ -2455,6 +2566,10 @@ def _advisory_leaf(spec: dict, table: str, leaf_id: str) -> LeafConfig:
         model=spec.get("model", ""), effort=spec.get("effort", ""),
         memory_max=memory_max_value(spec.get("memory_max", ""),
                                     f"[[leaves.{table}]] '{leaf_id}'.memory_max"),
+        # Prose style (INSTANCE DELTA, eduralph/pdca-harness#535 — instance #235): a
+        # per-leaf key documented for any leaf table must reach the array-form ones
+        # too — the memory_max lesson this constructor's docstring records.
+        style_file=spec.get("style_file", ""),
     )
 
 
