@@ -434,7 +434,8 @@ def retire_cleared(d: Path, summary_path: Path) -> list[str]:
     # cannot shield its exactly-ticked neighbour (the round-5 drain stays drainable) —
     # while an EDITED open row protects every entry it could name, failing closed on the
     # same doctrine as round 4: a lingering finding is visible, a lost one is unrecoverable.
-    # (Upstream: eduralph/pdca-harness#335; this render carries the fix until that lands.)
+    # (INSTANCE DELTA — upstream eduralph/pdca-harness#335, OPEN: this render carries
+    # the fix until it lands.)
     protected: set[int] = set()
     for o in still_open:
         owned = [i for i, t in enumerate(ledger) if _norm_line(t) == o]

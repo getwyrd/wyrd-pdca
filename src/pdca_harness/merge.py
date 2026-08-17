@@ -330,7 +330,8 @@ def _behind_by(repo_spec: str, pr_url: str) -> int | None:
 
 
 def _sync_base(pr_url: str) -> bool:
-    """Bring a behind PR up to date with its base. INSTANCE DELTA (#531).
+    """Bring a behind PR up to date with its base. INSTANCE DELTA
+    (eduralph/pdca-harness#531, OPEN).
 
     The push re-triggers CI, so the rollup for the new head is EMPTY — which is precisely
     what :func:`_await_rollup` already polls on. The sync therefore needs no waiting of its
