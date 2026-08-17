@@ -117,6 +117,21 @@
     **Not** the same as host strictness — `strict = true` alone would make `gh pr merge`
     refuse every wave member after the first and stop the batch, since upstream has no
     `update-branch` path at all.
+  - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
+    vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
+    whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker
+    line itself or within the two lines right after it (forward-only, so a site can never
+    borrow a neighbour's reference): that is what the scanner keys on, so a short-form,
+    preceding-line or far-away reference reads as an unattributed divergence and warns.
+    `scripts/checks/delta_retirement.py` scans the engine, scripts, role prompts and
+    `pdca.toml` for the markers, asks `gh` for each named issue's state, and is loud when
+    one is CLOSED — naming the delta's sites so a human can judge whether the local code
+    can go (the fix landing upstream does **not** mean it is safe to drop unread). It runs
+    as the `delta retirement` `[[doctor.checks]]` row (group "upgrade", WARN — it needs
+    network and an authenticated `gh`, which is why it lives in `pdca doctor` rather than
+    the offline `make check`). Run it before any `copier update`, alongside the #217
+    standing rule from the v0.57.0 upgrade review: audit **every** off-default key at an
+    upgrade, not only the delta being changed.
   - **The host-side backstop is real**, and was the precondition recorded here in 2026-08-08:
     `main`'s required contexts are `docs-check`, `require-issue`, `docs-immutability`,
     **`gate`**, **`dco`** (verified 2026-08-16). So even if the rollup gate were bypassed,
