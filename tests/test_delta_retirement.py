@@ -55,11 +55,17 @@ def _gh(issues: dict[tuple[str, int], tuple[str, str]] | None = None,
         raises: Exception | None = None):
     """A fake `gh` runner, mirroring the real call shape (argv[1] is issue|pr,
     argv[3] the number). Unlisted ⇒ that subcommand fails; ``raises`` ⇒ the binary
-    itself is unavailable (FileNotFoundError et al.)."""
+    itself is unavailable (FileNotFoundError et al.). The stub ASSERTS the
+    load-bearing call shape — the binary name, the view subcommand, the --json
+    request, captured text output and a finite timeout — so a regression in how
+    the real `gh` is invoked cannot hide behind a permissive fake."""
     tables = {"issue": issues or {}, "pr": prs or {}}
-    def runner(argv, capture_output=True, text=True):
+    def runner(argv, capture_output=False, text=False, timeout=None):
         if raises is not None:
             raise raises
+        assert argv[0] == "gh" and argv[2] == "view" and "--json" in argv
+        assert capture_output is True and text is True
+        assert timeout is not None and 0 < timeout <= 300
         got = tables[argv[1]].get((argv[argv.index("-R") + 1], int(argv[3])))
         if got is None:
             return SimpleNamespace(returncode=1, stdout="", stderr="not found")
@@ -120,6 +126,25 @@ class ScanAssociation(unittest.TestCase):
         s = self._sites(f"# INSTANCE DELTA (#228, upstream {UPSTREAM}#531).\n")
         self.assertEqual(s[0].refs, ((UPSTREAM, 531),))
 
+    def test_ref_three_lines_below_is_out_of_window(self):
+        # The documented window is the marker line plus TWO lines — a ref on the
+        # third reads as unattributed, exactly as docs/INTEGRATION.md §2 warns.
+        s = self._sites("# INSTANCE DELTA: a wrapped comment\n"
+                        "# that keeps wrapping\n"
+                        "# and wrapping some more\n"
+                        f"# ({UPSTREAM}#531).\n")
+        self.assertEqual(s[0].refs, ())
+
+    def test_non_utf8_bytes_do_not_crash_the_scan(self):
+        # A stray binary byte in a scanned file must not take the checker down —
+        # errors="replace" keeps the line-shape and the refs readable.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "mod.py"
+            p.write_bytes(b"# INSTANCE DELTA (" + UPSTREAM.encode() + b"#7)\n"
+                          b"\xff\xfe not text \xff\n")
+            s = dr.scan_file(p, "mod.py")
+        self.assertEqual(s[0].refs, ((UPSTREAM, 7),))
+
 
 class MainVerdicts(unittest.TestCase):
     FILES = {
@@ -178,6 +203,41 @@ class MainVerdicts(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("UNREACHABLE", text)
 
+    def test_wedged_gh_is_unreachable_not_a_hang_or_traceback(self):
+        import subprocess
+        rc, text = self._run(_gh(raises=subprocess.TimeoutExpired("gh", 30)))
+        self.assertEqual(rc, 3)
+        self.assertIn("UNREACHABLE", text)
+
+    def test_a_reply_without_a_state_is_unreachable_not_a_candidate(self):
+        # `gh` exiting 0 with JSON that carries no `state` confirmed nothing — the
+        # "retirement candidate" banner on such a reply would assert a fix landed
+        # on evidence that never said so.
+        def runner(argv, capture_output=False, text=False, timeout=None):
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        rc, text = self._run(runner)
+        self.assertEqual(rc, 3)
+        self.assertIn("UNREACHABLE", text)
+        self.assertNotIn("RETIREMENT CANDIDATE", text)
+
+    def test_one_unreachable_issue_does_not_swallow_the_rest_of_the_report(self):
+        # 462 unanswerable, 531 CLOSED: both must appear — an early UNREACHABLE
+        # stopping the loop would hide a real retirement candidate behind it.
+        rc, text = self._run(_gh(issues={(UPSTREAM, 531): ("CLOSED", "sync")}))
+        self.assertEqual(rc, 3)  # unreachable outranks, but both are reported
+        self.assertIn("UNREACHABLE", text)
+        self.assertIn("RETIREMENT CANDIDATE", text)
+        self.assertIn(f"{UPSTREAM}#531", text)
+
+    def test_the_default_root_is_this_repo(self):
+        # main() with no explicit root must scan THIS project tree, and say so in
+        # the header — the doctor row relies on that default.
+        out = io.StringIO()
+        rc = dr.main(runner=_gh(), out=out)
+        self.assertEqual(rc, 3)  # live sites found, every query stubbed to fail
+        self.assertIn("delta-retirement:", out.getvalue())
+        self.assertIn(f"(root: {ROOT})", out.getvalue())
+
     def test_unattributed_marker_warns(self):
         rc, text = self._run(_gh(), files={
             "src/x.py": "# INSTANCE DELTA with no issue named\n"})
@@ -213,6 +273,30 @@ class LiveTreeDiscipline(unittest.TestCase):
                          "marked divergence without a retirement condition — name the "
                          "upstream issue in full `owner/repo#N` form on the marker line "
                          "or the two lines right after it")
+        # The scan must span roots, not stop at its own exclusion: the engine AND
+        # the config both carry live sites today.
+        paths = {s.path for s in sites}
+        self.assertIn("pdca.toml", paths)
+        self.assertTrue(any(p.startswith("src/") for p in paths))
+
+    def test_no_near_miss_marker_spelling_hides_from_the_scanner(self):
+        # The guard above is vacuous for a marker the regex never finds — so pin
+        # the realistic drift shapes (INSTANCE-DELTA, INSTANCE_DELTA) to the
+        # canonical spelling: every near-miss in the scan roots must ALSO be a
+        # real marker hit, or someone wrote a divergence the checker cannot see.
+        import re
+        near = re.compile(r"\binstance[\s_-]+delta\b", re.IGNORECASE)
+        offenders = []
+        for f in dr._iter_files(ROOT):
+            if f.resolve() == Path(dr.__file__).resolve():
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+            for i, line in enumerate(text.splitlines(), 1):
+                if near.search(line) and not dr._MARKER.search(line):
+                    offenders.append(f"{f.relative_to(ROOT)}:{i}: {line.strip()}")
+        self.assertEqual(offenders, [],
+                         "near-miss marker spelling — use `INSTANCE DELTA` exactly, "
+                         "or the retirement check cannot track it")
 
     def test_the_documented_deltas_are_found(self):
         # The three deltas issue #231 tables, plus the #335 carry (marked with #231).

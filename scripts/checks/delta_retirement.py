@@ -125,21 +125,26 @@ def issue_state(repo: str, num: int, *, runner=subprocess.run) -> tuple[str, str
 
     Tries the issue endpoint first, then the PR one — a delta may name either kind,
     and ``gh issue view`` refuses a PR number rather than answering for it. A missing
-    ``gh`` binary is the same answer as an unauthenticated one: ``None``, reported
-    UNREACHABLE — never a traceback.
+    ``gh`` binary, a hung network (30s per call, mirroring the doctor's own gh probe
+    bound), or a reply that does not actually carry a ``state`` are all the same
+    answer: ``None``, reported UNREACHABLE — never a traceback, and never a
+    "retirement candidate" verdict on evidence that confirmed nothing.
     """
     for sub in ("issue", "pr"):
         try:
             r = runner(["gh", sub, "view", str(num), "-R", repo,
-                        "--json", "state,title"], capture_output=True, text=True)
-        except OSError:  # gh not installed (FileNotFoundError) or not executable
-            return None
+                        "--json", "state,title"], capture_output=True, text=True,
+                       timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None  # gh not installed / not executable / wedged
         if r.returncode == 0:
             try:
                 data = json.loads(r.stdout)
-                return str(data.get("state", "?")).upper(), str(data.get("title", ""))
             except (json.JSONDecodeError, AttributeError):
                 return None
+            if not isinstance(data, dict) or "state" not in data:
+                return None
+            return str(data["state"]).upper(), str(data.get("title", ""))
     return None
 
 
