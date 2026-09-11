@@ -66,6 +66,18 @@ either serialises needlessly or lets two bundles collide on a shared file and wa
 Bare ids only on the value line; put the *why* in `Ordering note:`. Sequencing is the
 human's to confirm (like scope) — **ask when the order isn't clear.**
 
+## Before you brief anything — the intake cap (`wyrd-pdca-P1`)
+
+Run `scripts/plan-cap` first, every session. It counts the bundles past Plan and not yet
+signed off and compares them with the cap (6). **Above the cap you do not author a new
+brief, do not run `pdca split --accept`, and do not draft a reslicing** — say so, quote the
+line the script printed, and offer the human only what still closes work: a
+`close-disposition` brief, a repair of a brief already in the batch, or stopping here.
+The cap is the counterweight to a cycle whose splits and filed findings opened issues
+faster than Do could close them (INTEGRATION §11, `wyrd-pdca-P1`); it lifts by itself as
+sign-offs land. The human can override for one id by saying so — record the override
+and the count in that brief's ordering note, so Act can see it.
+
 ## How you work
 
 - **The tracker is the source of truth — go straight to it, don't scan this repo.**
@@ -166,6 +178,10 @@ pdca split <id> --accept     # files one tracker issue per child as a SUB-ISSUE 
 You do **not** leave the session to file issues by hand. `--accept` does it (pass `--ids`
 instead only when the issues already exist, or when the tracker is not one the driver can
 reach — it will say so plainly rather than skipping).
+
+**`--accept` is intake.** Every child it files is a new bundle past Plan, so it is subject
+to the cap above: above the cap, write the proposal with the human if the seams are clear
+now, but leave it unaccepted and say which number has to fall first (`scripts/plan-cap`).
 
 What happens next no longer depends on how this run was started:
 

@@ -29,6 +29,54 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-09-11 — backlog flow (no new frozen cycles; decided via getwyrd/wyrd-pdca#238)
+
+> Out-of-band Act: a tracker-flow review rather than a frozen-bundle sweep. Input:
+> `docs/2026-09-11-backlog-reversal-proposal.md`. Applies delta 1 of that proposal; deltas
+> 2–8 are filed as getwyrd/wyrd-pdca#239–#244 and wait for their own Act lines.
+
+## What the records showed
+
+- **Plan intake outran Do with nothing to stop it.** `pdca status` on 2026-09-11 read 18
+  PLANNED, 4 BUILT unsigned, 1 AWAITING_SIGNOFF, 1 ITERATE_DO — 24 bundles past Plan for a
+  consumer that runs one `flow` at a time on two lanes. Host tracker, August 2026: 78 issues
+  opened, 20 closed; 63 of the 64 still-open August issues were the cycle's own output
+  (split children, findings filed as issues, routed follow-ups). No earlier Act entry
+  measured opened-vs-closed, so the gap never registered as a process failure.
+- **A dependency on a DISCONTINUED bundle is a permanent block, not a wait.** #508, #625,
+  #633 and #637 declared `Depends on: 636` after #636 was discontinued and re-sliced;
+  `check_dep_graph` needs COMPLETE, so the 0.1 Alpha critical path could never schedule.
+  Repointed 2026-09-11 to #636's actual children (each brief's ordering note says how).
+
+## Process deltas
+
+- Ruleset: **`wyrd-pdca-P1` — Plan intake cap.** Above 6 bundles past Plan and unsigned,
+  no new brief, no `pdca split --accept`, no reslicing proposal; close-disposition briefs
+  and in-batch repairs exempt.   (`docs/INTEGRATION.md` §11)
+- Gates: **`scripts/plan-cap`** — prints the count against the cap, exits non-zero above
+  it; `--status-file` for tests; cap from `--cap` / `$PDCA_PLANNED_CAP` / 6.
+  (`scripts/plan-cap`, `tests/test_plan_cap.py`)
+- Agent role prompts: planner runs the cap first and refuses intake above it; `--accept`
+  named as intake. Splitter records the cap line at the top of every proposal and states
+  that acceptance waits above the cap.   (`agents/{planner,splitter}.md` and the
+  `.claude/agents/` copies)
+
+## Follow-ups routed
+
+- Harness: a `planned_cap` knob so the driver enforces what the prompts now ask for →
+  eduralph/pdca-harness#544. Companion harness items from the same review: #545 (split
+  closes its parent, bounded depth), #546 (`flow --only`).
+- Instance deltas 2–8 of the proposal → getwyrd/wyrd-pdca#239 (splits close parent, once
+  only), #240 (findings stay in the bundle), #241 (sizer recalibration), #242 (critical-path
+  run plan), #243 (harness freeze), #244 (Act judges by flow). Owner: Eduard.
+
+## How effectiveness will be judged
+
+- `scripts/plan-cap` reads at or under 6 by the Act review after wyrd #637 merges, and no
+  `split --accept` or new brief lands while it reads over.
+- September and October each show host-tracker issues closed ≥ opened (the #244 header,
+  once adopted, makes this one line per entry).
+
 # Act review — 2026-08-02 — cycles considered: issue_115, issue_503, issue_504, issue_505, issue_507, issue_509, issue_510, issue_575, issue_576, issue_577, issue_634, issue_635, issue_638, issue_648, issue_649, issue_650, issue_651, issue_652
 
 > Eighteen bundles frozen since the last frozen-bundle review (2026-07-16); the 07-18
