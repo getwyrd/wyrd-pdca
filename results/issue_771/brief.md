@@ -21,7 +21,14 @@
   `{session, parts:<set>}` (`:665`, `:823`, `:2193`) and `{parts:<set>}` alone (the root
   flip's unnamed staged parts, `:662`, `:919-921`); under `retire:bytes:` + a per-part `s:`
   token — `{chunks:[…]}` (`:659`, `:672`, `:1620`); under `retire:bytes:` + a `g:` token —
-  `{generation: {inode, version, chunks?, segments?}}` (`:355`, `:2417`); under
+  `{generation: {inode, version, chunks | segments}}` — **exactly one of the two, settled by
+  the human 2026-09-11 after four rounds oscillated on it:** a generation mirrors the
+  committed map, which is the two-arm `ChunkMap::Flat | Segmented` (`metadata.rs:1014`) with
+  no inline chunks on a `SegmentedMap`, so a flat generation retires by its copied `chunks`
+  and a segmented one by its `segments` group re-read at drain time (`:2417`). **Both present
+  is a decode error, neither present is R2.** `0016` spells the row two ways (`:355`
+  `chunks, segments?`; `:2417` `chunks?, segments`) — those are the two cases, not a union;
+  the PR description records the erratum, this slice does not edit `0016`; under
   `retire:records:` + a suffix-free `s:` token — `{parts:<set>}` (`:662`), `{seg:{nonce,
   epoch}}` (`:663`, `:665`, `:823`), **and both together in one payload** (`:356`, "and/or").
   A payload type whose arms make `{session, parts}` or `{parts} + {seg}` inexpressible fails
@@ -90,10 +97,10 @@
   so it genuinely compiles and runs under the gate's own invocation. The RED leg reverts
   production, the test then fails to **compile**, and the gate reports **UNVERIFIABLE (exit
   77)** — **EXPECTED and PRE-DECLARED** here so it lands as a known sign-off item, not a
-  surprise NEEDS-HUMAN. **What Do MUST capture instead (binding): NINE isolating negations,
-  and this list is the authority for that count** — one per binding rejection leg (R2, R3,
-  R4-session-under-part, R4-chunks-under-session, R5, R6-epoch, R7, R8-noncanonical) plus one
-  for R9 (break the identity on one accepted witness). For each: remove that single check, run
+  surprise NEEDS-HUMAN. **What Do MUST capture instead (binding): TEN isolating negations,
+  and this list is the authority for that count** — one per binding rejection leg (R1-generation-both,
+  R2, R3, R4-session-under-part, R4-chunks-under-session, R5, R6-epoch, R7, R8-noncanonical) plus
+  one for R9 (break the identity on one accepted witness). For each: remove that single check, run
   the test, paste the failing output into `build-notes.md`, revert. **Each negation must
   ISOLATE its rule** — exactly one test fails. A leg that stays green under its own negation
   is not load-bearing and must be rewritten. R1's completeness legs are negated the other way
@@ -115,6 +122,14 @@
   other bundle in flight (#721 and #722 share `crates/core/src/metadata.rs` and
   `crates/dst/tests/custodian.rs` with **child-2**, not with this one). child-2 depends on this
   child; see its ordering note.
+  **Decision 2026-09-11 (human, before round 5):** the generation payload carries exactly one
+  of `chunks` / `segments`; both present is a decode error. Attempts 1–3 built that, auto-iterate
+  rounds 2 and 3 instructed the opposite, attempt 4 built the hybrid, the round-4 adversary
+  refuted it from the data model. The round-2 adversary had already marked this NEEDS-HUMAN
+  ("a format decision a rebuild should not guess"). Reviewer and adversary: cite R1 above;
+  do not re-open it. Round 5 removes the `bytes_generation_with_both_sources_decodes` witness,
+  tightens the shape check, corrects the module doc comment, and adds the R1-generation-both
+  negation — nothing else changes on this point.
 - **Surfaces:** data
 - **Difficulty:** high — rated on **effect propagation**, the second half of the blast-radius
   criterion, not on edge-case density (the gates own that) and not on file count, which is
@@ -210,3 +225,64 @@
   two archived attempts, #692's two, and #717's own three — the batch review's token-scope
   blocker and the round-3 epoch blocker are legs R4 and R6 here, not suggestions.
 - **Disposition hint:** new-feature
+
+## Iteration 1 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 1): rebuilding for the implementation-level findings — C4 Verification (red→green) — Accept the declared born-at-tier evidence posture — the independent and frozen green runs pass 27 tests, but the stashed pre-fix leg does not compile or execute a discriminator, so no behavioral red was established (`gate-logs/C4-verify.log:10`, `gate-logs/C4-verify.log:180`).; C5 Causal adequacy — Rebuild the scope relation and add isolating rejection coverage for record-mode or sessionless `parts:"all"` — the current causal suite omits the unsafe spelling identified by the writer table (`crates/core/src/multipart.rs:2736`, `crates/core/tests/multipart_retire_obligation.rs:334`).; T1 Structure — Decide whether to re-enter Plan for the size cap — the three-file patch has about 1,060 added nonblank/non-comment lines against the brief’s ≤1,000-semantic-line budget, which affects reviewability of this frozen format.; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 4 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_771/review-b. 2 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 4 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_771/review-b
+- Full previous attempt preserved in `iteration-v1/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
+
+## Iteration 2 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 2): rebuilding for the implementation-level findings — C4 Verification (red→green) — Accept the declared born-at-tier evidence posture — the independent and frozen post-fix runs pass 26 tests and full CI, but the pre-fix leg never executes a discriminator, so no behavioral red→green was established (`gate-logs/C4-verify.log:10`, `gate-logs/C4-verify.log:108`).; C5 Causal adequacy — Add an accepted round-trip witness for a generation carrying both `chunks` and `segments` — the format explicitly permits the hybrid, while the suite tests only the two separate forms, so a regression rejecting the combined form can survive (`crates/core/src/multipart.rs:2581`, `crates/core/tests/multipart_retire_obligation.rs:309`, `crates/core/tests/multipart_retire_obligation.rs:325`).; T5 Judgment — Rebuild with the hybrid generation acceptance/identity test and rerun the batched review — without that witness, the claimed complete accepted set for this frozen record format is not causally demonstrated (`crates/core/tests/multipart_retire_obligation.rs:306`).; **R9's advertised "file-wide property" is unfalsifiable; it cannot fail for; **`PartNumberSet::from_numbers` can mint a value whose stored spelling its; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 2 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_771/review-b. 3 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 2 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_771/review-b
+- Full previous attempt preserved in `iteration-v2/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
+
+## Iteration 3 — carry-forward (from the previous attempt)
+- Sign-off rationale: Rebuild targeting the substantive implementation/spec-conformance defects found, not the unrelated RUSTSEC/cargo-deny item or the size backstop's iterate-plan suggestion: 1. C5 mutant survivor: the "empty obligation must be rejected" (R2) rule does not actually fire when a generation record's `chunks` list is present but empty (`crates/core/src/multipart.rs:2704`, match guard `!chunks.is_empty()` can be replaced with `true` and all 27 tests still pass). Normalize an empty `chunks` to `RetireObligationOwesNothing` before the arm split, add a witness test with a present-but-empty flat map to `an_obligation_owing_nothing_is_rejected`. 2. T2 Shape FAIL: the brief requires the payload to express a generation carrying BOTH `chunks` and `segments` together (a hybrid, `0016:355`/`:2417`), but `RetiredMap` (`crates/core/src/multipart.rs:2632`) makes them mutually exclusive and decode rejects the required hybrid shape. Implement the hybrid per the brief's R1 completeness leg. 3. The new architecture-doc paragraph (`docs/design/architecture/05-building-block-view.md:204`) asserts install/drain CAS behavior that does not exist in this tree yet and contradicts the immediately preceding paragraph. Trim it to only the namespaces, the value's contents, and the decoded-against-its-key rule per R10's own instruction ("extend the sentence, do not restate the proposal"). 4. T5 Judgment: consider narrowing `RetirePayload`'s public `Deserialize` boundary so value-only decoding cannot bypass the documented key-relation validation (`crates/core/src/multipart.rs:2762`, `:2994`). Explicitly out of scope for this iteration: the C4-ci `cargo deny` / RUSTSEC-2026-0258 `h2` advisory (unrelated supply-chain finding), and the size-backstop's iterate-plan recommendation — proceeding with iterate-do on the findings above instead.
+- Sign-off session carry-forward (captured live, before §9 flattened it):
+  Rebuild targeting the substantive implementation/spec-conformance defects found, not the unrelated RUSTSEC/cargo-deny item or the size backstop's iterate-plan suggestion:
+  1. C5 mutant survivor: the "empty obligation must be rejected" (R2) rule does not actually fire when a generation record's `chunks` list is present but empty (`crates/core/src/multipart.rs:2704`, match guard `!chunks.is_empty()` can be replaced with `true` and all 27 tests still pass). Normalize an empty `chunks` to `RetireObligationOwesNothing` before the arm split, add a witness test with a present-but-empty flat map to `an_obligation_owing_nothing_is_rejected`.
+  2. T2 Shape FAIL: the brief requires the payload to express a generation carrying BOTH `chunks` and `segments` together (a hybrid, `0016:355`/`:2417`), but `RetiredMap` (`crates/core/src/multipart.rs:2632`) makes them mutually exclusive and decode rejects the required hybrid shape. Implement the hybrid per the brief's R1 completeness leg.
+  3. The new architecture-doc paragraph (`docs/design/architecture/05-building-block-view.md:204`) asserts install/drain CAS behavior that does not exist in this tree yet and contradicts the immediately preceding paragraph. Trim it to only the namespaces, the value's contents, and the decoded-against-its-key rule per R10's own instruction ("extend the sentence, do not restate the proposal").
+  4. T5 Judgment: consider narrowing `RetirePayload`'s public `Deserialize` boundary so value-only decoding cannot bypass the documented key-relation validation (`crates/core/src/multipart.rs:2762`, `:2994`).
+  Explicitly out of scope for this iteration: the C4-ci `cargo deny` / RUSTSEC-2026-0258 `h2` advisory (unrelated supply-chain finding), and the size-backstop's iterate-plan recommendation — proceeding with iterate-do on the findings above instead.
+- Failing gate: C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) — xtask: `cargo deny check` failed with exit status: 1
+- Failing gate: C5 surviving mutants on the bundle diff (cargo mutants --in-diff) (advisory) — 76 mutants tested in 2m: 1 missed, 46 caught, 29 unviable
+- Full previous attempt preserved in `iteration-v3/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
+
+## Iteration 4 — carry-forward (from the previous attempt)
+- Sign-off rationale: Rationale (human decision, overriding the bundle's own size-backstop recommendation of iterate-plan): the findings are judged tractable within this slice as-is. Fix on the next round: 1. [impl] `decode_retire_obligation` (multipart.rs:3144-3157) validates the record's mode (bytes vs. records) but discards it before returning, so a drain given only the decode result cannot tell apart two opposite obligations that share the same {parts} shape (bytes mode = orphan-mark then delete; records mode = delete records, never orphan-mark live data). Fix inside this diff's own signature — return (RetireMode, RetireToken, RetirePayload), or expose the mode on the payload — plus a test leg asserting the two keys' decode results differ. 2. [impl] carried from round 2: the decoder accepts a hybrid generation shape (both flat chunk-list AND segment-group) that no writer in the codebase can install, licensed by a module doc comment (multipart.rs:2583) that misstates the data model — InodeRecord's ChunkMap is a two-arm Flat | Segmented enum, never both. Concrete repro: key retire_key(Bytes, g:42:4) with value {"generation":{"inode":42,"version":4,"chunks":[...], "segments":{...}}} currently decodes Ok. Tighten checked_shape to reject "both" and correct the doc comment's claim. 3. The C4 CI red (cargo deny / h2 RUSTSEC-2026-0258) is a pre-existing transitive dependency advisory unrelated to this diff — not this slice's to fix; carry forward as a known, separately-tracked blocker rather than re-diagnosing it each round. 4. T5 Judgment (RetirePayload: Deserialize bypasses the key-bound decode boundary) and the Validation/fitness-to-purpose freeze-timing question remain open for the next round's sign-off to weigh, not resolved here. Note: §6's last bullet was truncated by a known SUMMARY assembly bug (carried-forward items losing their tail); the full text was recovered from the archived round-2 check-advisory-adversary.md and is reflected in finding #2 above.
+- Sign-off session carry-forward (captured live, before §9 flattened it):
+  Rationale (human decision, overriding the bundle's own size-backstop recommendation of
+  iterate-plan): the findings are judged tractable within this slice as-is.
+
+  Fix on the next round:
+  1. [impl] `decode_retire_obligation` (multipart.rs:3144-3157) validates the record's mode
+     (bytes vs. records) but discards it before returning, so a drain given only the decode
+     result cannot tell apart two opposite obligations that share the same {parts} shape
+     (bytes mode = orphan-mark then delete; records mode = delete records, never orphan-mark
+     live data). Fix inside this diff's own signature — return (RetireMode, RetireToken,
+     RetirePayload), or expose the mode on the payload — plus a test leg asserting the two
+     keys' decode results differ.
+  2. [impl] carried from round 2: the decoder accepts a hybrid generation shape (both flat
+     chunk-list AND segment-group) that no writer in the codebase can install, licensed by a
+     module doc comment (multipart.rs:2583) that misstates the data model — InodeRecord's
+     ChunkMap is a two-arm Flat | Segmented enum, never both. Concrete repro: key
+     retire_key(Bytes, g:42:4) with value {"generation":{"inode":42,"version":4,"chunks":[...],
+     "segments":{...}}} currently decodes Ok. Tighten checked_shape to reject "both" and
+     correct the doc comment's claim.
+  3. The C4 CI red (cargo deny / h2 RUSTSEC-2026-0258) is a pre-existing transitive dependency
+     advisory unrelated to this diff — not this slice's to fix; carry forward as a known,
+     separately-tracked blocker rather than re-diagnosing it each round.
+  4. T5 Judgment (RetirePayload: Deserialize bypasses the key-bound decode boundary) and the
+     Validation/fitness-to-purpose freeze-timing question remain open for the next round's
+     sign-off to weigh, not resolved here.
+
+  Note: §6's last bullet was truncated by a known SUMMARY assembly bug (carried-forward items
+  losing their tail); the full text was recovered from the archived round-2
+  check-advisory-adversary.md and is reflected in finding #2 above.
+- Failing gate: C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) — xtask: `cargo deny check` failed with exit status: 1
+- Full previous attempt preserved in `iteration-v4/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).

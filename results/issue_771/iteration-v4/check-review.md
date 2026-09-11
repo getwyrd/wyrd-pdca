@@ -1,0 +1,15 @@
+Review of issue #771’s multipart retirement-obligation value, key-bound decoder, canonical part-range encoding, tests, and architecture documentation.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief gives a falsifiable R1–R10 matrix for every accepted writer shape, every rejected structural mismatch, and exact-byte identity (`brief.md:14`). |
+| C2 Reproduction (red pre-fix) | N/A | This is new functionality with no base reader or writer; the declared evidence is criterion absence rather than an existing behavioral defect (`brief.md:144`). |
+| C3 Change | PASS | The change stays within the authorized decoder, new test, and one living-architecture sentence, with the keyed decode boundary at `crates/core/src/multipart.rs:3144` and docs currency at `docs/design/architecture/05-building-block-view.md:202`. |
+| C4 Verification (red→green) | FAIL | The required CI gate remains red on unchanged `Cargo.lock` dependency `h2 0.4.15` / RUSTSEC-2026-0258, and the retained test under stashed production fails to compile before running a discriminator, so a verified behavioral red→green cannot be claimed (`gate-logs/C4-ci.log:5250`; `gate-logs/C4-verify.log:102`). |
+| C5 Causal adequacy | PASS | The key-bound checks cover mode, scope, generation identity, exact segment epoch, and wildcard context, while the 27-test causal suite and 74-mutant run report no survivor (`crates/core/src/multipart.rs:3021`; `crates/core/tests/multipart_retire_obligation.rs:413`; `gate-logs/C5-mutants.log:10`). |
+| T1 Structure | PASS | The patch changes exactly the three authorized files and contains 997 added nonblank, non-comment semantic lines, within the brief’s 1,000-line cap; the new test is isolated at `crates/core/tests/multipart_retire_obligation.rs:1`. |
+| T2 Shape | PASS | The closed wire supports combined `{session, parts}`, `{parts, seg}`, and hybrid generation obligations, while private fields and the absence of `Deserialize` prevent a value-only bypass (`crates/core/src/multipart.rs:2811`; `crates/core/src/multipart.rs:2869`). |
+| T3 Runtime | PASS | The pure decoder has no store, async, clock, or external-service path, and its targeted 27-test suite plus the workspace test run pass with the intended liberal placement-length boundary (`crates/core/tests/multipart_retire_obligation.rs:727`; `gate-logs/C4-ci.log:988`). |
+| T4 Contribution | N/A | `pr-description.md` is absent by design at Check, and the mandatory substantive contribution-artifact audit reruns at publish (`gate-logs/T4-contribution.log:10`). |
+| T5 Judgment | PASS | The affected-path prior-art record covers merged history and the closed/rejected #654, #692, and #717 attempts, and the frozen multi-pass review reports zero blockers (`brief.md:204`; `gate-logs/T4-batch-review.log:10`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether to freeze this exact-byte obligation format before any production writer or consumer exists — downstream persistence will make an inadequate shape costly to revise (`crates/core/src/multipart.rs:72`; `crates/core/src/multipart.rs:2397`). |
