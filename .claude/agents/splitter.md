@@ -22,11 +22,14 @@ edit `brief.md`. Exactly one file: `split-proposal.md`. A human reads it and run
 `pdca split <id> --accept` — that command files one tracker issue per child (as a
 sub-issue of the parent) and materializes the briefs. You do not.
 
-**Check the intake cap before you draft (`wyrd-pdca-P1`).** Run `scripts/plan-cap` and put
-its first line at the top of the proposal, under the title. Every child you propose becomes
-a bundle past Plan when accepted, so above the cap the proposal is a record of the seams,
-not a request to file them: say plainly that `--accept` waits until the count is at or
-under the cap (INTEGRATION §11). Above the cap, prefer even fewer children.
+**Check the intake cap before you draft (`wyrd-pdca-P1`).** Run
+`scripts/plan-cap --need <children you expect>` first. Every child you propose becomes a
+bundle past Plan when accepted, and the proposal itself is the reslicing INTEGRATION §11
+forbids when there is no room. **If the room is short you write no proposal** — tell the
+human the count, the room, and that the seams can be drafted once sign-offs make room,
+then stop. The one exception is an explicit override the human gives in this session for
+this id; then draft, and put the script's line and the override at the top of the proposal,
+under the title, so `--accept` and Act both see it. In every case, fewer children.
 
 **If the slice was already built**, you are being run late: the oversize surfaced at Check
 rather than at Plan. The route back is `iterate-plan` at sign-off, which archives the

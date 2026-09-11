@@ -50,15 +50,18 @@
 
 ## Process deltas
 
-- Ruleset: **`wyrd-pdca-P1` — Plan intake cap.** Above 6 bundles past Plan and unsigned,
-  no new brief, no `pdca split --accept`, no reslicing proposal; close-disposition briefs
-  and in-batch repairs exempt.   (`docs/INTEGRATION.md` §11)
-- Gates: **`scripts/plan-cap`** — prints the count against the cap, exits non-zero above
-  it; `--status-file` for tests; cap from `--cap` / `$PDCA_PLANNED_CAP` / 6.
-  (`scripts/plan-cap`, `tests/test_plan_cap.py`)
-- Agent role prompts: planner runs the cap first and refuses intake above it; `--accept`
-  named as intake. Splitter records the cap line at the top of every proposal and states
-  that acceptance waits above the cap.   (`agents/{planner,splitter}.md` and the
+- Ruleset: **`wyrd-pdca-P1` — Plan intake cap.** Bundles past Plan and unsigned never
+  exceed 6; the room `6 − count` is a budget every brief and split child spends. Short
+  room: no new brief, no `pdca split --accept`, no split/reslicing proposal;
+  close-disposition briefs and in-batch repairs exempt; per-id human override recorded in
+  the brief.   (`docs/INTEGRATION.md` §11)
+- Gates: **`scripts/plan-cap --need N`** — prints count and room, exits 1 when N does not
+  fit, 2 when status cannot be read; `--status-file` for tests; cap from `--cap` /
+  `$PDCA_PLANNED_CAP` / 6.   (`scripts/plan-cap`, `tests/test_plan_cap.py`)
+- Agent role prompts: planner runs the cap before a batch (`--need` = batch size) and
+  after each brief, authors nothing new when the room is short, names `--accept` and
+  proposals as intake. Splitter runs it before drafting and writes no proposal when the
+  room is short, override excepted.   (`agents/{planner,splitter}.md` and the
   `.claude/agents/` copies)
 
 ## Follow-ups routed

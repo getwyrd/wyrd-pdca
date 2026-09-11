@@ -446,13 +446,19 @@ keeps the builder STOP backstop.
 Add repo-prefixed rules (e.g. `wyrd-pdca-C7`) that *tighten or add to* a generic rule —
 never weaken one — as running cycles surface them.
 
-- **`wyrd-pdca-P1` — Plan intake cap (2026-09-11, getwyrd/wyrd-pdca#238).** While more
-  than **6** bundles are past Plan and not yet signed off, Plan-side intake is closed:
-  **no new `brief.md`, no `pdca split --accept`, no reslicing proposal.** Counted states are
-  PLANNED, BUILT, CHECKED, AWAITING_SIGNOFF, ITERATE_DO and ITERATE_PLAN, exactly as
-  `pdca status` prints them; UNPLANNED, COMPLETE, DISCONTINUED and RESOLVED are not intake.
-  `scripts/plan-cap` prints the count against the cap and exits non-zero above it — the
-  planner and splitter run it before doing anything, and the human reads the same line.
+- **`wyrd-pdca-P1` — Plan intake cap (2026-09-11, getwyrd/wyrd-pdca#238).** Bundles past
+  Plan and not yet signed off may never number more than **6**. The cap is a budget: the
+  room is `6 − count`, every new brief and every child a split files spends one, and
+  **when the room is short, Plan-side intake is closed — no new `brief.md`, no
+  `pdca split --accept`, no split or reslicing proposal** (a proposal is intake with the
+  filing deferred). A count of 6 leaves room for none. Counted states are PLANNED, BUILT,
+  CHECKED, AWAITING_SIGNOFF, ITERATE_DO and ITERATE_PLAN, exactly as `pdca status` prints
+  them; UNPLANNED, COMPLETE, DISCONTINUED and RESOLVED are not intake.
+  `scripts/plan-cap --need N` prints the count and the room and exits non-zero when N does
+  not fit — the planner runs it before a batch and after each brief, the splitter before
+  drafting, and the human reads the same line. An explicit per-id override by the human,
+  recorded in that brief's ordering note (or at the top of the split proposal) with the
+  count, is the only way past a short room.
   *Why:* the cycle has three issue producers (splits, findings filed as tracker items, Act
   follow-ups) and one serial consumer; in August 2026 the host tracker opened 78 issues and
   closed 20, and 63 of the 64 still-open August issues were the cycle's own output
