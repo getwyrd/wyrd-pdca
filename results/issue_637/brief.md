@@ -253,7 +253,7 @@
   signature** (changing it destroys this slice's assertion red and collides with #625); any file
   under `docs/design/adr/` or `docs/design/specs/`, and any edit to `0016`.
 - **Repo + branch target:** getwyrd/wyrd @ main
-- **Depends on:** 634, 636
+- **Depends on:** 634, 691, 715, 716, 771, 772
 - **Conflicts with:** 625
 - **Ordering note:** **wave 3 of the five-slice stack 634 → 635 → 636 → 637 → 508.** Both edges
   are genuine build-on dependencies: GC's ledger walk consumes **#634**'s `scan_page`
@@ -275,6 +275,7 @@
   every earlier wave, **at minimum `main` + #634 + #635 + #636**. The test file must therefore call
   `reconcile_step` with **whatever arity its base provides** rather than hard-coding today's seven
   arguments — and this slice still must not change it.
+  **RE-POINTED 2026-09-11 — `636` removed from `Depends on`.** #636 was DISCONTINUED at sign-off (2026-07-31) and re-sliced into #654–#660 (`docs/2026-07-31-alpha-reslicing-proposal.md`); #654 was then split into #691 (merged), #692 → #715/#716 (merged) + #717 → #771/#772, and #693. A `Depends on` id must reach COMPLETE before the driver schedules the dependent (`src/pdca_harness/waves.py:57-83`, `cli.py:_blocked_by`), and a DISCONTINUED bundle never does — so `636` was a permanent block, not a wait. Replaced by the slices that land what this bundle consumes: the staged record types (`slot:`/`part:`/`psum:`/`sidx:`) and the `retire:` types — #691, #715, #716 (COMPLETE) and #771/#772 (the retire obligation and the owned staging entry, in flight). The verb × state table (#693) and the store-I/O slices #656–#659 are NOT prerequisites of staged-byte protection (proposal §#637: "needs 636.1's record types only"), so this bundle can build as soon as #772 completes.
 - **Surfaces:** data
 - **Difficulty:** high
 - **Do model:** opus-max

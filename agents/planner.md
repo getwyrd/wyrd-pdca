@@ -55,6 +55,32 @@ either serialises needlessly or lets two bundles collide on a shared file and wa
 Bare ids only on the value line; put the *why* in `Ordering note:`. Sequencing is the
 human's to confirm (like scope) — **ask when the order isn't clear.**
 
+## Before you brief anything — the intake cap (`wyrd-pdca-P1`)
+
+The cap is a **budget, not a gate you pass once.** Bundles past Plan and not yet signed
+off may never number more than 6, so the room you have is `6 − count`, and every brief
+you author and every child a split files spends one of it.
+
+- Run `scripts/plan-cap --need N` **before the batch**, with N the number of briefs the
+  human wants. It prints the count, the room, and whether N fits; it exits non-zero when
+  it does not. A count of 6 leaves room for none — a single brief then exceeds the cap.
+- Run it again **after each brief** in a batch, and before `pdca split --accept` with
+  `--need <children>`. The count only moves when you or a sign-off move it, so the
+  check is cheap and the number is always the current one.
+- **When there is no room you author nothing new:** no brief, no `pdca split --accept`,
+  and no split or reslicing proposal either — a proposal is intake with the filing
+  deferred, and the rule in INTEGRATION §11 names it. Say so, quote the script's line,
+  and offer the human only what still closes work: a `close-disposition` brief, a repair
+  of a brief already in the batch (an UNPLANNED or ITERATE_PLAN id the flow is driving),
+  or stopping here.
+- **The one exception is an explicit override.** If the human says, in this session,
+  that one id goes in over the cap, record the override and the count in that brief's
+  ordering note (or at the top of the split proposal), so Act can see it. An override
+  covers the one id it names, not the session.
+
+The cap is the counterweight to a cycle whose splits and filed findings opened issues
+faster than Do could close them; it lifts by itself as sign-offs land.
+
 ## How you work
 
 - **The tracker is the source of truth — go straight to it, don't scan this repo.**
@@ -155,6 +181,12 @@ pdca split <id> --accept     # files one tracker issue per child as a SUB-ISSUE 
 You do **not** leave the session to file issues by hand. `--accept` does it (pass `--ids`
 instead only when the issues already exist, or when the tracker is not one the driver can
 reach — it will say so plainly rather than skipping).
+
+**A split is intake twice over.** Every child `--accept` files is a new bundle past Plan,
+and the proposal itself is the reslicing the cap forbids when there is no room. So, before
+`pdca split <id>`: `scripts/plan-cap --need <children you expect>`. No room means no
+proposal and no accept — not a proposal "for later". The only way past that is the
+explicit per-id override above, recorded at the top of the proposal.
 
 What happens next no longer depends on how this run was started:
 

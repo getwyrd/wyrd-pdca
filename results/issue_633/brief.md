@@ -142,7 +142,7 @@
   by guarding a single module, because it quantifies over every session state and the actor set
   that can exit it.
 - **Repo + branch target:** getwyrd/wyrd @ main
-- **Depends on:** 625, 636
+- **Depends on:** 625, 693, 658, 659
 - **Conflicts with:** 637
 - **Ordering note:** **RE-POINTED 2026-07-26 — #508 was re-planned as five slices, and this
   bundle's prerequisites moved from `508, 625` to `625, 636`.** #508's seventh attempt was
@@ -161,6 +161,7 @@
   `crates/custodian/src/{gc,restore,reconciliation}.rs` — the same files this slice reaches into
   for the reaper's skip branch and terminal predicate — so without the edge the two would share
   a wave and be built blind on one base.
+  **RE-POINTED 2026-09-11 — `636` removed from `Depends on`.** #636 was DISCONTINUED at sign-off (2026-07-31) and re-sliced into #654–#660 (`docs/2026-07-31-alpha-reslicing-proposal.md`); #654 was then split into #691 (merged), #692 → #715/#716 (merged) + #717 → #771/#772, and #693. A `Depends on` id must reach COMPLETE before the driver schedules the dependent (`src/pdca_harness/waves.py:57-83`, `cli.py:_blocked_by`), and a DISCONTINUED bundle never does — so `636` was a permanent block, not a wait. Replaced by the slices that land what these verbs touch: the fenced `Completing → Aborting` edge (#693 table, #658 Complete) and the `retire:` ledger (#659); everything else arrives through `Depends on: 625`. #658/#659 have no bundle yet, so `pdca status` reads blocked-by them — that is the true state.
 - **Surfaces:** data
 - **Difficulty:** high
 - **External dependencies:** none
