@@ -1,0 +1,2538 @@
+diff --git a/crates/custodian/src/gc.rs b/crates/custodian/src/gc.rs
+index 4112cd0..be07523 100644
+--- a/crates/custodian/src/gc.rs
++++ b/crates/custodian/src/gc.rs
+@@ -19,6 +19,14 @@
+ //! grace window** — long enough that an in-flight reader holding the prior version is
+ //! never torn (`0005:291-294`; the pending-ledger sweep pattern of architecture §5).
+ //!
++//! The `orphan:` ledger is **walked, never read whole** (proposal 0016, `0016:1392-1408`):
++//! each pass reads one window of at most [`ORPHAN_WINDOW`] entries, in cursor-keyed
++//! [`MetadataStore::scan_page`] pages, from where the previous pass stopped, and returns to
++//! the head of the ledger at its end ([`OrphanWindow`]). What a pass concludes from its
++//! window is only what that window can show: a fragment whose mark lies outside it is left
++//! for a later pass, never reclaimed on other evidence meanwhile. Its own writes commit in
++//! batches of at most [`CLEANUP_BATCH`].
++//!
+ //! The loop's load-bearing invariant, whose violation is **silent corruption**:
+ //! **never reclaim a referenced fragment** — a fragment a committed chunk map's
+ //! placement record points at is **never** passed to `delete_fragment`
+@@ -34,7 +42,7 @@
+ //! Dependency boundary (ADR-0010, `0005:421-422`): this loop stays over the
+ //! `traits` / `core` seams plus `tracing` — **no** concrete backend.
+ 
+-use std::collections::{BTreeMap, HashMap, HashSet};
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ 
+ // The orphan-ledger key protocol lives in `core::metadata` (beside `pending_key`) so the
+ // delete path that WRITES a grace record and this GC loop that READS it share one
+@@ -46,10 +54,66 @@ use wyrd_core::metadata::{
+     self, parse_orphan_key, ChunkMapError, EcScheme, InodeRecord, InodeState, MalformedPlacement,
+     ORPHAN_PREFIX,
+ };
+-use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
++use wyrd_traits::{
++    BoxError, ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, ScanPage,
++    WriteBatch, SCAN_CAP,
++};
+ 
+ use crate::reconciliation::Reconciled;
+ 
++/// **B** — how many `orphan:` ledger entries one GC pass reads: its *window* of the ledger.
++///
++/// The ledger is never read by one `scan`. `scan` fails whole past [`SCAN_CAP`] and returns no
++/// partial result, and one maximum segmented-object retirement installs ~1.78 M marks against a
++/// cap of 1,048,576 (`0016:1392-1398`) — so a single large delete would fail GC on every pass
++/// from then on, the pass that should shrink the ledger being the one that cannot start
++/// (`0016:1396-1398`). A pass instead reads at most `B` entries, counted across however many
++/// [`MetadataStore::scan_page`] pages the store's own page cap splits them into, resuming where
++/// the previous pass stopped ([`OrphanWindow`]).
++///
++/// Derivation: `SCAN_CAP / 16` = 65,536. A pass already holds up to `SCAN_CAP` entries of each
++/// of two other namespaces (its `inode:` and `pending:` scans), so its window of the ledger adds
++/// at most a sixteenth of one scan's heap bound again, whatever the ledger's size. At that rate a
++/// ledger holding the largest single retirement 0016 sizes drains in ⌈1,780,000 / 65,536⌉ = 28
++/// passes.
++pub(crate) const ORPHAN_WINDOW: usize = SCAN_CAP / 16;
++
++/// **W** — the most writes one commit of a GC pass's own ledger cleanup carries.
++///
++/// A pass deletes the `orphan:` marks it consumed and the `pending:` entries it retired in
++/// commits of at most `W` deletes each, never in one batch sized by the pass: that batch grew
++/// with the ledger, and one past the backend's transaction envelope failed AFTER the fragments
++/// were already deleted, leaving their marks behind. `W` is restore's `MARK_BATCH` precedent
++/// (`restore.rs`), the existing bounded commit against the same envelope.
++///
++/// **Bytes: bounded.** Every key a cleanup commit deletes is an
++/// `orphan:<dserver>:<chunk>:<index>` key (at most 73 bytes) or a `pending:<chunk>` key (at most
++/// 47), so `W` of them come to under 73 KB — far inside the 10 MB per transaction of the
++/// inherited envelope (`MetadataStore`, "Operational envelope").
++///
++/// **Operations: NOT calibrated.** The envelope's other half is 5 s per transaction, and a
++/// backend applies a batch's mutations one after another inside it — TiKV takes a lock round
++/// trip per delete — so whether `W` deletes finish inside 5 s depends on the deployment's round
++/// trip time, and a batch of ~1,000 small marks can exceed it (`0016:630-636`). Proposal 0016
++/// bounds every such batch by an operation-count knob `B_ops` calibrated against the slowest
++/// supported backend (`0016:640-643`); `W` is not that calibration. What it does guarantee is
++/// that a cleanup commit's size is a constant, independent of the ledger and of the pass.
++pub(crate) const CLEANUP_BATCH: usize = 1_000;
++
++/// Where the `orphan:` ledger walk resumes: the one persisted record of [`OrphanWindow`].
++///
++/// Its value is the last ledger key a pass read — the exclusive cursor the next pass starts
++/// after — or empty to start at the head of the ledger (as does an absent record, before the
++/// first lap has ended, or a value that is not an `orphan:` key at all). It is a position, never
++/// evidence: whatever it holds, the walk only reads from there, so a stale or damaged value
++/// costs at most a lap, never a mark.
++///
++/// It lives in the metadata store because nothing else survives between passes: the deployed
++/// loop builds a fresh [`GcContext`] every pass (`crates/server/src/custodian.rs`), and shared
++/// mutable globals are ruled out (ADR-0035). Being in the store also carries the walk across a
++/// leader change. Outside `orphan:`, so the walk never reads its own bookmark.
++pub(crate) const ORPHAN_CURSOR_KEY: &[u8] = b"gc:orphan-cursor";
++
+ pub(crate) fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
+     std::str::from_utf8(key)
+         .ok()?
+@@ -138,7 +202,9 @@ pub async fn mark_orphaned(
+ /// report the store converged — [`Reconciled::Changed`] if any fragment bytes were
+ /// reclaimed, and [`Reconciled::Satisfied`] otherwise. Scrub answers the identical
+ /// condition the identical way ([`crate::scrub::reconcile`]): one incomplete set, one
+-/// rule, read twice.
++/// rule, read twice. `Satisfied` is "this pass reclaimed nothing", as it always was — over
++/// the one window of the `orphan:` ledger the pass read ([`OrphanWindow`]), never a claim
++/// about the rest of the ledger.
+ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Reconciled> {
+     // The reference set is the safety gate: every fragment a *committed* chunk map's
+     // placement record points at. A fragment in this set is NEVER reclaimed
+@@ -173,12 +239,24 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
+         ExpiredPendingPolicy::Reclaim => expired_pending_chunks(ctx.meta, now_millis).await?,
+         ExpiredPendingPolicy::Defer => HashSet::new(),
+     };
+-    // Input (2): orphaned fragments and the instant each was stranded.
+-    let orphaned_at = orphan_leases(ctx.meta).await?;
++    // Input (2): ONE WINDOW of the orphan ledger — at most `ORPHAN_WINDOW` entries, paged from
++    // where the previous pass stopped. Never the whole prefix in one `scan`: past `SCAN_CAP`
++    // that read fails whole on every pass, and the pass that should shrink the ledger would be
++    // the one that cannot start (`0016:1392-1408`).
++    let window = OrphanWindow::read(ctx.meta).await?;
++    // Where the NEXT pass resumes is recorded before this one acts on its window, so a fault
++    // later in the pass cannot pin the walk here for good: the window's marks are all still in
++    // the ledger, and the walk reads them again on its next lap.
++    window.record_resume_point(ctx.meta).await?;
+ 
+     let mut changed = false;
+-    let mut cleanup = WriteBatch::new();
+-    let mut swept_pending: HashSet<ChunkId> = HashSet::new();
++    let mut cleanup = Cleanup::new(ctx.meta);
++    // For the expired-lease input, per chunk: did this pass reclaim any of its bytes, and does
++    // any unprotected fragment of it survive the pass? Its `pending:` entry is the one record
++    // naming every such survivor, so it is retired only when the first holds and the second
++    // does not (below).
++    let mut reclaimed_expired: BTreeSet<ChunkId> = BTreeSet::new();
++    let mut still_held: HashSet<ChunkId> = HashSet::new();
+ 
+     for &(dserver, store) in ctx.fleet {
+         for frag in store.list_fragments().await? {
+@@ -193,7 +271,8 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
+                 continue;
+             }
+ 
+-            let reason = if let Some(&since) = orphaned_at.get(&(dserver, frag)) {
++            let mark = window.mark_of(dserver, frag);
++            let reason = if let Some(ReadMark::Stamped(since)) = mark {
+                 // Orphan input: reclaim ONLY after the reader-safe grace window.
+                 if now_millis >= since.saturating_add(ctx.grace_window_millis) {
+                     Some("orphan")
+@@ -201,8 +280,26 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
+                     emit_skip(dserver, frag, "within-grace");
+                     None
+                 }
+-            } else if expired_pending.contains(&frag.chunk) {
+-                // Expired pending-lease input: the lease TTL is its grace.
++            } else if mark.is_none()
++                && expired_pending.contains(&frag.chunk)
++                && window.covers_mark_of(dserver, frag)
++            {
++                // Expired pending-lease input: the lease TTL is its grace — for a fragment this
++                // window shows has NO mark, and for no other. A mark outranks the lease: it may
++                // still be inside its own grace window, which a reader holding the prior version
++                // is relying on. So the arm needs the window to have covered the key position
++                // the fragment's mark would occupy and found nothing there. A mark this pass did
++                // not read — outside its window — is unknown, not absent; one it read and could
++                // not decode is a mark all the same (`ReadMark::Unreadable`). Both fall to the
++                // conservative arm below and wait for a pass that can see them.
++                //
++                // "Covered and absent" is sound although the page that covered the position may
++                // have been read a moment ago: every in-tree writer of a mark that dereferences
++                // (unlink, supersede, repoint, evacuation) writes it in the SAME commit that
++                // dereferences the fragment, and the reference set this pass gates on was read
++                // before this window was — a fragment dereferenced after that read is still
++                // protected this pass. The one writer that marks without dereferencing, the
++                // post-restore pass, never marks a fragment whose chunk holds a `pending:` entry.
+                 Some("expired-lease")
+             } else {
+                 // No evidence the grace window elapsed — conservatively keep it
+@@ -213,23 +310,37 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
+             if let Some(reason) = reason {
+                 store.delete_fragment(frag).await?;
+                 emit_reclaim(dserver, frag, reason);
+-                cleanup = cleanup.delete(orphan_key(dserver, frag));
+-                if reason == "expired-lease" {
+-                    swept_pending.insert(frag.chunk);
++                if reason == "orphan" {
++                    // Consume the mark this pass read and judged — the one key it holds a
++                    // licence to delete. An expired-lease reclaim deletes no ledger key at all:
++                    // its window found none at this position, and a key it did not read is not
++                    // one to destroy.
++                    cleanup.delete(orphan_key(dserver, frag)).await?;
++                }
++                if expired_pending.contains(&frag.chunk) {
++                    reclaimed_expired.insert(frag.chunk);
+                 }
+                 changed = true;
++            } else if expired_pending.contains(&frag.chunk) {
++                // An unprotected fragment of an expired-lease chunk survives this pass — a mark
++                // in its grace window, one outside this window, or none that can be seen yet.
++                still_held.insert(frag.chunk);
+             }
+         }
+     }
+ 
+-    // Retire the swept pending-ledger entries (the byte reclaim the stand-in
+-    // deferred, `write.rs:330-331`) and the consumed orphan grace records.
+-    for chunk in swept_pending {
+-        cleanup = cleanup.delete(metadata::pending_key(chunk));
+-    }
+-    if changed {
+-        ctx.meta.commit(cleanup).await?;
++    // Retire the swept pending-ledger entries (the byte reclaim the stand-in deferred,
++    // `write.rs:330-331`) — but an entry is CHUNK-WIDE evidence, and under a paged walk one pass
++    // may reclaim some of a chunk's fragments while others wait for a later window. Deleting the
++    // entry then would leave those with neither the entry nor a mark: evidence-free bytes GC
++    // keeps forever. So an entry goes only once this pass has reclaimed bytes of its chunk and no
++    // unprotected fragment of it is left for the entry to account for.
++    for chunk in reclaimed_expired {
++        if !still_held.contains(&chunk) {
++            cleanup.delete(metadata::pending_key(chunk)).await?;
++        }
+     }
++    cleanup.finish().await?;
+ 
+     Ok(if !referenced.unresolvable.is_empty() {
+         // Refuse to certify — whatever this pass reclaimed above is durable either way (a
+@@ -517,23 +628,271 @@ async fn expired_pending_chunks(
+     Ok(set)
+ }
+ 
+-/// The orphan ledger: each stranded `(dserver, fragment)` and the instant it became
+-/// orphaned.
+-pub(crate) async fn orphan_leases(
++/// What one pass's [`OrphanWindow`] read of a fragment's own mark.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ReadMark {
++    /// The mark, stamped with the instant its fragment was orphaned.
++    Stamped(u64),
++    /// The mark, holding a value that does not read as an instant. Still a mark: it is evidence
++    /// that something stranded this fragment, and the instant it would have given is unknown,
++    /// so it can neither start nor end a grace window — its fragment is kept, on no other
++    /// evidence, until a human repairs the value ([`emit_unreadable_mark`]).
++    Unreadable,
++}
++
++/// One GC pass's **window** of the `orphan:` ledger: at most [`ORPHAN_WINDOW`] entries, read
++/// in [`MetadataStore::scan_page`] pages from where the previous pass stopped, and the key range
++/// they span.
++///
++/// The walk resumes from the cursor in [`ORPHAN_CURSOR_KEY`] and returns to the head of the
++/// ledger once a pass reaches its end, so every entry present for a whole lap is read once per
++/// lap (the no-skip-for-stable-keys clause of `scan_page`). An entry written behind the walk
++/// after its page was read may be missed until the next lap; nothing is concluded from that miss
++/// that could not be concluded from absence (see [`OrphanWindow::covers_mark_of`]).
++///
++/// Only a key a writer could have written is read as a mark: its fragment's own key, exactly as
++/// [`orphan_key`] spells it. [`parse_orphan_key`] reads each field as a plain integer, so
++/// `orphan:5:01:0` decodes to the position `orphan:5:1:0` names — a spelling no writer produces,
++/// sorting elsewhere in the ledger, possibly in a different window from the mark itself. Such a
++/// key, or one that does not parse at all, is classified, skipped and named on the audit seam
++/// ([`emit_malformed_orphan_key`]), never taken for the mark of the position it parses to.
++pub(crate) struct OrphanWindow {
++    /// The exclusive lower end of the key range read: the cursor this pass resumed from, or
++    /// `None` when it started at the head of the ledger.
++    after: Option<Vec<u8>>,
++    /// The inclusive upper end: the last key read, or `None` when the pass reached the end of the
++    /// ledger (the range then runs to the end of the prefix). Also where the next pass resumes.
++    through: Option<Vec<u8>>,
++    /// The marks read, keyed by the fragment each is its own key for.
++    marks: HashMap<(DServerId, FragmentId), ReadMark>,
++    /// The cursor record's value as this pass found it, so it is rewritten only when it moves.
++    stored: Option<Vec<u8>>,
++}
++
++impl OrphanWindow {
++    /// Read this pass's window: resume from the persisted cursor and page until [`ORPHAN_WINDOW`]
++    /// entries are in hand or the ledger ends, whichever comes first.
++    async fn read(meta: &dyn MetadataStore) -> Result<Self> {
++        let stored = meta
++            .get(ORPHAN_CURSOR_KEY)
++            .await?
++            .map(|value| value.to_vec());
++        // Only a key inside the ledger is a place to resume; anything else is the head.
++        let after = stored
++            .clone()
++            .filter(|cursor| cursor.starts_with(ORPHAN_PREFIX));
++
++        let mut marks = HashMap::new();
++        let mut position = after.clone();
++        let mut read = 0;
++        // Each page asks for exactly what is left of the budget, and `ledger_page` refuses a page
++        // longer than it asked for, so `read` lands on `ORPHAN_WINDOW` exactly and never past it.
++        let through = loop {
++            let (page, next) = ledger_page(meta, position.as_deref(), ORPHAN_WINDOW - read).await?;
++            read += page.len();
++            for (key, value) in page {
++                classify_ledger_entry(&mut marks, &key, &value);
++                position = Some(key);
++            }
++            if next.is_none() {
++                // The end of the ledger: the range read runs to the end of the prefix, and the
++                // next pass starts again at its head.
++                break None;
++            }
++            if read == ORPHAN_WINDOW {
++                break position;
++            }
++        };
++        Ok(Self {
++            after,
++            through,
++            marks,
++            stored,
++        })
++    }
++
++    /// Persist where the next pass resumes — after the last key this one read, or the head of
++    /// the ledger once it reached the end — writing the cursor record only when it moves. A
++    /// small ledger read whole every pass therefore writes nothing.
++    ///
++    /// A blind put, like every other write GC makes: whatever value lands, the walk only reads
++    /// from there, so no precondition protects anything a racing writer (a deposed custodian
++    /// finishing its pass) could harm.
++    async fn record_resume_point(&self, meta: &dyn MetadataStore) -> Result<()> {
++        let resume: &[u8] = self.through.as_deref().unwrap_or_default();
++        let unchanged = match &self.stored {
++            None => resume.is_empty(),
++            Some(stored) => stored.as_slice() == resume,
++        };
++        if !unchanged {
++            meta.commit(WriteBatch::new().put(ORPHAN_CURSOR_KEY, resume.to_vec()))
++                .await?;
++        }
++        Ok(())
++    }
++
++    /// The fragment's own mark, if this window read it.
++    fn mark_of(&self, dserver: DServerId, frag: FragmentId) -> Option<ReadMark> {
++        self.marks.get(&(dserver, frag)).copied()
++    }
++
++    /// Whether this window read the key range the fragment's own mark would occupy — so that
++    /// [`Self::mark_of`] answering `None` means the fragment has **no** mark, rather than that
++    /// this pass did not look.
++    fn covers_mark_of(&self, dserver: DServerId, frag: FragmentId) -> bool {
++        let key = orphan_key(dserver, frag);
++        self.after
++            .as_deref()
++            .is_none_or(|after| key.as_slice() > after)
++            && self
++                .through
++                .as_deref()
++                .is_none_or(|through| key.as_slice() <= through)
++    }
++}
++
++/// Read one `orphan:` ledger entry into `marks` — or, for a key no writer spells, classify it,
++/// name it and skip it (ADR-0045 decision 3: a record that does not decode is never acted on).
++///
++/// A value that does not read as an instant is decoded exactly as the ledger always has been
++/// (the bare decimal [`mark_orphaned`] writes); it still counts as its fragment's mark
++/// ([`ReadMark::Unreadable`]) and is named on the audit seam.
++fn classify_ledger_entry(
++    marks: &mut HashMap<(DServerId, FragmentId), ReadMark>,
++    key: &[u8],
++    value: &[u8],
++) {
++    let Some(slot) =
++        parse_orphan_key(key).filter(|&(dserver, frag)| orphan_key(dserver, frag) == key)
++    else {
++        emit_malformed_orphan_key(&object_name(key));
++        return;
++    };
++    let mark = match std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()) {
++        Some(at) => ReadMark::Stamped(at),
++        None => {
++            emit_unreadable_mark(&object_name(key));
++            ReadMark::Unreadable
++        }
++    };
++    marks.insert(slot, mark);
++}
++
++/// One page of the `orphan:` ledger strictly after `after`, at most `limit` entries — refused
++/// if it is longer than that, or does not move the walk forward.
++///
++/// `scan_page`'s contract already promises both (a page holds at most `limit` entries, starts
++/// strictly after its cursor, and is empty only at the end), but a walk that trusted it blindly
++/// would read past its budget on a store that broke the bound — the pass would no longer be
++/// bounded — and loop forever on one that broke the cursor. So a walker checks the two things its
++/// bound and its termination rest on: the page is no longer than it asked for, and it either
++/// ends the walk or carries it past `after`. Anything else is an error, never a page accepted
++/// silently.
++async fn ledger_page(
+     meta: &dyn MetadataStore,
+-) -> Result<HashMap<(DServerId, FragmentId), u64>> {
+-    let mut map = HashMap::new();
+-    for (key, value) in meta.scan(ORPHAN_PREFIX).await? {
+-        if let Some(slot) = parse_orphan_key(&key) {
+-            if let Some(at) = std::str::from_utf8(&value)
+-                .ok()
+-                .and_then(|s| s.parse().ok())
+-            {
+-                map.insert(slot, at);
++    after: Option<&[u8]>,
++    limit: usize,
++) -> Result<ScanPage> {
++    let (page, next) = meta.scan_page(ORPHAN_PREFIX, after, limit).await?;
++    if page.len() > limit {
++        return Err(BoxError::from(format!(
++            "orphan-ledger scan_page after {:?} returned {} entries for a limit of {limit} — \
++             refused rather than read past the walk's budget",
++            after.map(object_name),
++            page.len(),
++        )));
++    }
++    let advances = match (page.last(), after) {
++        (Some((last, _)), Some(after)) => last.as_slice() > after,
++        (Some(_), None) => true,
++        (None, _) => next.is_none(),
++    };
++    if !advances {
++        return Err(BoxError::from(format!(
++            "orphan-ledger scan_page after {:?} returned a page that does not advance the walk \
++             ({} entries, next {:?}) — refused rather than walked forever",
++            after.map(object_name),
++            page.len(),
++            next.as_deref().map(object_name),
++        )));
++    }
++    Ok((page, next))
++}
++
++/// Which of `candidates` carry their own `orphan:` mark — their key exactly as [`orphan_key`]
++/// spells it, whatever its value holds.
++///
++/// The post-restore pass's "already marked" judgement, read over the **whole** ledger in pages
++/// of at most [`ORPHAN_WINDOW`] entries, never with one `scan`. It must see every mark: the pass
++/// writes a fresh stamp for any candidate it did not find marked, and a stamp written over a
++/// mark it failed to read restarts that mark's grace clock — or, for a value that does not read
++/// as an instant, erases the only evidence a human has to repair. So it walks to the end, and
++/// what it holds at once is one page plus the candidates' own keys, never the ledger. Existence
++/// is all it asks, so no value is decoded here.
++pub(crate) async fn marked_among(
++    meta: &dyn MetadataStore,
++    candidates: &[(DServerId, FragmentId)],
++) -> Result<HashSet<(DServerId, FragmentId)>> {
++    let mut marked = HashSet::new();
++    if candidates.is_empty() {
++        return Ok(marked);
++    }
++    let wanted: HashMap<Vec<u8>, (DServerId, FragmentId)> = candidates
++        .iter()
++        .map(|&(dserver, frag)| (orphan_key(dserver, frag), (dserver, frag)))
++        .collect();
++    let mut after: Option<Vec<u8>> = None;
++    loop {
++        let (page, next) = ledger_page(meta, after.as_deref(), ORPHAN_WINDOW).await?;
++        for (key, _value) in &page {
++            if let Some(&slot) = wanted.get(key) {
++                marked.insert(slot);
+             }
+         }
++        match (next, page.into_iter().last()) {
++            (Some(_), Some((last, _))) => after = Some(last),
++            _ => return Ok(marked),
++        }
++    }
++}
++
++/// A GC pass's own ledger writes, committed in batches of at most [`CLEANUP_BATCH`] deletes.
++///
++/// Blind deletes, like the single batch this replaces: no precondition, so the commit can never
++/// come back `Conflict` (`CommitOutcome`, clause 3), and nothing here reads anything into one.
++struct Cleanup<'a> {
++    meta: &'a dyn MetadataStore,
++    batch: WriteBatch,
++}
++
++impl<'a> Cleanup<'a> {
++    fn new(meta: &'a dyn MetadataStore) -> Self {
++        Self {
++            meta,
++            batch: WriteBatch::new(),
++        }
++    }
++
++    /// Queue `key` for deletion, committing the batch the moment it holds [`CLEANUP_BATCH`].
++    async fn delete(&mut self, key: Vec<u8>) -> Result<()> {
++        self.batch = std::mem::take(&mut self.batch).delete(key);
++        if self.batch.deletes.len() >= CLEANUP_BATCH {
++            self.commit_queued().await?;
++        }
++        Ok(())
++    }
++
++    /// Commit whatever is still queued.
++    async fn finish(mut self) -> Result<()> {
++        self.commit_queued().await
++    }
++
++    async fn commit_queued(&mut self) -> Result<()> {
++        if !self.batch.deletes.is_empty() {
++            self.meta.commit(std::mem::take(&mut self.batch)).await?;
++        }
++        Ok(())
+     }
+-    Ok(map)
+ }
+ 
+ /// Emit a reclamation on the durability-plane seam (ADR-0011 / ADR-0012): a metric
+@@ -608,6 +967,35 @@ fn emit_unreadable_pending(entry: &str, fault: &str) {
+     );
+ }
+ 
++/// Emit an `orphan:` mark whose value GC could **not read as an instant** on the durability-plane
++/// seam (ADR-0011 / ADR-0012): the mark still counts as its fragment's mark, so the fragment is
++/// kept on no other evidence — neither its grace window nor an expired lease can reclaim it —
++/// and the mark is left in place, until a human repairs the value. Named by key, escaped as
++/// [`object_name`] escapes an `inode:` key, as [`emit_unreadable_pending`] names its entry.
++fn emit_unreadable_mark(mark: &str) {
++    tracing::warn!(monotonic_counter.gc_unreadable_orphan_marks = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.gc.audit",
++        action = "unreadable-orphan-mark",
++        mark = %mark,
++        "gc could not read an orphan-ledger mark's value as an instant; it still counts as a mark, so its fragment is kept and the mark left in place — operator signal",
++    );
++}
++
++/// Emit a key under `orphan:` that **no writer spells** on the durability-plane seam (ADR-0011 /
++/// ADR-0012): it does not parse, or it parses to a position [`orphan_key`] spells differently.
++/// It licenses nothing — no reclaim, no delete — and is left in place for a human, named by key
++/// as [`emit_unreadable_mark`] names a mark.
++fn emit_malformed_orphan_key(key: &str) {
++    tracing::warn!(monotonic_counter.gc_malformed_orphan_keys = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.gc.audit",
++        action = "malformed-orphan-key",
++        key = %key,
++        "gc found an orphan-ledger key no writer spells; it licenses nothing and is left in place — operator signal",
++    );
++}
++
+ /// Emit a skip (a still-referenced or within-grace fragment) on the same seam — the
+ /// observable record that GC *considered* and *declined* a fragment.
+ fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
+diff --git a/crates/custodian/src/restore.rs b/crates/custodian/src/restore.rs
+index 574950a..fe52300 100644
+--- a/crates/custodian/src/restore.rs
++++ b/crates/custodian/src/restore.rs
+@@ -89,7 +89,7 @@ use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
+ use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
+ 
+ use crate::gc::{
+-    object_name, orphan_key, orphan_leases, parse_pending_chunk, referenced_fragments, GcContext,
++    marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments, GcContext,
+     ReferenceSet,
+ };
+ 
+@@ -109,8 +109,9 @@ pub struct RestoreReport {
+     /// them on its normal grace window. **This pass deletes nothing**; these become
+     /// collectable, not collected.
+     pub stranded_marked: usize,
+-    /// Unreferenced fragments that already carried an `orphan:` record. Left untouched —
+-    /// re-stamping would reset the grace clock and delay their reclamation.
++    /// Unreferenced fragments that already carried an `orphan:` record — their own key, whatever
++    /// its value holds. Left untouched — re-stamping would reset the grace clock and delay their
++    /// reclamation, or overwrite a value GC cannot read that a human still has to repair.
+     pub already_marked: usize,
+     /// Unreferenced fragments left alone because their chunk still holds a `pending:`
+     /// lease — an in-flight write, whose lease TTL is already its grace. GC owns them.
+@@ -305,7 +306,6 @@ pub async fn reconcile_after_restore(
+     // not attribution.
+     let mut unreadable = BTreeSet::new();
+     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
+-    let already = orphan_leases(ctx.meta).await?;
+     let PendingLedger {
+         held: pending,
+         unreadable: pending_unreadable,
+@@ -367,7 +367,9 @@ pub async fn reconcile_after_restore(
+         canonical.entry(frag).or_default().push(dserver);
+     }
+ 
+-    // Pass 2 — decide, with the full picture.
++    // Pass 2 — decide, with the full picture: first which fragments may be marked at all, then
++    // (below) which of those already are.
++    let mut candidates: Vec<(DServerId, FragmentId)> = Vec::new();
+     for (dserver, frag) in on_disk {
+         // SAFETY GATE, identical to GC's: never mark a fragment the restored map points at —
+         // nor any fragment of a malformed-placement chunk, whose true placement cannot be
+@@ -410,7 +412,19 @@ pub async fn reconcile_after_restore(
+             // is exactly right, and is the leak this pass exists to close.
+         }
+ 
+-        if already.contains_key(&(dserver, frag)) {
++        candidates.push((dserver, frag));
++    }
++
++    // Which candidates ALREADY carry their own `orphan:` record — judged over the WHOLE ledger,
++    // walked in bounded pages (`gc::marked_among`), never one `scan` (which fails whole past
++    // `SCAN_CAP`) and never part of it: the put below re-stamps anything this judgement missed,
++    // restarting that mark's grace clock. Any value counts, readable or not — a mark whose value
++    // does not read as an instant is still a mark, and re-stamping it would erase the only
++    // evidence a human has to repair. Read only once the candidates are known, so a pass with
++    // nothing it may mark reads none of the ledger.
++    let already = marked_among(ctx.meta, &candidates).await?;
++    for (dserver, frag) in candidates {
++        if already.contains(&(dserver, frag)) {
+             report.already_marked += 1;
+             continue;
+         }
+diff --git a/crates/custodian/tests/gc_ledger_walk.rs b/crates/custodian/tests/gc_ledger_walk.rs
+new file mode 100644
+index 0000000..9f1e704
+--- /dev/null
++++ b/crates/custodian/tests/gc_ledger_walk.rs
+@@ -0,0 +1,1383 @@
++//! Issue #661 (child 1 of #637): the `orphan:` ledger is **walked in pages, never read by one
++//! `scan`** — by GC and by the post-restore pass alike (proposal 0016, `0016:1392-1408`).
++//!
++//! `scan` fails whole past its cap and returns no partial result (`MetadataStore`, clause 5), and
++//! one maximum segmented-object retirement installs ~1.78 M marks against `SCAN_CAP` =
++//! 1,048,576. A GC that read the ledger with one `scan` would fail every pass from the first large
++//! delete on — the pass that should shrink the ledger being the one that cannot start — and the
++//! post-restore command could never finish. On `main` both do exactly that: `gc.rs:177` (the
++//! `scan` at `:526`) and `restore.rs:308`.
++//!
++//! Every leg runs the production entry points — `reconcile_step` with a `GcContext`, and
++//! `reconcile_after_restore` — over in-memory doubles. The metadata double ([`LedgerMeta`])
++//! enforces a **lowered** cap the way the production backends' `with_scan_cap` knob does
++//! (`crates/metadata-redb/tests/scan.rs:9-19`): a `scan` whose answer would exceed [`CAP`] fails
++//! with `ScanCapExceeded`, and a `scan_page` page carries at most [`CAP`] entries (unless a test
++//! breaks the page contract on purpose, [`PageFault`]). Its `scan_page` is implemented directly
++//! over its own ordered map with the shared page helpers — deliberately NOT
++//! `wyrd_testkit::test_double_scan_page`, which pages over `scan` and so inherits the very cap the
++//! walk exists to escape. The page cap sits below the window, so one pass needs several pages to
++//! read its budget, as it would against a real backend.
++//!
++//! The double records what each pass received: every `orphan:` entry `scan_page` handed out
++//! (counted across the pass's pages), every `scan` whose range reaches the `orphan:` prefix, and
++//! every commit. Every pass builds a fresh `GcContext`, exactly as the deployed loop does
++//! (`crates/server/src/custodian.rs:600-608`), so a walk that kept its place anywhere but the
++//! store would restart each time. Each leg asserts on the pass's `Result` before anything else:
++//! on `main` every leg's first pass fails on the ledger past the cap, and that is its red.
++//!
++//! The legs:
++//!
++//! * **A** — a GC pass survives a ledger past the cap and drains it.
++//! * **B** — one pass reads at most [`B`] entries (exactly [`B`] while that many remain), drains
++//!   `P` in exactly `⌈P / B⌉` passes, and commits its own deletes in batches of at most [`W`],
++//!   `⌈n / W⌉` of them.
++//! * **C** — a retention-safe head more than a window long does not starve the tail behind it,
++//!   and the walk wraps back to the head.
++//! * **D** — what a partial read may conclude: (i) an unread mark outranks an expired lease —
++//!   ahead of the window, behind it, or exactly on the cursor the pass resumed from, the one key
++//!   the window's range leaves out; (ii) a chunk's `pending:` entry outlives every fragment it
++//!   still accounts for; (iii) a mark whose value is unreadable counts as a mark, is never
++//!   deleted, and is named on the audit seam.
++//! * **E** — only a fragment's own key, as `orphan_key` spells it, licenses a reclaim.
++//! * **F** — restore survives the same ledger and never re-stamps a mark it did not read.
++//! * **The walk's guards** — a store whose `scan_page` repeats its cursor, or answers more than
++//!   it was asked for, is refused with an error by both passes rather than walked.
++//!
++//! **The two constants are pinned by literal.** [`B`] and [`W`] are the production window and
++//! cleanup batch (`gc::ORPHAN_WINDOW`, `gc::CLEANUP_BATCH`), written here as numbers rather than
++//! named — this file compiles against `main`, where neither exists — so a change to either
++//! production value fails this file instead of silently moving the bound it pins.
++//!
++//! **What leg B's commit bound proves, and what it does not.** It proves every commit of a pass's
++//! own cleanup carries at most [`W`] writes: a constant, independent of the ledger and of the
++//! pass. It does not prove a [`W`]-write commit finishes inside the backend's 5-second transaction
++//! envelope — that depends on the deployment's round-trip time (proposal 0016's calibrated
++//! `B_ops`, `0016:640-643`), which no in-memory test can measure.
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, HashMap, HashSet};
++use std::ops::Bound;
++use std::sync::{Arc, Mutex};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, orphan_key, parse_orphan_key, PendingEntry, ORPHAN_PREFIX};
++use wyrd_custodian::{
++    mark_orphaned, reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy,
++    FencedZone, GcContext, ReconcileError, Reconciled, RestoreReport,
++};
++use wyrd_traits::{
++    page_cursor, page_limit, page_start, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId,
++    Health, MetadataStore, PageStart, Result, ScanCapExceeded, ScanPage, WriteBatch,
++};
++
++/// **B**, the production window (`gc::ORPHAN_WINDOW` = `SCAN_CAP / 16`): the most `orphan:`
++/// entries one GC pass receives, across all of its pages.
++const B: usize = 65_536;
++
++/// **W**, the production cleanup batch (`gc::CLEANUP_BATCH`): the most writes one commit of a
++/// pass's own ledger cleanup carries.
++const W: usize = 1_000;
++
++/// The double's lowered cap — on one `scan`'s answer and on one `scan_page` page, the single knob
++/// the production backends apply to both. Far below every ledger seeded here, so a `scan` of the
++/// ledger fails; below [`B`], and not a divisor of it, so a pass reads its window in several pages
++/// and the last of them is cut to the budget.
++const CAP: usize = 5_000;
++
++/// The grace window every GC leg runs with.
++const GRACE: u64 = 1_000;
++
++/// An instant far from zero, so a stamp at it is inside the grace window and a stamp at zero is
++/// long past it.
++const NOW: u64 = 1_000_000;
++
++// ---- the metadata double ----
++
++/// What the double handed out and accepted during one pass.
++#[derive(Default)]
++struct Tap {
++    /// `orphan:` entries handed out by `scan_page`, counted across every page of the pass.
++    orphan_entries: usize,
++    /// Each `orphan:` page, in order.
++    orphan_pages: Vec<Page>,
++    /// Every `scan` whose range reaches the `orphan:` prefix — there must be none.
++    orphan_scans: Vec<Vec<u8>>,
++    /// Every commit.
++    commits: Vec<Commit>,
++    /// The watched keys (see [`LedgerMeta::watch`]) some page handed out.
++    watched_seen: HashSet<Vec<u8>>,
++}
++
++/// One `orphan:` page, as the double answered it.
++struct Page {
++    /// The cursor the page was asked for: it starts after this key, or at the head for `None`.
++    after: Option<Vec<u8>>,
++    first: Option<Vec<u8>>,
++    last: Option<Vec<u8>>,
++    terminal: bool,
++}
++
++/// One commit, as the double accepted it.
++struct Commit {
++    puts: Vec<Vec<u8>>,
++    deletes: Vec<Vec<u8>>,
++}
++
++/// The key range one pass's ledger pages ran across.
++#[derive(Debug)]
++struct Span {
++    first: Vec<u8>,
++    last: Vec<u8>,
++    /// The pages ended with the terminal one: the walk reached the end of the ledger.
++    reached_end: bool,
++}
++
++impl Tap {
++    /// Where the pass's ledger pages ran — `None` when no page carried an entry.
++    fn span(&self) -> Option<Span> {
++        let first = self
++            .orphan_pages
++            .iter()
++            .find_map(|page| page.first.clone())?;
++        let last = self
++            .orphan_pages
++            .iter()
++            .rev()
++            .find_map(|page| page.last.clone())?;
++        Some(Span {
++            first,
++            last,
++            reached_end: self.reached_end(),
++        })
++    }
++
++    /// Whether the pass's pages ended with the terminal page — the walk reached the ledger's end.
++    fn reached_end(&self) -> bool {
++        self.orphan_pages.last().is_some_and(|page| page.terminal)
++    }
++
++    /// The cursor the pass's first ledger page was asked for — where the walk resumed from, or
++    /// `None` when it started at the head (or read no page at all).
++    fn resumed_from(&self) -> Option<&[u8]> {
++        self.orphan_pages.first()?.after.as_deref()
++    }
++}
++
++/// How the double's `scan_page` answers: honestly, or breaking one clause of its contract
++/// (`crates/traits/src/lib.rs:1377-1408`) — the stores the walk must refuse rather than walk.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++enum PageFault {
++    /// Every clause kept.
++    #[default]
++    Honest,
++    /// Clause 2 broken: the page starts AT its cursor rather than strictly after it, one key a
++    /// page — so from the second page on it hands back the very key it was asked to pass.
++    RepeatsCursor,
++    /// The page bound broken: one entry more than the caller's `limit`.
++    OverLong,
++}
++
++/// An in-memory metadata store over an ORDERED map, with a lowered cap (see the module docs).
++#[derive(Default)]
++struct LedgerMeta {
++    kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
++    tap: Mutex<Tap>,
++    watched: Mutex<HashSet<Vec<u8>>>,
++    fault: PageFault,
++}
++
++/// Whether a `scan` of `prefix` reaches keys under `orphan:` — a prefix of it (`""`, `"orph"`),
++/// or a narrowing of it (`"orphan:5:"`).
++fn reaches_orphan(prefix: &[u8]) -> bool {
++    ORPHAN_PREFIX.starts_with(prefix) || prefix.starts_with(ORPHAN_PREFIX)
++}
++
++impl LedgerMeta {
++    fn seed(&self, key: Vec<u8>, value: impl Into<Bytes>) {
++        self.kv.lock().unwrap().insert(key, value.into());
++    }
++
++    /// Seed `frag`'s mark on `dserver`, stamped `at` — the exact key and value
++    /// [`mark_orphaned`] writes (pinned by [`assert_seeding_is_mark_orphaned`]).
++    fn seed_mark(&self, dserver: DServerId, frag: FragmentId, at: u64) {
++        self.seed(orphan_key(dserver, frag), at.to_string());
++    }
++
++    fn value(&self, key: &[u8]) -> Option<Bytes> {
++        self.kv.lock().unwrap().get(key).cloned()
++    }
++
++    fn orphan_len(&self) -> usize {
++        self.kv
++            .lock()
++            .unwrap()
++            .range(ORPHAN_PREFIX.to_vec()..)
++            .take_while(|(key, _)| key.starts_with(ORPHAN_PREFIX))
++            .count()
++    }
++
++    /// Every `orphan:` key, in order.
++    fn orphan_keys(&self) -> Vec<Vec<u8>> {
++        self.kv
++            .lock()
++            .unwrap()
++            .range(ORPHAN_PREFIX.to_vec()..)
++            .take_while(|(key, _)| key.starts_with(ORPHAN_PREFIX))
++            .map(|(key, _)| key.clone())
++            .collect()
++    }
++
++    /// Record, per pass, whether a page handed out `key`.
++    fn watch(&self, key: Vec<u8>) {
++        self.watched.lock().unwrap().insert(key);
++    }
++
++    /// What the double saw since the last call, resetting it.
++    fn take_tap(&self) -> Tap {
++        std::mem::take(&mut *self.tap.lock().unwrap())
++    }
++}
++
++#[async_trait]
++impl MetadataStore for LedgerMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.value(key))
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        if reaches_orphan(prefix) {
++            self.tap.lock().unwrap().orphan_scans.push(prefix.to_vec());
++        }
++        let hits: Vec<(Vec<u8>, Bytes)> = self
++            .kv
++            .lock()
++            .unwrap()
++            .range(prefix.to_vec()..)
++            .take_while(|(key, _)| key.starts_with(prefix))
++            .take(CAP + 1)
++            .map(|(key, value)| (key.clone(), value.clone()))
++            .collect();
++        // `>` not `>=`: exactly `CAP` keys is a complete answer, as on every backend.
++        if hits.len() > CAP {
++            return Err(Box::new(ScanCapExceeded {
++                cap: CAP,
++                prefix: prefix.to_vec(),
++            }));
++        }
++        Ok(hits)
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<ScanPage> {
++        let honest = page_limit(limit, CAP, prefix)?;
++        // A broken store breaks only the `orphan:` walk; every other listing stays honest.
++        let fault = if prefix == ORPHAN_PREFIX {
++            self.fault
++        } else {
++            PageFault::Honest
++        };
++        let lower = match page_start(prefix, after) {
++            PageStart::Prefix => Bound::Included(prefix.to_vec()),
++            PageStart::After(cursor) if fault == PageFault::RepeatsCursor => {
++                Bound::Included(cursor.to_vec())
++            }
++            PageStart::After(cursor) => Bound::Excluded(cursor.to_vec()),
++            PageStart::PastPrefix => return Ok((Vec::new(), None)),
++        };
++        // How many entries this page hands out: the resolved page bound, or a broken one.
++        let bound = match fault {
++            PageFault::Honest => honest,
++            PageFault::RepeatsCursor => 1,
++            PageFault::OverLong => limit.saturating_add(1),
++        };
++        let items: Vec<(Vec<u8>, Bytes)> = self
++            .kv
++            .lock()
++            .unwrap()
++            .range((lower, Bound::Unbounded))
++            .take_while(|(key, _)| key.starts_with(prefix))
++            .take(bound)
++            .map(|(key, value)| (key.clone(), value.clone()))
++            .collect();
++        let next = page_cursor(&items, bound);
++        if reaches_orphan(prefix) {
++            let watched = self.watched.lock().unwrap();
++            let mut tap = self.tap.lock().unwrap();
++            tap.orphan_entries += items
++                .iter()
++                .filter(|(key, _)| key.starts_with(ORPHAN_PREFIX))
++                .count();
++            tap.orphan_pages.push(Page {
++                after: after.map(<[u8]>::to_vec),
++                first: items.first().map(|(key, _)| key.clone()),
++                last: items.last().map(|(key, _)| key.clone()),
++                terminal: next.is_none(),
++            });
++            for (key, _) in &items {
++                if watched.contains(key) {
++                    tap.watched_seen.insert(key.clone());
++                }
++            }
++        }
++        Ok((items, next))
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        {
++            let mut kv = self.kv.lock().unwrap();
++            for pre in &batch.preconditions {
++                if kv.get(&pre.key).cloned() != pre.expected {
++                    return Ok(CommitOutcome::Conflict);
++                }
++            }
++            for (key, value) in &batch.puts {
++                kv.insert(key.clone(), value.clone());
++            }
++            for key in &batch.deletes {
++                kv.remove(key);
++            }
++        }
++        self.tap.lock().unwrap().commits.push(Commit {
++            puts: batch.puts.into_iter().map(|(key, _)| key).collect(),
++            deletes: batch.deletes,
++        });
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++// ---- the D-server double ----
++
++/// One D server's fragment bytes — a deliberately dumb `ChunkStore`.
++#[derive(Default)]
++struct MemDServer {
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++}
++
++impl MemDServer {
++    fn put(&self, frag: FragmentId) {
++        self.frags
++            .lock()
++            .unwrap()
++            .insert(frag, Bytes::from_static(b"bytes"));
++    }
++
++    fn holds(&self, frag: FragmentId) -> bool {
++        self.frags.lock().unwrap().contains_key(&frag)
++    }
++
++    fn fragment_count(&self) -> usize {
++        self.frags.lock().unwrap().len()
++    }
++}
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        _deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        self.frags.lock().unwrap().insert(id, fragment);
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++// ---- helpers ----
++
++fn frag(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// The fleet view a `GcContext` takes: `servers[i]` is D server `i`.
++fn fleet_of(servers: &[MemDServer]) -> Vec<(DServerId, &dyn ChunkStore)> {
++    servers
++        .iter()
++        .enumerate()
++        .map(|(id, server)| (id as DServerId, server as &dyn ChunkStore))
++        .collect()
++}
++
++async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
++    let leader = Custodian::elect(coord, "zone-gc-ledger-walk")
++        .await
++        .unwrap();
++    let mut zone = FencedZone::new();
++    zone.install(leader.leadership());
++    (zone, leader)
++}
++
++/// An expired pending lease over `chunk`, written through the production writer.
++async fn put_expired_lease(meta: &LedgerMeta, chunk: ChunkId) {
++    let outcome = metadata::put_pending(
++        meta,
++        chunk,
++        &PendingEntry {
++            lease_expiry_millis: 1,
++            owner: None,
++            staged: None,
++        },
++    )
++    .await
++    .unwrap();
++    assert_eq!(outcome, CommitOutcome::Committed);
++}
++
++/// The fixture's seeded marks are the production writer's: one [`mark_orphaned`] call and one
++/// [`LedgerMeta::seed_mark`] leave byte-identical stores.
++async fn assert_seeding_is_mark_orphaned() {
++    let written = LedgerMeta::default();
++    mark_orphaned(&written, 3, frag(77, 2), 4_242)
++        .await
++        .unwrap();
++    let seeded = LedgerMeta::default();
++    seeded.seed_mark(3, frag(77, 2), 4_242);
++    assert_eq!(
++        *written.kv.lock().unwrap(),
++        *seeded.kv.lock().unwrap(),
++        "fixture: a seeded mark must be exactly what `mark_orphaned` writes"
++    );
++}
++
++/// The walk's driver: one custodian, and one GC pass at a time the way the deployed loop runs one.
++struct Walk {
++    zone: FencedZone,
++    custodian: Custodian,
++    policy: ExpiredPendingPolicy,
++    passes: usize,
++}
++
++impl Walk {
++    async fn new(coord: &MemCoordination, policy: ExpiredPendingPolicy) -> Self {
++        let (zone, custodian) = elect(coord).await;
++        Self {
++            zone,
++            custodian,
++            policy,
++            passes: 0,
++        }
++    }
++
++    /// One GC pass at `now` with a FRESH `GcContext` built for it alone
++    /// (`crates/server/src/custodian.rs:600-608`), through the fenced `reconcile_step`. Asserts
++    /// on the pass's `Result` before anything else, then on the bounds every pass is held to, and
++    /// returns what the double saw.
++    async fn pass(
++        &mut self,
++        leg: &str,
++        meta: &LedgerMeta,
++        fleet: &[(DServerId, &dyn ChunkStore)],
++        now: u64,
++    ) -> Tap {
++        self.passes += 1;
++        meta.take_tap();
++        let ctx = GcContext {
++            meta,
++            fleet,
++            grace_window_millis: GRACE,
++            expired_pending: self.policy,
++        };
++        let outcome: std::result::Result<Reconciled, ReconcileError> = reconcile_step(
++            &self.zone,
++            &self.custodian,
++            Some(&ctx),
++            None,
++            None,
++            None,
++            now,
++        )
++        .await;
++        if let Err(err) = &outcome {
++            panic!(
++                "{leg}: GC pass {} failed: {err}. On main this is the single `scan` of the \
++                 `orphan:` ledger past the cap (`gc.rs:177`, the scan at `:526`) — a ledger this \
++                 size fails every pass, and the pass that should shrink it can never start",
++                self.passes
++            );
++        }
++        let tap = meta.take_tap();
++        assert_bounded(leg, self.passes, &tap);
++        tap
++    }
++}
++
++/// The bounds every pass is held to, in every leg: the step never `scan`s the `orphan:` prefix
++/// (`0016:1398-1399` — the ledger is "never read by a single scan"), a pass receives at most [`B`]
++/// ledger entries across all of its pages, no commit carries more than [`W`] writes, and the
++/// commits carrying its `n` key deletes number exactly `⌈n / W⌉` — so a batch flushed late, or
++/// never, or one sized by the pass, fails here.
++fn assert_bounded(leg: &str, pass: usize, tap: &Tap) {
++    assert!(
++        tap.orphan_scans.is_empty(),
++        "{leg}, pass {pass}: the step ran `scan` over {:?}, which reaches the `orphan:` ledger — \
++         a ledger past the cap fails that read whole",
++        tap.orphan_scans
++            .iter()
++            .map(|prefix| String::from_utf8_lossy(prefix).into_owned())
++            .collect::<Vec<_>>()
++    );
++    assert!(
++        tap.orphan_entries <= B,
++        "{leg}, pass {pass}: the pass received {} `orphan:` entries, over its window of {B}",
++        tap.orphan_entries
++    );
++    for (i, commit) in tap.commits.iter().enumerate() {
++        let writes = commit.puts.len() + commit.deletes.len();
++        assert!(
++            writes <= W,
++            "{leg}, pass {pass}: commit {i} carried {writes} writes, over the cleanup batch of {W}"
++        );
++    }
++    let deletes: usize = tap.commits.iter().map(|commit| commit.deletes.len()).sum();
++    let carrying = tap
++        .commits
++        .iter()
++        .filter(|commit| !commit.deletes.is_empty())
++        .count();
++    assert_eq!(
++        carrying,
++        deletes.div_ceil(W),
++        "{leg}, pass {pass}: {deletes} key deletes rode {carrying} commits; batches of {W} make \
++         that exactly {}",
++        deletes.div_ceil(W)
++    );
++}
++
++/// Where `key` sat relative to one pass's window: read by it, ahead of it, behind it — or the pass
++/// read no entry at all.
++#[derive(Debug, PartialEq, Eq)]
++enum Relative {
++    Read,
++    Ahead,
++    Behind,
++    NothingRead,
++}
++
++fn relative(tap: &Tap, key: &[u8]) -> Relative {
++    if tap.watched_seen.contains(key) {
++        return Relative::Read;
++    }
++    match tap.span() {
++        None => Relative::NothingRead,
++        Some(span) if !span.reached_end && key > span.last.as_slice() => Relative::Ahead,
++        Some(span) if key < span.first.as_slice() => Relative::Behind,
++        // The pass's pages ran across the key without handing it out: a page skipped a key the
++        // store holds, which no correct walk over this double can do.
++        Some(span) => panic!("a pass's pages spanned {key:?} without handing it out: {span:?}"),
++    }
++}
++
++// ---- leg A: a GC pass survives a ledger past the cap ----
++
++/// A ledger larger than the lowered cap, every mark actionable — fragment present, unreferenced,
++/// past its grace window. Every pass returns `Ok`, and passes run until the ledger is empty
++/// reclaim every fragment and remove every consumed key. On `main` the first pass returns
++/// `Err(ReconcileError::Store)` from the single `scan` (`gc.rs:177`): the red.
++#[tokio::test]
++async fn a_gc_pass_survives_an_orphan_ledger_past_the_scan_cap() {
++    assert_seeding_is_mark_orphaned().await;
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..4).map(|_| MemDServer::default()).collect();
++    let population = 3 * CAP + 1;
++    for i in 0..population {
++        let dserver = (i % servers.len()) as DServerId;
++        let frag = frag(1_000_000 + i as ChunkId, 0);
++        servers[dserver as usize].put(frag);
++        meta.seed_mark(dserver, frag, 0);
++    }
++    assert!(
++        meta.orphan_len() > CAP,
++        "fixture: the ledger must be past the cap"
++    );
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Defer).await;
++    let fleet = fleet_of(&servers);
++    while meta.orphan_len() > 0 {
++        assert!(
++            walk.passes < population.div_ceil(B) + 1,
++            "leg A: the ledger is not drained after {} passes",
++            walk.passes
++        );
++        walk.pass("leg A", &meta, &fleet, NOW).await;
++    }
++    for (id, server) in servers.iter().enumerate() {
++        assert_eq!(
++            server.fragment_count(),
++            0,
++            "leg A: every actionable fragment is reclaimed — D server {id} still holds some"
++        );
++    }
++}
++
++// ---- leg B: one pass reads and writes a bounded, pinned amount ----
++
++/// A population `P > B`, every mark actionable. No pass receives more than [`B`] entries, and
++/// while at least [`B`] remain a pass receives exactly [`B`] — so a budget that silently under-reads
++/// fails. `P` drains in exactly `⌈P / B⌉` passes, not fewer. Each pass consumes every mark it
++/// received, and commits those deletes in `⌈n / W⌉` commits of at most [`W`] (`assert_bounded`).
++#[tokio::test]
++async fn b_one_pass_reads_and_writes_a_bounded_pinned_amount() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..4).map(|_| MemDServer::default()).collect();
++    let population = 2 * B + B / 2 + 123;
++    for i in 0..population {
++        let dserver = (i % servers.len()) as DServerId;
++        let frag = frag(1_000_000 + i as ChunkId, 0);
++        servers[dserver as usize].put(frag);
++        meta.seed_mark(dserver, frag, 0);
++    }
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Defer).await;
++    let fleet = fleet_of(&servers);
++    let drained_in = population.div_ceil(B);
++    while meta.orphan_len() > 0 {
++        assert!(
++            walk.passes < drained_in,
++            "leg B: {population} entries are not drained after {} passes; windows of {B} drain \
++             them in exactly {drained_in}",
++            walk.passes
++        );
++        let before = meta.orphan_len();
++        let tap = walk.pass("leg B", &meta, &fleet, NOW).await;
++        assert_eq!(
++            tap.orphan_entries,
++            before.min(B),
++            "leg B, pass {}: {before} entries remained, so the pass must receive exactly {} of \
++             them — a window that under-reads leaves the ledger to grow",
++            walk.passes,
++            before.min(B)
++        );
++        let deletes: usize = tap.commits.iter().map(|commit| commit.deletes.len()).sum();
++        assert_eq!(
++            deletes, tap.orphan_entries,
++            "leg B, pass {}: every mark the pass received was actionable, so each is consumed",
++            walk.passes
++        );
++    }
++    assert_eq!(
++        walk.passes, drained_in,
++        "leg B: {population} entries drain in exactly ⌈P / B⌉ = {drained_in} passes"
++    );
++    for (id, server) in servers.iter().enumerate() {
++        assert_eq!(
++            server.fragment_count(),
++            0,
++            "leg B: D server {id} still holds fragments"
++        );
++    }
++}
++
++// ---- leg C: the tail does not starve, and the walk wraps ----
++
++/// A retention-safe **head** — more than [`B`] marks still inside their grace window, first in key
++/// order — and an actionable **tail** behind it, together past the cap. Every tail fragment is
++/// reclaimed within `⌈(head + tail) / B⌉ + 1` passes and no head fragment or head mark is touched;
++/// then, with the head aged past grace, every head fragment is reclaimed within as many further
++/// passes. A walk that restarted at the first key every pass never reaches the tail; one that
++/// stopped at the end never reaches the head again.
++#[tokio::test]
++async fn c_the_tail_does_not_starve_and_the_walk_wraps() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..3).map(|_| MemDServer::default()).collect();
++    let head = B + B / 4 + 11;
++    let tail = B / 2 + 7;
++    // Head on D server 1, tail on D server 2: every `orphan:1:` key sorts before every
++    // `orphan:2:` key, so the head is first in the ledger.
++    let head_frags: Vec<FragmentId> = (0..head)
++        .map(|i| frag(2_000_000 + i as ChunkId, 0))
++        .collect();
++    let tail_frags: Vec<FragmentId> = (0..tail)
++        .map(|i| frag(3_000_000 + i as ChunkId, 0))
++        .collect();
++    for &f in &head_frags {
++        servers[1].put(f);
++        meta.seed_mark(1, f, NOW);
++    }
++    for &f in &tail_frags {
++        servers[2].put(f);
++        meta.seed_mark(2, f, 0);
++    }
++    let stamp = Bytes::from(NOW.to_string());
++    let bound = (head + tail).div_ceil(B) + 1;
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Defer).await;
++    let fleet = fleet_of(&servers);
++    let mut passes = 0;
++    while servers[2].fragment_count() > 0 {
++        assert!(
++            passes < bound,
++            "leg C: {} tail fragments are still on disk after {passes} passes — the retention-safe \
++             head starved the tail behind it (bound ⌈(head + tail) / B⌉ + 1 = {bound})",
++            servers[2].fragment_count()
++        );
++        walk.pass("leg C", &meta, &fleet, NOW).await;
++        passes += 1;
++        assert_eq!(
++            servers[1].fragment_count(),
++            head,
++            "leg C: a head fragment inside its grace window was reclaimed"
++        );
++        for &f in &head_frags {
++            assert_eq!(
++                meta.value(&orphan_key(1, f)).as_ref(),
++                Some(&stamp),
++                "leg C: the head mark for {f:?} was deleted or rewritten inside its grace window"
++            );
++        }
++    }
++
++    // Age the head past its grace window: the walk has to come back round to the start.
++    let later = NOW + GRACE;
++    let mut passes = 0;
++    while servers[1].fragment_count() > 0 {
++        assert!(
++            passes < bound,
++            "leg C: {} head fragments are still on disk {passes} passes after the head aged past \
++             grace — the walk never returned to the start of the ledger (bound {bound})",
++            servers[1].fragment_count()
++        );
++        walk.pass("leg C", &meta, &fleet, later).await;
++        passes += 1;
++    }
++    assert_eq!(
++        meta.orphan_len(),
++        0,
++        "leg C: every consumed mark is removed"
++    );
++}
++
++// ---- leg D: what a pass may conclude from a partial read ----
++
++/// The fragment legs D(i) and D(iii) keep: chunk 7, index 0, on D server 2 — its mark sorts after
++/// every `orphan:1:` filler and before every `orphan:3:` one.
++const KEPT: FragmentId = FragmentId { chunk: 7, index: 0 };
++
++/// Fill the ledger with `before` marks on D server 1 and `after` marks on D server 3 — marks with
++/// no fragment on disk, which no pass reclaims and none consumes, so the ledger stays several
++/// windows long for as many passes as a leg runs.
++fn seed_filler(meta: &LedgerMeta, before: usize, after: usize) {
++    for i in 0..before {
++        meta.seed_mark(1, frag(5_000_000 + i as ChunkId, 0), 0);
++    }
++    for i in 0..after {
++        meta.seed_mark(3, frag(6_000_000 + i as ChunkId, 0), 0);
++    }
++}
++
++/// **D(i) — an unread mark outranks an expired lease.** Under `ExpiredPendingPolicy::Reclaim`, a
++/// fragment whose chunk carries an EXPIRED `pending:` lease and whose own mark is still inside its
++/// grace window survives every pass until that mark's grace elapses. The ledger is four windows
++/// long, so in most passes the mark sits outside the window being read — ahead of it in some and
++/// behind it in others. A pass that reclaimed on the lease because it had not read the mark would
++/// tear a reader the mark's grace window protects (round 1's patch did; three blocking findings).
++#[tokio::test]
++async fn d1_an_unread_mark_outranks_an_expired_lease() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..4).map(|_| MemDServer::default()).collect();
++    seed_filler(&meta, B + B / 2, 2 * B);
++    servers[2].put(KEPT);
++    meta.seed_mark(2, KEPT, NOW);
++    put_expired_lease(&meta, KEPT.chunk).await;
++    let mark = orphan_key(2, KEPT);
++    meta.watch(mark.clone());
++    let lap = meta.orphan_len().div_ceil(B);
++    assert!(lap >= 3, "fixture: the ledger must be several windows long");
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Reclaim).await;
++    let fleet = fleet_of(&servers);
++    let stamp = Bytes::from(NOW.to_string());
++    let mut seen = Vec::new();
++    // Two full laps and one more pass, all inside the mark's grace window.
++    for _ in 0..2 * lap + 1 {
++        let tap = walk.pass("leg D(i)", &meta, &fleet, NOW).await;
++        assert!(
++            servers[2].holds(KEPT),
++            "leg D(i), pass {}: the fragment was reclaimed on its expired lease while its own mark \
++             ({:?} relative to the pass's window) is inside its grace window",
++            walk.passes,
++            relative(&tap, &mark)
++        );
++        assert_eq!(
++            meta.value(&mark).as_ref(),
++            Some(&stamp),
++            "leg D(i): the mark was deleted or rewritten inside its grace window"
++        );
++        assert!(
++            meta.value(&metadata::pending_key(KEPT.chunk)).is_some(),
++            "leg D(i): the lease's entry was retired while the fragment it names is on disk"
++        );
++        seen.push(relative(&tap, &mark));
++    }
++    assert!(
++        seen.contains(&Relative::Ahead) && seen.contains(&Relative::Behind),
++        "fixture: the mark must sit ahead of the window in some passes and behind it in others: \
++         {seen:?}"
++    );
++
++    // The mark's own grace elapses: now, and only now, its fragment is reclaimed.
++    let later = NOW + GRACE;
++    let mut passes = 0;
++    while servers[2].holds(KEPT) {
++        assert!(
++            passes <= lap,
++            "leg D(i): the fragment outlived its mark's grace window by {passes} passes"
++        );
++        walk.pass("leg D(i)", &meta, &fleet, later).await;
++        passes += 1;
++    }
++    assert!(
++        meta.value(&mark).is_none(),
++        "leg D(i): the consumed mark is removed with its fragment"
++    );
++    assert!(
++        meta.value(&metadata::pending_key(KEPT.chunk)).is_none(),
++        "leg D(i): with no fragment of the chunk left, the expired entry is retired"
++    );
++}
++
++/// **D(i) on the window's lower bound — a mark that IS the cursor the pass resumed from.** A
++/// window's key range is `(cursor, last key read]`, and the cursor is the last key the PREVIOUS
++/// pass read: of every key in the ledger, the one at the cursor is exactly the one the range
++/// leaves out. So the fragment's own mark — inside its grace window, over an expired lease, under
++/// `ExpiredPendingPolicy::Reclaim` — is seeded as the ledger's `B`-th key: each lap's first pass
++/// ends its window on it, and the next pass resumes from it without reading it. That pass has to
++/// treat the mark as unknown, not absent. A coverage test that let the bound in (`>=` for `>`)
++/// would find the fragment "covered and unmarked" and reclaim it on the lease, inside its mark's
++/// grace window.
++#[tokio::test]
++async fn d1_a_mark_on_the_resume_cursor_outranks_an_expired_lease() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..4).map(|_| MemDServer::default()).collect();
++    // `B - 1` filler keys before the mark and half a window after it: the mark is the last key of
++    // the first window, and the ledger, past the cap, is two windows long.
++    seed_filler(&meta, B - 1, B / 2);
++    servers[2].put(KEPT);
++    meta.seed_mark(2, KEPT, NOW);
++    put_expired_lease(&meta, KEPT.chunk).await;
++    let mark = orphan_key(2, KEPT);
++    meta.watch(mark.clone());
++    assert_eq!(
++        meta.orphan_keys().iter().position(|key| *key == mark),
++        Some(B - 1),
++        "fixture: the mark must be the ledger's B-th key, the last one of the first window"
++    );
++    assert!(
++        meta.orphan_len() > CAP,
++        "fixture: the ledger must be past the cap"
++    );
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Reclaim).await;
++    let fleet = fleet_of(&servers);
++    let stamp = Bytes::from(NOW.to_string());
++    let (mut ended_on, mut resumed_from) = (0, 0);
++    // Two laps of two passes each, all inside the mark's grace window.
++    for _ in 0..4 {
++        let tap = walk.pass("leg D(i), cursor", &meta, &fleet, NOW).await;
++        assert!(
++            servers[2].holds(KEPT),
++            "leg D(i), cursor, pass {}: the fragment was reclaimed on its expired lease while its \
++             own mark — the cursor this pass resumed from, which it did not read — is inside its \
++             grace window",
++            walk.passes
++        );
++        assert_eq!(
++            meta.value(&mark).as_ref(),
++            Some(&stamp),
++            "leg D(i), cursor: the mark was deleted or rewritten inside its grace window"
++        );
++        assert!(
++            meta.value(&metadata::pending_key(KEPT.chunk)).is_some(),
++            "leg D(i), cursor: the lease's entry was retired while the fragment it names is on disk"
++        );
++        ended_on += usize::from(
++            tap.span()
++                .is_some_and(|span| span.last == mark && !span.reached_end),
++        );
++        resumed_from += usize::from(
++            tap.resumed_from() == Some(mark.as_slice()) && !tap.watched_seen.contains(&mark),
++        );
++    }
++    assert!(
++        ended_on >= 2 && resumed_from >= 2,
++        "fixture: in each lap one window must end on the mark and the next pass resume from it \
++         without reading it (a window ended on it {ended_on} times, a pass resumed from it \
++         {resumed_from} times)"
++    );
++
++    // Its grace elapses: the next pass to read the mark reclaims the fragment, consumes the mark
++    // and retires the entry — within one lap.
++    let later = NOW + GRACE;
++    let mut passes = 0;
++    while servers[2].holds(KEPT) {
++        assert!(
++            passes < 2,
++            "leg D(i), cursor: the fragment outlived its mark's grace window by {passes} passes"
++        );
++        walk.pass("leg D(i), cursor", &meta, &fleet, later).await;
++        passes += 1;
++    }
++    assert!(
++        meta.value(&mark).is_none(),
++        "leg D(i), cursor: the consumed mark is removed with its fragment"
++    );
++    assert!(
++        meta.value(&metadata::pending_key(KEPT.chunk)).is_none(),
++        "leg D(i), cursor: with no fragment of the chunk left, the expired entry is retired"
++    );
++}
++
++/// **D(ii) — a chunk's `pending:` entry outlives every fragment it accounts for.** A chunk under an
++/// expired lease has UNMARKED fragments on four D servers whose key positions fall in four
++/// different windows, in a ledger past the cap of marks that do not touch it. Between any two
++/// passes, every fragment of the chunk still on disk has its `pending:` entry or an `orphan:` mark;
++/// the entry is deleted only once no fragment remains for it to account for; and every fragment
++/// is reclaimed within `⌈P / B⌉ + 1` passes. A pass that retired the entry chunk-wide after
++/// sweeping only its own window's fragments would leave the rest evidence-free, kept forever.
++#[tokio::test]
++async fn d2_an_expired_leases_entry_outlives_every_fragment_it_accounts_for() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
++    let block = B * 4 / 5;
++    // Filler on the odd D servers 1, 3, 5, 7, 9, a block each; the chunk's fragments on the even
++    // ones between them, so each fragment's position lands a block further into the ledger.
++    for (n, dserver) in [1, 3, 5, 7, 9].into_iter().enumerate() {
++        for i in 0..block {
++            meta.seed_mark(dserver, frag(7_000_000 + (n * block + i) as ChunkId, 0), 0);
++        }
++    }
++    let chunk: ChunkId = 9;
++    let leased: Vec<(DServerId, FragmentId)> = [2, 4, 6, 8]
++        .into_iter()
++        .enumerate()
++        .map(|(index, dserver)| (dserver, frag(chunk, index as u16)))
++        .collect();
++    for &(dserver, f) in &leased {
++        servers[dserver as usize].put(f);
++    }
++    put_expired_lease(&meta, chunk).await;
++    let population = meta.orphan_len();
++    assert!(population > CAP, "fixture: the ledger must be past the cap");
++    let bound = population.div_ceil(B) + 1;
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Reclaim).await;
++    let fleet = fleet_of(&servers);
++    let mut spans = Vec::new();
++    while leased.iter().any(|&(d, f)| servers[d as usize].holds(f)) {
++        assert!(
++            walk.passes < bound,
++            "leg D(ii): fragments of the leased chunk are still on disk after {} passes (bound \
++             ⌈P / B⌉ + 1 = {bound})",
++            walk.passes
++        );
++        let tap = walk.pass("leg D(ii)", &meta, &fleet, NOW).await;
++        spans.extend(tap.span());
++        let entry = meta.value(&metadata::pending_key(chunk));
++        for &(dserver, f) in &leased {
++            if servers[dserver as usize].holds(f) {
++                assert!(
++                    entry.is_some() || meta.value(&orphan_key(dserver, f)).is_some(),
++                    "leg D(ii), pass {}: {f:?} on D server {dserver} is on disk with neither its \
++                     `pending:` entry nor an `orphan:` mark — evidence-free bytes GC keeps forever",
++                    walk.passes
++                );
++            }
++        }
++    }
++    assert!(
++        meta.value(&metadata::pending_key(chunk)).is_none(),
++        "leg D(ii): with every fragment reclaimed, nothing is left for the entry to account for"
++    );
++    // The fixture really spread the positions across windows: no single pass's pages spanned them.
++    let window_holding = |key: &Vec<u8>| {
++        spans
++            .iter()
++            .position(|span: &Span| *key > span.first && (span.reached_end || *key < span.last))
++    };
++    let distinct: HashSet<usize> = leased
++        .iter()
++        .filter_map(|&(dserver, f)| window_holding(&orphan_key(dserver, f)))
++        .collect();
++    assert!(
++        distinct.len() >= 2,
++        "fixture: the leased fragments' positions must fall in different windows: {spans:?}"
++    );
++}
++
++/// Collects what a `tracing` subscriber writes, so leg D(iii) reads back the audit lines the pass
++/// actually emitted (`crates/custodian/tests/gc.rs:895-918`).
++#[derive(Clone, Default)]
++struct Capture(Arc<Mutex<Vec<u8>>>);
++
++impl std::io::Write for Capture {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.0.lock().unwrap().extend_from_slice(buf);
++        Ok(buf.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
++    type Writer = Self;
++    fn make_writer(&'w self) -> Self::Writer {
++        self.clone()
++    }
++}
++
++/// **D(iii) — an unreadable mark counts as a mark.** Set up as D(i), but the fragment's own mark
++/// holds a value that is not the decimal instant `mark_orphaned` writes. The fragment survives
++/// every pass through two full laps of the walk, the mark's key and value are never deleted or
++/// changed, and the mark is named on the GC audit seam, carrying its key. Treating the value as
++/// no mark at all hands the fragment to the expired-lease arm and deletes the mark with it — the
++/// last evidence a human has to repair.
++///
++/// The only leg in this binary that seeds an unreadable mark for GC to read, so no sibling fires
++/// that audit callsite; the #214 global-default guard is installed before its first pass
++/// (`crates/custodian/tests/gc.rs:1143-1146`).
++#[tokio::test]
++async fn d3_an_unreadable_mark_counts_as_a_mark() {
++    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..4).map(|_| MemDServer::default()).collect();
++    seed_filler(&meta, B + B / 2, 2 * B);
++    servers[2].put(KEPT);
++    let mark = orphan_key(2, KEPT);
++    let unreadable = Bytes::from_static(b"not an instant");
++    meta.seed(mark.clone(), unreadable.clone());
++    put_expired_lease(&meta, KEPT.chunk).await;
++    meta.watch(mark.clone());
++    let lap = meta.orphan_len().div_ceil(B);
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Reclaim).await;
++    let fleet = fleet_of(&servers);
++    let audit = Capture::default();
++    let (mut read_it, mut laps_ended) = (0, 0);
++    // Long after the lease expired and long after any grace window: nothing but the mark itself
++    // stands between the fragment and a reclaim.
++    let now = NOW + 10 * GRACE;
++    for _ in 0..2 * lap + 1 {
++        let tap = walk
++            .pass("leg D(iii)", &meta, &fleet, now)
++            .with_subscriber(tracing::Dispatch::new(
++                tracing_subscriber::registry().with(
++                    tracing_subscriber::fmt::layer()
++                        .json()
++                        .with_writer(audit.clone()),
++                ),
++            ))
++            .await;
++        assert!(
++            servers[2].holds(KEPT),
++            "leg D(iii), pass {}: the fragment was reclaimed although its own mark exists — a \
++             value the pass cannot read is still a mark",
++            walk.passes
++        );
++        assert_eq!(
++            meta.value(&mark).as_ref(),
++            Some(&unreadable),
++            "leg D(iii), pass {}: the unreadable mark was deleted or rewritten",
++            walk.passes
++        );
++        read_it += usize::from(tap.watched_seen.contains(&mark));
++        laps_ended += usize::from(tap.reached_end());
++    }
++    assert!(
++        read_it >= 2 && laps_ended >= 2,
++        "fixture: the run must cover two full laps, reading the mark in each (read in {read_it} \
++         passes, {laps_ended} laps ended)"
++    );
++
++    let logged = String::from_utf8(audit.0.lock().unwrap().clone()).unwrap();
++    let named = format!(r#""mark":"{}""#, String::from_utf8_lossy(&mark));
++    assert!(
++        logged
++            .lines()
++            .any(|line| line.contains(r#""action":"unreadable-orphan-mark""#)
++                && line.contains(r#""target":"wyrd.custodian.gc.audit""#)
++                && line.contains(&named)),
++        "leg D(iii): the unreadable mark must be named on the GC audit seam, carrying its key \
++         ({named}). got: {logged}"
++    );
++}
++
++// ---- leg E: only a fragment's own key licenses a reclaim ----
++
++/// `parse_orphan_key` reads each field as a plain integer (`crates/core/src/metadata.rs:78-85`),
++/// so `orphan:5:01:0` decodes to the position `orphan:5:1:0` names — and no writer spells it
++/// (every writer goes through `orphan_key`). The fragment's own mark is inside its grace window;
++/// the other spelling carries an old stamp, more than [`B`] keys earlier in the ledger. The fragment
++/// survives until its own mark's grace elapses, and the other spelling is never deleted,
++/// rewritten or acted on. A pass that judged the fragment on the early window alone would reclaim
++/// it on a key no writer wrote.
++#[tokio::test]
++async fn e_only_a_fragments_own_key_licenses_a_reclaim() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..6).map(|_| MemDServer::default()).collect();
++    let own = frag(1, 0);
++    let own_key = orphan_key(5, own);
++    let other_key = b"orphan:5:01:0".to_vec();
++    assert_eq!(
++        parse_orphan_key(&other_key),
++        Some((5, own)),
++        "fixture: the other spelling decodes to the fragment's own position"
++    );
++    servers[5].put(own);
++    meta.seed_mark(5, own, NOW);
++    meta.seed(other_key.clone(), "0");
++    // Chunk ids 100000.. spell `orphan:5:1<digits>:0`, which sorts after `orphan:5:01:0` and
++    // before `orphan:5:1:0`: more than a window of keys between the two spellings.
++    for i in 0..B + 500 {
++        meta.seed_mark(5, frag(100_000 + i as ChunkId, 0), 0);
++    }
++    let keys = meta.orphan_keys();
++    let between = keys
++        .iter()
++        .filter(|key| **key > other_key && **key < own_key)
++        .count();
++    assert!(
++        keys.first() == Some(&other_key) && between > B,
++        "fixture: the other spelling must open the ledger, more than a window before the mark"
++    );
++    let lap = keys.len().div_ceil(B);
++
++    let coord = MemCoordination::new();
++    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Reclaim).await;
++    let fleet = fleet_of(&servers);
++    let stamp = Bytes::from(NOW.to_string());
++    let old = Bytes::from_static(b"0");
++    let mut touched = Vec::new();
++    for _ in 0..2 * lap + 1 {
++        let tap = walk.pass("leg E", &meta, &fleet, NOW).await;
++        assert!(
++            servers[5].holds(own),
++            "leg E, pass {}: the fragment was reclaimed inside its own mark's grace window — on a \
++             key no writer spells",
++            walk.passes
++        );
++        assert_eq!(
++            meta.value(&own_key).as_ref(),
++            Some(&stamp),
++            "leg E: own mark changed"
++        );
++        touched.extend(tap.commits);
++    }
++
++    let later = NOW + GRACE;
++    let mut passes = 0;
++    while servers[5].holds(own) {
++        assert!(
++            passes <= lap,
++            "leg E: the fragment outlived its own mark's grace window by {passes} passes"
++        );
++        let tap = walk.pass("leg E", &meta, &fleet, later).await;
++        touched.extend(tap.commits);
++        passes += 1;
++    }
++    assert!(
++        meta.value(&own_key).is_none(),
++        "leg E: the consumed own mark is removed"
++    );
++    assert_eq!(
++        meta.value(&other_key).as_ref(),
++        Some(&old),
++        "leg E: the other spelling must be left exactly as it was"
++    );
++    assert!(
++        touched
++            .iter()
++            .all(|commit| !commit.puts.contains(&other_key) && !commit.deletes.contains(&other_key)),
++        "leg E: no commit may write or delete the other spelling"
++    );
++}
++
++// ---- leg F: restore survives the same ledger, and never re-stamps a mark it did not read ----
++
++/// `reconcile_after_restore` over a ledger past the cap returns `Ok` (on `main`, `restore.rs:308`
++/// returns `Err`: the red). It writes a fresh stamp for any stranded fragment it did not find
++/// marked, so a judgement drawn from part of the ledger would silently restart the grace clock of
++/// every mark beyond it. Pre-marked stranded fragments sort after both the first [`B`] keys and
++/// the first [`CAP`] keys, one of them the ledger's last key, plus one whose mark is unreadable:
++/// each keeps its value bytes and is counted `already_marked`. A genuine stray with no mark IS
++/// marked, so the leg cannot pass on a pass that did nothing.
++#[tokio::test]
++async fn f_restore_survives_the_ledger_and_never_restamps_a_mark_it_did_not_read() {
++    let meta = LedgerMeta::default();
++    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
++    for i in 0..B + CAP + 1_000 {
++        meta.seed_mark(1, frag(8_000_000 + i as ChunkId, 0), 0);
++    }
++    let pass_clock = NOW;
++    let stamped_before = pass_clock - 100;
++    // On D server 9, so every one of their keys sorts after every filler key.
++    let premarked = [frag(12, 0), frag(13, 0), frag(19, 0)];
++    let unreadable = frag(14, 0);
++    let stray = frag(15, 0);
++    for f in premarked {
++        servers[9].put(f);
++        meta.seed_mark(9, f, stamped_before);
++    }
++    servers[9].put(unreadable);
++    let garbage = Bytes::from_static(b"not an instant");
++    meta.seed(orphan_key(9, unreadable), garbage.clone());
++    servers[9].put(stray);
++    let keys = meta.orphan_keys();
++    assert!(
++        keys.last() == Some(&orphan_key(9, frag(19, 0)))
++            && keys
++                .iter()
++                .position(|key| *key == orphan_key(9, premarked[0]))
++                > Some(B.max(CAP)),
++        "fixture: the pre-marked marks must sort past the first window and the first cap's worth, \
++         one of them last"
++    );
++
++    let fleet = fleet_of(&servers);
++    let ctx = GcContext {
++        meta: &meta,
++        fleet: &fleet,
++        grace_window_millis: GRACE,
++        expired_pending: ExpiredPendingPolicy::Reclaim,
++    };
++    meta.take_tap();
++    let report: RestoreReport = match reconcile_after_restore(&ctx, pass_clock).await {
++        Ok(report) => report,
++        Err(err) => panic!(
++            "leg F: the post-restore pass failed: {err}. On main this is its single `scan` of \
++             the `orphan:` ledger past the cap (`restore.rs:308`)"
++        ),
++    };
++    let tap = meta.take_tap();
++    assert!(
++        tap.orphan_scans.is_empty(),
++        "leg F: the pass ran `scan` over the `orphan:` ledger"
++    );
++    let stamp = Bytes::from(stamped_before.to_string());
++    for f in premarked {
++        assert_eq!(
++            meta.value(&orphan_key(9, f)).as_ref(),
++            Some(&stamp),
++            "leg F: the mark for {f:?} was re-stamped — its grace clock restarted"
++        );
++    }
++    assert_eq!(
++        meta.value(&orphan_key(9, unreadable)).as_ref(),
++        Some(&garbage),
++        "leg F: the unreadable mark was re-stamped — the only evidence a human had is gone"
++    );
++    assert_eq!(
++        report.already_marked, 4,
++        "leg F: every pre-marked fragment carried an `orphan:` record: {report:?}"
++    );
++    assert_eq!(
++        (report.stranded_marked, meta.value(&orphan_key(9, stray))),
++        (1, Some(Bytes::from(pass_clock.to_string()))),
++        "leg F: the genuine stray is marked, at the pass's clock: {report:?}"
++    );
++}
++
++// ---- the walk's guards: a page outside the `scan_page` contract is refused, never walked ----
++
++/// `scan_page` promises a page of at most `limit` entries that starts strictly after its cursor
++/// (clause 2 and "The page bound", `crates/traits/src/lib.rs:1377-1408`). The walk's bound and its
++/// termination rest on those two promises, so a store that breaks either is refused with an
++/// error — by GC's pass and by the post-restore pass alike — rather than walked:
++///
++/// * a store that **repeats its cursor** (an inclusive `after`, one key a page) hands back, from
++///   its second page on, the very key it was asked to pass. Walked, GC's window would read that
++///   one key its whole budget over and leave its cursor there for good, and restore's walk to the
++///   end of the ledger would never end;
++/// * a store that **overruns its limit** answers one entry more than it was asked for. Walked,
++///   the window's budget would no longer bound what a pass reads.
++///
++/// On `main` both passes fail on the ledger past the cap instead — an error, but not this one.
++#[tokio::test]
++async fn guard_a_page_outside_the_scan_page_contract_is_refused_not_walked() {
++    for (fault, refusal) in [
++        (PageFault::RepeatsCursor, "does not advance the walk"),
++        (
++            PageFault::OverLong,
++            "refused rather than read past the walk's budget",
++        ),
++    ] {
++        let meta = LedgerMeta {
++            fault,
++            ..LedgerMeta::default()
++        };
++        let servers: Vec<MemDServer> = (0..3).map(|_| MemDServer::default()).collect();
++        // Past the cap and past one window, so an over-long page can outrun a window's ask.
++        for i in 0..B + 2 {
++            meta.seed_mark(1, frag(9_000_000 + i as ChunkId, 0), 0);
++        }
++        // A stray the post-restore pass may mark, so that it reads the ledger at all.
++        servers[2].put(frag(3, 0));
++        let fleet = fleet_of(&servers);
++        let ctx = GcContext {
++            meta: &meta,
++            fleet: &fleet,
++            grace_window_millis: GRACE,
++            expired_pending: ExpiredPendingPolicy::Defer,
++        };
++
++        let coord = MemCoordination::new();
++        let (zone, custodian) = elect(&coord).await;
++        let gc = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, NOW).await;
++        let Err(err) = gc else {
++            panic!(
++                "{fault:?}: the GC pass walked a page outside the contract instead of refusing it"
++            );
++        };
++        assert!(
++            err.to_string().contains(refusal),
++            "{fault:?}: the GC pass must refuse the page ({refusal:?}); it failed on something \
++             else: {err}"
++        );
++
++        let Err(err) = reconcile_after_restore(&ctx, NOW).await else {
++            panic!(
++                "{fault:?}: the post-restore pass walked a page outside the contract instead of \
++                 refusing it"
++            );
++        };
++        assert!(
++            err.to_string().contains(refusal),
++            "{fault:?}: the post-restore pass must refuse the page ({refusal:?}); it failed on \
++             something else: {err}"
++        );
++    }
++}
+diff --git a/crates/custodian/tests/segmented_map_restore.rs b/crates/custodian/tests/segmented_map_restore.rs
+index 8e5dc09..232045c 100644
+--- a/crates/custodian/tests/segmented_map_restore.rs
++++ b/crates/custodian/tests/segmented_map_restore.rs
+@@ -629,42 +629,43 @@ async fn an_unreadable_object_does_not_starve_the_objects_the_pass_could_read()
+ // ---- criterion (3), continued: the name outlives a store fault that ends the pass ----
+ 
+ /// Attribution a later fault can swallow is not attribution. The pass reads more of the store
+-/// after the reference build — the `orphan:` and `pending:` ledgers, then the fleet — and any of
+-/// those reads can fail for reasons that have nothing to do with the damaged record: a backend
+-/// blip, a partitioned store. That error propagates, and rightly (a pass that cannot read the
+-/// store has no answer for any object). But by then this pass already KNOWS which record it
+-/// could not read, and if that name were held back for a report the fault stops it from
++/// after the reference build — the `pending:` ledger, the committed namespace again, then the
++/// fleet — and any of those reads can fail for reasons that have nothing to do with the damaged
++/// record: a backend blip, a partitioned store. That error propagates, and rightly (a pass that
++/// cannot read the store has no answer for any object). But by then this pass already KNOWS which
++/// record it could not read, and if that name were held back for a report the fault stops it from
+ /// returning, the operator would be left with an error naming nothing and the record still
+ /// blocking every future pass — the stall with no way out that C-1 forbids.
+ ///
+-/// So the name must already be on the durability seam. Asserted per intervening read, and on the
+-/// injected fault's own text, so a leg cannot pass on some *other* error.
++/// So the name must already be on the durability seam. Asserted on the `pending:` read that
++/// follows the reference build, and on the injected fault's own text, so the leg cannot pass on
++/// some *other* error. (The `orphan:` ledger is no longer a read this pass makes over a hole: it
++/// is walked only for the fragments the pass may mark, and while a record is unreadable it may
++/// mark none — #661.)
+ #[tokio::test]
+ async fn a_record_already_known_unreadable_is_named_before_a_later_read_can_fail() {
+     enable_audit_callsites();
+-    for ledger in [b"orphan:".as_slice(), b"pending:".as_slice()] {
+-        let meta = MemMeta::default();
+-        let d0 = MemDServer::default();
+-        seed_damaged(&meta, &d0).await;
+-        let meta = meta.fail_scans_of(ledger);
+-
+-        let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+-        let audit = Capture::default();
+-        let failed = reconcile(&meta, &fleet)
+-            .with_subscriber(capturing_dispatch(audit.clone()))
+-            .await
+-            .expect_err("fixture: the poisoned ledger read must end the pass with an error");
+-
+-        assert!(
+-            failed.to_string().contains(STORE_FAULT),
+-            "fixture: the pass must have failed on the INJECTED store fault: {failed}"
+-        );
+-        assert_attributes_blocker(
+-            &audit.contents(),
+-            "wyrd.custodian.restore.audit",
+-            DAMAGED_OBJECT,
+-        );
+-    }
++    let meta = MemMeta::default();
++    let d0 = MemDServer::default();
++    seed_damaged(&meta, &d0).await;
++    let meta = meta.fail_scans_of(b"pending:");
++
++    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
++    let audit = Capture::default();
++    let failed = reconcile(&meta, &fleet)
++        .with_subscriber(capturing_dispatch(audit.clone()))
++        .await
++        .expect_err("fixture: the poisoned ledger read must end the pass with an error");
++
++    assert!(
++        failed.to_string().contains(STORE_FAULT),
++        "fixture: the pass must have failed on the INJECTED store fault: {failed}"
++    );
++    assert_attributes_blocker(
++        &audit.contents(),
++        "wyrd.custodian.restore.audit",
++        DAMAGED_OBJECT,
++    );
+ }
+ 
+ // ---- criterion (2c): the marks and the report rest on ONE reading ----
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index dc8cc58..34cf9f2 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -1783,9 +1783,13 @@ const RESTORE_STRAY: ChunkId = 0x6513;
+ const LATE_INODE: InodeId = 2;
+ /// How far past the pass's start the concurrent writer's landing point is drawn from, in
+ /// simulated milliseconds. One `network_hop` is 1 ms and the pass's two `inode:` readings are
+-/// three hops apart, so this span spans "before the second reading", the tie with it, and "after
+-/// the whole pass" — and the coverage property below **proves** the middle one is reached rather
+-/// than assuming it.
++/// two hops apart, with the `pending:` scan between them (the `orphan:` ledger is read after both,
++/// and only for the fragments the pass may mark — #661), so this span spans "before the second
++/// reading", the tie with it, and "after the whole pass" — and the coverage property below
++/// **proves** the middle one is reached rather than assuming it. A writer drawn to land at 0 ms
++/// starts at once rather than sleeping: the simulator's `sleep` never finishes inside the tick it
++/// was called in, so a zero sleep would start the writer a hop late — onto the tie with the
++/// second reading, never ahead of it.
+ const RESTORE_NEMESIS_SPAN: u32 = 6;
+ 
+ /// A recording tap over the DST tier's simulated-TiKV store: every trait call is forwarded
+@@ -1969,7 +1973,10 @@ async fn restore_under_a_concurrent_writer(nemesis: Nemesis, delay_millis: u64)
+         let meta = Arc::clone(&meta);
+         let held_key = held_key.clone();
+         async move {
+-            madsim::time::sleep(Duration::from_millis(delay_millis)).await;
++            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
++            if delay_millis > 0 {
++                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
++            }
+             let outcome = match nemesis {
+                 Nemesis::LateCommit => {
+                     metadata::create(&*meta, ROOT, "late", LATE_INODE, &late_record).await
+@@ -2165,6 +2172,389 @@ async fn prop_restore_two_readings_cover_the_divergence_window() {
+     }
+ }
+ 
++// ---- property 12: GC's paged walk of the `orphan:` ledger under a concurrent unlink (#661) ----
++//
++// GC reads the orphan ledger in cursor-keyed `scan_page` pages, never with one `scan` (proposal
++// 0016, `0016:1392-1408`), so a pass's view of the ledger is assembled over several reads with
++// real await boundaries between them — and a writer can land in between. The per-pass legs in
++// `crates/custodian/tests/gc_ledger_walk.rs` pin the walk's decisions over doubles that never
++// yield; here the ledger is paged over the simulated-TiKV model with a page cap the seed picks,
++// and a genuinely concurrent task unlinks an object at an instant the seed picks, writing fresh
++// marks (inside grace) behind the walk's current page and ahead of it.
++//
++// The ledger stays below the production window (`gc::ORPHAN_WINDOW`): that is a constant, and a
++// test could lower it only through a context field or a global, both ruled out. So every pass
++// reads the whole ledger in several pages, and what the simulator sweeps is where between those
++// pages the writer lands — the no-skip clause (`scan_page` clause 4) doing its work under a real
++// interleaving rather than a scripted one.
++//
++// The property is the retention rule itself: no fragment that is referenced, or whose own mark is
++// inside its grace window, is ever deleted — and every fragment actionable when the run starts is
++// reclaimed by its end. The unlinked object's chunks also carry a stale, EXPIRED `pending:` lease
++// (a writer that died between its commit and its release), so a walk that let the lease outrank a
++// mark it had not read would delete those fragments inside their grace window.
++
++/// The object referenced for the whole run: chunk 7, one fragment on server 1. Its fragment also
++/// carries a stale mark long past grace, so the reference is the only thing keeping it.
++const WALK_LIVE: ChunkId = 7;
++/// The unlinked object's two chunks: chunk 1 on server 0 and chunk 9 on server 3. Their marks —
++/// written by the unlink — are the first (`orphan:0:1:0`) and last (`orphan:3:9:0`) keys of the
++/// ledger, so wherever the walk is mid-way when they land, one is behind it and one ahead.
++const WALK_VICTIM: [(ChunkId, DServerId); 2] = [(1, 0), (9, 3)];
++/// Where the actionable ledger's chunk ids start: `5000..`, four digits each, so they sort after
++/// `orphan:0:1:0` and `orphan:2:4…:0` and before `orphan:1:7:0` and `orphan:3:9:0`.
++const WALK_ACTIONABLE_BASE: ChunkId = 5000;
++/// Two unreferenced fragments on server 2 whose marks are inside grace for the whole run.
++const WALK_WITHIN_GRACE: [ChunkId; 2] = [4000, 4001];
++const WALK_VICTIM_INODE: InodeId = 3;
++const WALK_LIVE_INODE: InodeId = 4;
++const WALK_GRACE: u64 = 1_000;
++/// Every pass runs at this instant; the unlink stamps it too, so its marks are inside grace for
++/// the whole run while everything stamped at zero is long past it.
++const WALK_NOW: u64 = 10_000;
++/// Passes per run: the first reclaims the actionable ledger, the rest walk what the unlink wrote.
++const WALK_PASSES: usize = 3;
++/// How far past the run's start the unlink's landing point is drawn from, in simulated
++/// milliseconds. One `network_hop` is 1 ms; a pass is its two scans, the cursor read, one hop per
++/// page and a cleanup commit, and the unlink itself spans four hops (two reads and a commit) — so
++/// this spans "before the first page", every gap between pages of the first walk, the gaps between
++/// passes, and "after the whole run". The coverage property below proves the mid-walk landing is
++/// reached rather than assuming it.
++const WALK_NEMESIS_SPAN: u32 = 32;
++
++/// One observation at the store seam, in the order the simulation produced them. Keys are kept as
++/// text: every key in this run is ASCII, so text order is the store's byte order, and a failure
++/// message stays readable.
++#[derive(Clone, Debug)]
++enum WalkEvent {
++    /// The run began a GC pass.
++    Pass,
++    /// A `scan_page` of the `orphan:` ledger answered, ending on `last`; `more` is whether it
++    /// handed back a cursor (the walk was not done).
++    Page { last: Option<String>, more: bool },
++    /// A commit wrote these `orphan:` marks — the unlink, the only writer of marks in the run.
++    Marked(Vec<String>),
++}
++
++/// A recording tap over the simulated-TiKV store: every call is forwarded unchanged, network hops
++/// included, and the orphan-ledger pages and mark-writing commits are logged in the order they
++/// complete. Instance state only (ADR-0035).
++struct WalkMeta {
++    inner: SimTikvMetadataStore,
++    events: Mutex<Vec<WalkEvent>>,
++}
++
++impl WalkMeta {
++    fn log(&self, event: WalkEvent) {
++        self.events.lock().unwrap().push(event);
++    }
++}
++
++#[async_trait]
++impl MetadataStore for WalkMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<wyrd_traits::ScanPage> {
++        let (items, next) = self.inner.scan_page(prefix, after, limit).await?;
++        if prefix == metadata::ORPHAN_PREFIX {
++            self.log(WalkEvent::Page {
++                last: items
++                    .last()
++                    .map(|(key, _)| String::from_utf8_lossy(key).into_owned()),
++                more: next.is_some(),
++            });
++        }
++        Ok((items, next))
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let marks: Vec<String> = batch
++            .puts
++            .iter()
++            .filter(|(key, _)| key.starts_with(metadata::ORPHAN_PREFIX))
++            .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
++            .collect();
++        let outcome = self.inner.commit(batch).await?;
++        if outcome == CommitOutcome::Committed && !marks.is_empty() {
++            self.log(WalkEvent::Marked(marks));
++        }
++        Ok(outcome)
++    }
++}
++
++/// Where the unlink's marks landed relative to the walk — observed at the store seam.
++struct WalkLanding {
++    /// Between two pages of one pass's walk: after a page that handed back a cursor, before the
++    /// next page of the same pass.
++    mid_walk: bool,
++    /// Mid-walk, with marks both behind the walk's cursor and ahead of it.
++    behind_and_ahead: bool,
++}
++
++fn walk_landing(events: &[WalkEvent]) -> WalkLanding {
++    let mut cursor: Option<&String> = None;
++    for event in events {
++        match event {
++            WalkEvent::Pass => cursor = None,
++            WalkEvent::Page { last, more } => cursor = last.as_ref().filter(|_| *more),
++            WalkEvent::Marked(keys) => {
++                let Some(at) = cursor else {
++                    return WalkLanding {
++                        mid_walk: false,
++                        behind_and_ahead: false,
++                    };
++                };
++                return WalkLanding {
++                    mid_walk: true,
++                    behind_and_ahead: keys.iter().any(|key| key < at)
++                        && keys.iter().any(|key| key > at),
++                };
++            }
++        }
++    }
++    WalkLanding {
++        mid_walk: false,
++        behind_and_ahead: false,
++    }
++}
++
++/// A committed flat record placing each `(chunk, dserver)` as an un-erasure-coded chunk.
++fn flat_committed_on(chunks: &[(ChunkId, DServerId)]) -> InodeRecord {
++    InodeRecord {
++        size: 5 * chunks.len() as u64,
++        chunk_map: chunks
++            .iter()
++            .map(|&(id, dserver)| ChunkRef {
++                id,
++                scheme: EcScheme::None,
++                len: 5,
++                placement: vec![dserver],
++            })
++            .collect::<Vec<_>>()
++            .into(),
++        state: InodeState::Committed,
++        version: 1,
++        ..Default::default()
++    }
++}
++
++/// One run: `WALK_PASSES` GC passes, each with a fresh `GcContext`, over a ledger of `actionable`
++/// reclaimable marks (plus the live object's stale mark and two within-grace ones) paged `page_cap`
++/// at a time, while the unlink lands `delay_millis` into the run. Asserts the retention property
++/// and returns where the unlink landed.
++async fn gc_walk_under_a_concurrent_unlink(
++    page_cap: usize,
++    actionable: usize,
++    delay_millis: u64,
++) -> WalkLanding {
++    let d = servers();
++    let meta = Arc::new(WalkMeta {
++        inner: SimTikvMetadataStore::new().with_scan_cap(page_cap),
++        events: Mutex::new(Vec::new()),
++    });
++
++    // The live object, referenced for the whole run — and a stale mark on its fragment, long past
++    // grace, so only the reference keeps it.
++    let live = frag_of(WALK_LIVE);
++    d[1].put_fragment(live, Bytes::from_static(b"live"), None)
++        .await
++        .unwrap();
++    let live_record = flat_committed_on(&[(WALK_LIVE, 1)]);
++    let created = metadata::create(&*meta, ROOT, "walk-live", WALK_LIVE_INODE, &live_record);
++    assert_eq!(created.await.unwrap(), CommitOutcome::Committed);
++    mark_orphaned(&*meta, 1, live, 0).await.unwrap();
++
++    // The object the concurrent task unlinks: referenced until it lands. Its chunks keep a stale,
++    // expired lease, so after the unlink a mark is all that stands between them and a reclaim.
++    for &(chunk, dserver) in &WALK_VICTIM {
++        d[dserver as usize]
++            .put_fragment(frag_of(chunk), Bytes::from_static(b"victim"), None)
++            .await
++            .unwrap();
++        let lease = PendingEntry {
++            lease_expiry_millis: 1,
++            owner: None,
++            staged: None,
++        };
++        metadata::put_pending(&*meta, chunk, &lease).await.unwrap();
++    }
++    let victim_record = flat_committed_on(&WALK_VICTIM);
++    let created = metadata::create(
++        &*meta,
++        ROOT,
++        "walk-victim",
++        WALK_VICTIM_INODE,
++        &victim_record,
++    );
++    assert_eq!(created.await.unwrap(), CommitOutcome::Committed);
++
++    // Unreferenced fragments whose marks are inside grace for the whole run.
++    for &chunk in &WALK_WITHIN_GRACE {
++        d[2].put_fragment(frag_of(chunk), Bytes::from_static(b"held"), None)
++            .await
++            .unwrap();
++        mark_orphaned(&*meta, 2, frag_of(chunk), WALK_NOW)
++            .await
++            .unwrap();
++    }
++
++    // The actionable ledger: unreferenced fragments whose marks are long past grace.
++    let reclaimable: Vec<(DServerId, FragmentId)> = (0..actionable)
++        .map(|i| {
++            let chunk = WALK_ACTIONABLE_BASE + i as ChunkId;
++            ((i % 4) as DServerId, frag_of(chunk))
++        })
++        .collect();
++    for &(dserver, frag) in &reclaimable {
++        d[dserver as usize]
++            .put_fragment(frag, Bytes::from_static(b"garbage"), None)
++            .await
++            .unwrap();
++        mark_orphaned(&*meta, dserver, frag, 0).await.unwrap();
++    }
++
++    // The run starts here: what the fixture wrote above is not the concurrent writer.
++    meta.events.lock().unwrap().clear();
++
++    // The genuinely concurrent unlink, landing where the seed (or the coverage walk) puts it.
++    let writer = madsim::task::spawn({
++        let meta = Arc::clone(&meta);
++        async move {
++            // Zero means now: the simulator's `sleep` never finishes inside the tick it was called
++            // in (see `RESTORE_NEMESIS_SPAN`).
++            if delay_millis > 0 {
++                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
++            }
++            let unlinked = metadata::unlink(&*meta, ROOT, "walk-victim", WALK_NOW)
++                .await
++                .unwrap()
++                .expect("the victim's name is bound until this unlink");
++            assert_eq!(
++                unlinked.outcome,
++                CommitOutcome::Committed,
++                "the concurrent unlink must land, or this run tests nothing"
++            );
++        }
++    });
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord, "zone-gc-walk").await;
++    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
++    for pass in 1..=WALK_PASSES {
++        meta.log(WalkEvent::Pass);
++        // A FRESH context every pass, as the deployed loop builds one
++        // (`crates/server/src/custodian.rs:600-608`).
++        let ctx = GcContext {
++            meta: &*meta,
++            fleet: &fleet,
++            grace_window_millis: WALK_GRACE,
++            expired_pending: ExpiredPendingPolicy::Reclaim,
++        };
++        let outcome =
++            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, WALK_NOW).await;
++        assert!(
++            outcome.is_ok(),
++            "GC pass {pass} failed (page cap {page_cap}, unlink at {delay_millis} ms): {:?}",
++            outcome.err()
++        );
++    }
++    writer
++        .await
++        .expect("the concurrent unlink ran to completion");
++    let events = meta.events.lock().unwrap().clone();
++
++    // (1) NEVER DELETE A REFERENCED FRAGMENT, OR ONE WHOSE OWN MARK IS INSIDE GRACE.
++    assert!(
++        d[1].get_fragment(live).await.unwrap().is_some(),
++        "the referenced object's fragment was deleted (page cap {page_cap}, unlink at \
++         {delay_millis} ms): {events:?}"
++    );
++    for &(chunk, dserver) in &WALK_VICTIM {
++        assert!(
++            d[dserver as usize]
++                .get_fragment(frag_of(chunk))
++                .await
++                .unwrap()
++                .is_some(),
++            "chunk {chunk} on server {dserver} was deleted — referenced until the unlink, and \
++             marked inside grace after it (page cap {page_cap}, unlink at {delay_millis} ms): \
++             {events:?}"
++        );
++        assert_eq!(
++            meta.get(&metadata::orphan_key(dserver, frag_of(chunk)))
++                .await
++                .unwrap(),
++            Some(Bytes::from(WALK_NOW.to_string())),
++            "the unlink's mark for chunk {chunk} was consumed inside its grace window"
++        );
++    }
++    for &chunk in &WALK_WITHIN_GRACE {
++        assert!(
++            d[2].get_fragment(frag_of(chunk)).await.unwrap().is_some(),
++            "a fragment whose mark is inside grace was deleted (page cap {page_cap}, unlink at \
++             {delay_millis} ms)"
++        );
++    }
++
++    // (2) EVERY FRAGMENT ACTIONABLE AT THE START IS RECLAIMED BY THE END, its mark consumed.
++    for &(dserver, frag) in &reclaimable {
++        assert!(
++            d[dserver as usize]
++                .get_fragment(frag)
++                .await
++                .unwrap()
++                .is_none()
++                && !is_marked(&*meta, dserver, frag).await,
++            "{frag:?} on server {dserver} was actionable from the start and survived the run \
++             (page cap {page_cap}, unlink at {delay_millis} ms): {events:?}"
++        );
++    }
++
++    walk_landing(&events)
++}
++
++/// The campaign leg: the seed picks the page cap, how long the ledger is, and where the unlink
++/// lands, so 50 seeds sweep the schedule space around the walk's pages.
++async fn prop_gc_orphan_walk_under_a_concurrent_unlink(rng: &mut ChaCha8Rng) {
++    let page_cap = 3 + (rng.next_u32() % 4) as usize;
++    let actionable =
++        page_cap * (3 + (rng.next_u32() % 3) as usize) + (rng.next_u32() as usize % page_cap);
++    let delay = u64::from(rng.next_u32() % (WALK_NEMESIS_SPAN + 1));
++    gc_walk_under_a_concurrent_unlink(page_cap, actionable, delay).await;
++}
++
++/// **The mid-walk landing is genuinely REACHED.** Walks the unlink's landing point across the
++/// whole span in one run, asserting the full property at every point, then asserts that at least
++/// one landing fell between two pages of a pass's walk with marks both behind the walk's cursor and
++/// ahead of it — the interleaving this property is about. Without it, a span that drifted past the
++/// walk would leave the campaign green with nothing behind it.
++async fn prop_gc_orphan_walk_reaches_the_mid_walk_landing() {
++    let mut mid_walk = Vec::new();
++    for delay in 0..=u64::from(WALK_NEMESIS_SPAN) {
++        let landing = gc_walk_under_a_concurrent_unlink(3, 12, delay).await;
++        if landing.mid_walk && landing.behind_and_ahead {
++            mid_walk.push(delay);
++        }
++    }
++    assert!(
++        !mid_walk.is_empty(),
++        "no landing point in 0..={WALK_NEMESIS_SPAN} ms fell between two pages of a walk with \
++         marks both behind and ahead of it — the interleaving this property exists for was never \
++         exercised"
++    );
++}
++
+ // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
+ 
+ /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
+@@ -2247,6 +2637,18 @@ dst_campaign_test! {
+     }
+ }
+ 
++dst_campaign_test! {
++    async fn gc_orphan_walk_under_a_concurrent_unlink() {
++        prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rand_seed()).await;
++    }
++}
++
++dst_campaign_test! {
++    async fn gc_orphan_walk_reaches_the_mid_walk_landing() {
++        prop_gc_orphan_walk_reaches_the_mid_walk_landing().await;
++    }
++}
++
+ // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
+ 
+ /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
+@@ -2279,6 +2681,7 @@ dst_campaign_test! {
+             prop_reader_flips_atomically_across_commit(&mut rng).await;
+             prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rng).await;
+             prop_restore_two_readings_never_license_a_mark(&mut rng).await;
++            prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
+         }
+     }
+ }
+diff --git a/docs/design/architecture/06-runtime-view.md b/docs/design/architecture/06-runtime-view.md
+index 27d619f..7031af3 100644
+--- a/docs/design/architecture/06-runtime-view.md
++++ b/docs/design/architecture/06-runtime-view.md
+@@ -72,5 +72,7 @@ Delete is a commit-point operation too, and its cost is paid lazily, off the cri
+ 
+ 1. **Unlink (the commit point).** Removing the dirent — and tombstoning the inode/version — is a single atomic metadata mutation, linearized globally by L2 for the *name* so no zone ever resurrects a deleted file (section 8.1). The delete acknowledges here; the object is now invisible to every consistency-sensitive reader and its chunks are unreferenced.
+ 2. **Reclaim (custodian GC, L4).** The orphaned fragments are reclaimed by a GC custodian after a grace period — long enough that an in-flight reader holding the old version is never torn — exactly the pending-ledger sweep pattern (section 5). Reclamation is background work, not on the delete's latency path.
++
++   The ledger of these grace records can outgrow what one metadata listing may return — a single delete of the largest segmented object writes more records than that — so GC **walks it in bounded windows** rather than reading it whole. Each pass reads at most a fixed number of records, in pages, starting where the previous pass stopped, and returns to the start of the ledger once it reaches the end; where to resume is kept in one small record of its own in the metadata store, so the walk carries over from pass to pass and across a change of leader. A pass concludes only what its window shows: a fragment whose record lies outside the window is left for a later pass, never reclaimed meanwhile on other evidence such as an expired write lease; a record whose value cannot be read still counts as a record — its fragment is kept and the record is named to the operator — and only a record spelled exactly as the delete path writes it can license a reclaim. The chunk-wide lease entry of an interrupted write is retired only once no fragment it accounts for is left, since other windows may still hold some. GC's own clean-up writes go out in commits of a fixed size, never one commit sized by the pass. The post-restore pass reads the same ledger page by page too, to its end, before deciding which fragments already carry a record.
+ 3. **Propagate across zones (L3).** If the object had replicas, the deletion propagates through the replica catalog: each holding zone drops its catalog record and its GC reclaims the local fragments. Until propagation completes, a *stale-tolerant* read in a lagging zone may still see the old object, bounded by replication lag (section 8.1); consistency-sensitive reads route to the home zone and never do.
+ 4. **Prove it (audit + crypto-erase).** The deletion is recorded in the append-only audit/event log — the operator's compliance and GDPR-deletion story (section 8.3). Where per-tenant envelope encryption is enabled, dropping the object/tenant key crypto-shreds the data immediately, making it unrecoverable independent of when GC runs (section 8.5).
