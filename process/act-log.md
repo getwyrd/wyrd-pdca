@@ -29,6 +29,72 @@
 - The next Do phases should not recreate <specific issue>. Watch the next K cycles.
 -->
 
+# Act review — 2026-09-20 — review coverage after wyrd PR #821 (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act, triggered by three post-merge P1 findings on wyrd PR #821 (bundle #800) that
+> the cycle had not surfaced. Decided with the human; applied here as configuration.
+
+## What the records exposed
+
+- **The refutation pass never ran on #800.** `[[leaves.advisory]] adversary` was gated on
+  `difficulty` containing "high"/"hard"; #800 and its parent #661 were rated `medium`, so the
+  driver skipped it silently — no artifact, no note in §5. Every bundle that got an adversary
+  pass (#771, #772, #803, #804, #635, #636, #681, #697) was rated `high`; #661, #693, #800
+  (`medium`) and #655 (`low`) got none. The reviewer had raised the deadline-straddling hazard
+  as a C5 NEEDS-HUMAN; sign-off accepted it on 2026-09-15 with no rationale in §9, and the
+  post-merge review turned it into a P1. `difficulty` is a size label the planner writes, not
+  a statement about which invariants a slice touches.
+- **Two findings were in nobody's pass.** The batched pre-PR review (3 codex passes) returned
+  0 findings on a 119 KB patch the size backstop had flagged. Its rubric has no row for a
+  transaction's sequential operation count (only bytes), and its `CommitUnknownResult` row is
+  about rollback, not about losing the accounting of a delete that landed. Both are the
+  correctness lens `agents/code-review.md` describes, which no leaf ran.
+- **The ladder topped out on one lineage.** Escalation went sonnet/high → opus/max and stayed
+  on opus; #637 hit an Opus-specific refusal twice in a row with no other family to fall to.
+
+## Process deltas
+
+- Gates / leaves: **three-tier builder ladder by attempt** — tier 1 sonnet/xhigh (every first
+  attempt), tier 2 opus/xhigh (attempts 2 to 4), tier 3 fable/xhigh (attempt 5 on). Effort
+  stays xhigh on every tier; the ladder climbs by model, then by family. The difficulty
+  auto-route to opus is retired; `Do model:` pins remain (`sonnet`, `fable`, `opus`,
+  `opus-max`) and set the first attempt only.   (`pdca.toml` `[leaves.builder]`, `[[leaves.builder_escalation]]`,
+  `[[leaves.builder_variant]]`)
+- Gates / leaves: **adversary always on** — the `when` gate on `difficulty` is removed.
+  (`pdca.toml` `[[leaves.advisory]] id = "adversary"`)
+- Gates / leaves: **third-party code-review lens always on** — new `[[leaves.advisory]]
+  id = "code-review"`, codex family, `agents/code-review.md`, advisory.
+- Spec template + agent prompt: **`Difficulty` no longer routes anything at Do or Check.**
+  The planner prompt and the three brief templates now say so, name what the field still
+  feeds (the size estimate), and tell the planner to pin `Do model:` — with the valid
+  instance names — for a brief it rates `high`, since the rating alone no longer buys a
+  stronger first build.   (`agents/planner.md` + `.claude/agents/planner.md`,
+  `templates/{brief,plan-pointer,design-proposal}.md.tpl`)
+- Gates / leaves: **codex leaves move to `gpt-6-astra`** (reviewer, plan-reviewer, code-review,
+  the codex builder pin) — OpenAI's current top Codex model, in Codex since 2026-09-09 and
+  probed on this host; `gpt-5.6-sol` remains the fallback pin.
+
+## Follow-ups routed
+
+- Rubric rows for the batched pre-PR review: sequential operation count vs the five-second
+  envelope; settle an unknown commit result that follows a delete. Owner: Eduard; next step:
+  edit `AGENTS.md` § Review rubric in the target repo when the freeze allows.
+- Sign-off: a NEEDS-HUMAN accepted as "a future writer's obligation" should carry a written
+  rationale in §9 and, where possible, a mechanical guard — the signoff prompt should ask for
+  it. Owner: Eduard.
+
+## How effectiveness will be judged
+
+- Every Check from here on shows three advisory artifacts (`check-review.md`,
+  `check-advisory-adversary.md`, `check-advisory-code-review.md`); a missing one is a fault,
+  not a gate.
+- `loop-telemetry.json` for the next five bundles that iterate records, for every attempt
+  `n`, exactly the tier the ladder assigns to `n`: attempt 1 sonnet/xhigh (or the brief's
+  `Do model:` pin), attempts 2 to 4 opus/xhigh, attempt 5 on fable/xhigh — and never a tier
+  the ladder does not assign to that attempt.
+- The next post-merge review on a merged PR finds nothing the cycle did not already have in
+  §6. Two in a row that do trigger a rubric revision, not another leaf.
+
 # Act review — 2026-09-11 — backlog flow (no new frozen cycles; decided via getwyrd/wyrd-pdca#238)
 
 > Out-of-band Act: a tracker-flow review rather than a frozen-bundle sweep. Input:
