@@ -117,7 +117,14 @@
   `Cargo.lock` (mechanical), `crates/core/tests/multipart_state_machine.rs` (new).
 - **Repro instruction:** n/a — new functionality; only the grammar and records (previous
   children) exist on the base.
-- **External dependencies:** `typos`, `docs-renderer`, `cargo-deny`, `cargo-machete`, `cargo-mutants` — all registered doctor ids; `cargo-deny` in particular re-runs the ADR-0003 wall over the `sha2` addition to `crates/core` (INTEGRATION §3). Nothing else beyond the base Rust toolchain: pure functions, no runtime, no Docker, no crate new to the workspace.
+- **External dependencies:** `typos`, `docs-renderer`, `cargo-deny`, `cargo-machete`, `cargo-mutants`
+  <br>*(All five on the field's own line and all registered doctor ids — the driver reads only
+  that line, and every backticked word on it is a dependency token. cargo-deny in particular
+  re-runs the ADR-0003 wall over the sha2 addition to crates/core (INTEGRATION §3). Nothing
+  else beyond the base Rust toolchain: pure functions, no runtime, no Docker, no crate new to
+  the workspace. Repaired 2026-09-12: the prose used to sit on the field line with sha2 and
+  crates/core in backticks, so the pre-dispatch guard read them as unregistered dependencies
+  and held this bundle out of its wave.)*
 - **Test file:** `crates/core/tests/multipart_state_machine.rs` — a **NEW** file, not
   optional (C4-verify's added-`*/tests/*.rs` discriminator; `--classify` dry-run
   confirmed). The five legs live here; co-located unit tests may ship in addition.
@@ -147,3 +154,16 @@
 
 Draft only until Check sign-off. Pushing to a feature/draft branch and opening a draft PR
 MAY happen during the cycle. The PR MUST NOT be marked ready before sign-off accepts.
+
+## Iteration 1 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 1): rebuilding for the implementation-level findings — C4 Verification (red→green) — Accept the pre-declared born-at-tier limitation — both the frozen gate and an independent stash/pop rerun produced compile-only red (101) and 21-test green, so no behavioral pre-fix discriminator executed (`gate-logs/C4-verify.log:10`; `gate-logs/C4-verify.log:82`).; C5 Causal adequacy — Rebuild the tests to require the full composed retry ETag and accept exactly `MAX_PART_NUMBER` — the current oracle repeats the digest-only shape and mutation testing preserves the maximum-boundary regression (`crates/core/tests/multipart_state_machine.rs:126`; `gate-logs/C5-mutants.log:14`).; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 4 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_693/review-b. 2 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: C5 surviving mutants on the bundle diff (cargo mutants --in-diff) (advisory) — 32 mutants tested in 50s: 2 missed, 9 caught, 21 unviable
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 4 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_693/review-b
+- Full previous attempt preserved in `iteration-v1/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
+
+## Iteration 2 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 2): rebuilding for the implementation-level findings — C4 Verification (red→green) — Accept compile-only pre-fix evidence as sufficient for this born-at-tier API: no behavioral discriminator executes red, while the restored 22-test suite, 94.6% diff coverage, mutation run, and frozen full CI are green (`gate-logs/C4-verify.log:10`, `gate-logs/C4-verify.log:15`; `gate-logs/C4-diff-cov.log:69`; `gate-logs/C5-mutants.log:13`; `gate-logs/C4-ci.log:3497`).; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 3 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_693/review-b. 3 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 3 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_693/review-b
+- Full previous attempt preserved in `iteration-v2/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).

@@ -1,0 +1,15 @@
+Task under review: make staged multipart fragments scrubbed and safely reconstructable under session, orphan-mark, deadline, and destination-drain fences.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief makes the staged scrub/repair invariant, loss branches, dependency assumptions, and iteration-3 waivers explicit enough to judge without inventing scope. |
+| C2 Reproduction (red pre-fix) | FAIL | The pre-fix discriminator never executes: independent stashing reproduces a compile error because the new test names patch-added context fields at `crates/custodian/tests/staged_repair.rs:741-742`, contrary to the required base-visible test seam. |
+| C3 Change | PASS | The core change follows the requested protocol: committed parts enter scrub at `crates/custodian/src/scrub.rs:172-180`, and staged repair durably pre-marks before the deadline-bound write and fenced adoption at `crates/custodian/src/reconstruction/staged.rs:612-710`. |
+| C4 Verification (red→green) | FAIL | Green is independently confirmed at 39/39 and frozen CI/DST are green, but no behavioral red exists because the stashed build stops at `crates/custodian/tests/staged_repair.rs:741-742`; therefore the required red→green claim is unverified. |
+| C5 Causal adequacy | NEEDS-HUMAN [impl] | Mutation produced two hang-inducing timeouts rather than survivors, but the rebuild must cover placements whose server is absent from the live fleet — `by_dserver` includes them at `crates/custodian/src/scrub.rs:166-180`, while only `ctx.fleet` is visited at `crates/custodian/src/scrub.rs:183-250`. |
+| T1 Structure | PASS | The rebuilt design uses one injected clock for mark stamps and deadlines (`crates/custodian/src/reconstruction.rs:111-127`) and wires the run-loop source through the required Clock seam (`crates/server/src/custodian.rs:503-541`). |
+| T2 Shape | PASS | The large protocol is isolated behind the staged reconstruction submodule (`crates/custodian/src/reconstruction.rs:76-77`), while the carry-forward explicitly settles the otherwise out-of-scope context-field expansion. |
+| T3 Runtime | FAIL | A deployed pass drops unreachable peers from the live view at `crates/server/src/custodian.rs:265-287`, then scrub silently skips their staged placements and may report `Satisfied` at `crates/custodian/src/scrub.rs:183-264`, leaving redundancy degraded indefinitely. |
+| T4 Contribution | NEEDS-HUMAN | Decide whether the brief's explicit `docs/` exclusion may override documentation currency — `docs/design/architecture/06-runtime-view.md:80` now materially contradicts staged scrub behavior; TiKV compile passed and the publish-only artifact audit is correctly N/A/deferred. |
+| T5 Judgment | PASS | The affected-path prior-art review and rejected-v1 comparison were already recorded and human-settled across the carried iterations, and no rejected finding class is being re-raised. |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Human must decide fitness after the live-fleet repair gap and missing executable red are resolved — accepting now would claim staged redundancy maintenance without evidence for a deployed peer-loss path. |

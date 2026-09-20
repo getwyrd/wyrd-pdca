@@ -1,0 +1,15 @@
+The staged-reference-set patch prevents custodian GC and post-restore reconciliation from treating live multipart fragments as reclaimable, with only the mandated final fitness sign-off outstanding.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief identifies a concrete C-1 data-loss path and gives falsifiable A–G outcomes for GC, restore, handoffs, bounds, corruption, seeded DST, and CI. |
+| C2 Reproduction (red pre-fix) | PASS | An independent stash run kept the unchanged new test and produced 0/11 red by assertion; restoring the patch produced 11/11 green (`crates/custodian/tests/staged_protection.rs:621`). |
+| C3 Change | PASS | The shared predicate now distinguishes placed, whole-chunk-held, and incomplete staged protection, and restore consults that same gate before marking (`crates/custodian/src/gc.rs:468`, `crates/custodian/src/restore.rs:408`). |
+| C4 Verification (red→green) | PASS | Independent runs passed 11/11 focused cases, both 50-seed madsim handoff tests, the CLI verdict test, `typos`, docs lint/render, and fmt; the frozen full gate also ends `xtask ci: all checks passed` (`gate-logs/C4-ci.log:3550`) with 100% instrumentable diff coverage (`gate-logs/C4-diff-cov.log:746`). |
+| C5 Causal adequacy | PASS | The change removes the missing-reference cause by reading protection source-before-destination (`sidx:` → `part:` → `inode:`), not by adding a capability probe or symptom guard (`crates/custodian/src/gc.rs:542`, `crates/custodian/src/gc.rs:773`). |
+| T1 Structure | PASS | Staged state is a disjoint member of the shared reference set, leaving committed-only consumers structurally able to keep their existing answers (`crates/custodian/src/gc.rs:416`, `crates/custodian/src/gc.rs:446`). |
+| T2 Shape | PASS | The focused suite drives production entry points without naming patch-added symbols and pairs each protection assertion with a reclaim/mark control (`crates/custodian/tests/staged_protection.rs:13`, `crates/custodian/tests/staged_protection.rs:45`). |
+| T3 Runtime | PASS | Runtime work is bounded by one capped `mpu:` scan plus two capped per-session scans, avoiding an unbounded global `part:` or `sidx:` read (`crates/custodian/src/gc.rs:768`, `crates/custodian/src/gc.rs:789`). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design and their substantive audit reruns at publish (`gate-logs/T4-contribution.log:10`); the frozen brief records the affected-path prior-art check across merged, open, closed, and rejected work. |
+| T5 Judgment | PASS | The evidence exercises every claimed safety leg, mutation testing reports no survivors, and the frozen deep multi-pass review records zero findings (`gate-logs/C5-mutants.log:13`, `gate-logs/T4-batch-review.log:10`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | Decide whether fleet-wide fail-closed retention on unreadable staged records and the added per-session metadata reads are acceptable operational tradeoffs—they prevent data loss but can defer reclamation and increase every shared reference-set build (`crates/custodian/src/gc.rs:477`, `crates/custodian/src/gc.rs:789`). |

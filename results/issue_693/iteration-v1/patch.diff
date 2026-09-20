@@ -1,0 +1,1400 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 014ad1e..4f83586 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5030,6 +5030,7 @@ dependencies = [
+  "reed-solomon-simd",
+  "serde",
+  "serde_json",
++ "sha2",
+  "tempfile",
+  "tokio",
+  "tokio-stream",
+diff --git a/crates/core/Cargo.toml b/crates/core/Cargo.toml
+index 187c14f..c7ee4ce 100644
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -20,6 +20,12 @@ futures-util.workspace = true
+ reed-solomon-simd.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
++# `multipart_etag` / `complete_fingerprint` (issue #693, proposal 0016 decision 3,
++# `0016:894-1037`, `:3064-3070`; ADR-0047:73-89, `:112`). NOT a new dependency decision:
++# `sha2 = "0.11"` is already a workspace dependency (`Cargo.toml:147`), used by
++# `gateway-s3`/`server`, inside the `deny.toml` allowlist — ADR-0003's audit is not
++# re-opened by naming it here too.
++sha2.workspace = true
+ 
+ [dev-dependencies]
+ # The fragment-fault audit tests assert on what the read path ACTUALLY emitted (#530) — a
+diff --git a/crates/core/src/multipart.rs b/crates/core/src/multipart.rs
+index 5be1563..dc319c1 100644
+--- a/crates/core/src/multipart.rs
++++ b/crates/core/src/multipart.rs
+@@ -2,7 +2,7 @@
+ //! spelled in (proposal 0016,
+ //! `docs/design/proposals/draft/0016-multipart-commit-protocol.md`).
+ //!
+-//! This is slices 1–2 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
++//! This is slices 1–3 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
+ //! deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
+ //! `async fn`. After this module a reader can name every key the protocol will ever write
+ //! (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
+@@ -12,7 +12,8 @@
+ //! whose identity lives partly in their **key**: the retirement obligation ([`RetirePayload`])
+ //! and the owned staging entry ([`OwnedEntry`] — `sidx:`'s [`crate::metadata::PendingEntry`]
+ //! with its two ownership fields, its planned placement a [`StagedPlacement`]). The outcome
+-//! enums, the answer table and `multipart_etag` are the next child's (`0016` decision 3,
++//! enums, decision 3's verb x state answer table, and the two digests (`multipart_etag`,
++//! `complete_fingerprint`) land in this module too (issue #693, `0016` decision 3,
+ //! `:894-1037`, `0016:3064-3070`).
+ //!
+ //! There is **no** `encode_record`/`decode_record` envelope, and this header's earlier forward
+@@ -110,6 +111,10 @@ use std::fmt;
+ 
+ use serde::de::Error as DeError;
+ use serde::{Deserialize, Deserializer, Serialize, Serializer};
++// `sha2::Digest` is the trait `Sha256::new`/`update`/`finalize` come from
++// (`crates/gateway-s3/src/crypto.rs:21` wraps it the same way); aliased so it never shadows
++// this module's own `Digest` (the SHA-256 *value* type, ADR-0047).
++use sha2::{Digest as _, Sha256};
+ use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
+ 
+ use crate::erasure;
+@@ -502,6 +507,36 @@ pub enum RecordError {
+         /// The parity-fragment count that accompanied it.
+         m: u8,
+     },
++    /// A named-part list, or a composed [`MultipartEtag`]'s count suffix, naming **zero**
++    /// parts — not a set any Complete can have named.
++    NoPartsNamed,
++    /// A named-part list carrying the same part number twice (`0016:993-999`): a client
++    /// error, refused rather than settled by "whichever one won the insert."
++    DuplicatePart {
++        /// The part number named more than once.
++        part_number: u32,
++    },
++    /// A named-part list not in strictly ascending part-number order (`0016:707`, `:994`;
++    /// the carried-forward v2 finding — sorting erases the client's request order, so this
++    /// is refused, never silently sorted).
++    PartsOutOfOrder {
++        /// The part number found out of order.
++        part_number: u32,
++        /// The part number immediately before it in the list.
++        previous: u32,
++    },
++    /// Text that is not `<64 lowercase-hex>-<N>`, a composed [`MultipartEtag`].
++    MultipartEtagMalformed {
++        /// The rejected text.
++        etag: String,
++    },
++    /// A composed [`MultipartEtag`]'s count suffix past [`MAX_PART_NUMBER`] — the
++    /// count-vs-keyspace check the v2 review found missing: an ascending, duplicate-free
++    /// list can never name more distinct parts than that.
++    EtagPartCountOutOfRange {
++        /// The count found.
++        parts: u64,
++    },
+ }
+ 
+ impl fmt::Display for RecordError {
+@@ -709,6 +744,33 @@ impl fmt::Display for RecordError {
+                 f,
+                 "invalid staged EC scheme rs({k},{m}); unsupported by the erasure coder"
+             ),
++            Self::NoPartsNamed => {
++                write!(
++                    f,
++                    "a named-part list or composed multipart ETag names zero parts"
++                )
++            }
++            Self::DuplicatePart { part_number } => write!(
++                f,
++                "part number {part_number} is named more than once in an ascending part list"
++            ),
++            Self::PartsOutOfOrder {
++                part_number,
++                previous,
++            } => write!(
++                f,
++                "part number {part_number} follows {previous} in a list that must be \
++                 strictly ascending: refused, never silently sorted"
++            ),
++            Self::MultipartEtagMalformed { etag } => write!(
++                f,
++                "{etag:?} is not `<64 lowercase-hex>-<N>`, a composed multipart ETag"
++            ),
++            Self::EtagPartCountOutOfRange { parts } => write!(
++                f,
++                "a multipart ETag's part count {parts} is outside the format bound \
++                 [1, {MAX_PART_NUMBER}]"
++            ),
+         }
+     }
+ }
+@@ -935,10 +997,7 @@ impl<'de> Deserialize<'de> for SlotIndex {
+ ///
+ /// The basis ADR-0047 settled for Wyrd's opaque change token — **never MD5**. A validated
+ /// type because a digest's *shape* is structural: a short or uppercase digest is not a
+-/// value any composition could use. Computing one (`Digest::of`, over `sha2`) is the next
+-/// child's — `sha2` is not a dependency of this crate yet, so this slice carries only the
+-/// **shape** every later child's `Digest::of` will populate: construction from raw bytes,
+-/// and the validating hex parse.
++/// value any composition could use.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct Digest([u8; 32]);
+ 
+@@ -948,6 +1007,15 @@ impl Digest {
+         Self(bytes)
+     }
+ 
++    /// The SHA-256 digest of `data`, one shot (ADR-0047's basis). [`multipart_etag`] and
++    /// [`complete_fingerprint`] both go through this rather than reaching for `sha2`
++    /// directly, so the crate has exactly one call site that names the algorithm.
++    pub fn of(data: &[u8]) -> Self {
++        let mut hasher = Sha256::new();
++        hasher.update(data);
++        Self(hasher.finalize().into())
++    }
++
+     /// The validating parser: exactly 64 lowercase-hex characters. Rejects uppercase hex
+     /// (a second spelling of one digest), any other length, and any non-hex byte.
+     pub fn from_hex(text: &str) -> Result<Self, RecordError> {
+@@ -1013,8 +1081,8 @@ impl<'de> Deserialize<'de> for Digest {
+ 
+ /// Bytes as lowercase hex — the rendering ADR-0047 settled for the change token, matching
+ /// the wrapper style `crates/gateway-s3/src/crypto.rs:21-60` carries for this workspace's
+-/// other SHA-256 usage (a `sha2`-free rendering, since `sha2` is the next child's
+-/// dependency, not this one's).
++/// other SHA-256 usage. `sha2`-free: [`Digest::of`] is this module's one call site for the
++/// algorithm itself, and rendering a digest already in hand never needs it.
+ ///
+ /// Total by construction: a nibble indexes the private `HEX_DIGITS` table directly, so there
+ /// is **no** fallback character a rendering bug could hide behind. A digest that rendered a
+@@ -3633,3 +3701,558 @@ pub fn decode_owned_entry(
+     require_canonical(entry.to_pending(), value, "sidx:")?;
+     Ok((part_number, chunk, entry))
+ }
++
++// ===========================================================================
++// 11. The multipart ETag and the Complete request-identity fingerprint
++//     (`0016:894-1037`; the deferral `0016:3064-3070`; ADR-0047:73-89,`:112`)
++// ===========================================================================
++
++/// The parts a Complete named, canonicalised to the **one** order both digests below are
++/// defined over: strictly ascending part number, each number named once.
++///
++/// **Refuses rather than sorts** ([`RecordError::PartsOutOfOrder`] /
++/// [`RecordError::DuplicatePart`]) — the carried-forward v2 review finding: a prior revision
++/// coalesced and sorted via a `BTreeMap`, silently accepting a request the client never
++/// made. 0016 makes ascending part numbers a Complete *validation* (`0016:707`, `:994`), so
++/// this function receives an already-ascending, duplicate-free list or refuses it.
++///
++/// One definition, shared by [`multipart_etag`] and [`complete_fingerprint`], so "the parts
++/// the client named" cannot mean two different orders to the two digests.
++fn canonical_named_parts(
++    named: &[(PartNumber, Digest)],
++) -> Result<Vec<(u32, Digest)>, RecordError> {
++    if named.is_empty() {
++        return Err(RecordError::NoPartsNamed);
++    }
++    let mut ordered = Vec::with_capacity(named.len());
++    let mut previous: Option<u32> = None;
++    for (part_number, digest) in named {
++        let number = part_number.get();
++        if let Some(previous) = previous {
++            if number == previous {
++                return Err(RecordError::DuplicatePart {
++                    part_number: number,
++                });
++            }
++            if number < previous {
++                return Err(RecordError::PartsOutOfOrder {
++                    part_number: number,
++                    previous,
++                });
++            }
++        }
++        previous = Some(number);
++        ordered.push((number, *digest));
++    }
++    Ok(ordered)
++}
++
++/// A composed **multipart ETag**: `<64 lowercase hex>-<N>`, a validated type so a stored
++/// [`Completion`] can never carry a spelling a client comparison would treat as a different
++/// object.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct MultipartEtag {
++    composed: Digest,
++    parts: u32,
++}
++
++impl MultipartEtag {
++    /// The validating parser — the inverse of [`fmt::Display`]: 64 lowercase-hex characters,
++    /// a `-`, then a **canonical** decimal part count — non-zero and at most
++    /// [`MAX_PART_NUMBER`] (the count-vs-keyspace check the v2 review found missing).
++    pub fn parse(text: &str) -> Result<Self, RecordError> {
++        let malformed = || RecordError::MultipartEtagMalformed {
++            etag: text.to_string(),
++        };
++        let (hex, count_text) = text.rsplit_once('-').ok_or_else(malformed)?;
++        let composed = Digest::from_hex(hex)?;
++        let parts: u32 = canonical_decimal(count_text).ok_or_else(malformed)?;
++        if parts == 0 {
++            return Err(RecordError::NoPartsNamed);
++        }
++        if parts > MAX_PART_NUMBER {
++            return Err(RecordError::EtagPartCountOutOfRange {
++                parts: u64::from(parts),
++            });
++        }
++        Ok(Self { composed, parts })
++    }
++
++    /// The SHA-256 over the concatenated raw part digests.
++    pub const fn composed(&self) -> Digest {
++        self.composed
++    }
++
++    /// How many parts the object was assembled from — the `-N` suffix.
++    pub const fn parts(&self) -> u32 {
++        self.parts
++    }
++}
++
++impl fmt::Display for MultipartEtag {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}-{}", self.composed, self.parts)
++    }
++}
++
++impl Serialize for MultipartEtag {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_str(&self.to_string())
++    }
++}
++
++impl<'de> Deserialize<'de> for MultipartEtag {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::parse(&String::deserialize(deserializer)?).map_err(DeError::custom)
++    }
++}
++
++/// The **multipart ETag** — the composition this slice settles on top of ADR-0047's basis,
++/// which closed the digest algorithm and deferred only the composition
++/// (`docs/design/adr/0047-object-metadata-model.md:73-89`, `:112`; `0016:3064-3070`):
++///
++/// ```text
++/// etag = lowercase_hex( SHA-256( d_1 || d_2 || ... || d_N ) ) + "-" + N
++/// ```
++///
++/// `d_i` is the **raw 32 binary digest bytes** — never hex text, no separators, no part
++/// numbers mixed in — of the *i*-th part in ascending part-number order over exactly the
++/// parts the caller named, and `N` is that count. **Never MD5**: S3's own multipart ETag is
++/// an MD5-of-MD5s, but ADR-0047 rejected re-opening the dependency wall for a legacy
++/// equality S3 itself does not guarantee, and the value is opaque to clients regardless.
++pub fn multipart_etag(named: &[(PartNumber, Digest)]) -> Result<MultipartEtag, RecordError> {
++    let ordered = canonical_named_parts(named)?;
++    let mut concatenated = Vec::with_capacity(ordered.len() * 32);
++    for (_, digest) in &ordered {
++        concatenated.extend_from_slice(digest.as_bytes());
++    }
++    Ok(MultipartEtag {
++        composed: Digest::of(&concatenated),
++        parts: ordered.len() as u32,
++    })
++}
++
++/// The **request identity** a `Completed` tombstone answers a retry on — a digest over the
++/// ordered `(part_number, digest)` pairs the winning Complete named (`0016:898-908`).
++///
++/// Separate from [`multipart_etag`] deliberately: the ETag is a function of the digests
++/// alone, so two different part *numberings* of the same bodies would collide in it here the
++/// numbers are mixed in, so a client reusing an upload id with a **different assembly** is
++/// answered `NoSuchUpload` rather than told *its* assembly succeeded while the store holds
++/// an earlier one. Fixed-width fields and a length-first hash make the encoding injective.
++pub fn complete_fingerprint(named: &[(PartNumber, Digest)]) -> Result<Digest, RecordError> {
++    let ordered = canonical_named_parts(named)?;
++    let mut bytes = Vec::with_capacity(8 + ordered.len() * (4 + 32));
++    bytes.extend_from_slice(&(ordered.len() as u64).to_be_bytes());
++    for (part_number, digest) in &ordered {
++        bytes.extend_from_slice(&part_number.to_be_bytes());
++        bytes.extend_from_slice(digest.as_bytes());
++    }
++    Ok(Digest::of(&bytes))
++}
++
++// ===========================================================================
++// 12. Typed outcomes — every non-success answer is a value, never "an error"
++//     (`0016:969-978`; the S3 status/XML mapping is #508's)
++// ===========================================================================
++
++/// Why a part a Complete named is invalid (`0016:993-999`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum InvalidPart {
++    /// The named part has no `part:` record — never committed, or superseded.
++    Absent,
++    /// The named part's recorded digest is not the one the client named.
++    DigestMismatch,
++    /// The named parts are not in strictly ascending part-number order.
++    OutOfOrder,
++}
++
++/// Which ceiling produced a backpressure refusal — designed behaviour, not a failure
++/// (`0016:129-136`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Backpressure {
++    /// The fleet admission ledger is at its stored `max_sessions`.
++    SessionCap {
++        /// The live session count the ledger records.
++        count: u64,
++        /// The limit **the ledger** was checked against — never a local derivation.
++        max_sessions: u64,
++    },
++    /// Every `MAX_INFLIGHT_PARTS` slot index of this session is taken — by live parts, or by
++    /// the residue of parts that crashed mid-stream and never released their slot
++    /// (`0016:349`, F11a).
++    InflightParts {
++        /// The size of the session's slot key space.
++        max_inflight_parts: u32,
++    },
++    /// The create lost the serialized admission CAS this many times.
++    AdmissionContention {
++        /// Attempts spent.
++        attempts: u32,
++    },
++}
++
++/// A **typed** protocol answer other than success. #508 maps each to its S3 status and error
++/// code; this slice pins the answers and names no status code.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Refusal {
++    /// No session can serve this request: the upload id is unknown, the session is aborting,
++    /// or it already completed a **different** assembly.
++    NoSuchUpload,
++    /// The target bucket has no `bucket:` record (ADR-0046 §4).
++    NoSuchBucket,
++    /// The session is fenced into `Completing` by a publisher that still owns it. There is
++    /// **no** client path that resumes a `Completing` session (`0016:980-986`).
++    OperationAborted,
++    /// The named part list does not match the frozen part set. The fence is **released**
++    /// before this is answered, so a client typo never wedges a session (`0016:993-999`).
++    InvalidPart {
++        /// The offending part number.
++        part_number: PartNumber,
++        /// What was wrong with it.
++        reason: InvalidPart,
++    },
++    /// A part, or the session's cumulative staged chunks, is past a ceiling the protocol
++    /// enforces by **refusal** rather than by an over-envelope commit. The session stays
++    /// usable and abortable, and anything already staged is compensated.
++    EntityTooLarge {
++        /// The chunk count the request would have installed.
++        chunks: u64,
++        /// The ceiling it crossed.
++        limit: u64,
++    },
++    /// Designed backpressure.
++    SlowDown {
++        /// Which ceiling engaged.
++        pressure: Backpressure,
++    },
++    /// This process's [`Budget`] disagrees with the one stored in `mpuctl`, so it **refuses
++    /// to admit and alarms** rather than silently deferring to either value (`0016:348`).
++    ProfileSkew {
++        /// What this process derives from its own configuration.
++        local: Box<Budget>,
++        /// What the ledger records.
++        ledger: Box<Budget>,
++    },
++    /// The session has spent all `MAX_COMPLETE_ATTEMPTS` fences; its only exit is Abort
++    /// (`0016:1477`).
++    CompleteAttemptsExhausted,
++}
++
++/// What a winning (or recorded) publication established.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Publication {
++    /// The inode the object key resolves to.
++    pub inode: InodeId,
++    /// The version the flip recorded — `prior.version + 1` computed from the **re-read**
++    /// prior at that attempt, never a fence-frozen number (`0016:925-932`).
++    pub version: u64,
++    /// The published content's ETag digest — mirrors [`Completion::etag`], the field this
++    /// answers when it is the tombstone's recorded value rather than a fresh flip's.
++    pub etag: Digest,
++    /// The publication instant.
++    pub completed_at_millis: u64,
++}
++
++impl Publication {
++    /// The publication a `Completed` tombstone recorded.
++    pub fn of(completion: &Completion) -> Self {
++        Self {
++            inode: completion.inode,
++            version: completion.version,
++            etag: completion.etag,
++            completed_at_millis: completion.completed_at_millis,
++        }
++    }
++}
++
++/// What `CreateMultipartUpload` answers (#656) — named here so #656 answers in this
++/// vocabulary rather than inventing its own.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CreateOutcome {
++    /// A session record and its `seggrp:` reservation are durable and the admission counter
++    /// has been incremented exactly once.
++    Created {
++        /// The session's id.
++        upload_id: UploadId,
++    },
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What a slot reservation answers (#657).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReserveOutcome {
++    /// An in-flight slot index is held by this attempt.
++    Reserved {
++        /// The index claimed.
++        index: SlotIndex,
++        /// The attempt holding it.
++        attempt_id: AttemptId,
++    },
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `UploadPart` answers once a part body has been staged and validated (#657) — the
++/// body half of the verb; the *lifecycle* half (whether the session may accept a part at
++/// all) is [`UploadPartAnswer`], decision 3's table cell.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum UploadPartOutcome {
++    /// The part is durable: its `part:` + `psum:` records exist, its slot is released and
++    /// its owned `sidx:` entries are gone — all in one batch.
++    Committed {
++        /// The part number.
++        part_number: PartNumber,
++        /// Its content digest.
++        digest: Digest,
++    },
++    /// A typed refusal. Anything this attempt staged has been **compensated** whenever the
++    /// session was still live enough to own the cleanup.
++    Refused(Refusal),
++}
++
++/// What `CompleteMultipartUpload` answers once its named-part list has been validated
++/// against the frozen part set (#658) — the assembly half of the verb; the *lifecycle* half
++/// is [`CompleteAnswer`], decision 3's table cell.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CompleteOutcome {
++    /// The object is published: this call's flip won.
++    Published(Box<Publication>),
++    /// A `Completed` tombstone answered an **identical** retry inside its window, with the
++    /// **recorded** ETag (`0016:898-908`).
++    AlreadyCompleted(Box<Publication>),
++    /// A typed refusal; nothing was published and the session is not left fenced.
++    Refused(Refusal),
++}
++
++/// What `AbortMultipartUpload` answers (#656) — the body half of the verb; the *lifecycle*
++/// half is [`AbortAnswer`], decision 3's table cell.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AbortOutcome {
++    /// The fence landed: the session is `Aborting` and its teardown obligation is durable.
++    /// **This is the response** — byte reclamation is the drain's, asynchronously and in
++    /// bounded batches, so a 10,000-part teardown never rides inside one request
++    /// (`0016:1000-1003`).
++    Fenced,
++    /// The session was already `Aborting` — idempotent success.
++    AlreadyAborting,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++// ===========================================================================
++// 13. Decision 3 — the verb x state answer table, as total pure functions
++//     (`0016:894-1037`, the table at `0016:969-978`)
++// ===========================================================================
++
++/// The five multipart verbs decision 3 answers (`0016:969-978`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum Verb {
++    /// Stage one part's bytes against an `Open` session.
++    UploadPart,
++    /// Fence and assemble the named parts into the published object.
++    CompleteMultipartUpload,
++    /// Fence for teardown without publishing.
++    AbortMultipartUpload,
++    /// List the parts staged (or frozen) under one session.
++    ListParts,
++    /// List the fleet's in-progress sessions.
++    ListMultipartUploads,
++}
++
++impl Verb {
++    /// Every verb the table answers, named so a test can enumerate the product without
++    /// re-deriving it by hand. Adding a verb without a matching arm in [`answer`] is a
++    /// compile error, not a silent gap — this array only makes that obligation visible to
++    /// the table test as well.
++    pub const ALL: [Self; 5] = [
++        Self::UploadPart,
++        Self::CompleteMultipartUpload,
++        Self::AbortMultipartUpload,
++        Self::ListParts,
++        Self::ListMultipartUploads,
++    ];
++}
++
++/// What `UploadPart` answers in a state (`0016:971`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum UploadPartAnswer {
++    /// The session is `Open`: the part is accepted.
++    Accepted,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `CompleteMultipartUpload` answers in a state (`0016:972`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum CompleteAnswer {
++    /// The session is `Open`: this call may fence and publish.
++    Fences,
++    /// A `Completed` tombstone whose recorded `complete_fingerprint` **matches** the
++    /// request's: the identical retry is answered with the **recorded** publication
++    /// (`0016:898-908`).
++    AlreadyCompleted(Box<Publication>),
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `AbortMultipartUpload` answers in a state (`0016:973`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum AbortAnswer {
++    /// The session is `Open`: the fence commit **is** the response.
++    Fences,
++    /// The session is already `Aborting`: idempotent success.
++    AlreadyAborting,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// What `ListParts` answers in a state (`0016:974`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ListPartsAnswer {
++    /// The session is `Open`: the still-growing part set.
++    OpenSet,
++    /// The session is `Completing`: the frozen part set the fence read.
++    FrozenSet,
++    /// A typed refusal.
++    Refused(Refusal),
++}
++
++/// Whether `ListMultipartUploads` lists this session (`0016:975`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ListUploadsAnswer {
++    /// In progress: listed.
++    Listed,
++    /// Tearing down or torn down: not listed.
++    NotListed,
++}
++
++/// One cell of decision 3's table, so the whole verb x state product can be enumerated
++/// through a single entry point ([`answer`]) and asserted **total**.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Answer {
++    /// `UploadPart`'s answer.
++    UploadPart(UploadPartAnswer),
++    /// `CompleteMultipartUpload`'s answer.
++    Complete(CompleteAnswer),
++    /// `AbortMultipartUpload`'s answer.
++    Abort(AbortAnswer),
++    /// `ListParts`' answer.
++    ListParts(ListPartsAnswer),
++    /// `ListMultipartUploads`'s answer.
++    ListUploads(ListUploadsAnswer),
++}
++
++/// What `UploadPart` answers against `state` (`None` = the record is absent).
++///
++/// A part accepted after the fence would be invisible to the publication that already read
++/// the set — a silently lost part — so every state but `Open` refuses (`0016:1029`).
++pub fn upload_part_answer(state: Option<&SessionState>) -> UploadPartAnswer {
++    match state {
++        Some(SessionState::Open {}) => UploadPartAnswer::Accepted,
++        Some(
++            SessionState::Completing { .. }
++            | SessionState::Aborting {}
++            | SessionState::Completed { .. },
++        )
++        | None => UploadPartAnswer::Refused(Refusal::NoSuchUpload),
++    }
++}
++
++/// What `CompleteMultipartUpload` answers against `state` (`None` = the record is absent),
++/// for a request whose named parts fingerprint to `request_fingerprint` (`None` for a
++/// caller — [`answer`]'s own no-fingerprint callers — that has none to offer, which cannot
++/// match any recorded fingerprint and so is the honest input for every non-conditional
++/// cell).
++///
++/// The tombstone cell is the one 0016 spends most words on, and the **only** cell with a
++/// condition: within its window a `Completed` session answers the recorded publication when
++/// the request's [`complete_fingerprint`] matches the recorded one, and `NoSuchUpload`
++/// otherwise — the honest answer, since the upload id is consumed and no session exists
++/// that could publish the assembly being asked for (`0016:898-908`).
++///
++/// **The one function [`answer`] delegates to for this verb**, never a second inline copy
++/// of the same table: a duplicate would let a fix to one copy leave the other's cell
++/// silently wrong, exactly the risk this module's typed vocabulary exists to close.
++pub fn complete_answer(
++    state: Option<&SessionState>,
++    request_fingerprint: Option<&Digest>,
++) -> CompleteAnswer {
++    match state {
++        None => CompleteAnswer::Refused(Refusal::NoSuchUpload),
++        Some(SessionState::Open {}) => CompleteAnswer::Fences,
++        Some(SessionState::Completing { .. }) => CompleteAnswer::Refused(Refusal::OperationAborted),
++        Some(SessionState::Aborting {}) => CompleteAnswer::Refused(Refusal::NoSuchUpload),
++        Some(SessionState::Completed { completion }) => match request_fingerprint {
++            Some(fingerprint) if completion.complete_fingerprint == *fingerprint => {
++                CompleteAnswer::AlreadyCompleted(Box::new(Publication::of(completion)))
++            }
++            _ => CompleteAnswer::Refused(Refusal::NoSuchUpload),
++        },
++    }
++}
++
++/// What `AbortMultipartUpload` answers against `state` (`None` = the record is absent).
++///
++/// `Completing` is `409` for **every** client verb including this one: an Abort that could
++/// preempt a live publisher would race the flip it is fencing against (`0016:980-986`).
++pub fn abort_answer(state: Option<&SessionState>) -> AbortAnswer {
++    match state {
++        Some(SessionState::Open {}) => AbortAnswer::Fences,
++        Some(SessionState::Completing { .. }) => AbortAnswer::Refused(Refusal::OperationAborted),
++        Some(SessionState::Aborting {}) => AbortAnswer::AlreadyAborting,
++        Some(SessionState::Completed { .. }) | None => AbortAnswer::Refused(Refusal::NoSuchUpload),
++    }
++}
++
++/// What `ListParts` answers against `state` (`None` = the record is absent).
++pub fn list_parts_answer(state: Option<&SessionState>) -> ListPartsAnswer {
++    match state {
++        Some(SessionState::Open {}) => ListPartsAnswer::OpenSet,
++        Some(SessionState::Completing { .. }) => ListPartsAnswer::FrozenSet,
++        Some(SessionState::Aborting {} | SessionState::Completed { .. }) | None => {
++            ListPartsAnswer::Refused(Refusal::NoSuchUpload)
++        }
++    }
++}
++
++/// Whether `ListMultipartUploads` lists a session in `state` (`None` = the record is
++/// absent). A session the reaper fenced at `W_session` is `Aborting`, so it drops out of the
++/// listing — the S3-visible signal that the upload expired.
++pub fn list_uploads_answer(state: Option<&SessionState>) -> ListUploadsAnswer {
++    match state {
++        Some(SessionState::Open {} | SessionState::Completing { .. }) => ListUploadsAnswer::Listed,
++        Some(SessionState::Aborting {} | SessionState::Completed { .. }) | None => {
++            ListUploadsAnswer::NotListed
++        }
++    }
++}
++
++/// Decision 3's answer table (`0016:969-978`) as **one total pure function** over the 5-verb
++/// x 5-state product — `Open`/`Completing`/`Aborting`/`Completed`/absent.
++///
++/// `request_fingerprint` is consulted **only** for the one conditional cell
++/// (`CompleteMultipartUpload` against a `Completed` tombstone) and ignored everywhere else,
++/// so the function can be called uniformly over the whole product; an absent one cannot
++/// match any recorded fingerprint, which is the honest answer for a Complete that named no
++/// parts at all.
++///
++/// Every match below is exhaustive, so answering a new (verb, state) cell is a compile-time
++/// obligation rather than a silent gap; [`Verb::ALL`] makes the verb half of that obligation
++/// visible to the table test.
++pub fn answer(
++    verb: Verb,
++    state: Option<&SessionState>,
++    request_fingerprint: Option<&Digest>,
++) -> Answer {
++    match verb {
++        Verb::UploadPart => Answer::UploadPart(upload_part_answer(state)),
++        Verb::CompleteMultipartUpload => {
++            Answer::Complete(complete_answer(state, request_fingerprint))
++        }
++        Verb::AbortMultipartUpload => Answer::Abort(abort_answer(state)),
++        Verb::ListParts => Answer::ListParts(list_parts_answer(state)),
++        Verb::ListMultipartUploads => Answer::ListUploads(list_uploads_answer(state)),
++    }
++}
+diff --git a/crates/core/tests/multipart_state_machine.rs b/crates/core/tests/multipart_state_machine.rs
+new file mode 100644
+index 0000000..2ebe648
+--- /dev/null
++++ b/crates/core/tests/multipart_state_machine.rs
+@@ -0,0 +1,662 @@
++//! Issue #693 (654 split 3/3) — decision 3's **verb x state answer table** as pure, total
++//! functions (`wyrd_core::multipart::{answer, Verb, *Answer, *Outcome, Refusal, InvalidPart,
++//! Backpressure, Publication}`) and the two digests, `multipart_etag` and
++//! `complete_fingerprint` (proposal 0016 decision 3, `:894-1037`; the deferral
++//! `:3064-3070`; ADR-0047:73-89, `:112`). **Pure**: no store, no async, no fixture beyond
++//! literals and the production functions under test.
++//!
++//! The five legs (Success criterion, brief #693):
++//!
++//! * **leg 1** — every reachable (verb, state) cell of the 5x5 product
++//!   (`{UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts,
++//!   ListMultipartUploads} x {Open, Completing, Aborting, Completed, absent}`) is answered by
++//!   its typed outcome, asserted through one exhaustive helper so an unanswered cell fails
++//!   loudly rather than falling through a wildcard; the `Complete x Completed` cell's two
++//!   branches (fingerprint match / mismatch) both get their own assertion;
++//! * **leg 2** — `multipart_etag` matches an independent oracle (a hand-rolled concatenation
++//!   and a second, direct `sha2` call, never through `canonical_named_parts` or
++//!   `Digest::of`), and its discriminating cases;
++//! * **leg 3** — `complete_fingerprint` tells an identical retry from a different assembly;
++//! * **leg 4** — `MultipartEtag::parse` validates its grammar, not just its shape;
++//! * **leg 5** — every public outcome enum is matched without a wildcard arm, so a
++//!   `#[non_exhaustive]` marker (or one added later) would fail this file to compile.
++//!
++//! No `#![cfg(...)]` here — this file always compiles and always runs.
++
++#![forbid(unsafe_code)]
++
++use sha2::{Digest as _, Sha256};
++use wyrd_core::multipart::{
++    abort_answer, answer, complete_answer, complete_fingerprint, list_parts_answer,
++    list_uploads_answer, multipart_etag, upload_part_answer, AbortAnswer, AbortOutcome, Answer,
++    Backpressure, CompleteAnswer, CompleteOutcome, Completion, CreateOutcome, Digest, InvalidPart,
++    ListPartsAnswer, ListUploadsAnswer, MultipartEtag, PartNumber, Publication, PublishTarget,
++    RecordError, Refusal, ReserveOutcome, SessionState, UploadPartAnswer, UploadPartOutcome, Verb,
++};
++
++// ===========================================================================
++// Shared fixtures
++// ===========================================================================
++
++fn part(n: u32) -> PartNumber {
++    PartNumber::new(n).expect("test part number in range")
++}
++
++/// A digest derived from a label, so every fixture below is visibly distinct (never the
++/// all-zero digest a copy-paste mistake could produce unnoticed).
++fn digest(label: &str) -> Digest {
++    let padded = format!("{:0<64}", hex(label.as_bytes()));
++    Digest::from_hex(&padded).expect("test label is short enough to pad to 64 hex chars")
++}
++
++/// Independent hex rendering — deliberately **not** `wyrd_core::multipart::hex_lower` — so
++/// leg 2's oracle shares no code with the production rendering path it is checking.
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// The five states decision 3's table answers against: the four live [`SessionState`]s plus
++/// "absent" (`None`). Fixed field values throughout — decision 3's table does not vary by
++/// them — except `complete_fingerprint`, which is the one field the conditional cell reads.
++fn open() -> SessionState {
++    SessionState::Open {}
++}
++
++fn completing() -> SessionState {
++    SessionState::Completing {
++        fenced_at_millis: 1,
++        segments_written: 0,
++        publish_target: PublishTarget {
++            parent: 7,
++            name: "object".to_string(),
++            epoch: 1,
++        },
++    }
++}
++
++fn aborting() -> SessionState {
++    SessionState::Aborting {}
++}
++
++fn completed(complete_fingerprint: Digest) -> SessionState {
++    SessionState::Completed {
++        completion: Completion {
++            inode: 9,
++            version: 3,
++            etag: digest("published-etag"),
++            completed_at_millis: 42,
++            complete_fingerprint,
++        },
++    }
++}
++
++/// The fingerprint [`completed`] below is stamped with — the "winning Complete's" identity.
++fn recorded_fingerprint() -> Digest {
++    complete_fingerprint(&[(part(1), digest("one")), (part(2), digest("two"))])
++        .expect("a two-part ascending list fingerprints")
++}
++
++// ===========================================================================
++// Leg 1 — every reachable decision-3 cell (0016:969-978)
++// ===========================================================================
++
++/// One cell's expected [`Answer`], keyed by verb and state — the oracle leg 1's helper
++/// checks every produced [`Answer`] against.
++fn expected(verb: Verb, state: Option<&SessionState>) -> Answer {
++    match (verb, state) {
++        (Verb::UploadPart, Some(SessionState::Open {})) => {
++            Answer::UploadPart(UploadPartAnswer::Accepted)
++        }
++        (Verb::UploadPart, _) => {
++            Answer::UploadPart(UploadPartAnswer::Refused(Refusal::NoSuchUpload))
++        }
++        (Verb::CompleteMultipartUpload, Some(SessionState::Open {})) => {
++            Answer::Complete(CompleteAnswer::Fences)
++        }
++        (Verb::CompleteMultipartUpload, Some(SessionState::Completing { .. })) => {
++            Answer::Complete(CompleteAnswer::Refused(Refusal::OperationAborted))
++        }
++        (Verb::CompleteMultipartUpload, Some(SessionState::Aborting {})) => {
++            Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++        }
++        (Verb::CompleteMultipartUpload, Some(SessionState::Completed { .. })) => {
++            // The conditional cell: `answer()` is called with the RECORDED fingerprint
++            // below, so this is the match branch. The mismatch branch is its own
++            // assertion, `complete_tombstone_mismatch_is_refused`.
++            Answer::Complete(CompleteAnswer::AlreadyCompleted(Box::new(Publication {
++                inode: 9,
++                version: 3,
++                etag: digest("published-etag"),
++                completed_at_millis: 42,
++            })))
++        }
++        (Verb::CompleteMultipartUpload, None) => {
++            Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++        }
++        (Verb::AbortMultipartUpload, Some(SessionState::Open {})) => {
++            Answer::Abort(AbortAnswer::Fences)
++        }
++        (Verb::AbortMultipartUpload, Some(SessionState::Completing { .. })) => {
++            Answer::Abort(AbortAnswer::Refused(Refusal::OperationAborted))
++        }
++        (Verb::AbortMultipartUpload, Some(SessionState::Aborting {})) => {
++            Answer::Abort(AbortAnswer::AlreadyAborting)
++        }
++        (Verb::AbortMultipartUpload, _) => {
++            Answer::Abort(AbortAnswer::Refused(Refusal::NoSuchUpload))
++        }
++        (Verb::ListParts, Some(SessionState::Open {})) => {
++            Answer::ListParts(ListPartsAnswer::OpenSet)
++        }
++        (Verb::ListParts, Some(SessionState::Completing { .. })) => {
++            Answer::ListParts(ListPartsAnswer::FrozenSet)
++        }
++        (Verb::ListParts, _) => Answer::ListParts(ListPartsAnswer::Refused(Refusal::NoSuchUpload)),
++        (
++            Verb::ListMultipartUploads,
++            Some(SessionState::Open {} | SessionState::Completing { .. }),
++        ) => Answer::ListUploads(ListUploadsAnswer::Listed),
++        (Verb::ListMultipartUploads, _) => Answer::ListUploads(ListUploadsAnswer::NotListed),
++    }
++}
++
++/// Leg 1's helper: enumerates the full `Verb::ALL` x 5-state product, calls [`answer`] on
++/// every cell, and asserts it against [`expected`] — 25 cells, none skipped. A verb or state
++/// added later without a matching arm above fails to *compile* ([`answer`]'s own exhaustive
++/// match), and a mismatch here fails the assertion, so neither can slip in silently.
++#[test]
++fn every_decision_3_cell_is_answered() {
++    let fingerprint = recorded_fingerprint();
++    let live_states = [open(), completing(), aborting(), completed(fingerprint)];
++    let mut cells = 0usize;
++    for verb in Verb::ALL {
++        // The absent cell.
++        cells += 1;
++        assert_eq!(
++            answer(verb, None, None),
++            expected(verb, None),
++            "{verb:?} x absent"
++        );
++
++        for state in &live_states {
++            cells += 1;
++            let request_fingerprint =
++                matches!(state, SessionState::Completed { .. }).then_some(&fingerprint);
++            assert_eq!(
++                answer(verb, Some(state), request_fingerprint),
++                expected(verb, Some(state)),
++                "{verb:?} x {state:?}"
++            );
++        }
++    }
++    assert_eq!(cells, 25, "the product must be exactly 5 verbs x 5 states");
++}
++
++/// The conditional cell's **other** branch: a `Completed` tombstone answers a request whose
++/// fingerprint does **not** match the recorded one with `NoSuchUpload`, never the recorded
++/// publication (`0016:898-908`).
++#[test]
++fn complete_tombstone_mismatch_is_refused() {
++    let recorded = recorded_fingerprint();
++    let different = complete_fingerprint(&[(part(1), digest("one"))]).unwrap();
++    assert_ne!(recorded, different);
++
++    let state = completed(recorded);
++    assert_eq!(
++        complete_answer(Some(&state), Some(&different)),
++        CompleteAnswer::Refused(Refusal::NoSuchUpload)
++    );
++    assert_eq!(
++        answer(
++            Verb::CompleteMultipartUpload,
++            Some(&state),
++            Some(&different)
++        ),
++        Answer::Complete(CompleteAnswer::Refused(Refusal::NoSuchUpload))
++    );
++}
++
++/// [`answer`]'s per-verb helpers agree with the dispatcher — each is independently callable
++/// (the shape #508/#656-#659 need), not merely reachable through [`answer`].
++#[test]
++fn per_verb_helpers_agree_with_the_dispatcher() {
++    let state = open();
++    assert_eq!(
++        Answer::UploadPart(upload_part_answer(Some(&state))),
++        answer(Verb::UploadPart, Some(&state), None)
++    );
++    assert_eq!(
++        Answer::Abort(abort_answer(Some(&state))),
++        answer(Verb::AbortMultipartUpload, Some(&state), None)
++    );
++    assert_eq!(
++        Answer::ListParts(list_parts_answer(Some(&state))),
++        answer(Verb::ListParts, Some(&state), None)
++    );
++    assert_eq!(
++        Answer::ListUploads(list_uploads_answer(Some(&state))),
++        answer(Verb::ListMultipartUploads, Some(&state), None)
++    );
++}
++
++// ===========================================================================
++// Leg 2 — `multipart_etag` against an independent oracle
++// ===========================================================================
++
++/// The oracle: concatenates the **raw** digest bytes in the order given (the caller sorts,
++/// this helper does not) and hashes with `sha2` directly — no call into
++/// `canonical_named_parts` or `Digest::of`, so this is genuinely a second implementation of
++/// the composition, not a restatement of the first.
++fn oracle_etag(ordered_raw: &[[u8; 32]]) -> String {
++    let mut hasher = Sha256::new();
++    for bytes in ordered_raw {
++        hasher.update(bytes);
++    }
++    format!("{}-{}", hex(&hasher.finalize()), ordered_raw.len())
++}
++
++#[test]
++fn multipart_etag_matches_the_oracle_for_one_part() {
++    let d1 = digest("solo");
++    let etag = multipart_etag(&[(part(1), d1)]).unwrap();
++    assert_eq!(etag.to_string(), oracle_etag(&[*d1.as_bytes()]));
++    assert_eq!(etag.parts(), 1);
++}
++
++#[test]
++fn multipart_etag_strict_subset_differs_from_full_set() {
++    let d1 = digest("one");
++    let d2 = digest("two");
++    let full = multipart_etag(&[(part(1), d1), (part(2), d2)]).unwrap();
++    let subset = multipart_etag(&[(part(1), d1)]).unwrap();
++    assert_ne!(full, subset);
++    assert_eq!(full.parts(), 2);
++    assert_eq!(subset.parts(), 1);
++}
++
++#[test]
++fn multipart_etag_is_over_raw_bytes_not_hex_text() {
++    let d1 = digest("one");
++    let d2 = digest("two");
++    let etag = multipart_etag(&[(part(1), d1), (part(2), d2)]).unwrap();
++
++    // The wrong composition: hash the ordered digests' HEX TEXT instead of their raw bytes.
++    let mut hasher = Sha256::new();
++    hasher.update(d1.to_hex().as_bytes());
++    hasher.update(d2.to_hex().as_bytes());
++    let hex_text_etag = format!("{}-{}", hex(&hasher.finalize()), 2);
++
++    assert_ne!(etag.to_string(), hex_text_etag);
++    assert_eq!(
++        etag.to_string(),
++        oracle_etag(&[*d1.as_bytes(), *d2.as_bytes()])
++    );
++}
++
++#[test]
++fn multipart_etag_suffix_is_the_named_count() {
++    let named: Vec<(PartNumber, Digest)> =
++        (1..=5).map(|n| (part(n), digest(&n.to_string()))).collect();
++    let etag = multipart_etag(&named).unwrap();
++    assert_eq!(etag.parts(), 5);
++    assert!(etag.to_string().ends_with("-5"));
++}
++
++#[test]
++fn multipart_etag_refuses_a_duplicate_part_number() {
++    let d1 = digest("one");
++    let d2 = digest("two");
++    let err = multipart_etag(&[(part(1), d1), (part(1), d2)]).unwrap_err();
++    assert_eq!(err, RecordError::DuplicatePart { part_number: 1 });
++}
++
++#[test]
++fn multipart_etag_refuses_a_non_ascending_list_rather_than_sorting_it() {
++    let d1 = digest("one");
++    let d2 = digest("two");
++    let d3 = digest("three");
++
++    // Deliberately out of order: 3, 1, 2.
++    let out_of_order = [(part(3), d3), (part(1), d1), (part(2), d2)];
++    let err = multipart_etag(&out_of_order).unwrap_err();
++    assert_eq!(
++        err,
++        RecordError::PartsOutOfOrder {
++            part_number: 1,
++            previous: 3
++        }
++    );
++
++    // Never silently sorted: the ascending list with the SAME parts is a completely
++    // different value from a hypothetical "sort the input" composition, so the mere
++    // presence of an ascending oracle equal to the sorted-order etag would not, by
++    // itself, prove refusal — the assertion above (`unwrap_err`) is what proves it. This
++    // second check pins that the ascending composition remains reachable through its own
++    // (already-ascending) call, not through the refused one.
++    let ascending = multipart_etag(&[(part(1), d1), (part(2), d2), (part(3), d3)]).unwrap();
++    assert_eq!(
++        ascending.to_string(),
++        oracle_etag(&[*d1.as_bytes(), *d2.as_bytes(), *d3.as_bytes()])
++    );
++}
++
++// ===========================================================================
++// Leg 3 — `complete_fingerprint` tells an identical retry from a different assembly
++// ===========================================================================
++
++#[test]
++fn complete_fingerprint_agrees_on_an_identical_ascending_retry() {
++    let named = [(part(1), digest("one")), (part(2), digest("two"))];
++    let first = complete_fingerprint(&named).unwrap();
++    let retry = complete_fingerprint(&named).unwrap();
++    assert_eq!(first, retry);
++}
++
++#[test]
++fn complete_fingerprint_disagrees_on_one_changed_digest() {
++    let original =
++        complete_fingerprint(&[(part(1), digest("one")), (part(2), digest("two"))]).unwrap();
++    let changed =
++        complete_fingerprint(&[(part(1), digest("one")), (part(2), digest("TWO-DIFFERENT"))])
++            .unwrap();
++    assert_ne!(original, changed);
++}
++
++/// Same digests, in the same relative order, named under **different literal part
++/// numbers** (`2` vs `5` for the second part) — deliberately a case where sorting by
++/// ascending part number leaves the digest *sequence* identical (`d1` then `d2` either
++/// way), so this can only disagree if the part numbers themselves are hashed in, not just
++/// used to order the digests. A composition that dropped the numbers from the hash (and
++/// used them only to sort) would wrongly agree here.
++#[test]
++fn complete_fingerprint_disagrees_on_the_same_digests_under_different_numbering() {
++    let d1 = digest("one");
++    let d2 = digest("two");
++    let original = complete_fingerprint(&[(part(1), d1), (part(2), d2)]).unwrap();
++    let renumbered = complete_fingerprint(&[(part(1), d1), (part(5), d2)]).unwrap();
++    assert_ne!(original, renumbered);
++}
++
++#[test]
++fn complete_fingerprint_disagrees_on_a_strict_subset() {
++    let full = complete_fingerprint(&[
++        (part(1), digest("one")),
++        (part(2), digest("two")),
++        (part(3), digest("three")),
++    ])
++    .unwrap();
++    let subset =
++        complete_fingerprint(&[(part(1), digest("one")), (part(2), digest("two"))]).unwrap();
++    assert_ne!(full, subset);
++}
++
++#[test]
++fn complete_fingerprint_refuses_the_same_malformed_lists_as_multipart_etag() {
++    let duplicate = [(part(1), digest("one")), (part(1), digest("two"))];
++    assert_eq!(
++        multipart_etag(&duplicate).unwrap_err(),
++        complete_fingerprint(&duplicate).unwrap_err()
++    );
++
++    let out_of_order = [(part(2), digest("two")), (part(1), digest("one"))];
++    assert_eq!(
++        multipart_etag(&out_of_order).unwrap_err(),
++        complete_fingerprint(&out_of_order).unwrap_err()
++    );
++}
++
++// ===========================================================================
++// Leg 4 — `MultipartEtag` decode is validating
++// ===========================================================================
++
++#[test]
++fn multipart_etag_parse_round_trips_a_composed_value() {
++    let etag = multipart_etag(&[(part(1), digest("one")), (part(2), digest("two"))]).unwrap();
++    let text = etag.to_string();
++    let parsed = MultipartEtag::parse(&text).unwrap();
++    assert_eq!(parsed, etag);
++    assert_eq!(parsed.composed(), etag.composed());
++    assert_eq!(parsed.parts(), 2);
++}
++
++#[test]
++fn multipart_etag_parse_rejects_a_zero_part_count() {
++    let hex64 = hex(digest("valid").as_bytes());
++    let err = MultipartEtag::parse(&format!("{hex64}-0")).unwrap_err();
++    assert_eq!(err, RecordError::NoPartsNamed);
++}
++
++#[test]
++fn multipart_etag_parse_rejects_a_count_past_the_keyspace() {
++    let hex64 = hex(digest("valid").as_bytes());
++    let err = MultipartEtag::parse(&format!("{hex64}-1000000")).unwrap_err();
++    assert_eq!(
++        err,
++        RecordError::EtagPartCountOutOfRange { parts: 1_000_000 }
++    );
++}
++
++#[test]
++fn multipart_etag_parse_rejects_malformed_hex() {
++    let hex64 = hex(digest("valid").as_bytes());
++    let uppercase = hex64.to_uppercase();
++    assert!(matches!(
++        MultipartEtag::parse(&format!("{uppercase}-1")),
++        Err(RecordError::DigestNotHex { .. })
++    ));
++
++    let short = &hex64[..63];
++    assert!(matches!(
++        MultipartEtag::parse(&format!("{short}-1")),
++        Err(RecordError::DigestNotHex { .. })
++    ));
++}
++
++#[test]
++fn multipart_etag_parse_rejects_a_malformed_suffix() {
++    let hex64 = hex(digest("valid").as_bytes());
++    for suffix in ["", "+1", "01", "1x", "-1"] {
++        let text = format!("{hex64}-{suffix}");
++        assert!(
++            MultipartEtag::parse(&text).is_err(),
++            "expected {text:?} to be refused"
++        );
++    }
++}
++
++#[test]
++fn multipart_etag_parse_rejects_a_missing_separator() {
++    let hex64 = hex(digest("valid").as_bytes());
++    assert!(matches!(
++        MultipartEtag::parse(&hex64),
++        Err(RecordError::MultipartEtagMalformed { .. })
++    ));
++}
++
++// ===========================================================================
++// Leg 5 — the outcome enums are exhaustive (no `#[non_exhaustive]`)
++// ===========================================================================
++//
++// Each function below matches every declared variant with no `_` arm. If any of these
++// types carried `#[non_exhaustive]` — today, or after a future edit — this file, compiled
++// as an external crate against `wyrd_core`, would fail with "non-exhaustive patterns"
++// rather than compiling and passing, exactly the leg-5 contract.
++
++fn exhaust_invalid_part(value: &InvalidPart) -> &'static str {
++    match value {
++        InvalidPart::Absent => "absent",
++        InvalidPart::DigestMismatch => "digest-mismatch",
++        InvalidPart::OutOfOrder => "out-of-order",
++    }
++}
++
++fn exhaust_backpressure(value: &Backpressure) -> &'static str {
++    match value {
++        Backpressure::SessionCap { .. } => "session-cap",
++        Backpressure::InflightParts { .. } => "inflight-parts",
++        Backpressure::AdmissionContention { .. } => "admission-contention",
++    }
++}
++
++fn exhaust_refusal(value: &Refusal) -> &'static str {
++    match value {
++        Refusal::NoSuchUpload => "no-such-upload",
++        Refusal::NoSuchBucket => "no-such-bucket",
++        Refusal::OperationAborted => "operation-aborted",
++        Refusal::InvalidPart { .. } => "invalid-part",
++        Refusal::EntityTooLarge { .. } => "entity-too-large",
++        Refusal::SlowDown { .. } => "slow-down",
++        Refusal::ProfileSkew { .. } => "profile-skew",
++        Refusal::CompleteAttemptsExhausted => "complete-attempts-exhausted",
++    }
++}
++
++fn exhaust_create_outcome(value: &CreateOutcome) -> &'static str {
++    match value {
++        CreateOutcome::Created { .. } => "created",
++        CreateOutcome::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_reserve_outcome(value: &ReserveOutcome) -> &'static str {
++    match value {
++        ReserveOutcome::Reserved { .. } => "reserved",
++        ReserveOutcome::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_upload_part_outcome(value: &UploadPartOutcome) -> &'static str {
++    match value {
++        UploadPartOutcome::Committed { .. } => "committed",
++        UploadPartOutcome::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_complete_outcome(value: &CompleteOutcome) -> &'static str {
++    match value {
++        CompleteOutcome::Published(_) => "published",
++        CompleteOutcome::AlreadyCompleted(_) => "already-completed",
++        CompleteOutcome::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_abort_outcome(value: &AbortOutcome) -> &'static str {
++    match value {
++        AbortOutcome::Fenced => "fenced",
++        AbortOutcome::AlreadyAborting => "already-aborting",
++        AbortOutcome::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_verb(value: Verb) -> &'static str {
++    match value {
++        Verb::UploadPart => "upload-part",
++        Verb::CompleteMultipartUpload => "complete",
++        Verb::AbortMultipartUpload => "abort",
++        Verb::ListParts => "list-parts",
++        Verb::ListMultipartUploads => "list-uploads",
++    }
++}
++
++fn exhaust_upload_part_answer(value: &UploadPartAnswer) -> &'static str {
++    match value {
++        UploadPartAnswer::Accepted => "accepted",
++        UploadPartAnswer::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_complete_answer(value: &CompleteAnswer) -> &'static str {
++    match value {
++        CompleteAnswer::Fences => "fences",
++        CompleteAnswer::AlreadyCompleted(_) => "already-completed",
++        CompleteAnswer::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_abort_answer(value: &AbortAnswer) -> &'static str {
++    match value {
++        AbortAnswer::Fences => "fences",
++        AbortAnswer::AlreadyAborting => "already-aborting",
++        AbortAnswer::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_list_parts_answer(value: &ListPartsAnswer) -> &'static str {
++    match value {
++        ListPartsAnswer::OpenSet => "open-set",
++        ListPartsAnswer::FrozenSet => "frozen-set",
++        ListPartsAnswer::Refused(_) => "refused",
++    }
++}
++
++fn exhaust_list_uploads_answer(value: &ListUploadsAnswer) -> &'static str {
++    match value {
++        ListUploadsAnswer::Listed => "listed",
++        ListUploadsAnswer::NotListed => "not-listed",
++    }
++}
++
++fn exhaust_answer(value: &Answer) -> &'static str {
++    match value {
++        Answer::UploadPart(_) => "upload-part",
++        Answer::Complete(_) => "complete",
++        Answer::Abort(_) => "abort",
++        Answer::ListParts(_) => "list-parts",
++        Answer::ListUploads(_) => "list-uploads",
++    }
++}
++
++#[test]
++fn outcome_enums_are_exhaustive_no_non_exhaustive_marker() {
++    assert_eq!(
++        exhaust_invalid_part(&InvalidPart::OutOfOrder),
++        "out-of-order"
++    );
++    assert_eq!(
++        exhaust_backpressure(&Backpressure::AdmissionContention { attempts: 3 }),
++        "admission-contention"
++    );
++    assert_eq!(exhaust_refusal(&Refusal::NoSuchUpload), "no-such-upload");
++    assert_eq!(
++        exhaust_create_outcome(&CreateOutcome::Refused(Refusal::NoSuchBucket)),
++        "refused"
++    );
++    assert_eq!(
++        exhaust_reserve_outcome(&ReserveOutcome::Refused(Refusal::CompleteAttemptsExhausted)),
++        "refused"
++    );
++    assert_eq!(
++        exhaust_upload_part_outcome(&UploadPartOutcome::Committed {
++            part_number: part(1),
++            digest: digest("committed")
++        }),
++        "committed"
++    );
++    assert_eq!(
++        exhaust_complete_outcome(&CompleteOutcome::Refused(Refusal::OperationAborted)),
++        "refused"
++    );
++    assert_eq!(exhaust_abort_outcome(&AbortOutcome::Fenced), "fenced");
++    assert_eq!(exhaust_verb(Verb::ListMultipartUploads), "list-uploads");
++    assert_eq!(
++        exhaust_upload_part_answer(&UploadPartAnswer::Accepted),
++        "accepted"
++    );
++    assert_eq!(exhaust_complete_answer(&CompleteAnswer::Fences), "fences");
++    assert_eq!(
++        exhaust_abort_answer(&AbortAnswer::AlreadyAborting),
++        "already-aborting"
++    );
++    assert_eq!(
++        exhaust_list_parts_answer(&ListPartsAnswer::OpenSet),
++        "open-set"
++    );
++    assert_eq!(
++        exhaust_list_uploads_answer(&ListUploadsAnswer::Listed),
++        "listed"
++    );
++    assert_eq!(
++        exhaust_answer(&Answer::ListUploads(ListUploadsAnswer::NotListed)),
++        "list-uploads"
++    );
++}

@@ -142,7 +142,7 @@
   #285 panic class made durable.
 - **Repo + branch target:** getwyrd/wyrd @ main
 - **Depends on:** 771
-- **Conflicts with:** 721, 722
+- **Conflicts with:** 776, 722
 - **Ordering note:** Wave 1 — terminal. `Depends on: child-1` is a genuine build-on:
   `decode_owned_entry(key, bytes)` mirrors the module's first key-taking decoder, which
   child-1 introduces (every decoder on the base is value-only —`decode_session_record`,
@@ -150,12 +150,16 @@
   wave-serialises the two files they share, `crates/core/src/multipart.rs` and the one sentence
   of `docs/design/architecture/05-building-block-view.md:202`. **This child alone carries the
   chain's external conflicts, and they cannot be declared here** (proposal ordering fields may
-  only name sibling labels): after `--accept`, add `- **Conflicts with:** 721, 722` to this
-  child's materialised `brief.md`. #711 was split into **#721** (the placement primitive in
-  `crates/core/src/metadata.rs` + its repair caller) and **#722** (the drain caller +
-  `crates/dst/tests/custodian.rs`); this child edits both files, so it must never share a wave
-  with either. **#693** (and **#655** behind it) currently declare `Depends on: 717` and must be
-  repointed at this child. **Cite `metadata.rs` by symbol, not by line number** — #721 may land
+  only name sibling labels): after `--accept`, add `- **Conflicts with:** 776, 722` to this
+  child's materialised `brief.md` — **done, and re-pointed 2026-08-19.** #711 was split into
+  **#721** and **#722** (the drain caller + `crates/dst/tests/custodian.rs`); **#721 has since
+  split again** (Plan, 2026-08-19) into **#776** (the placement primitive — the *only* one of
+  the two that touches `crates/core/src/metadata.rs`) and **#777** (the repair caller, which
+  touches `crates/custodian/*` **only** and therefore does *not* conflict with this child). So
+  the `metadata.rs` conflict is now with **#776**, not #721, and #722 still carries the
+  `crates/dst/tests/custodian.rs` conflict; this child must never share a wave with either.
+  **#693** (and **#655** behind it) currently declare `Depends on: 717` and must be
+  repointed at this child. **Cite `metadata.rs` by symbol, not by line number** — #776 may land
   in that file first.
 - **Surfaces:** data
 - **Difficulty:** high — 13 files across 5 crates plus a rendered docs file, and the only child
@@ -289,3 +293,16 @@
   #717's own three — the batch review's `PendingEntry`-under-`pending:` blocker is leg S4 here
   and the adversary's cross-crate-mintability finding is leg S9; neither is a suggestion.
 - **Disposition hint:** new-feature
+
+## Iteration 1 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 1): rebuilding for the implementation-level findings — C2 Reproduction (red pre-fix) — Accept born-at-tier criterion absence as sufficient reproduction — the stashed base has no `multipart_owned_staging` target, while retaining the test only produces missing-new-API compile errors and never executes behavior (`gate-logs/C4-verify.log:10`).; C4 Verification (red→green) — Accept green verification without an executable behavioral RED — the reviewer reran all 13 focused tests and the custodian GC leg green, frozen CI/deny/docs and TiKV gates passed, but the RED discriminator never compiled (`gate-logs/C4-verify.log:10`, `gate-logs/C4-ci.log:3452`).; **Nothing tests the GC skip's audit signal.** That signal is the only; Minor: `OwnedEntry::from_pending`'s ordinary-shape arm; Minor docs wording in the S10 sentence; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 5 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_772/review-b. 3 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: C5 surviving mutants on the bundle diff (cargo mutants --in-diff) (advisory) — 35 mutants tested in 54s: 1 missed, 8 caught, 26 unviable
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 5 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_772/review-b
+- Full previous attempt preserved in `iteration-v1/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
+
+## Iteration 2 — carry-forward (from the previous attempt)
+- Sign-off rationale: Auto-iterate (round 2): rebuilding for the implementation-level findings — C2 Reproduction (red pre-fix) — Accept compile-time criterion absence as the pre-fix reproduction — the retained test imports APIs absent from the base and fails before any behavior executes, so no runtime symptom is reproduced (`gate-logs/C4-verify.log:15`, `gate-logs/C4-verify.log:170`).; C4 Verification (red→green) — Accept green-only verification without an executable behavioral RED — the fixed 14-test discriminator and focused custodian test pass and frozen CI is green, but the verifier explicitly established no RED (`gate-logs/C4-verify.log:10`, `gate-logs/C4-verify.log:170`, `gate-logs/C4-ci.log:3453`).; The GC half of S5 doesn't prove "the sweep completes for every other entry" (`crates/custodian/tests/gc.rs:926`). Negation: change `continue;` to `break;` in the skip arm at `crates/custodian/src/gc.rs:506`, so the scan stops at the first unreadable entry. The test still **passed 16 of 40 runs**. Control run: the unmodified test passed 40/40 alone and 20/20 alongside its siblings. The mutant is caught only when the `HashMap`-backed `MemMeta` (`crates/custodian/tests/gc.rs:56`) happens to yield `pending:226` (the misfiled entry, `:948`) before `pending:225` (the ordinary lease, `:934`). A failing run shows why: `left: Satisfied, right: Changed` at `:982`. On any key-ordered store (redb, FDB, TiKV), 225 always comes first, so the mutant would pass every time. The `scan` contract leaves order unspecified (`crates/traits/src/lib.rs:1352-1355`), so the fix needs a witness that doesn't depend on order. For example: give this leg a key-ordered store and add a second ordinary expired lease whose key sorts after the misfiled one, then assert it was reclaimed. The core half doesn't have this gap: `crates/core/tests/multipart_owned_staging.rs:560` runs on ordered redb and asserts the full skipped-key list, which catches `break`. C5's pass (`gate-logs/C5-mutants.log`: 9 caught, 29 unviable) doesn't cover this, because cargo-mutants never generates a `continue`→`break` mutant.; The docs overstate the operator signal. `docs/design/architecture/05-building-block-view.md:202` says "the two `pending:` expiry sweeps skip it … and name it for an operator", and the module header `crates/core/src/multipart.rs:103-104` says the same. In a default deployment, GC's expired-lease input runs under `ExpiredPendingPolicy::Defer` unless `--gc-expired-pending` is passed (`crates/server/src/cli.rs:975-979`, `crates/custodian/src/gc.rs:172-175`), so GC never reads `pending:` there. `write::sweep_expired_leases` has no production caller, only tests. So by default nothing names a misfiled entry to an operator. The only visible effect is a boxed error from `renew_pending` / `live_lease_guards` on a write that touches that chunk. Fix: qualify the clause (e.g. "when GC's expired-lease input is armed"), keeping S10's length limit.; T4 batched multi-pass rubric review (3x codex, union, triaged) FAILED (gating) — review-branch: 2 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_772/review-b. 6 finding(s) needing human judgment were deferred to sign-off, not addressed here.
+- Failing gate: T4 batched multi-pass rubric review (3x codex, union, triaged) — review-branch: 2 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_772/review-b
+- Full previous attempt preserved in `iteration-v2/` (patch.diff, build-notes.md, SUMMARY.md, check-*).
+- Address the above; do NOT re-attempt the rejected approach unchanged. Satisfy the brief's Success criterion (the end result).
