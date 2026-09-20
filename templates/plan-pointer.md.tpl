@@ -29,8 +29,9 @@
 - **Scope:** <the one logical change this realizes> / out of scope: <what is excluded>
 - **Difficulty:** <`low` | `medium` | `high` — the change's **blast-radius / cross-file
   reach** (files/call-sites touched and how far effects propagate, what a diff-reviewer
-  must hold in view), NOT edge-case density. Routes the Do backend and review depth
-  (issues #133/#134). Optional; absent/unknown is the safe default — nothing is skipped.>
+  must hold in view), NOT edge-case density. Feeds the size estimate only (since
+  2026-09-20): the builder tier is the attempt ladder plus an explicit `Do model:` pin, and the
+  adversary and code-review lenses run on every bundle. Optional; absent skips nothing.>
 - **External dependencies:** <build tools (e.g. `protoc`), runtime services (Docker, a live
   etcd/TiKV), and required topology/environment shape (a ≥3-replica cluster) the slice needs
   to build AND to make the success criterion go red→green — enumerated here so they preflight

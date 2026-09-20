@@ -64,6 +64,12 @@
   (`pdca.toml` `[[leaves.advisory]] id = "adversary"`)
 - Gates / leaves: **third-party code-review lens always on** — new `[[leaves.advisory]]
   id = "code-review"`, codex family, `agents/code-review.md`, advisory.
+- Spec template + agent prompt: **`Difficulty` no longer routes anything at Do or Check.**
+  The planner prompt and the three brief templates now say so, name what the field still
+  feeds (the size estimate), and tell the planner to pin `Do model:` — with the valid
+  instance names — for a brief it rates `high`, since the rating alone no longer buys a
+  stronger first build.   (`agents/planner.md` + `.claude/agents/planner.md`,
+  `templates/{brief,plan-pointer,design-proposal}.md.tpl`)
 - Gates / leaves: **codex leaves move to `gpt-6-astra`** (reviewer, plan-reviewer, code-review,
   the codex builder pin) — OpenAI's current top Codex model, in Codex since 2026-09-09 and
   probed on this host; `gpt-5.6-sol` remains the fallback pin.
@@ -82,8 +88,10 @@
 - Every Check from here on shows three advisory artifacts (`check-review.md`,
   `check-advisory-adversary.md`, `check-advisory-code-review.md`); a missing one is a fault,
   not a gate.
-- `loop-telemetry.json` for the next five bundles that iterate shows attempts on three
-  distinct (model, effort) tiers, never the same tier twice.
+- `loop-telemetry.json` for the next five bundles that iterate records, for every attempt
+  `n`, exactly the tier the ladder assigns to `n`: attempt 1 sonnet/xhigh (or the brief's
+  `Do model:` pin), attempts 2 to 4 opus/xhigh, attempt 5 on fable/xhigh — and never a tier
+  the ladder does not assign to that attempt.
 - The next post-merge review on a merged PR finds nothing the cycle did not already have in
   §6. Two in a row that do trigger a rubric revision, not another leaf.
 

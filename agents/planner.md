@@ -126,8 +126,16 @@ faster than Do could close them; it lifts by itself as sign-offs land.
   far its effects propagate — what a diff-reviewer must hold in view. A localized one-site
   change is `low`; a wide, cross-cutting change is `high`. Size *blast-radius only* — leave
   edge-case density to the deterministic gates, since a single scalar mixing the two would
-  mis-route a high-edge-case but low-blast bundle. This signal routes the Do backend and
-  review depth (#133/#134); when unsure, rate **up** (the higher tier is the safe default).
+  mis-route a high-edge-case but low-blast bundle. Since 2026-09-20 this signal routes
+  NOTHING at Do or Check: the builder tier is the attempt ladder (sonnet/xhigh first, opus/xhigh
+  for attempts 2 to 4, fable/xhigh from attempt 5) and the adversary and code-review lenses run
+  on every bundle. It still feeds the size estimate. So a brief you rate `high` gets no
+  stronger first build from the rating alone — **pin one with `- **Do model:** <name>`**:
+  `opus` for a hard slice (tier 2 from the start), `fable` to start on the other lineage,
+  `opus-max` for max effort, `sonnet` to insist on tier 1, `codex` cross-vendor (best-effort).
+  A name matching no variant falls back to tier 1 silently, so spell it exactly. The pin sets
+  the first attempt only; the ladder takes over from attempt 2. When unsure, rate **up** for
+  the sizer and pin `opus`.
 
 ## Solution-design discipline (`docs/principles.md`)
 

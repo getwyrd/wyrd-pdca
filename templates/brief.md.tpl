@@ -39,13 +39,16 @@
 - **Difficulty:** <`low` | `medium` | `high` — the fix's **blast-radius / cross-file
   reach**: how many files/call-sites it touches and how far its effects propagate (what a
   diff-reviewer must hold in view), NOT edge-case density (the deterministic gates own
-  that). low = a localized one-site change; high = a wide, cross-cutting change. Routes
-  the Do backend and review depth (issues #133/#134). Optional; absent/unknown is the safe
-  default — no review or capability is skipped on a missing tag.>
-- **Do model:** <optional — pin the Do backend explicitly to a `[[leaves.builder_variant]]`
-  `model` name (e.g. `frontier`), OVERRIDING the difficulty `when` routing. Use when a bundle
-  must run on a specific backend regardless of difficulty (e.g. keep a privacy-sensitive fix on
-  a local model). Absent ⇒ the difficulty routing / default builder; issue #167.>
+  that). low = a localized one-site change; high = a wide, cross-cutting change. Feeds the
+  size estimate only (since 2026-09-20): the builder tier is the attempt ladder and the
+  adversary and code-review lenses run on every bundle, so a `high` rating buys no stronger
+  first build by itself — pin `Do model:` below for that. Optional; absent skips nothing.>
+- **Do model:** <optional — the builder for the FIRST attempt, by `[[leaves.builder_variant]]`
+  `model` name: `sonnet` (tier 1, the default), `opus` (tier 2 from the start — the pin for a
+  brief rated `high`), `fable` (start on the other lineage), `opus-max` (max effort), `codex`
+  (cross-vendor, best-effort). The escalation ladder overrides from attempt 2 regardless. A
+  name matching no variant falls back to tier 1 silently — spell it exactly. Absent ⇒ tier 1;
+  issue #167.>
 - **Scope:** <the defect to remove — one logical fix. MUST NOT name a probe/guard/helper
   (a capability check, `hasattr`, `try/except import`): naming a mechanism seats the fix
   shape for Do. Leave mechanism to Do; Do prefers removing the cause over guarding it
