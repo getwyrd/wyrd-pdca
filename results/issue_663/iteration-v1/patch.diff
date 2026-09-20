@@ -1,0 +1,3920 @@
+diff --git a/crates/custodian/src/gc.rs b/crates/custodian/src/gc.rs
+index c63960b..ab7ba04 100644
+--- a/crates/custodian/src/gc.rs
++++ b/crates/custodian/src/gc.rs
+@@ -64,8 +64,9 @@
+ //! then committed inodes, the order that leaves a chunk in at least one class whenever a part
+ //! commit or a publication lands mid-read (`0016:782-800`). A staged record the pass cannot read
+ //! makes that class incomplete, which reclaims nothing and certifies nothing exactly as an
+-//! unreadable committed map does; a store fault under one of its reads fails the pass. Scrub and
+-//! the drain-status surface do not read the class at all.
++//! unreadable committed map does; a store fault under one of its reads fails the pass. The same
++//! session walk (`walk_staged`) serves scrub and reconstruction, which read the class for their
++//! own purposes (#663); the drain-status surface does not read it at all.
+ //!
+ //! Dependency boundary (ADR-0010, `0005:421-422`): this loop stays over the
+ //! `traits` / `core` seams plus `tracing` — **no** concrete backend.
+@@ -871,10 +872,12 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
+ /// A class of its own, **disjoint** from the committed [`ReferenceSet`] rather than merged into
+ /// it, so each consumer decides for itself what staged bytes mean to it (`0016:767-782`, `:881`),
+ /// and built by a reader of its own ([`staged_fragments`]) rather than inside
+-/// [`referenced_fragments`]. Only the two passes that delete or mark read it: GC's reclaim
+-/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]). Scrub and the drain-status
+-/// query share the committed build and read no upload record at all, so an upload record's
+-/// damage, a store fault reading one, or the cost of reading them cannot reach their answers.
++/// [`referenced_fragments`]. Only the two passes that delete or mark read this set: GC's reclaim
++/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]). Scrub and reconstruction
++/// walk the same session ranges ([`walk_staged`]) into readings of their own — scrub the committed
++/// parts it verifies, reconstruction the records of the chunks it owes a repair on — and the
++/// drain-status query reads no upload record at all, so an upload record's damage, a store fault
++/// reading one, or the cost of reading them cannot reach its answer.
+ ///
+ /// Its rules mirror the committed set's, one level each:
+ ///
+@@ -890,8 +893,7 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
+ ///   which chunks it protects, so the class is **incomplete** ([`Self::unresolvable`]) and
+ ///   protects every fragment in the fleet, exactly as an unreadable committed map does.
+ ///
+-/// deferred: #663, #664 — scrub and reconstruction (#663), and drain status and rebalance (#664),
+-/// acting on staged bytes.
++/// deferred: #664 — drain status and rebalance acting on staged bytes.
+ #[derive(Default)]
+ pub(crate) struct StagedSet {
+     /// `(dserver, fragment)` a staged record places: each chunk of a committed part at its recorded
+@@ -1038,29 +1040,106 @@ pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedS
+     // bounded only by the profile the gateways admitted sessions under, which this pass does not
+     // check; each page of it stays bounded by `STAGED_PAGE`.
+     let mut set = StagedSet::default();
++    walk_staged(meta, StagedRanges::OwnedThenParts, |record| match record {
++        StagedRecord::UnnamedSession { key, fault } => {
++            set.unresolvable.insert(key.to_vec(), fault);
++        }
++        StagedRecord::Owned { key, value } => set.read_owned_entry(key, value),
++        // The session's value is never decoded here: protection does not depend on it.
++        StagedRecord::Part { key, value, .. } => set.read_part(key, value),
++    })
++    .await?;
++    Ok(set)
++}
++
++/// Which of each listed session's staged ranges a [`walk_staged`] reads.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum StagedRanges {
++    /// The owned staging entries (`sidx:<id>:`), then the committed parts (`part:<id>:`) — the
++    /// source-before-destination order a part commit's move needs ([`staged_fragments`]).
++    OwnedThenParts,
++    /// The committed parts alone: for a reader that acts only on a committed part's recorded
++    /// scheme and placement (scrub's verify), to which a still-streaming chunk is nothing yet.
++    Parts,
++}
++
++/// One record a [`walk_staged`] met, handed to its visitor in the order the walk read it.
++pub(crate) enum StagedRecord<'r> {
++    /// A key under `mpu:` that names no upload. Its ranges cannot be named, so what it stages is
++    /// unknown: a reader holding this treats its reading as **incomplete**.
++    UnnamedSession {
++        /// The key as the store spells it.
++        key: &'r [u8],
++        /// Why it names no upload.
++        fault: String,
++    },
++    /// One owned staging entry (`sidx:`) of a listed session.
++    Owned {
++        /// The entry's key.
++        key: &'r [u8],
++        /// The entry's value.
++        value: &'r [u8],
++    },
++    /// One committed part (`part:`) of a listed session.
++    Part {
++        /// The record's key.
++        key: &'r [u8],
++        /// The record's value, exactly as the walk read it.
++        value: &'r [u8],
++        /// The owning session's value, exactly as the listing read it — undecoded. A reader that
++        /// acts on the part under the session's fence pins these bytes; the others ignore them.
++        session: &'r [u8],
++    },
++}
++
++/// Walk every session listed under `mpu:` and, for each, the staged `ranges` it names, handing
++/// each record to `visit` — the one bounded walk the staged readers share ([`staged_fragments`]
++/// here, scrub's and reconstruction's own readings), so none of them can read the class in a
++/// different order or with a different bound.
++///
++/// Per session, a whole source range is read before its destination is begun (owned entries, then
++/// committed parts — `0016:782-790`), each in pages of at most [`STAGED_PAGE`], and no read covers
++/// another session's records. A key under `mpu:` that names no upload is handed on as
++/// [`StagedRecord::UnnamedSession`] and the walk goes on. A store fault under any read fails the
++/// walk with a [`StagedReadFault`] naming the range; what `visit` saw before it is a partial
++/// reading, and every caller propagates the fault rather than act on one.
++pub(crate) async fn walk_staged(
++    meta: &dyn MetadataStore,
++    ranges: StagedRanges,
++    mut visit: impl FnMut(StagedRecord<'_>),
++) -> Result<()> {
+     let mut after: Option<Vec<u8>> = None;
+     loop {
+         let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
+-        for (key, _session) in &sessions {
++        for (key, session) in &sessions {
+             let upload = match parse_mpu_key(key) {
+                 Ok(upload) => upload,
+                 Err(fault) => {
+-                    set.unresolvable.insert(key.clone(), fault.to_string());
++                    visit(StagedRecord::UnnamedSession {
++                        key,
++                        fault: fault.to_string(),
++                    });
+                     continue;
+                 }
+             };
+-            walk_staged_range(meta, &sidx_range(&upload), |key, value| {
+-                set.read_owned_entry(key, value)
+-            })
+-            .await?;
++            if ranges == StagedRanges::OwnedThenParts {
++                walk_staged_range(meta, &sidx_range(&upload), |key, value| {
++                    visit(StagedRecord::Owned { key, value })
++                })
++                .await?;
++            }
+             walk_staged_range(meta, &part_range(&upload), |key, value| {
+-                set.read_part(key, value)
++                visit(StagedRecord::Part {
++                    key,
++                    value,
++                    session,
++                })
+             })
+             .await?;
+         }
+         match (next, sessions.into_iter().last()) {
+             (Some(_), Some((last, _))) => after = Some(last),
+-            _ => return Ok(set),
++            _ => return Ok(()),
+         }
+     }
+ }
+diff --git a/crates/custodian/src/reconciliation.rs b/crates/custodian/src/reconciliation.rs
+index 07cdd65..1dd8171 100644
+--- a/crates/custodian/src/reconciliation.rs
++++ b/crates/custodian/src/reconciliation.rs
+@@ -24,9 +24,9 @@ pub enum Reconciled {
+     Changed,
+     /// The loop ran over everything it could read and **refuses to certify the rest**: at
+     /// least one committed object's chunk map could not be read
+-    /// (`crate::gc::ReferenceSet::unresolvable`) — or, for GC, one staged multipart record
+-    /// (`crate::gc::StagedSet::unresolvable`) — so the set the loop reasoned over is
+-    /// incomplete.
++    /// (`crate::gc::ReferenceSet::unresolvable`) — or, for GC, scrub and reconstruction, one
++    /// staged multipart record (`crate::gc::StagedSet::unresolvable` and those loops' own
++    /// staged readings) — so the set the loop reasoned over is incomplete.
+     ///
+     /// A third outcome rather than a flavour of the other two, because it is a different
+     /// **claim**. `Satisfied` says every referenced fragment was checked and matched — over
+diff --git a/crates/custodian/src/reconstruction.rs b/crates/custodian/src/reconstruction.rs
+index f4bc1e7..0176b95 100644
+--- a/crates/custodian/src/reconstruction.rs
++++ b/crates/custodian/src/reconstruction.rs
+@@ -39,6 +39,17 @@
+ //! encrypts *below* EC (ADR-0021, `0005:285-286`), so the custodian rebuilds
+ //! **ciphertext** fragments and never needs tenant keys.
+ //!
++//! A chunk no committed chunk map names may still be **staged**: named by a multipart upload's
++//! committed part (`part:`), or by an owned entry of a part still streaming (`sidx:`). Such an
++//! obligation is resolved against those records, never drained for want of a committed map
++//! (proposal 0016's reconstruction row, `0016:825`). A committed part's chunk is repaired by a
++//! **re-place** fenced like a part upload (the `staged` submodule): the destination is
++//! pre-marked `orphan:` before its fragment is written, the write carries an authorization
++//! deadline, and one CAS pinned to the session still being `Open` at its epoch and to the part
++//! record's exact bytes adopts it — so a lost race leaves the written fragment covered by its
++//! pre-mark and the obligation queued, and nothing is stranded. A still-streaming chunk, or one
++//! whose session is fenced, keeps its obligation until it can be repaired.
++//!
+ //! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
+ //! `traits` / `core` seams plus `tracing` — the erasure math, the placement selector,
+ //! and the on-disk fragment format are all borrowed from `core`, so `custodian` gains
+@@ -56,9 +67,12 @@ use wyrd_traits::{
+     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+ };
+ 
++use crate::desired_state::draining_servers;
+ use crate::gc::object_name;
+ use crate::reconciliation::Reconciled;
+ 
++mod staged;
++
+ /// What the reconstruction reconciler reads, rebuilds, and re-places over: the
+ /// authoritative metadata store (committed chunk maps + the shared repair queue), the
+ /// **fleet** of D servers — each a [`ChunkStore`] keyed by its stable [`DServerId`],
+@@ -70,7 +84,7 @@ use crate::reconciliation::Reconciled;
+ /// deployed custodian process (Option A, `0005:524-527`). The loop is correct over
+ /// these abstractions and reachable through the real [`crate::reconcile_step`].
+ pub struct ReconstructionContext<'a> {
+-    /// The authoritative metadata store (chunk maps + the repair queue).
++    /// The authoritative metadata store (chunk maps, multipart records + the repair queue).
+     pub meta: &'a dyn MetadataStore,
+     /// The fleet of D servers, each addressed by its stable id. A server absent from
+     /// this map (or holding no/no-longer-intact bytes) is a **loss** the rebuild reads
+@@ -112,12 +126,10 @@ pub fn repair_priority(survivors: usize, k: usize) -> i64 {
+ /// missing fragments an assessment pass found — enough to both **prioritize** the
+ /// drain and **execute** the rebuild without re-fetching.
+ struct RepairPlan {
+-    /// Which committed object of this pass's ONE reading holds the chunk ([`Reading::objects`],
+-    /// which carries that object's identity and the generation the scan returned) — an index,
+-    /// never a copy: every obligation inside an N-entry object shares that one snapshot, so Q
+-    /// obligations cost N decoded entries **once**, not Q×N. The rest of the plan is scalars
+-    /// plus this chunk's own survivors.
+-    object: usize,
++    /// Which record of this pass's ONE reading holds the chunk, and so which record the repair
++    /// repoints. An index, never a copy: every obligation inside one record shares that one
++    /// snapshot. The rest of the plan is scalars plus this chunk's own survivors.
++    target: Target,
+     chunk_index: usize,
+     chunk_id: ChunkId,
+     k: usize,
+@@ -134,14 +146,29 @@ struct RepairPlan {
+     len: usize,
+ }
+ 
++/// Which record a [`RepairPlan`] repoints.
++enum Target {
++    /// A committed **flat** object of this pass's reading ([`Reading::objects`], which carries
++    /// its identity and the generation the scan returned): repaired by [`repair_chunk`]'s
++    /// version-conditional commit. Q obligations inside an N-entry object cost N decoded entries
++    /// **once**, not Q×N.
++    Committed(usize),
++    /// A multipart upload's committed part ([`staged::StagedReading`]): repaired by the fenced
++    /// re-place ([`staged::repair`]).
++    Staged(staged::StagedTarget),
++}
++
+ /// One reconstruction reconciliation pass over `ctx` at logical time `now_millis`.
+ /// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
+ /// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
+ /// repointed, [`Reconciled::Satisfied`] otherwise — and [`Reconciled::Blocked`] when the pass
+ /// cannot certify what it did not do: a committed object it could not read (its reading has a
+-/// hole in it, see [`read_committed`]), a repair it refused because the chunk's committed
+-/// reference lives in a `seg:` record (#682 owns that write path), or one it refused because
+-/// the repointed record would not survive the backend value ceiling ([`RepairOutcome::Refused`]).
++/// hole in it, see [`read_committed`]), a staged record it could not read (the same hole in the
++/// staged class, see [`staged::read`]), a repair it refused because the chunk's committed
++/// reference lives in a `seg:` record (#682 owns that write path), one it refused because the
++/// repointed record would not survive the backend value ceiling ([`RepairOutcome::Refused`]), or
++/// a staged repair it withheld because a record it would have to rewrite cannot be read
++/// ([`Assessment::Withheld`]).
+ pub(crate) async fn reconcile(
+     ctx: &ReconstructionContext<'_>,
+     now_millis: u64,
+@@ -162,16 +189,38 @@ pub(crate) async fn reconcile(
+     // and with nothing owed there is nothing to read and nothing to claim — the base's own
+     // behaviour (its per-obligation loop scanned zero times over an empty queue), kept, and
+     // the same shape `rebalance.rs:115-117` uses to answer without touching `inode:` at all.
++    //
++    // The STAGED class is read FIRST — every listed session's owned entries, then its committed
++    // parts — and the committed namespace after it. "No record references this chunk" is the one
++    // fact that discards an obligation, and a chunk's reference only ever moves forward: a part
++    // commit moves it from an owned entry to a part record, a publication from a part record to a
++    // committed inode. Reading each source before its destination sees it on at least one side of
++    // any move that lands mid-pass (`0016:782-800`, the order GC reads the same classes in), so
++    // a chunk published under this pass is never mistaken for a deleted one.
+     let reading = if queue.is_empty() {
+         Reading::default()
+     } else {
+-        read_committed(ctx.meta, &queue).await?
++        let staged = staged::read(ctx.meta, &queue).await?;
++        Reading {
++            staged,
++            ..read_committed(ctx.meta, &queue).await?
++        }
++    };
++    // The D servers an operator is draining: a staged re-place never chooses one as its
++    // destination (`0016:885`). Read only when a staged chunk is owed a repair.
++    let draining: BTreeSet<DServerId> = if reading.staged.owes_repairs() {
++        draining_servers(ctx.meta).await?.into_keys().collect()
++    } else {
++        BTreeSet::new()
+     };
+ 
+     // Assess each obligation (locate the chunk in that reading, gather + verify survivors)
+     // so the drain can be ordered by repair priority before any rebuild commits.
+     let mut plans = Vec::new();
+     let mut drain_only = Vec::new();
++    // A staged repair this pass would not attempt because a record it would have to rewrite
++    // cannot be read: named where it was met, the obligation kept, and the pass does not certify.
++    let mut withheld = false;
+     // The under-replicated **level**: the *repairable backlog* — every chunk this pass found
+     // to have physically lost redundancy that reconstruction *can still rebuild* (`Repairable`,
+     // survivors ≥ `k`). This is the durability signal (`0005:326-329`, architecture §7.4 step
+@@ -207,7 +256,7 @@ pub(crate) async fn reconcile(
+     // not floor the day-one "returns to zero" signal.
+     let mut repair_blocked = 0usize;
+     for &chunk in &queue {
+-        match assess(ctx, &stores, &reading, chunk).await? {
++        match assess(ctx, &stores, &reading, &draining, chunk).await? {
+             Assessment::Repairable(plan) => {
+                 under_replicated += 1;
+                 plans.push(plan);
+@@ -254,6 +303,16 @@ pub(crate) async fn reconcile(
+             // (it is the last record saying live data is under-replicated) and the pass
+             // refuses to certify below.
+             Assessment::Refused => {}
++            // A staged chunk this pass may not repair YET: still streaming, or its session is
++            // fenced out of `Open`. Named on the audit seam, kept off the backlog gauge like
++            // every other never-repaired-this-pass condition, and its obligation kept: the
++            // chunk is repaired once its part commits, or — fenced by a Complete — once it is
++            // published (`0016:825`).
++            Assessment::Deferred(reason) => staged::emit_deferred(chunk, reason),
++            // A staged repair this pass will not attempt: a record it would have to rewrite
++            // cannot be read. Already named where it was met; the obligation stays queued and
++            // the pass refuses to certify below.
++            Assessment::Withheld => withheld = true,
+         }
+     }
+ 
+@@ -270,7 +329,9 @@ pub(crate) async fn reconcile(
+     // time-to-repair sample. Every non-success is offset on its own counter so the
+     // up-front count nets back to true successes: a repair that loses the CAS race is
+     // recorded on `reconstruction_conflict`, one that cannot proceed (the selector
+-    // chose a server outside the fleet view, so nothing is committed) on
++    // chose a server outside the fleet view, so nothing is committed — or, for a staged
++    // re-place, no destination was usable, its pre-mark lost its precondition, or its
++    // write's authorization deadline passed) on
+     // `reconstruction_aborted`, and one refused because the repointed record would cross the
+     // backend value ceiling on `reconstruction_ceiling_refused` — so successful repairs are
+     // `reconstruction_repaired − conflict − aborted − ceiling_refused`. Every offset leaves
+@@ -307,8 +368,17 @@ pub(crate) async fn reconcile(
+     // the segmented refusal the reading records — the pass may not certify over it.
+     let mut ceiling_refused = false;
+     for plan in &plans {
+-        let object = &reading.objects[plan.object];
+-        match repair_chunk(ctx, &stores, object, plan, now_millis).await? {
++        let outcome = match &plan.target {
++            Target::Committed(object) => {
++                let object = &reading.objects[*object];
++                repair_chunk(ctx, &stores, object, plan, now_millis).await?
++            }
++            Target::Staged(target) => {
++                let part = reading.staged.part(target);
++                staged::repair(ctx, &stores, part, &draining, target, plan, now_millis).await?
++            }
++        };
++        match outcome {
+             RepairOutcome::Committed => changed = true,
+             RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
+             RepairOutcome::Aborted => emit_aborted(plan.chunk_id),
+@@ -329,8 +399,9 @@ pub(crate) async fn reconcile(
+     // obligation. Discarding one on the first is silent data loss — the obligation is the
+     // last record saying live data is under-replicated. One rule over the ONE batch both
+     // paths flow into, so no site can drift from it; over a complete reading both behave
+-    // exactly as they always have.
+-    if !reading.incomplete && !drain_only.is_empty() {
++    // exactly as they always have. A staged record this pass could not read is the same hole:
++    // the chunk may be one it stages.
++    if !reading.incomplete && !reading.staged.incomplete() && !drain_only.is_empty() {
+         let mut batch = WriteBatch::new();
+         for chunk in drain_only {
+             batch = batch.delete(repair::repair_key(chunk));
+@@ -338,9 +409,14 @@ pub(crate) async fn reconcile(
+         ctx.meta.commit(batch).await?;
+     }
+ 
+-    // A hole in what this pass may claim: an object it could not read, a repair it may not
+-    // perform, or one it refused because the record it would leave behind could not survive.
+-    let hole = reading.incomplete || !reading.refused.is_empty() || ceiling_refused;
++    // A hole in what this pass may claim: an object or staged record it could not read, a
++    // repair it may not perform, one it refused because the record it would leave behind could
++    // not survive, or one it withheld over a record it cannot read.
++    let hole = reading.incomplete
++        || reading.staged.incomplete()
++        || !reading.refused.is_empty()
++        || ceiling_refused
++        || withheld;
+     Ok(if hole {
+         // **This pass certifies only over the reading it performed.** It either could not
+         // read every committed object, or held back a repair it may not perform — either way
+@@ -383,6 +459,9 @@ struct Reading {
+     /// OBJECT: two obligations inside one segmented object are one refusal, not two. Ordered
+     /// (the store's own byte order), so the audit trail is deterministic.
+     refused: BTreeSet<Vec<u8>>,
++    /// Where each queued chunk that no committed map names is **staged**, read before the
++    /// committed namespace ([`staged::read`]).
++    staged: staged::StagedReading,
+ }
+ 
+ impl Reading {
+@@ -592,25 +671,39 @@ enum Assessment {
+     /// certify. Named and counted once per *object* by [`read_committed`], and kept off the
+     /// repairable-backlog gauge like every other never-repaired condition.
+     Refused,
++    /// A **staged** chunk this pass may not repair yet — still streaming (only an owned `sidx:`
++    /// entry names it), or its session is fenced out of `Open` — carrying the reason for the
++    /// audit line. Not a drain: the obligation stays queued, and the chunk is repaired once its
++    /// part commits, or once it is published (`0016:825`).
++    Deferred(&'static str),
++    /// A **staged** repair this pass will not attempt because a record it would have to rewrite
++    /// cannot be read — the session record, or the `orphan:` mark at a position the move would
++    /// vacate. It never overwrites metadata it cannot parse (ADR-0045): nothing is written, the
++    /// obligation stays queued, the record is named NEEDS-HUMAN where it was met, and the pass
++    /// does not certify.
++    Withheld,
+ }
+ 
+-/// Locate `chunk` in **this pass's own reading** of the committed namespace — never a scan of
+-/// its own — then gather and **verify** its surviving fragments, classifying it into an
+-/// [`Assessment`].
++/// Locate `chunk` in **this pass's own reading** — the committed namespace, then the staged class
++/// — never a scan of its own, then gather and **verify** its surviving fragments, classifying it
++/// into an [`Assessment`].
+ async fn assess(
+     ctx: &ReconstructionContext<'_>,
+     stores: &HashMap<DServerId, &dyn ChunkStore>,
+     reading: &Reading,
++    draining: &BTreeSet<DServerId>,
+     chunk: ChunkId,
+ ) -> Result<Assessment> {
+     let site = match reading.sites.get(&chunk) {
+         Some(Site::Flat(site)) => site,
+         // Refused, not repaired and not discarded: the reference is in a `seg:` record.
+         Some(Site::Refused) => return Ok(Assessment::Refused),
+-        // The chunk is referenced by no committed chunk map — it was deleted out from under
+-        // the obligation. Nothing to repair. Acted on only over a COMPLETE reading:
+-        // `reconcile` gates the one batch both drain paths flow into.
+-        None => return Ok(Assessment::Drain),
++        // The chunk is referenced by no committed chunk map. A multipart upload may still stage
++        // it — this pass read that class first — and only a chunk no staged record names either
++        // was deleted out from under the obligation (`staged::assess` answers `Drain` for it).
++        // Acted on only over a COMPLETE reading of both: `reconcile` gates the one batch both
++        // drain paths flow into.
++        None => return staged::assess(ctx, stores, &reading.staged, draining, chunk).await,
+     };
+     // The reading proved this generation's own map is flat and carried this chunk's own
+     // reference along, so the shape is settled before the assessment starts rather than
+@@ -642,14 +735,53 @@ async fn assess(
+         EcScheme::ReedSolomon { k, m } => (k as usize, m as usize),
+     };
+ 
++    let gathered = gather(ctx, stores, chunk, &placement, chunk_ref.scheme).await?;
++    if let Some(settled) = gathered.settle(k, ctx.topology) {
++        return Ok(settled);
++    }
++
++    Ok(Assessment::Repairable(Box::new(RepairPlan {
++        target: Target::Committed(site.object),
++        chunk_index: site.index,
++        chunk_id: chunk,
++        k,
++        m,
++        survivors: gathered.survivors,
++        survivor_domains: gathered.survivor_domains,
++        missing: gathered.missing,
++        placement,
++        len: chunk_ref.len as usize,
++    })))
++}
++
++/// What gathering one chunk's placed fragments found — shared by the committed and the staged
++/// assessment, so both read a fault, and a survivor, by one rule.
++struct Gathered {
++    /// `(fragment_index, decoded shard bytes)` for each intact survivor.
++    survivors: Vec<(usize, Vec<u8>)>,
++    /// The failure domains the survivors occupy.
++    survivor_domains: Vec<FailureDomain>,
++    /// Fragment indices that are missing or checksum-failing.
++    missing: Vec<usize>,
++    /// How many missing fragments are missing ONLY because their placed D server is
++    /// configured-but-unreachable this pass (`ctx.unreachable`) — transiently unavailable, not
++    /// confirmed lost. Used below to distinguish a recoverable degraded state from real data
++    /// loss (iteration-7 MUST-FIX). Zero in the M3 library contexts (empty `unreachable`), so a
++    /// missing fragment is always `confirmed gone` there — prior semantics unchanged.
++    transient_missing: usize,
++}
++
++/// Fetch and **verify** every fragment `placement` names for `chunk` under `scheme`.
++async fn gather(
++    ctx: &ReconstructionContext<'_>,
++    stores: &HashMap<DServerId, &dyn ChunkStore>,
++    chunk: ChunkId,
++    placement: &[DServerId],
++    scheme: EcScheme,
++) -> Result<Gathered> {
+     let mut survivors = Vec::new();
+     let mut survivor_domains = Vec::new();
+     let mut missing = Vec::new();
+-    // How many missing fragments are missing ONLY because their placed D server is
+-    // configured-but-unreachable this pass (`ctx.unreachable`) — transiently unavailable, not
+-    // confirmed lost. Used below to distinguish a recoverable degraded state from real data
+-    // loss (iteration-7 MUST-FIX). Zero in the M3 library contexts (empty `unreachable`), so a
+-    // missing fragment is always `confirmed gone` there — prior semantics unchanged.
+     let mut transient_missing = 0usize;
+     for (index, &dserver) in placement.iter().enumerate() {
+         let frag = FragmentId {
+@@ -683,7 +815,7 @@ async fn assess(
+         // dependency.
+         match bytes
+             .as_deref()
+-            .and_then(|b| repair::intact_shard(b, frag, chunk_ref.scheme))
++            .and_then(|b| repair::intact_shard(b, frag, scheme))
+         {
+             Some(shard) => {
+                 survivors.push((index, shard));
+@@ -701,49 +833,54 @@ async fn assess(
+             }
+         }
+     }
++    Ok(Gathered {
++        survivors,
++        survivor_domains,
++        missing,
++        transient_missing,
++    })
++}
+ 
+-    if missing.is_empty() {
+-        // Already at full redundancy: a stale / duplicate obligation. Drain it.
+-        return Ok(Assessment::Drain);
+-    }
+-    if survivors.len() < k {
+-        // Below the scheme's tolerance. Distinguish a REACHABILITY-driven shortfall from a
+-        // CONFIRMED one: fragments missing only because their D server is transiently
+-        // unreachable this pass return with the server, so counting them as present may reach
+-        // `k`. Only when even then the chunk is still below `k` is data confirmably LOST
+-        // (iteration-7 MUST-FIX) — otherwise a rolling restart / partition would falsely page
+-        // as permanent data loss on physically-intact fragments.
+-        if survivors.len() + transient_missing >= k {
+-            return Ok(Assessment::Unreachable);
++impl Gathered {
++    /// The assessment this gather settles its chunk on, or `None` when the chunk is repairable
++    /// — placing its rebuilt shard(s) against `topology`.
++    fn settle(&self, k: usize, topology: &Topology) -> Option<Assessment> {
++        if self.missing.is_empty() {
++            // Already at full redundancy: a stale / duplicate obligation. Drain it.
++            return Some(Assessment::Drain);
+         }
+-        return Ok(Assessment::Unrepairable);
+-    }
+-    // Repairable in principle (survivors ≥ `k`). But the rebuild must PLACE each missing shard
+-    // in a failure domain distinct from every survivor's; if no free distinct domain remains
+-    // (a minimal cluster at exactly `n` with a domain down), the repair cannot proceed this
+-    // pass. Route it to the distinct `Blocked` signal rather than the repairable-backlog gauge
+-    // — a never-completable repair counted there would floor the day-one "returns to zero"
+-    // gauge at ≥1 forever (iteration-7 MUST-FIX). It becomes repairable again when a free
+-    // distinct domain (capacity) returns. This mirrors the selector `repair_chunk` runs, so a
+-    // chunk that WOULD abort in the repair loop is diverted before it inflates the backlog.
+-    if select_distinct_domains_excluding(ctx.topology, missing.len() as u16, &survivor_domains)
++        if self.survivors.len() < k {
++            // Below the scheme's tolerance. Distinguish a REACHABILITY-driven shortfall from a
++            // CONFIRMED one: fragments missing only because their D server is transiently
++            // unreachable this pass return with the server, so counting them as present may
++            // reach `k`. Only when even then the chunk is still below `k` is data confirmably
++            // LOST (iteration-7 MUST-FIX) — otherwise a rolling restart / partition would falsely
++            // page as permanent data loss on physically-intact fragments.
++            if self.survivors.len() + self.transient_missing >= k {
++                return Some(Assessment::Unreachable);
++            }
++            return Some(Assessment::Unrepairable);
++        }
++        // Repairable in principle (survivors ≥ `k`). But the rebuild must PLACE each missing
++        // shard in a failure domain distinct from every survivor's; if no free distinct domain
++        // remains (a minimal cluster at exactly `n` with a domain down), the repair cannot
++        // proceed this pass. Route it to the distinct `Blocked` signal rather than the
++        // repairable-backlog gauge — a never-completable repair counted there would floor the
++        // day-one "returns to zero" gauge at ≥1 forever (iteration-7 MUST-FIX). It becomes
++        // repairable again when a free distinct domain (capacity) returns. This mirrors the
++        // selector the repair runs, so a chunk that WOULD abort in the repair loop is diverted
++        // before it inflates the backlog.
++        if select_distinct_domains_excluding(
++            topology,
++            self.missing.len() as u16,
++            &self.survivor_domains,
++        )
+         .is_err()
+-    {
+-        return Ok(Assessment::Blocked);
++        {
++            return Some(Assessment::Blocked);
++        }
++        None
+     }
+-
+-    Ok(Assessment::Repairable(Box::new(RepairPlan {
+-        object: site.object,
+-        chunk_index: site.index,
+-        chunk_id: chunk,
+-        k,
+-        m,
+-        survivors,
+-        survivor_domains,
+-        missing,
+-        placement,
+-        len: chunk_ref.len as usize,
+-    })))
+ }
+ 
+ /// POSIX `EIO` (errno 5) — the OS errno a block-layer read fault raises (a dead sector,
+@@ -801,7 +938,9 @@ enum RepairOutcome {
+     /// The repair could not proceed (e.g. the selector chose a server outside the
+     /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
+     /// aborted plan is not mistaken for a success (see [`emit_aborted`]). Every cause here
+-    /// is **transient**: it clears when the server returns to this pass's fleet view.
++    /// is **transient**: it clears when the server returns to this pass's fleet view — or,
++    /// for a staged re-place, on a later pass that finds a usable destination, pre-marks it
++    /// against records read afresh, and authorizes its write anew ([`staged::repair`]).
+     Aborted,
+     /// The repoint would have crossed the backend value ceiling
+     /// ([`metadata::flat_value_ceiling_crossed`]), so it was refused before anything at all
+diff --git a/crates/custodian/src/scrub.rs b/crates/custodian/src/scrub.rs
+index 6cb797f..0eeaa7a 100644
+--- a/crates/custodian/src/scrub.rs
++++ b/crates/custodian/src/scrub.rs
+@@ -7,7 +7,9 @@
+ //! read path's read-time checksum verification (`0005:262-266`, the read path in
+ //! `crates/core/src/read.rs`). One pass walks the reference set — every
+ //! `(dserver, fragment)` a **committed** chunk map's placement record names
+-//! (`referenced_fragments`) — and, for each one, fetches its bytes **directly from
++//! (`referenced_fragments`), and every one a multipart upload's **committed part** names
++//! (proposal 0016's scrub row, `0016:824`: a staged fragment can rot for the hours a session stays
++//! open) — and, for each one, fetches its bytes **directly from
+ //! its placed D server** ([`ChunkStore::get_fragment`]) rather than only whatever that
+ //! server's own listing happens to return (issue #330: a fragment that is simply
+ //! *absent* from the store is otherwise never observed, because nothing ever asks the
+@@ -35,20 +37,31 @@
+ //! about their integrity. It therefore answers [`Reconciled::Blocked`] rather than certify
+ //! a store it could only partly read — the identical condition GC answers the identical way
+ //! (`crate::gc::reconcile`), because two passes disagreeing about one set is a state an
+-//! operator cannot resolve from outside.
++//! operator cannot resolve from outside. A committed part scrub could not read — a part
++//! record or key that will not decode, a session key naming no upload — is the same hole in
++//! the staged half of the set, answered the same way.
++//!
++//! **Only a committed part's fragments are staged scrub findings.** A still-streaming chunk —
++//! one an owned `sidx:` entry names and no `part:` record does yet — is expected to be
++//! incomplete, and the scheme to verify it against is the one its part record will carry
++//! (`0016:824`), so scrub does not read owned entries at all. A committed part's placement is
++//! held to its exact length: every staged record is born with a full one (`0016:828`), so
++//! the identity fallback a pre-M3 committed map's empty placement gets does not apply, and a
++//! wrong-length one is named and never expanded into phantom findings.
+ //!
+ //! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
+ //! `traits` / `core` seams plus `tracing` — the checksum verify is borrowed from
+ //! `core` (which owns the on-disk-format reader), so `custodian` gains no
+ //! chunk-format dependency and no new on-disk-format knowledge.
+ 
+-use std::collections::HashMap;
++use std::collections::{BTreeMap, HashMap, HashSet};
+ 
+ use wyrd_core::metadata::EcScheme;
++use wyrd_core::multipart::{decode_part_record, parse_part_key};
+ use wyrd_core::repair;
+ use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result};
+ 
+-use crate::gc::referenced_fragments;
++use crate::gc::{object_name, referenced_fragments, walk_staged, StagedRanges, StagedRecord};
+ use crate::reconciliation::Reconciled;
+ 
+ /// What the scrub reconciler reads over: the authoritative metadata store (committed
+@@ -60,7 +73,8 @@ use crate::reconciliation::Reconciled;
+ /// custodian process (Option A, `0005:524-527`). The loop is correct over these
+ /// abstractions and reachable through the real [`crate::reconcile_step`].
+ pub struct ScrubContext<'a> {
+-    /// The authoritative metadata store (chunk maps + the repair queue).
++    /// The authoritative metadata store (chunk maps, multipart part records + the repair
++    /// queue).
+     pub meta: &'a dyn MetadataStore,
+     /// The fleet of D servers to scrub, each addressed by its stable id.
+     pub fleet: &'a [(DServerId, &'a dyn ChunkStore)],
+@@ -69,13 +83,35 @@ pub struct ScrubContext<'a> {
+ /// One scrub reconciliation pass over `ctx`. Dispatched only from
+ /// [`crate::reconcile_step`] (the fenced control point) — never a parallel entry.
+ ///
+-/// Returns [`Reconciled::Blocked`] if any committed object's chunk map could not be read
+-/// (the reference set is **incomplete**: this pass verified everything it could reach and
+-/// certifies nothing over the store — see [`emit_unscrubbable`]), [`Reconciled::Changed`] if
++/// Returns [`Reconciled::Blocked`] if any committed object's chunk map could not be read, or
++/// any committed part (the reference set is **incomplete**: this pass verified everything it
++/// could reach and certifies nothing over the store — see [`emit_unscrubbable`] and
++/// [`emit_unscrubbable_staged`]), [`Reconciled::Changed`] if
+ /// any chunk was enqueued for reconstruction, and [`Reconciled::Satisfied`] otherwise. GC
+ /// answers the identical condition the identical way ([`crate::gc::reconcile`]) — one
+ /// incomplete set, one rule, read twice.
+ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Result<Reconciled> {
++    // The staged half first: every fragment a multipart upload's COMMITTED PART names, with the
++    // scheme its part record carries (`0016:824`). Read before the committed set, the order GC
++    // reads the two classes in (`gc.rs`), so a publication landing mid-pass leaves a chunk in at
++    // least one of them. A part is committed only after every fragment it names has been written
++    // (the part-commit analogue of `write.rs:220`), and GC never reclaims a fragment a part
++    // record names (`crate::gc::StagedSet`), so a missing one is a loss, never a race.
++    let parts = committed_parts(ctx.meta).await?;
++    // Attributed the moment the reading returns, before the next store read, for the reason the
++    // committed set's attribution below explains.
++    for (record, fault) in &parts.unresolvable {
++        emit_unscrubbable_staged(&object_name(record), fault);
++    }
++    for malformed in &parts.malformed {
++        emit_malformed_staged(
++            &object_name(&malformed.record),
++            malformed.chunk,
++            malformed.expected,
++            malformed.actual,
++        );
++    }
++
+     // The reference set: every fragment a *committed* chunk map points at, keyed by
+     // the D server its placement record names. This is the SAME set GC uses as its
+     // safety gate (`crate::gc::referenced_fragments`) — an orphan / pending-garbage
+@@ -133,6 +169,16 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+             by_dserver.entry(dserver).or_default().push((frag, scheme));
+         }
+     }
++    // ...and every committed part's fragment, against the scheme ITS record carries. A fragment a
++    // committed chunk map also places (a publication read mid-flight) is verified once, against
++    // the committed map's scheme, which is the one a reader decodes it by.
++    let mut seen: HashSet<(DServerId, FragmentId)> = HashSet::new();
++    for &(dserver, frag, scheme) in &parts.placed {
++        if referenced.placed.contains(&(dserver, frag)) || !seen.insert((dserver, frag)) {
++            continue;
++        }
++        by_dserver.entry(dserver).or_default().push((frag, scheme));
++    }
+ 
+     let mut changed = false;
+     for &(dserver, store) in ctx.fleet {
+@@ -169,11 +215,12 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+                 // durable-loss category as corruption — the Invariant to restore is
+                 // that a referenced fragment is either present-and-intact or a durable
+                 // repair obligation, never silently absorbed either way. False
+-                // positives are guarded structurally: `referenced` only holds
+-                // COMMITTED chunk-map placements (an in-flight write's provisional map
+-                // is excluded), and GC's own safety gate never reclaims anything in
+-                // this same set — so an `Ok(None)` here can only mean genuine loss,
+-                // not a pending-GC or in-flight-write race.
++                // positives are guarded structurally: the walk only holds COMMITTED
++                // chunk-map placements and COMMITTED part placements (an in-flight
++                // write's provisional map and a still-streaming part's owned entries are
++                // excluded), and GC's own safety gate never reclaims anything either
++                // names — so an `Ok(None)` here can only mean genuine loss, not a
++                // pending-GC or in-flight-write race.
+                 Ok(None) => {
+                     emit_missing(dserver, frag);
+                     repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
+@@ -202,17 +249,130 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
+         }
+     }
+ 
+-    Ok(if !referenced.unresolvable.is_empty() {
+-        // Refuse to certify — whatever else this pass did. The enqueues above are durable in
+-        // the shared repair queue either way, so nothing is lost by reporting the blocker
+-        // instead of the convergence; what reporting `Satisfied` / `Changed` would destroy
+-        // is the only signal that this pass verified only PART of the store.
+-        Reconciled::Blocked
+-    } else if changed {
+-        Reconciled::Changed
+-    } else {
+-        Reconciled::Satisfied
++    Ok(
++        if !referenced.unresolvable.is_empty() || !parts.unresolvable.is_empty() {
++            // Refuse to certify — whatever else this pass did. The enqueues above are durable in
++            // the shared repair queue either way, so nothing is lost by reporting the blocker
++            // instead of the convergence; what reporting `Satisfied` / `Changed` would destroy
++            // is the only signal that this pass verified only PART of the store. A committed part
++            // it could not read is the same hole in the staged half of the set.
++            Reconciled::Blocked
++        } else if changed {
++            Reconciled::Changed
++        } else {
++            Reconciled::Satisfied
++        },
++    )
++}
++
++/// The staged half of what one scrub pass verifies: every fragment a multipart upload's
++/// **committed part** places, for every session listed under `mpu:`, with the scheme its part
++/// record carries — and what the reading could not use.
++#[derive(Default)]
++struct CommittedParts {
++    /// `(dserver, fragment, scheme)` for each fragment a committed part's full-length placement
++    /// names.
++    placed: Vec<(DServerId, FragmentId, EcScheme)>,
++    /// Committed-part chunks whose placement is not one D server per fragment: named, never
++    /// expanded.
++    malformed: Vec<MalformedPart>,
++    /// Staged records this reading could not read at all — a part key or value that will not
++    /// decode, or a session key naming no upload — keyed by their raw key bytes (as
++    /// [`crate::gc::ReferenceSet::unresolvable`] is, for its reasons), valued by the fault. While
++    /// non-empty, the pass certifies nothing.
++    unresolvable: BTreeMap<Vec<u8>, String>,
++}
++
++/// A committed part's chunk whose placement is not exactly one D server per fragment.
++struct MalformedPart {
++    record: Vec<u8>,
++    chunk: ChunkId,
++    expected: u16,
++    actual: usize,
++}
++
++impl CommittedParts {
++    /// Classify one `part:` record: its key and value validated as the staged protection class
++    /// validates them (`crate::gc::StagedSet`), each chunk placed only at a full-length
++    /// placement.
++    fn read(&mut self, key: &[u8], value: &[u8]) {
++        let part = match parse_part_key(key).and_then(|_| decode_part_record(value)) {
++            Ok(part) => part,
++            Err(fault) => {
++                self.unresolvable.insert(key.to_vec(), fault.to_string());
++                return;
++            }
++        };
++        for chunk in part.chunks() {
++            let expected = chunk.fragment_count();
++            if chunk.placement.len() != usize::from(expected) {
++                self.malformed.push(MalformedPart {
++                    record: key.to_vec(),
++                    chunk: chunk.id,
++                    expected,
++                    actual: chunk.placement.len(),
++                });
++                continue;
++            }
++            for (index, dserver) in chunk.fragments() {
++                let frag = FragmentId {
++                    chunk: chunk.id,
++                    index,
++                };
++                self.placed.push((dserver, frag, chunk.scheme));
++            }
++        }
++    }
++}
++
++/// Read [`CommittedParts`] through the staged walk every staged reader shares
++/// ([`walk_staged`]): the committed parts of every listed session, in bounded per-session pages,
++/// never one read of a whole namespace (`0016:890`). A store fault under any read fails the pass.
++async fn committed_parts(meta: &dyn MetadataStore) -> Result<CommittedParts> {
++    let mut parts = CommittedParts::default();
++    walk_staged(meta, StagedRanges::Parts, |record| match record {
++        StagedRecord::UnnamedSession { key, fault } => {
++            parts.unresolvable.insert(key.to_vec(), fault);
++        }
++        // Never met: a `Parts` walk reads no owned entry.
++        StagedRecord::Owned { .. } => {}
++        StagedRecord::Part { key, value, .. } => parts.read(key, value),
+     })
++    .await?;
++    Ok(parts)
++}
++
++/// Emit a staged record scrub could **not** read on the durability-plane seam (ADR-0011 /
++/// ADR-0012): a committed part's key or value that will not decode, or a session key naming no
++/// upload. None of the fragments it names was verified, so the pass refuses to certify the store
++/// — [`emit_unscrubbable`]'s signal for the staged half, under the action GC names the same
++/// record with (`crate::gc`'s `unresolvable-staged-record`).
++fn emit_unscrubbable_staged(record: &str, fault: &str) {
++    tracing::warn!(monotonic_counter.scrub_unresolvable_staged_records = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.scrub.audit",
++        action = "unresolvable-staged-record",
++        record = %record,
++        fault = %fault,
++        "scrub could not read a staged multipart record, so none of the fragments it names was verified this pass; scrub verifies everything else as usual and refuses to certify the store — operator signal",
++    );
++}
++
++/// Emit a committed part whose chunk placement is not one D server per fragment on the
++/// durability-plane seam: truncation or corruption. Scrub fails safe exactly as for a malformed
++/// committed placement ([`emit_malformed`]) — the placement is never expanded into phantom repair
++/// obligations — and names the record so the corruption can be found.
++fn emit_malformed_staged(record: &str, chunk: ChunkId, expected: u16, actual: usize) {
++    tracing::warn!(monotonic_counter.scrub_malformed_staged_placement = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.scrub.audit",
++        action = "malformed-staged-placement",
++        record = %record,
++        chunk = %wyrd_traits::chunk_hex(chunk),
++        expected,
++        actual,
++        "scrub found a committed part whose placement is not one D server per fragment (truncation/corruption); its fragments are not verified by placement and no phantom repair is enqueued — operator signal",
++    );
+ }
+ 
+ /// Emit a committed object scrub could **not** verify, on the durability-plane seam
+diff --git a/crates/custodian/tests/staged_protection.rs b/crates/custodian/tests/staged_protection.rs
+index 0fe4e1a..7693262 100644
+--- a/crates/custodian/tests/staged_protection.rs
++++ b/crates/custodian/tests/staged_protection.rs
+@@ -31,7 +31,8 @@
+ //! - **E** a staged record a pass cannot read, one it cannot trust, and a store fault under a
+ //!   staged read each fail closed — while a session VALUE, which no pass decodes, changes neither
+ //!   pass's answer.
+-//! - **F** scrub and the drain-status query read no upload record (a guard).
++//! - **F** the drain-status query reads no upload record (a guard); scrub reads committed parts
++//!   but no owned entry, and fails closed on a part it cannot read (#663).
+ //!
+ //! Nothing here names a symbol the fix adds: every type, function and string it uses is on
+ //! `main` already.
+@@ -2032,7 +2033,7 @@ async fn a_fault_reading_a_session_part_range_fails_both_passes() {
+     a_store_fault_under_a_staged_read_fails_both_passes("a9", 0x1730, part_range).await;
+ }
+ 
+-// ---- (F) scrub and drain status do not see upload records ---------------------------------------
++// ---- (F) drain status does not see upload records; scrub sees committed parts only --------------
+ 
+ /// What leg F adds to, or arms on, the store holding upload records.
+ #[derive(Clone, Copy, Debug)]
+@@ -2119,13 +2120,15 @@ async fn f_store(uploads: Option<UploadRecords>) -> (Meta, [Disk; 4]) {
+     (meta, d)
+ }
+ 
+-/// What scrub and the drain-status query answered over one store, and the `repair:` keys scrub
+-/// left.
+-#[derive(Debug, PartialEq)]
++/// What scrub and the drain-status query answered over one store, the `repair:` keys scrub left,
++/// and the reads each issued.
+ struct Answers {
+-    scrub: Reconciled,
++    /// `None` when the scrub pass failed.
++    scrub: Option<Reconciled>,
+     drain: ReconciliationStatus,
+     repairs: Vec<Vec<u8>>,
++    scrub_reads: Vec<Read>,
++    drain_reads: Vec<Read>,
+ }
+ 
+ async fn scrub_and_drain_status(meta: &Meta, d: &[Disk; 4], label: &str) -> Answers {
+@@ -2135,9 +2138,12 @@ async fn scrub_and_drain_status(meta: &Meta, d: &[Disk; 4], label: &str) -> Answ
+         meta,
+         fleet: &fleet,
+     };
++    meta.clear_reads();
+     let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW)
+         .await
+-        .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"));
++        .ok();
++    let scrub_reads = meta.reads();
++    meta.clear_reads();
+     let drain = reconciliation_status(meta, DRAINING)
+         .await
+         .unwrap_or_else(|fault| panic!("drain status returned Err over {label}: {fault}"));
+@@ -2145,22 +2151,38 @@ async fn scrub_and_drain_status(meta: &Meta, d: &[Disk; 4], label: &str) -> Answ
+         scrub: scrubbed,
+         drain,
+         repairs: meta.keys_under(b"repair:"),
++        scrub_reads,
++        drain_reads: meta.reads(),
+     }
+ }
+ 
+-/// **(F)** Scrub (`reconcile_step` with a `ScrubContext`) and `reconciliation_status` answer over a
+-/// store holding upload records exactly as over the same store without them — the same
+-/// `Reconciled`, the same `repair:` key for the missing chunk, the same drain status — with the
+-/// upload records healthy, with each (E)(i) damaged record in place, and with each (E)(iii) store
+-/// fault armed; and neither issues a read under `mpu:`, `sidx:` or `part:`. A consumer that does
+-/// not yet act on staged bytes inherits neither their reads, nor their damage, nor their faults
+-/// (`desired_state.rs:178-180`).
++/// The reads in `reads` under any of `prefixes`.
++fn reads_under<'r>(reads: &'r [Read], prefixes: &[&[u8]]) -> Vec<&'r Read> {
++    reads
++        .iter()
++        .filter(|read| {
++            prefixes
++                .iter()
++                .any(|prefix| read.subject().starts_with(prefix))
++        })
++        .collect()
++}
++
++/// **(F)** `reconciliation_status` answers over a store holding upload records exactly as over the
++/// same store without them — with the upload records healthy, with each (E)(i) damaged record in
++/// place, and with each (E)(iii) store fault armed — and issues no read under `mpu:`, `sidx:` or
++/// `part:`: a consumer that does not yet act on staged bytes inherits neither their reads, nor
++/// their damage, nor their faults (`desired_state.rs:178-180`).
+ ///
+-/// A guard: green on base.
+-// deferred: #663, #664 — those slices add upload records to scrub and to drain status, and own
+-// changing this leg.
++/// Scrub DOES act on them since #663 — it verifies a committed part's fragments — and the same
++/// conditions pin how far: it reads the session listing and each session's committed parts, and
++/// never an owned entry (a still-streaming chunk is no scrub finding), so owned-entry damage and a
++/// fault under an owned range leave its answer exactly as without uploads. A part record, part key
++/// or session key it cannot read still leaves the missing committed chunk enqueued, but the pass
++/// refuses to certify (`Blocked`); a store fault under the listing or a part range fails the pass.
++// deferred: #664 — drain status acting on staged bytes, and its half of this leg.
+ #[tokio::test]
+-async fn scrub_and_drain_status_do_not_read_upload_records() {
++async fn drain_status_reads_no_upload_record_and_scrub_reads_no_owned_entry() {
+     capture_audit();
+     let (without, without_disks) = f_store(None).await;
+     let expected =
+@@ -2171,39 +2193,60 @@ async fn scrub_and_drain_status_do_not_read_upload_records() {
+         "scrub must enqueue a repair for the missing chunk, or the comparison below compares \
+          nothing"
+     );
++    assert_eq!(expected.scrub, Some(Reconciled::Changed));
+     assert_eq!(expected.drain, ReconciliationStatus::Pending);
+ 
+-    for uploads in [
+-        UploadRecords::Healthy,
+-        UploadRecords::UndecodablePart,
+-        UploadRecords::UnparsablePartKey,
+-        UploadRecords::OwnedKeyNamingNoChunk,
+-        UploadRecords::SessionKeyNamingNoUpload,
+-        UploadRecords::SessionListingFails,
+-        UploadRecords::OwnedRangeFails,
+-        UploadRecords::PartRangeFails,
++    // What scrub must answer under each condition: `None` is a failed pass.
++    let unchanged = expected.scrub;
++    for (uploads, scrub) in [
++        (UploadRecords::Healthy, unchanged),
++        (UploadRecords::UndecodablePart, Some(Reconciled::Blocked)),
++        (UploadRecords::UnparsablePartKey, Some(Reconciled::Blocked)),
++        (UploadRecords::OwnedKeyNamingNoChunk, unchanged),
++        (
++            UploadRecords::SessionKeyNamingNoUpload,
++            Some(Reconciled::Blocked),
++        ),
++        (UploadRecords::SessionListingFails, None),
++        (UploadRecords::OwnedRangeFails, unchanged),
++        (UploadRecords::PartRangeFails, None),
+     ] {
+         let (with, with_disks) = f_store(Some(uploads)).await;
+-        with.clear_reads();
+         let label = format!("upload records {uploads:?}");
+         let answers = scrub_and_drain_status(&with, &with_disks, &label).await;
++
+         assert_eq!(
+-            answers, expected,
+-            "scrub or drain status answered differently with {label}"
++            answers.drain, expected.drain,
++            "drain status answered differently with {label}"
++        );
++        assert!(
++            !answers.drain_reads.is_empty(),
++            "the read log recorded nothing"
++        );
++        let staged = reads_under(
++            &answers.drain_reads,
++            &[MPU_PREFIX, SIDX_PREFIX, PART_PREFIX],
+         );
+-        let reads = with.reads();
+-        assert!(!reads.is_empty(), "the read log recorded nothing");
+-        let staged: Vec<&Read> = reads
+-            .iter()
+-            .filter(|read| {
+-                [MPU_PREFIX, SIDX_PREFIX, PART_PREFIX]
+-                    .iter()
+-                    .any(|prefix| read.subject().starts_with(prefix))
+-            })
+-            .collect();
+         assert!(
+             staged.is_empty(),
+-            "scrub or drain status read upload records with {label}: {staged:?}"
++            "drain status read upload records with {label}: {staged:?}"
++        );
++
++        assert_eq!(answers.scrub, scrub, "scrub answered wrongly with {label}");
++        if scrub.is_some() {
++            assert_eq!(
++                answers.repairs, expected.repairs,
++                "scrub enqueued differently with {label}"
++            );
++        }
++        let owned = reads_under(&answers.scrub_reads, &[SIDX_PREFIX]);
++        assert!(
++            owned.is_empty(),
++            "scrub read an owned entry with {label}: {owned:?}"
++        );
++        assert!(
++            !reads_under(&answers.scrub_reads, &[MPU_PREFIX]).is_empty(),
++            "scrub did not list the sessions with {label}"
+         );
+     }
+ }
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index a07bf04..894b920 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -3462,6 +3462,448 @@ async fn prop_gc_reclaim_intent_reaches_both_outcomes() {
+     );
+ }
+ 
++// ---- property 15: a staged re-place races a session fence (X29, #663) ----
++//
++// Reconstruction repairs a committed part's rotten fragment by a re-place: it pre-marks the
++// destination, writes the rebuilt fragment there, and adopts it in one CAS pinned to the session
++// still being `Open` at its epoch and to the part record's exact bytes (`0016:825`). A Complete, an
++// Abort or the reaper may fence the session — its own CAS, `Open@E` to `Aborting@E+1` — at any
++// instant. Whichever lands first, no fragment may end unreferenced AND unevidenced: the written
++// destination is either adopted by the part record or covered by its pre-mark, which GC then acts
++// on. And the session may never end `Aborting` with its part record naming a fragment that was not
++// written (`0016:888`).
++//
++// The per-leg cases in `crates/custodian/tests/staged_repair.rs` (C) land the fence at one scripted
++// instant. Here the fence is a genuinely concurrent task over the simulated-TiKV model, landing
++// where the seed puts it, and every read, commit and D-server write the pass makes spans simulated
++// time — so the fence lands before the pre-mark, between the pre-mark and the write, between the
++// write and the adoption, or after it. The coverage leg proves all four are reached.
++
++const REPLACE_UPLOAD: &str = "66306630663066306630663066306630";
++const REPLACE_OBJECT: &str = "replace";
++/// The committed part's chunk: `RS(2, 1)` on servers 0, 1, 2 (domains A, B, C).
++const REPLACE_CHUNK: ChunkId = 0x8050;
++/// The fragment the run rots: index 1, on server 1. Server 1 is kept busy, so the rebuild moves to
++/// domain D, server 3.
++const REPLACE_LOST: u16 = 1;
++const REPLACE_NOW: u64 = 10_000;
++/// A D server's request and reply hops around a fragment write, in simulated milliseconds. Two
++/// each, so the write lands strictly between the pre-mark commit and the adoption's decision with
++/// whole milliseconds on both sides, where a fence can land without tying either.
++const REPLACE_WRITE_HOP: u64 = 2;
++/// How far into the run the fence is drawn, in simulated milliseconds. A reconstruction pass here
++/// takes about 16: eight reads (the queue, the session listing, the owned and part ranges, the
++/// inodes, the drain records, the vacated source's mark and the destination's) of a hop each, the
++/// pre-mark commit (two hops), the write (two hops each way) and the adoption (two hops). The
++/// fence is a two-hop commit of its own, so this spans "before the pass lists the session" through
++/// "after the adoption".
++const REPLACE_SPAN: u32 = 20;
++
++fn replace_frag(index: u16) -> FragmentId {
++    FragmentId {
++        chunk: REPLACE_CHUNK,
++        index,
++    }
++}
++
++/// Where the fence landed, relative to the re-place's own steps.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum FenceWindow {
++    /// Before the pre-mark committed — or before the pass even listed the session.
++    BeforePreMark,
++    /// After the pre-mark committed and before the destination write landed.
++    PreMarkToWrite,
++    /// After the write landed and before the adoption was answered.
++    WriteToAdoption,
++    /// After the adoption was answered.
++    AfterAdoption,
++}
++
++impl FenceWindow {
++    const ALL: [FenceWindow; 4] = [
++        FenceWindow::BeforePreMark,
++        FenceWindow::PreMarkToWrite,
++        FenceWindow::WriteToAdoption,
++        FenceWindow::AfterAdoption,
++    ];
++}
++
++/// One observation at the store seams, in the order the simulation produced them — each logged
++/// the instant its batch applied or its bytes landed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ReplaceEvent {
++    /// The re-place's pre-mark batch was answered.
++    PreMark(CommitOutcome),
++    /// The destination write landed on this server.
++    Written(DServerId),
++    /// The re-place's adoption batch was answered.
++    Adoption(CommitOutcome),
++    /// The fence was answered.
++    Fence(CommitOutcome),
++}
++
++type ReplaceLog = Arc<Mutex<Vec<ReplaceEvent>>>;
++
++/// A recording tap over the simulated-TiKV store: every call forwarded, network hops included, and
++/// each of the three batches the run cares about logged when it is answered. Instance state only
++/// (ADR-0035).
++struct ReplaceMeta {
++    inner: SimTikvMetadataStore,
++    log: ReplaceLog,
++    premark: Vec<u8>,
++}
++
++#[async_trait]
++impl MetadataStore for ReplaceMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<wyrd_traits::ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let puts = |prefix: &[u8]| batch.puts.iter().any(|(key, _)| key.starts_with(prefix));
++        let event: Option<fn(CommitOutcome) -> ReplaceEvent> = if puts(b"mpu:") {
++            Some(ReplaceEvent::Fence)
++        } else if puts(b"part:") {
++            Some(ReplaceEvent::Adoption)
++        } else if batch.puts.iter().any(|(key, _)| *key == self.premark) {
++            Some(ReplaceEvent::PreMark)
++        } else {
++            None
++        };
++        let outcome = self.inner.commit(batch).await?;
++        if let Some(event) = event {
++            self.log.lock().unwrap().push(event(outcome));
++        }
++        Ok(outcome)
++    }
++}
++
++/// A D server whose writes span a request and a reply hop, logging the instant the bytes land.
++struct ReplaceDServer<'a> {
++    id: DServerId,
++    inner: &'a MemDServer,
++    log: ReplaceLog,
++}
++
++#[async_trait]
++impl ChunkStore for ReplaceDServer<'_> {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        madsim::time::sleep(Duration::from_millis(REPLACE_WRITE_HOP)).await;
++        self.inner
++            .put_fragment(id, fragment, deadline_millis)
++            .await?;
++        self.log
++            .lock()
++            .unwrap()
++            .push(ReplaceEvent::Written(self.id));
++        madsim::time::sleep(Duration::from_millis(REPLACE_WRITE_HOP)).await;
++        Ok(())
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        self.inner.get_fragment(id).await
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        self.inner.list_fragments().await
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.inner.delete_fragment(id).await
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++/// A session record targeting [`REPLACE_OBJECT`] at `epoch` in `state` (its JSON), as the base
++/// decoder spells it and checked against it.
++fn replace_session(epoch: u64, state: &str) -> Bytes {
++    let bytes = format!(
++        "{{\"parent\":{ROOT},\"object\":\"{REPLACE_OBJECT}\",\"created_at_millis\":100,\
++         \"clock_source\":\"wall\",\"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
++    )
++    .into_bytes();
++    decode_session_record(&bytes).expect("the seeded session record decodes");
++    Bytes::from(bytes)
++}
++
++/// The committed part record naming `chunk`, as the base decoder spells it and checked against it.
++fn replace_part(chunk: &ChunkRef) -> Bytes {
++    let bytes = format!(
++        "{{\"chunks\":[{}],\"len\":{},\"digest\":\"{}\",\"committed_at_millis\":800,\
++         \"session_epoch\":1}}",
++        String::from_utf8(metadata::encode(chunk).to_vec()).unwrap(),
++        chunk.len,
++        "ef".repeat(32)
++    )
++    .into_bytes();
++    decode_part_record(&bytes).expect("the seeded part record decodes");
++    Bytes::from(bytes)
++}
++
++/// Which window a run's fence landed in, read off the log.
++fn fence_window(events: &[ReplaceEvent]) -> FenceWindow {
++    let at = |wanted: fn(&ReplaceEvent) -> bool| events.iter().position(wanted);
++    let fence = at(|event| *event == ReplaceEvent::Fence(CommitOutcome::Committed))
++        .expect("the fence never landed");
++    let premark = at(|event| *event == ReplaceEvent::PreMark(CommitOutcome::Committed));
++    let written = at(|event| matches!(event, ReplaceEvent::Written(_)));
++    let adoption = at(|event| matches!(event, ReplaceEvent::Adoption(_)));
++    if premark.is_none_or(|premark| fence < premark) {
++        FenceWindow::BeforePreMark
++    } else if written.is_none_or(|written| fence < written) {
++        FenceWindow::PreMarkToWrite
++    } else if adoption.is_none_or(|adoption| fence < adoption) {
++        FenceWindow::WriteToAdoption
++    } else {
++        FenceWindow::AfterAdoption
++    }
++}
++
++/// One run: a reconstruction pass re-places the committed part's rotten fragment while a
++/// concurrent task fences the session `delay_millis` into the run. Asserts the invariants over what
++/// the run left behind, and returns where the fence landed.
++async fn replace_under_a_fence(delay_millis: u64) -> FenceWindow {
++    let d = servers();
++    let log: ReplaceLog = Arc::default();
++    let meta = Arc::new(ReplaceMeta {
++        inner: SimTikvMetadataStore::new(),
++        log: Arc::clone(&log),
++        premark: metadata::orphan_key(3, replace_frag(REPLACE_LOST)),
++    });
++    let upload = UploadId::new(REPLACE_UPLOAD).expect("32 lowercase-hex characters");
++    let session_key = mpu_key(&upload);
++    let part_key = part_key(&upload, PartNumber::new(1).expect("a part number in range"));
++    let open = replace_session(1, "{\"kind\":\"Open\"}");
++    let aborting = replace_session(2, "{\"kind\":\"Aborting\"}");
++    let scheme = EcScheme::ReedSolomon {
++        k: K as u8,
++        m: M as u8,
++    };
++
++    // An `Open` session with one committed part naming the chunk, every fragment on its server.
++    let data = b"a staged part's chunk the custodian re-places under a session fence";
++    let fragments: Vec<Bytes> = wyrd_core::erasure::encode(K, M, data)
++        .unwrap()
++        .iter()
++        .enumerate()
++        .map(|(index, shard)| {
++            write::encode_ec_fragment(REPLACE_CHUNK, index as u16, K as u8, M as u8, shard)
++        })
++        .collect();
++    let original: Vec<DServerId> = vec![0, 1, 2];
++    let chunk = ChunkRef {
++        id: REPLACE_CHUNK,
++        scheme,
++        len: data.len() as u64,
++        placement: original.clone(),
++    };
++    let seeded = meta
++        .commit(
++            WriteBatch::new()
++                .put(session_key.clone(), open.clone())
++                .put(part_key.clone(), replace_part(&chunk)),
++        )
++        .await
++        .unwrap();
++    assert_eq!(seeded, CommitOutcome::Committed);
++    for (index, &server) in original.iter().enumerate() {
++        d[server as usize]
++            .put_fragment(replace_frag(index as u16), fragments[index].clone(), None)
++            .await
++            .unwrap();
++    }
++    // The fragment rots on server 1, and scrub has queued its repair.
++    let mut rotten = fragments[usize::from(REPLACE_LOST)].to_vec();
++    rotten[CORE_HEADER_LEN as usize] ^= 0x01;
++    d[1].put_fragment(replace_frag(REPLACE_LOST), Bytes::from(rotten), None)
++        .await
++        .unwrap();
++    repair::enqueue_repair(&*meta, REPLACE_CHUNK, "scrub")
++        .await
++        .unwrap();
++    // The run starts here: what the fixture wrote above is not the race.
++    log.lock().unwrap().clear();
++
++    let fencer = madsim::task::spawn({
++        let meta = Arc::clone(&meta);
++        let (key, open, aborting) = (session_key.clone(), open.clone(), aborting.clone());
++        async move {
++            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
++            if delay_millis > 0 {
++                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
++            }
++            // The model locks a batch's precondition keys too, so the fence can lose a lock race
++            // to an in-flight pre-mark or adoption pinned to the same session; it retries, as a
++            // Complete or an Abort retries its CAS. Nothing else writes the session, so it lands.
++            for _ in 0..REPLACE_SPAN {
++                let fence = WriteBatch::new()
++                    .require(key.clone(), open.clone())
++                    .put(key.clone(), aborting.clone());
++                if meta.commit(fence).await.unwrap() == CommitOutcome::Committed {
++                    return true;
++                }
++                madsim::time::sleep(Duration::from_millis(1)).await;
++            }
++            false
++        }
++    });
++
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord, "zone-staged-replace").await;
++    let disks: Vec<ReplaceDServer<'_>> = d
++        .iter()
++        .enumerate()
++        .map(|(id, inner)| ReplaceDServer {
++            id: id as DServerId,
++            inner,
++            log: Arc::clone(&log),
++        })
++        .collect();
++    let fleet: Vec<(DServerId, &dyn ChunkStore)> = disks
++        .iter()
++        .map(|disk| (disk.id, disk as &dyn ChunkStore))
++        .collect();
++    let mut topology = four_domains();
++    topology.set_utilization(1, 100);
++    let ctx = ReconstructionContext {
++        meta: &*meta,
++        fleet: &fleet,
++        topology: &topology,
++        unreachable: &[],
++    };
++    let outcome =
++        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, REPLACE_NOW).await;
++    assert!(
++        outcome.is_ok(),
++        "the reconstruction pass failed (fence at {delay_millis} ms): {:?}",
++        outcome.err()
++    );
++    let fenced = fencer.await.expect("the fencer ran to completion");
++    assert!(
++        fenced,
++        "the fence never landed (fence at {delay_millis} ms): {:?}",
++        log.lock().unwrap()
++    );
++    let events = log.lock().unwrap().clone();
++
++    let part = meta.get(&part_key).await.unwrap().expect("the part record");
++    let part = decode_part_record(&part).expect("the part record decodes");
++    let placement = part.chunks()[0].placement.clone();
++    let adopted = events.contains(&ReplaceEvent::Adoption(CommitOutcome::Committed));
++    assert_eq!(
++        adopted,
++        placement != original,
++        "the adoption's answer and the part record disagree (fence at {delay_millis} ms): \
++         {events:?}"
++    );
++    assert_eq!(
++        meta.get(&session_key).await.unwrap(),
++        Some(aborting),
++        "the session did not end fenced"
++    );
++
++    // NO FRAGMENT ENDS UNREFERENCED AND UNEVIDENCED: every fragment on every server is named by
++    // the part record, or covered by an `orphan:` mark GC acts on.
++    for (id, disk) in d.iter().enumerate() {
++        let id = id as DServerId;
++        for fragment in disk.list_fragments().await.unwrap() {
++            let referenced = fragment.chunk == REPLACE_CHUNK
++                && placement.get(usize::from(fragment.index)) == Some(&id);
++            let evidenced = meta
++                .get(&metadata::orphan_key(id, fragment))
++                .await
++                .unwrap()
++                .is_some();
++            assert!(
++                referenced || evidenced,
++                "fragment {fragment:?} on server {id} is neither named nor marked (fence at \
++                 {delay_millis} ms): {events:?}"
++            );
++        }
++    }
++    // THE ABORTING SESSION'S PART RECORD NAMES NO FRAGMENT THAT WAS NOT WRITTEN: every position it
++    // names holds its fragment, and one the re-place moved it to holds the intact rebuild.
++    for (index, &server) in placement.iter().enumerate() {
++        let fragment = replace_frag(index as u16);
++        let held = d[server as usize]
++            .get_fragment(fragment)
++            .await
++            .unwrap()
++            .unwrap_or_else(|| {
++                panic!(
++                    "the part record names {fragment:?} on server {server}, which holds nothing \
++                     (fence at {delay_millis} ms): {events:?}"
++                )
++            });
++        if server != original[index] {
++            assert!(
++                repair::fragment_intact(&held, fragment, scheme),
++                "the part record was moved onto a fragment that is not the rebuild (fence at \
++                 {delay_millis} ms): {events:?}"
++            );
++        }
++    }
++    // The obligation goes only with the repair that satisfies it.
++    let queued = repair::queued_repairs(&*meta)
++        .await
++        .unwrap()
++        .contains(&REPLACE_CHUNK);
++    assert_eq!(
++        queued, !adopted,
++        "the obligation outlived the repair, or went without one (fence at {delay_millis} ms): \
++         {events:?}"
++    );
++    fence_window(&events)
++}
++
++/// The campaign leg: the seed picks where the fence lands, so 50 seeds sweep the re-place.
++async fn prop_staged_replace_never_strands_under_a_fence(rng: &mut ChaCha8Rng) {
++    let delay = u64::from(rng.next_u32() % (REPLACE_SPAN + 1));
++    replace_under_a_fence(delay).await;
++}
++
++/// **Every window is genuinely REACHED.** Walks the fence across the whole span, asserting the
++/// invariants at every point, then asserts that the fence landed before the pre-mark in some run,
++/// between the pre-mark and the write in another, between the write and the adoption in another,
++/// and after the adoption in another. Without it, a span that drifted away from the re-place would
++/// leave the campaign green with nothing behind it.
++async fn prop_staged_replace_reaches_every_fence_window() {
++    let mut reached = Vec::new();
++    for delay in 0..=u64::from(REPLACE_SPAN) {
++        let window = replace_under_a_fence(delay).await;
++        if !reached.contains(&window) {
++            reached.push(window);
++        }
++    }
++    for window in FenceWindow::ALL {
++        assert!(
++            reached.contains(&window),
++            "no fence in 0..={REPLACE_SPAN} ms landed {window:?}: reached only {reached:?}"
++        );
++    }
++}
++
+ // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
+ 
+ /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
+@@ -3580,6 +4022,18 @@ dst_campaign_test! {
+     }
+ }
+ 
++dst_campaign_test! {
++    async fn staged_replace_never_strands_under_a_fence() {
++        prop_staged_replace_never_strands_under_a_fence(&mut rand_seed()).await;
++    }
++}
++
++dst_campaign_test! {
++    async fn staged_replace_reaches_every_fence_window() {
++        prop_staged_replace_reaches_every_fence_window().await;
++    }
++}
++
+ // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
+ 
+ /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
+@@ -3615,6 +4069,7 @@ dst_campaign_test! {
+             prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
+             prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
+             prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
++            prop_staged_replace_never_strands_under_a_fence(&mut rng).await;
+         }
+     }
+ }
+diff --git a/crates/custodian/src/reconstruction/staged.rs b/crates/custodian/src/reconstruction/staged.rs
+new file mode 100644
+index 0000000..e4c28e9
+--- /dev/null
++++ b/crates/custodian/src/reconstruction/staged.rs
+@@ -0,0 +1,661 @@
++//! Reconstruction's **staged** half (proposal 0016 decision 2's reconstruction row, `0016:825`; its
++//! failure rows `0016:887-889`; the pre-mark and write-deadline rules, `0016:1285-1358`): resolving
++//! a repair obligation for a chunk a multipart upload **stages** — named by a committed part
++//! (`part:`) or by an owned staging entry (`sidx:`), and by no committed chunk map — and repairing
++//! a committed part's chunk by a fenced **re-place**.
++//!
++//! Scrub verifies a committed part's fragments exactly as it verifies a committed map's
++//! (`crate::scrub`) and enqueues the ordinary obligation. Without this module that obligation
++//! found no committed map, was assessed `Drain` and discarded, and the part stayed one fragment
++//! short until it was published — or for good, if it never was. Here it resolves to its part
++//! record, and the chunk is re-placed by the destination-pre-mark rule every move that adopts a
++//! pre-written fragment follows:
++//!
++//! ```text
++//! pre-mark: require(mpu == Open@E) ∧ require(part == prior) ∧ each destination's mark as read
++//!           ──► orphan:<P_new> = { now, event }      (a FRESH stamp, whatever was there before)
++//! write:    put_fragment(P_new, rebuilt shard, deadline = now + W_WRITE)   (refused once past)
++//! adopt:    require(mpu == Open@E) ∧ require(part == prior) ∧ require(orphan:<P_new> == pre-mark)
++//!           ∧ require_absent(desired:dserver:<S_new>) ∧ each vacated source's mark as read
++//!           ──► part: placement P_old → P_new, delete orphan:<P_new>,
++//!               orphan:<P_old> = { now, event }, delete repair:<chunk>
++//! ```
++//!
++//! **No outcome strands a fragment.** Every fragment the re-place writes is, at every instant,
++//! either adopted by the part record or covered by its pre-mark, because the pre-mark is durable
++//! before the write is sent and is deleted only by the batch that adopts the fragment. So:
++//!
++//! - a fence before the pre-mark — a Complete, an Abort or a reaper moving the session out of
++//!   `Open@E`, or a writer replacing the part record — makes the pre-mark batch lose, and nothing
++//!   is written at all;
++//! - a fence after it makes the adoption lose (X29, `0016:888`): the part record is left
++//!   byte-identical, the pre-mark stands over whatever was written so GC reclaims it after grace,
++//!   and the obligation stays queued — a repair blocked by a Complete is retried once the chunk is
++//!   published;
++//! - a drain recorded on the destination after it was chosen makes the adoption lose on
++//!   `require_absent(desired:dserver:<S_new>)` (`0016:885`: the fence that closes an intent's
++//!   placement closes a re-place's destination too), with the same pre-mark standing;
++//! - GC deciding to reclaim the pre-mark — it records `reclaiming` before it deletes anything
++//!   (`crate::gc`, `0016:1312-1336`) — makes the adoption lose on the pre-mark's exact bytes,
++//!   whatever the adoption's latency;
++//! - and the adoption itself is the one batch that removes the obligation, so an obligation goes
++//!   only once the repair is durable.
++//!
++//! **One clock for the move's whole lifecycle.** The pre-mark and the vacated source's mark are
++//! stamped with this pass's clock reading (`now_millis` — in the deployed loop, the wall clock the
++//! role hands every pass), GC ages both on that same clock, and the destination write's
++//! authorization deadline is fixed from that same reading: `now_millis + W_WRITE_MILLIS`. The D
++//! server enforces the deadline on its own clock, within `δ_clock` of this one (`ChunkStore::
++//! put_fragment`, #638). Two consequences carry the pre-mark rules (`0016:1338-1358`):
++//!
++//! - the write is authorized at the pre-mark's own stamp, so the pre-mark's age at authorization
++//!   is zero — below any `W_repoint` — and a pre-mark from an earlier attempt is never used as
++//!   this one's: a destination's existing mark, whatever event wrote it and however young it is,
++//!   is re-stamped fresh under a precondition on its exact bytes, so GC's clock for it restarts
++//!   before the write is sent. No write is ever authorized on a stale pre-mark;
++//! - a worker that stalls after the pre-mark commits — the pause `W_repoint` exists for — only
++//!   delivers an authorization whose deadline is already fixed, and the D server refuses it once
++//!   that deadline passes. So any fragment this re-place writes lands before
++//!   `stamp + W_WRITE_MILLIS` on the acceptor's clock, strictly inside its pre-mark's grace
++//!   ([`W_WRITE_MILLIS`] states the sizing): no fragment is written after its evidence may have
++//!   been reclaimed.
++//!
++//! **What it cannot read, it does not rewrite** (ADR-0045). A session record that will not decode,
++//! or a vacated source whose `orphan:` value is none of the three mark shapes, withholds the whole
++//! repair before anything is written — named NEEDS-HUMAN, the obligation kept, the pass not
++//! certified ([`Assessment::Withheld`]). A destination whose mark will not decode, or is already
++//! `reclaiming`, is never used: another is chosen.
++
++use std::collections::{BTreeSet, HashMap, HashSet};
++
++use wyrd_core::metadata::{
++    self, decode_orphan_mark, encode_orphan_mark, orphan_key, EcScheme, OrphanMark,
++};
++use wyrd_core::multipart::{
++    decode_owned_entry, decode_part_record, decode_session_record, mpu_key, parse_part_key,
++    parse_sidx_key, PartRecord, SessionState,
++};
++use wyrd_core::placement::select_distinct_domains_excluding;
++use wyrd_core::write::encode_ec_fragment;
++use wyrd_core::{erasure, repair};
++use wyrd_traits::{
++    is_write_deadline_expired, BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId,
++    MetadataStore, Result, WriteBatch,
++};
++
++use super::{gather, Assessment, ReconstructionContext, RepairOutcome, RepairPlan, Target};
++use crate::desired_state::desired_key;
++use crate::gc::{object_name, walk_staged, StagedRanges, StagedRecord};
++
++/// `W_write` for a staged re-place's destination write, in milliseconds: how long after its
++/// pre-mark was stamped the write may still take effect (`0016:1478-1479`). The D server refuses it
++/// from `stamp + W_WRITE_MILLIS` on, and the repair is retried by a later pass.
++///
++/// Sized against the deployed orphan grace `G_orphan` — 60 s, the lease TTL the deployed GC pass
++/// derives its window from (`crates/server/src/custodian.rs:114`) — under the strict
++/// `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`). This re-place authorizes its write at
++/// the pre-mark's own stamp, so none of that budget is spent between pre-mark and authorization,
++/// and 40 s of it is left for the skew between the custodian's clock and a D server's.
++const W_WRITE_MILLIS: u64 = 20_000;
++
++/// This pass's reading of the staged class, for the chunks it owes a repair on. Read BEFORE the
++/// committed namespace (`super::reconcile` says why), through the one session walk every staged
++/// reader shares ([`walk_staged`]).
++#[derive(Default)]
++pub(super) struct StagedReading {
++    /// One entry per committed part this pass owes a repair inside, held once and shared by every
++    /// obligation inside it — an object is held only if a repair is owed inside it.
++    parts: Vec<StagedPart>,
++    /// Each owed chunk a committed part names: the first such part in key order.
++    sites: HashMap<ChunkId, StagedSite>,
++    /// Owed chunks only an owned staging entry names: their part is still streaming.
++    in_flight: HashSet<ChunkId>,
++    /// A staged record this pass could not read at all, so the reading has a hole in it: a chunk
++    /// it owes may be one that record stages. Each is named where it was met.
++    incomplete: bool,
++}
++
++/// One committed part this pass owes a repair inside, as the walk read it: the snapshot every
++/// repair inside it is built from and conditioned on.
++pub(super) struct StagedPart {
++    /// The owning session's key, and its value exactly as the listing read it. Both batches of a
++    /// re-place are pinned to these bytes — `require(mpu == Open@E)` — and every transition
++    /// rewrites them, bumping the epoch, so any fence fails the re-place.
++    session_key: Vec<u8>,
++    session: Vec<u8>,
++    /// The part record's key, and its bytes exactly as read — the adoption's other pin,
++    /// `require(part == prior)`.
++    key: Vec<u8>,
++    prior: Vec<u8>,
++    /// Those bytes, decoded.
++    record: PartRecord,
++}
++
++/// Where an owed chunk sits in [`StagedReading::parts`].
++struct StagedSite {
++    part: usize,
++    /// The chunk's index within that part's own chunk list.
++    index: usize,
++}
++
++/// What a staged [`RepairPlan`] repoints: its part, and the `orphan:` mark this pass read at each
++/// position the move would vacate — one per missing fragment, in the plan's `missing` order. The
++/// adoption is preconditioned on each, so a mark that changes under it fails the CAS rather than
++/// being overwritten.
++pub(super) struct StagedTarget {
++    part: usize,
++    vacated: Vec<SourceMark>,
++}
++
++/// The `orphan:` mark at a position a re-place would vacate, as the assessment read it.
++enum SourceMark {
++    /// No mark: the adoption writes one, under `require_absent`.
++    Absent,
++    /// A legacy or structured mark, stale evidence from another unreference event: re-stamped
++    /// with this move's identity and stamp (`0016:1216-1224`), under a precondition on these
++    /// exact bytes.
++    Stamped(Vec<u8>),
++    /// GC has already recorded its decision to reclaim the position. No writer replaces such a
++    /// mark (`metadata::OrphanMark`), and none needs to: it already evidences the vacated bytes,
++    /// and GC finishes the reclaim once no record names them.
++    Reclaiming,
++}
++
++impl StagedReading {
++    /// Whether any queued chunk resolved to a committed part — the only case a re-place can run.
++    pub(super) fn owes_repairs(&self) -> bool {
++        !self.sites.is_empty()
++    }
++
++    /// Whether a staged record this pass could not read left a hole in the reading.
++    pub(super) fn incomplete(&self) -> bool {
++        self.incomplete
++    }
++
++    /// The part a staged plan repoints.
++    pub(super) fn part(&self, target: &StagedTarget) -> &StagedPart {
++        &self.parts[target.part]
++    }
++
++    /// Contain one staged record this reading could not read: name it for the operator where it
++    /// was met, and record that the reading now has a hole in it.
++    fn contain(&mut self, key: &[u8], fault: &str) {
++        emit_unresolvable_staged(&object_name(key), fault);
++        self.incomplete = true;
++    }
++
++    /// Classify one owned staging entry through the namespace's one decode entry point.
++    fn read_owned(&mut self, owed: &HashSet<ChunkId>, key: &[u8], value: &[u8]) {
++        let chunk = match decode_owned_entry(key, value) {
++            Ok((_part, chunk, _entry)) => chunk,
++            // The value will not decode, but the key still names its chunk: a staged record
++            // names it all the same — one that cannot be trusted, which is no reason to drop the
++            // chunk's obligation.
++            Err(_) => match parse_sidx_key(key) {
++                Ok((_upload, _part, chunk)) => chunk,
++                Err(fault) => return self.contain(key, &fault.to_string()),
++            },
++        };
++        if owed.contains(&chunk) {
++            self.in_flight.insert(chunk);
++        }
++    }
++
++    /// Classify one committed part: its key and value validated as the staged protection class
++    /// validates them (`crate::gc::StagedSet`), and held only if it names a chunk this pass owes.
++    fn read_part(&mut self, owed: &HashSet<ChunkId>, key: &[u8], value: &[u8], session: &[u8]) {
++        let read = parse_part_key(key)
++            .and_then(|(upload, _part)| Ok((upload, decode_part_record(value)?)));
++        let (upload, record) = match read {
++            Ok(read) => read,
++            Err(fault) => return self.contain(key, &fault.to_string()),
++        };
++        let named: Vec<(usize, ChunkId)> = record
++            .chunks()
++            .iter()
++            .enumerate()
++            .filter(|(_, chunk)| owed.contains(&chunk.id) && !self.sites.contains_key(&chunk.id))
++            .map(|(index, chunk)| (index, chunk.id))
++            .collect();
++        if named.is_empty() {
++            return;
++        }
++        self.parts.push(StagedPart {
++            session_key: mpu_key(&upload),
++            session: session.to_vec(),
++            key: key.to_vec(),
++            prior: value.to_vec(),
++            record,
++        });
++        let part = self.parts.len() - 1;
++        for (index, chunk) in named {
++            // The FIRST reference in key order wins, as the committed reading's does.
++            self.sites
++                .entry(chunk)
++                .or_insert(StagedSite { part, index });
++        }
++    }
++}
++
++/// Read this pass's [`StagedReading`] for `queue`: every listed session's owned entries, then its
++/// committed parts, in bounded pages, never one read of a whole namespace (`0016:890`). A record
++/// this pass cannot read is contained and named; a store fault under any read fails the pass.
++pub(super) async fn read(meta: &dyn MetadataStore, queue: &[ChunkId]) -> Result<StagedReading> {
++    let owed: HashSet<ChunkId> = queue.iter().copied().collect();
++    let mut reading = StagedReading::default();
++    walk_staged(meta, StagedRanges::OwnedThenParts, |record| match record {
++        StagedRecord::UnnamedSession { key, fault } => reading.contain(key, &fault),
++        StagedRecord::Owned { key, value } => reading.read_owned(&owed, key, value),
++        StagedRecord::Part {
++            key,
++            value,
++            session,
++        } => reading.read_part(&owed, key, value, session),
++    })
++    .await?;
++    Ok(reading)
++}
++
++/// Assess an owed chunk no committed chunk map names, against the staged class.
++///
++/// A chunk no staged record names either was deleted out from under the obligation: `Drain`,
++/// acted on only over a complete reading of both classes (`super::reconcile`). One only an owned
++/// entry names is still streaming, and one whose session is not `Open` is fenced: both keep
++/// their obligation ([`Assessment::Deferred`]). A committed part's chunk is gathered and verified
++/// exactly as a committed one is, against the scheme its part record carries — its placement held
++/// to the exact length every staged record is born with (`0016:828`), and its rebuild placed
++/// against the topology WITHOUT the servers an operator is draining (`0016:885`).
++pub(super) async fn assess(
++    ctx: &ReconstructionContext<'_>,
++    stores: &HashMap<DServerId, &dyn ChunkStore>,
++    staged: &StagedReading,
++    draining: &BTreeSet<DServerId>,
++    chunk: ChunkId,
++) -> Result<Assessment> {
++    let Some(site) = staged.sites.get(&chunk) else {
++        if staged.in_flight.contains(&chunk) {
++            return Ok(Assessment::Deferred("in-flight"));
++        }
++        return Ok(Assessment::Drain);
++    };
++    let part = &staged.parts[site.part];
++    // Only an `Open` session's part may be repointed: the re-place is fenced exactly like a part
++    // upload, and every other state has already fenced it. The adoption is pinned to these same
++    // bytes, so a session fenced after this read still fails it.
++    match decode_session_record(&part.session) {
++        Ok(session) if matches!(session.state(), SessionState::Open {}) => {}
++        Ok(_) => return Ok(Assessment::Deferred("session-fenced")),
++        Err(fault) => {
++            emit_withheld(&object_name(&part.session_key), &fault.to_string());
++            return Ok(Assessment::Withheld);
++        }
++    }
++    let chunk_ref = &part.record.chunks()[site.index];
++    if chunk_ref.placement.len() != usize::from(chunk_ref.fragment_count()) {
++        return Ok(Assessment::Malformed);
++    }
++    let (k, m) = match chunk_ref.scheme {
++        EcScheme::None => return Ok(Assessment::Unrepairable),
++        EcScheme::ReedSolomon { k, m } => (usize::from(k), usize::from(m)),
++    };
++    let gathered = gather(ctx, stores, chunk, &chunk_ref.placement, chunk_ref.scheme).await?;
++    if let Some(settled) = gathered.settle(k, &ctx.topology.excluding(draining)) {
++        return Ok(settled);
++    }
++    // The mark at each position the move would vacate, read now so that one no writer can parse
++    // withholds the repair before anything is written — pre-mark, fragment or record.
++    let mut vacated = Vec::with_capacity(gathered.missing.len());
++    for &index in &gathered.missing {
++        let key = orphan_key(chunk_ref.placement[index], fragment(chunk, index));
++        vacated.push(match ctx.meta.get(&key).await? {
++            None => SourceMark::Absent,
++            Some(current) => match decode_orphan_mark(&current) {
++                Ok(mark) if mark.is_reclaiming() => SourceMark::Reclaiming,
++                Ok(_) => SourceMark::Stamped(current.to_vec()),
++                Err(fault) => {
++                    emit_withheld(&object_name(&key), &fault.to_string());
++                    return Ok(Assessment::Withheld);
++                }
++            },
++        });
++    }
++    Ok(Assessment::Repairable(Box::new(RepairPlan {
++        target: Target::Staged(StagedTarget {
++            part: site.part,
++            vacated,
++        }),
++        chunk_index: site.index,
++        chunk_id: chunk,
++        k,
++        m,
++        survivors: gathered.survivors,
++        survivor_domains: gathered.survivor_domains,
++        missing: gathered.missing,
++        placement: chunk_ref.placement.clone(),
++        len: chunk_ref.len as usize,
++    })))
++}
++
++/// The mark at a destination position, as the choice of destination read it.
++enum DestinationMark {
++    /// No mark: the pre-mark is written under `require_absent`.
++    Absent,
++    /// A legacy or structured mark: re-stamped fresh, never reused with its old stamp, under a
++    /// precondition on these exact bytes.
++    Stamped(Vec<u8>),
++}
++
++/// Where one rebuilt fragment goes.
++struct Destination<'s> {
++    /// The fragment index it rebuilds — one of the plan's `missing`, in its order.
++    index: usize,
++    dserver: DServerId,
++    store: &'s dyn ChunkStore,
++    mark: DestinationMark,
++}
++
++/// Re-place `plan`'s missing fragment(s) of a committed part's chunk: rebuild, pre-mark each
++/// destination, write, and adopt in one CAS pinned to the session and the part record — the
++/// sequence and its guarantees are this module's own doc.
++///
++/// Returns [`RepairOutcome::Aborted`] when the re-place stopped before it could adopt anything and
++/// may simply be retried — no usable destination, a pre-mark that lost its precondition, a write
++/// refused past its deadline — [`RepairOutcome::Conflict`] when the adoption lost, and
++/// [`RepairOutcome::Refused`] when the repointed part record would cross the value ceiling. A
++/// transient store fault fails the pass, as it does on the committed path; every pre-mark already
++/// written covers whatever landed.
++pub(super) async fn repair(
++    ctx: &ReconstructionContext<'_>,
++    stores: &HashMap<DServerId, &dyn ChunkStore>,
++    part: &StagedPart,
++    draining: &BTreeSet<DServerId>,
++    target: &StagedTarget,
++    plan: &RepairPlan,
++    now_millis: u64,
++) -> Result<RepairOutcome> {
++    let (k, m, chunk) = (plan.k, plan.m, plan.chunk_id);
++
++    // Reconstruct the chunk's logical bytes from any `k` survivors and re-derive every shard
++    // (`erasure::encode` is deterministic, so a rebuilt shard is byte-identical to the original).
++    let data = erasure::reconstruct(k, m, plan.len, &plan.survivors)?;
++    let shards = erasure::encode(k, m, &data)?;
++
++    let Some(destinations) = choose_destinations(ctx, stores, draining, plan).await? else {
++        emit_aborted_reason(chunk, "no-usable-destination");
++        return Ok(RepairOutcome::Aborted);
++    };
++
++    // The part record the adoption would leave behind, judged before anything is written, as the
++    // committed path judges its record (`super::repair_chunk`).
++    let next = repointed_part(part, plan.chunk_index, &destinations)?;
++    if let Some(ceiling) = metadata::flat_value_ceiling_crossed(&next) {
++        return Ok(RepairOutcome::Refused {
++            bytes: next.len(),
++            ceiling,
++        });
++    }
++
++    // PRE-MARK every destination, durably, before any write is sent: from here on a fragment the
++    // re-place writes is covered by evidence GC acts on, whichever way the adoption goes. Fresh —
++    // stamped by this pass's clock under a per-move event, whatever mark was there before — and
++    // pinned to the session and the part record, so a fence that already landed writes nothing.
++    let event = format!("replace:{chunk:x}:{now_millis}");
++    let mark = encode_orphan_mark(&OrphanMark::structured(now_millis, event)?);
++    let mut premark = WriteBatch::new()
++        .require(part.session_key.clone(), part.session.clone())
++        .require(part.key.clone(), part.prior.clone());
++    for dest in &destinations {
++        let key = orphan_key(dest.dserver, fragment(chunk, dest.index));
++        premark = match &dest.mark {
++            DestinationMark::Absent => premark.require_absent(key.clone()),
++            DestinationMark::Stamped(current) => premark.require(key.clone(), current.clone()),
++        }
++        .put(key, mark.clone());
++    }
++    if ctx.meta.commit(premark).await? == CommitOutcome::Conflict {
++        emit_aborted_reason(chunk, "pre-mark-lost");
++        return Ok(RepairOutcome::Aborted);
++    }
++
++    // WRITE each rebuilt fragment, authorized until the deadline fixed at the pre-mark's own
++    // stamp. The D server refuses it past that deadline — with nothing landed, or with its
++    // landing unknown — and either way nothing is adopted: whatever landed is under the pre-mark.
++    let deadline = now_millis.saturating_add(W_WRITE_MILLIS);
++    for dest in &destinations {
++        let bytes = encode_ec_fragment(
++            chunk,
++            dest.index as u16,
++            k as u8,
++            m as u8,
++            &shards[dest.index],
++        );
++        match dest
++            .store
++            .put_fragment(fragment(chunk, dest.index), bytes, Some(deadline))
++            .await
++        {
++            Ok(()) => {}
++            Err(fault) if is_write_deadline_expired(fault.as_ref()) => {
++                emit_aborted_reason(chunk, "write-deadline-expired");
++                return Ok(RepairOutcome::Aborted);
++            }
++            Err(fault) => return Err(fault),
++        }
++    }
++
++    // ADOPT, in ONE CAS: the part record repointed, each pre-mark consumed, each vacated source
++    // orphaned, the obligation drained. It lands only if the session is still `Open` at the epoch
++    // this pass read, the part record is still the one it read, every pre-mark still holds the
++    // exact bytes written above (GC swaps a mark to `reclaiming` before it deletes anything), and
++    // no drain has been recorded on a destination since it was chosen.
++    let mut adopt = WriteBatch::new()
++        .require(part.session_key.clone(), part.session.clone())
++        .require(part.key.clone(), part.prior.clone())
++        .put(part.key.clone(), next)
++        .delete(repair::repair_key(chunk));
++    for dest in &destinations {
++        let key = orphan_key(dest.dserver, fragment(chunk, dest.index));
++        adopt = adopt
++            .require(key.clone(), mark.clone())
++            .delete(key)
++            .require_absent(desired_key(dest.dserver));
++    }
++    for ((dest, source), &index) in destinations.iter().zip(&target.vacated).zip(&plan.missing) {
++        let vacated = plan.placement[index];
++        if dest.dserver == vacated {
++            // Rebuilt in place: the position stays named, so nothing is vacated.
++            continue;
++        }
++        let key = orphan_key(vacated, fragment(chunk, index));
++        adopt = match source {
++            SourceMark::Absent => adopt.require_absent(key.clone()).put(key, mark.clone()),
++            SourceMark::Stamped(current) => adopt
++                .require(key.clone(), current.clone())
++                .put(key, mark.clone()),
++            SourceMark::Reclaiming => adopt,
++        };
++    }
++    Ok(match ctx.meta.commit(adopt).await? {
++        CommitOutcome::Committed => RepairOutcome::Committed,
++        // Lost the race: nothing was adopted and the obligation stays queued. Each written
++        // fragment stays under its pre-mark, which GC reclaims after grace.
++        CommitOutcome::Conflict => RepairOutcome::Conflict,
++    })
++}
++
++/// Choose a destination for each missing fragment: in failure domains distinct from each other and
++/// from the survivors' (the committed path's selector), never on a server an operator is
++/// draining, never outside this pass's fleet view, and never at a position whose `orphan:` mark is
++/// already `reclaiming` or cannot be read. A server ruled out is excluded and the choice is made
++/// again, so it ends once every chosen position is usable or no free domain is left (`None`) —
++/// each round excludes one more server, of finitely many.
++async fn choose_destinations<'s>(
++    ctx: &ReconstructionContext<'_>,
++    stores: &HashMap<DServerId, &'s dyn ChunkStore>,
++    draining: &BTreeSet<DServerId>,
++    plan: &RepairPlan,
++) -> Result<Option<Vec<Destination<'s>>>> {
++    let mut excluded = draining.clone();
++    'choose: loop {
++        let view = ctx.topology.excluding(&excluded);
++        let Ok(servers) = select_distinct_domains_excluding(
++            &view,
++            plan.missing.len() as u16,
++            &plan.survivor_domains,
++        ) else {
++            return Ok(None);
++        };
++        let mut chosen = Vec::with_capacity(servers.len());
++        for (&index, &dserver) in plan.missing.iter().zip(&servers) {
++            let Some(&store) = stores.get(&dserver) else {
++                excluded.insert(dserver);
++                continue 'choose;
++            };
++            let key = orphan_key(dserver, fragment(plan.chunk_id, index));
++            let mark = match ctx.meta.get(&key).await? {
++                None => DestinationMark::Absent,
++                Some(current) => match decode_orphan_mark(&current) {
++                    // GC has recorded its decision to reclaim this position (`0016:1312-1336`):
++                    // a fragment written here could be deleted by the reclaim in progress, and
++                    // no writer replaces a `reclaiming` mark (`metadata::OrphanMark`).
++                    Ok(found) if found.is_reclaiming() => {
++                        emit_unusable_destination(&object_name(&key), "reclaiming", None);
++                        excluded.insert(dserver);
++                        continue 'choose;
++                    }
++                    Ok(_) => DestinationMark::Stamped(current.to_vec()),
++                    // Never overwrite a mark no writer can parse (ADR-0045).
++                    Err(fault) => {
++                        emit_unusable_destination(
++                            &object_name(&key),
++                            "unreadable-mark",
++                            Some(&fault.to_string()),
++                        );
++                        excluded.insert(dserver);
++                        continue 'choose;
++                    }
++                },
++            };
++            chosen.push(Destination {
++                index,
++                dserver,
++                store,
++                mark,
++            });
++        }
++        return Ok(Some(chosen));
++    }
++}
++
++/// The part record the adoption writes: `part.prior` with the chunk at `chunk_index` placed on
++/// `destinations`, and nothing else changed.
++///
++/// A [`PartRecord`] has no writer-side constructor (`crates/core/src/multipart.rs:2492`), so the
++/// new value is derived from the stored bytes themselves: the one decoder accepts exactly the
++/// canonical encoding (`decode_part_record`'s canonical-bytes gate), which spells the chunk list
++/// as `metadata::encode` does, so that list is found in the stored bytes and replaced by the
++/// repointed one, and every other byte is kept. The result is accepted only if the same decoder
++/// reads it back, so this never writes a part record the decoder would refuse.
++fn repointed_part(
++    part: &StagedPart,
++    chunk_index: usize,
++    destinations: &[Destination<'_>],
++) -> Result<Vec<u8>> {
++    let mut chunks = part.record.chunks().to_vec();
++    for dest in destinations {
++        chunks[chunk_index].placement[dest.index] = dest.dserver;
++    }
++    let prior_list = metadata::encode(&part.record.chunks().to_vec());
++    let at = part
++        .prior
++        .windows(prior_list.len())
++        .position(|window| window == &prior_list[..])
++        .ok_or_else(|| {
++            BoxError::from(format!(
++                "the part record {} does not spell its own chunk list",
++                object_name(&part.key)
++            ))
++        })?;
++    let mut next = Vec::with_capacity(part.prior.len() + 20 * destinations.len());
++    next.extend_from_slice(&part.prior[..at]);
++    next.extend_from_slice(&metadata::encode(&chunks));
++    next.extend_from_slice(&part.prior[at + prior_list.len()..]);
++    decode_part_record(&next)?;
++    Ok(next)
++}
++
++fn fragment(chunk: ChunkId, index: usize) -> FragmentId {
++    FragmentId {
++        chunk,
++        index: index as u16,
++    }
++}
++
++/// Emit a staged record reconstruction could **not read** on the durability-plane seam (ADR-0011 /
++/// ADR-0012): its reading of the staged class has a hole, so the pass drains no obligation and
++/// certifies nothing until the record is repaired. The action GC and scrub name the same record
++/// with (`unresolvable-staged-record`), so one query finds every loop blocked on it.
++fn emit_unresolvable_staged(record: &str, fault: &str) {
++    tracing::warn!(monotonic_counter.reconstruction_unresolvable_staged_records = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "unresolvable-staged-record",
++        record = %record,
++        fault = %fault,
++        "reconstruction could not read a staged multipart record; this pass drains NOTHING and certifies NOTHING until it is repaired — operator signal",
++    );
++}
++
++/// Emit a staged repair this pass **may not perform yet** on the same seam — its part is still
++/// streaming (`in-flight`), or its session has been fenced out of `Open` (`session-fenced`). The
++/// obligation stays queued: the repair runs once the part commits, or once the chunk is published.
++pub(super) fn emit_deferred(chunk: ChunkId, reason: &'static str) {
++    tracing::info!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "staged-deferred",
++        reason,
++        chunk = %wyrd_traits::chunk_hex(chunk),
++        "reconstruction deferred a staged chunk's repair; the obligation stays queued",
++    );
++}
++
++/// Emit a staged repair **withheld** because a record it would have to rewrite cannot be read —
++/// the session record, or the `orphan:` mark at a position the move would vacate — on the same
++/// seam. NEEDS-HUMAN: nothing was written, the record is left byte for byte as it is, the
++/// obligation stays queued, and the pass does not certify until the record is repaired.
++fn emit_withheld(record: &str, fault: &str) {
++    tracing::warn!(monotonic_counter.reconstruction_withheld_staged_repairs = 1_u64);
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "withheld-staged-repair",
++        record = %record,
++        fault = %fault,
++        "reconstruction withheld a staged repair: a record it would have to rewrite cannot be read, and it never overwrites what it cannot parse; NOTHING was written and the obligation stays queued — NEEDS-HUMAN",
++    );
++}
++
++/// Emit why a staged re-place stopped before it could adopt anything (the `reconstruction_aborted`
++/// offset itself is emitted by `super::reconcile`), on the same seam.
++fn emit_aborted_reason(chunk: ChunkId, reason: &'static str) {
++    tracing::info!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "staged-aborted",
++        reason,
++        chunk = %wyrd_traits::chunk_hex(chunk),
++        "a staged re-place stopped before adopting anything; every fragment it wrote stays under its pre-mark, and the obligation stays queued",
++    );
++}
++
++/// Emit a destination position a staged re-place ruled out, on the same seam: its mark is already
++/// `reclaiming`, or it cannot be read (then with the codec's reason, NEEDS-HUMAN — the mark is
++/// left in place for a human, as GC leaves one).
++fn emit_unusable_destination(mark: &str, reason: &'static str, fault: Option<&str>) {
++    tracing::warn!(
++        target: "wyrd.custodian.reconstruction.audit",
++        action = "unusable-destination",
++        reason,
++        mark = %mark,
++        fault = fault.unwrap_or(""),
++        "a staged re-place ruled out a destination whose orphan mark it may not overwrite; another is chosen",
++    );
++}
+diff --git a/crates/custodian/tests/staged_repair.rs b/crates/custodian/tests/staged_repair.rs
+new file mode 100644
+index 0000000..768f793
+--- /dev/null
++++ b/crates/custodian/tests/staged_repair.rs
+@@ -0,0 +1,1675 @@
++//! Issue #663 (637.3) — **staged scrub and repair** (proposal 0016 decision 2's scrub and
++//! reconstruction rows, `docs/design/proposals/draft/0016-multipart-commit-protocol.md:824-825`;
++//! its failure rows `:874-890`; the pre-mark and write-deadline rules, `:1285-1358`).
++//!
++//! A multipart upload's committed parts hold durable bytes for as long as the session stays open.
++//! Scrub must verify them and queue a repair when one rots or goes missing, and reconstruction must
++//! resolve that repair against the part record — rebuild the fragment, re-place it under the
++//! session's fence, and strand nothing on any branch — instead of finding no committed chunk map
++//! and dropping the obligation.
++//!
++//! Every leg drives the production `reconcile_step` over in-memory doubles. No client creates a
++//! session before the S3 verbs, so every staged record is seeded as raw JSON the base decoders
++//! accept (the shapes of `crates/core/tests/multipart_session_records.rs:81-145`) and is
++//! round-tripped through them before a pass reads it. The D-server double **enforces** the write
++//! deadline `put_fragment` carries — a write arriving at or after it is refused with
++//! `WriteDeadlineExpired`, through the seam's own comparison, as the real D server does since #638
++//! — against a clock the test moves; and for every write that arrives it records the `orphan:` mark
++//! the metadata store held for that position at that instant.
++//!
++//! The legs (brief #663):
++//! - **A** scrub queues a repair for a committed part's bit-flipped fragment and for a missing one,
++//!   and queues nothing for a still-streaming (`sidx:`-only) chunk; a part it cannot read or trust
++//!   is named, never guessed at.
++//! - **B** reconstruction re-places a committed part's lost fragment: rebuilt intact and
++//!   scheme-correct on a new D server, the part record repointed there, the pre-mark consumed, the
++//!   vacated source marked for GC — which then reclaims it — and the obligation drained.
++//! - **C** the losing branch strands nothing (X29): a session fence, or a part rewrite, landing
++//!   between the destination write and the adoption.
++//! - **D** the pre-mark and write-deadline rules, one case each: (i) pre-mark durable before the
++//!   write, (ii) an existing mark re-stamped fresh, (iii) a `reclaiming` destination never used,
++//!   (iv) a write refused past its deadline aborts, (v) no write authorized on a stale pre-mark,
++//!   (vi) an unreadable vacated-source mark withholds the move.
++//! - **E** the drain fence on the destination: never chosen, and a drain recorded after it was
++//!   chosen loses the adoption.
++//! - plus the resolution rules that keep an obligation rather than drop it: a still-streaming
++//!   chunk, a fenced session, an unreadable session record, an unreadable staged record elsewhere,
++//!   a chunk that cannot be repaired — and the one that drains it: a chunk already whole.
++//!
++//! Nothing here names a symbol the fix adds: every type, function and string it uses is on the
++//! base already.
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, HashMap};
++use std::fmt::Debug;
++use std::ops::Bound;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, Once};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::field::{Field, Visit};
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::layer::Context;
++use tracing_subscriber::prelude::*;
++use wyrd_chunk_format::CORE_HEADER_LEN;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::erasure;
++use wyrd_core::metadata::{
++    self, decode_orphan_mark, orphan_key, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState,
++};
++use wyrd_core::multipart::{
++    decode_owned_entry, decode_part_record, decode_session_record, mpu_key, part_key, sidx_key,
++    OwnedEntry, PartNumber, StagedPlacement, UploadId,
++};
++use wyrd_core::placement::Topology;
++use wyrd_core::repair::{self, header_matches_identity};
++use wyrd_core::write::encode_ec_fragment;
++use wyrd_custodian::desired_state::desired_key;
++use wyrd_custodian::{
++    reconcile_step, set_lifecycle, Custodian, DServerLifecycle, ExpiredPendingPolicy, FencedZone,
++    GcContext, ReconcileError, Reconciled, ReconstructionContext, ScrubContext,
++};
++use wyrd_traits::{
++    BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
++    Result, WriteBatch, WriteDeadlineExpired,
++};
++
++/// The clock every pass runs at, and where the D servers' own clock starts.
++const NOW: u64 = 1_000_000;
++/// The reader-safe grace window the GC passes here run with.
++const GRACE: u64 = 50;
++/// How far a leg moves a clock to put it past any write deadline a re-place could carry.
++const ONE_DAY: u64 = 86_400_000;
++/// The orphan grace the deployed GC pass runs with — the 60 s lease TTL it derives its window from
++/// (`crates/server/src/custodian.rs:114`). A write's authorization deadline must fall strictly
++/// inside the grace of the pre-mark it lands under (`G_orphan > W_write + δ_clock`, `0016:1348`).
++const DEPLOYED_GRACE: u64 = 60_000;
++
++/// The bucket and object the session targets, and its epoch.
++const PARENT: InodeId = 42;
++const OBJECT: &str = "staged/object";
++const EPOCH: u64 = 3;
++
++/// The committed part's chunk: `RS(2, 1)`, three fragments on servers 0, 1, 2.
++const CHUNK: ChunkId = 0x663;
++const RS_2_1: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
++const PLACEMENT: [DServerId; 3] = [0, 1, 2];
++/// The fragment each leg loses — index 1, on server 1.
++const LOST: u16 = 1;
++const SOURCE: DServerId = 1;
++/// Where the rebuild goes: domain D, the least-loaded domain free of a survivor (the source's own
++/// domain, B, is kept busy so the rebuild moves).
++const DEST: DServerId = 3;
++/// The next choice, domain E.
++const SPARE: DServerId = 4;
++/// The chunk's bytes.
++const DATA: &[u8] = b"a committed part's chunk, erasure-coded across three D servers, staged";
++
++// ---- the metadata double ------------------------------------------------------------------------
++
++type CommitHook = Box<dyn FnMut(&Meta, &WriteBatch) + Send>;
++
++/// An in-memory `MetadataStore` over an ordered map, whose commits can run a hook once they have
++/// applied — where a leg lands a concurrent writer BETWEEN two of the pass's own commits.
++#[derive(Default)]
++struct Meta {
++    kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
++    after_commit: Mutex<Option<CommitHook>>,
++}
++
++impl Meta {
++    fn seed(&self, key: impl Into<Vec<u8>>, value: impl Into<Bytes>) {
++        self.kv.lock().unwrap().insert(key.into(), value.into());
++    }
++
++    fn value(&self, key: &[u8]) -> Option<Bytes> {
++        self.kv.lock().unwrap().get(key).cloned()
++    }
++
++    /// Apply `batch` atomically: every precondition holds, or nothing changes.
++    fn apply(&self, batch: WriteBatch) -> CommitOutcome {
++        let mut kv = self.kv.lock().unwrap();
++        for pre in &batch.preconditions {
++            if kv.get(&pre.key) != pre.expected.as_ref() {
++                return CommitOutcome::Conflict;
++            }
++        }
++        for key in batch.deletes {
++            kv.remove(&key);
++        }
++        for (key, value) in batch.puts {
++            kv.insert(key, value);
++        }
++        CommitOutcome::Committed
++    }
++
++    fn after_commit(&self, hook: impl FnMut(&Meta, &WriteBatch) + Send + 'static) {
++        *self.after_commit.lock().unwrap() = Some(Box::new(hook));
++    }
++}
++
++#[async_trait]
++impl MetadataStore for Meta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        Ok(self.value(key))
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        Ok(self
++            .kv
++            .lock()
++            .unwrap()
++            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
++            .take_while(|(key, _)| key.starts_with(prefix))
++            .map(|(key, value)| (key.clone(), value.clone()))
++            .collect())
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<wyrd_traits::ScanPage> {
++        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let outcome = self.apply(batch.clone());
++        if outcome == CommitOutcome::Committed {
++            let hook = self.after_commit.lock().unwrap().take();
++            if let Some(mut hook) = hook {
++                hook(self, &batch);
++                *self.after_commit.lock().unwrap() = Some(hook);
++            }
++        }
++        Ok(outcome)
++    }
++}
++
++// ---- the D-server double ------------------------------------------------------------------------
++
++/// Where in a `put_fragment` a D-server hook runs.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Stage {
++    /// The write has arrived; nothing is judged or written yet.
++    Arrived,
++    /// The write has landed.
++    Written,
++}
++
++type PutHook = Box<dyn FnMut(Stage) -> Result<()> + Send>;
++
++/// What one `put_fragment` met.
++#[derive(Clone, Debug)]
++struct Put {
++    frag: FragmentId,
++    /// The authorization deadline the write carried.
++    deadline: Option<u64>,
++    /// The `orphan:` value the metadata store held for this position when the write arrived.
++    mark_on_arrival: Option<Bytes>,
++    /// Whether the write took effect.
++    landed: bool,
++}
++
++/// One D server: its fragments, the clock its deadline judgment reads, the writes that reached it,
++/// and an optional hook a leg lands a concurrent writer — or a fault — with.
++struct Disk {
++    id: DServerId,
++    meta: Arc<Meta>,
++    clock: Arc<AtomicU64>,
++    frags: Mutex<HashMap<FragmentId, Bytes>>,
++    puts: Mutex<Vec<Put>>,
++    on_put: Mutex<Option<PutHook>>,
++}
++
++impl Disk {
++    fn hook(&self, stage: Stage) -> Result<()> {
++        let hook = self.on_put.lock().unwrap().take();
++        let Some(mut hook) = hook else {
++            return Ok(());
++        };
++        let result = hook(stage);
++        *self.on_put.lock().unwrap() = Some(hook);
++        result
++    }
++}
++
++#[async_trait]
++impl ChunkStore for Disk {
++    async fn put_fragment(
++        &self,
++        id: FragmentId,
++        fragment: Bytes,
++        deadline_millis: Option<u64>,
++    ) -> Result<()> {
++        let mut put = Put {
++            frag: id,
++            deadline: deadline_millis,
++            mark_on_arrival: self.meta.value(&orphan_key(self.id, id)),
++            landed: false,
++        };
++        if let Err(fault) = self.hook(Stage::Arrived) {
++            self.puts.lock().unwrap().push(put);
++            return Err(fault);
++        }
++        // The acceptor's own judgment, at its publication point, through the seam's one
++        // comparison (`ChunkStore::put_fragment`, #638).
++        if let Some(deadline) = deadline_millis {
++            let now = self.clock.load(Ordering::SeqCst);
++            if let Some(refusal) = WriteDeadlineExpired::if_elapsed(id, deadline, now) {
++                self.puts.lock().unwrap().push(put);
++                return Err(BoxError::from(refusal));
++            }
++        }
++        self.frags.lock().unwrap().insert(id, fragment);
++        put.landed = true;
++        self.puts.lock().unwrap().push(put);
++        self.hook(Stage::Written)
++    }
++
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.frags.lock().unwrap().get(&id).cloned())
++    }
++
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.frags.lock().unwrap().keys().copied().collect())
++    }
++
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.frags.lock().unwrap().remove(&id);
++        Ok(())
++    }
++
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++// ---- the audit seam -----------------------------------------------------------------------------
++
++/// One custodian audit event: its target, and the value of each of its fields.
++type AuditEvent = (String, Vec<String>);
++
++/// Every custodian audit event a pass emitted.
++#[derive(Clone, Default)]
++struct Audit(Arc<Mutex<Vec<AuditEvent>>>);
++
++impl Audit {
++    /// Whether an event on `target` carried `action` and a field naming `record`.
++    fn named(&self, target: &str, action: &str, record: &[u8]) -> bool {
++        let record = String::from_utf8_lossy(record);
++        self.0.lock().unwrap().iter().any(|(at, fields)| {
++            at == target
++                && fields.iter().any(|field| field == action)
++                && fields.iter().any(|field| field.contains(record.as_ref()))
++        })
++    }
++
++    /// How many events on `target` carried `action` and a field naming `record`.
++    fn count(&self, target: &str, action: &str, record: &str) -> usize {
++        self.0
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(at, fields)| {
++                at == target
++                    && fields.iter().any(|field| field == action)
++                    && fields.iter().any(|field| field.contains(record))
++            })
++            .count()
++    }
++}
++
++impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Audit {
++    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
++        let target = event.metadata().target();
++        if !target.starts_with("wyrd.custodian.") {
++            return;
++        }
++        let mut fields = Fields(Vec::new());
++        event.record(&mut fields);
++        self.0.lock().unwrap().push((target.to_owned(), fields.0));
++    }
++}
++
++struct Fields(Vec<String>);
++
++impl Visit for Fields {
++    fn record_str(&mut self, _field: &Field, value: &str) {
++        self.0.push(value.to_owned());
++    }
++
++    fn record_debug(&mut self, _field: &Field, value: &dyn Debug) {
++        self.0.push(format!("{value:?}"));
++    }
++}
++
++/// Install a permissive global `tracing` default once, before any audit callsite fires, so no
++/// callsite latches `Interest::never` under the parallel harness and a scoped capture sees every
++/// event (the reason `crates/custodian/tests/reconstruction.rs` does the same).
++fn enable_callsites() {
++    static INIT: Once = Once::new();
++    INIT.call_once(|| {
++        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
++    });
++}
++
++const RECONSTRUCTION_AUDIT: &str = "wyrd.custodian.reconstruction.audit";
++const SCRUB_AUDIT: &str = "wyrd.custodian.scrub.audit";
++
++// ---- the records --------------------------------------------------------------------------------
++
++fn upload(pair: &str) -> UploadId {
++    UploadId::new(pair.repeat(16)).expect("32 lowercase-hex characters")
++}
++
++fn part_no(n: u32) -> PartNumber {
++    PartNumber::new(n).expect("a part number in range")
++}
++
++/// A session record, spelled as the base decoder's own encoding and round-tripped through it.
++fn session(epoch: u64, state_json: &str) -> Bytes {
++    let bytes = format!(
++        "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",\"created_at_millis\":100,\
++         \"clock_source\":\"wall\",\"epoch\":{epoch},\"attempts\":1,\"state\":{state_json}}}"
++    )
++    .into_bytes();
++    let record = decode_session_record(&bytes)
++        .unwrap_or_else(|fault| panic!("the seeded session must decode: {fault}"));
++    assert_eq!(
++        metadata::encode(&record).as_ref(),
++        bytes.as_slice(),
++        "the seeded session must be the decoder's own spelling"
++    );
++    Bytes::from(bytes)
++}
++
++/// The session `Open` at [`EPOCH`].
++fn open() -> Bytes {
++    session(EPOCH, "{\"kind\":\"Open\"}")
++}
++
++/// The same session fenced for teardown: `Aborting` at the next epoch.
++fn aborting() -> Bytes {
++    session(EPOCH + 1, "{\"kind\":\"Aborting\"}")
++}
++
++/// The same session fenced for Complete: `Completing` at the next epoch.
++fn completing() -> Bytes {
++    session(
++        EPOCH + 1,
++        &format!(
++            "{{\"kind\":\"Completing\",\"fenced_at_millis\":900,\"segments_written\":0,\
++             \"publish_target\":{{\"parent\":{PARENT},\"name\":\"{OBJECT}\",\"epoch\":{}}}}}",
++            EPOCH + 1
++        ),
++    )
++}
++
++fn chunk_ref(id: ChunkId, placement: &[DServerId]) -> ChunkRef {
++    ChunkRef {
++        id,
++        scheme: RS_2_1,
++        len: DATA.len() as u64,
++        placement: placement.to_vec(),
++    }
++}
++
++/// A committed part record naming `chunks`, spelled as the base decoder's own encoding and
++/// round-tripped through it.
++fn part(chunks: &[ChunkRef], committed_at: u64) -> Bytes {
++    let refs: Vec<String> = chunks
++        .iter()
++        .map(|chunk| String::from_utf8(metadata::encode(chunk).to_vec()).unwrap())
++        .collect();
++    let len: u64 = chunks.iter().map(|chunk| chunk.len).sum();
++    let bytes = format!(
++        "{{\"chunks\":[{}],\"len\":{len},\"digest\":\"{}\",\"committed_at_millis\":{committed_at},\
++         \"session_epoch\":{EPOCH}}}",
++        refs.join(","),
++        "ef".repeat(32)
++    )
++    .into_bytes();
++    let record = decode_part_record(&bytes)
++        .unwrap_or_else(|fault| panic!("the seeded part record must decode: {fault}"));
++    assert_eq!(
++        metadata::encode(&record).as_ref(),
++        bytes.as_slice(),
++        "the seeded part record must be the decoder's own spelling"
++    );
++    Bytes::from(bytes)
++}
++
++/// The three fragments of [`DATA`] under `RS(2, 1)`, as the write path encodes them.
++fn fragments(chunk: ChunkId) -> Vec<Bytes> {
++    erasure::encode(2, 1, DATA)
++        .unwrap()
++        .iter()
++        .enumerate()
++        .map(|(index, shard)| encode_ec_fragment(chunk, index as u16, 2, 1, shard))
++        .collect()
++}
++
++/// `bytes` with a single bit flipped in the payload: its checksum no longer matches (the
++/// `corrupt_fragment` idiom, `crates/custodian/tests/scrub.rs:154-160`).
++fn bit_flipped(bytes: &Bytes) -> Bytes {
++    let mut rotten = bytes.to_vec();
++    rotten[CORE_HEADER_LEN as usize] ^= 0x01;
++    Bytes::from(rotten)
++}
++
++fn frag(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// A structured mark, spelled by the shared codec's own grammar.
++fn structured_mark(at: u64, event: &str) -> Bytes {
++    Bytes::from(format!(
++        "{{\"orphaned_at_millis\":{at},\"event\":\"{event}\"}}"
++    ))
++}
++
++// ---- the fixture --------------------------------------------------------------------------------
++
++/// Five D servers in five failure domains, A..E. One `Open` session with one committed part naming
++/// [`CHUNK`] on [`PLACEMENT`], every fragment on its server — nothing lost yet.
++struct Fixture {
++    meta: Arc<Meta>,
++    clock: Arc<AtomicU64>,
++    disks: Vec<Disk>,
++    upload: UploadId,
++    /// The part record exactly as seeded.
++    part: Bytes,
++    /// The chunk's three original fragments.
++    fragments: Vec<Bytes>,
++    /// Only domains A..C: no free domain but the lost fragment's own.
++    tight: bool,
++    /// A server the topology still lists but this pass's fleet view left out.
++    off_fleet: Option<DServerId>,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        let meta = Arc::new(Meta::default());
++        let clock = Arc::new(AtomicU64::new(NOW));
++        let disks = (0..5)
++            .map(|id| Disk {
++                id,
++                meta: Arc::clone(&meta),
++                clock: Arc::clone(&clock),
++                frags: Mutex::default(),
++                puts: Mutex::default(),
++                on_put: Mutex::default(),
++            })
++            .collect();
++        let upload = upload("66");
++        let part = part(&[chunk_ref(CHUNK, &PLACEMENT)], 800);
++        meta.seed(mpu_key(&upload), open());
++        meta.seed(part_key(&upload, part_no(1)), part.clone());
++        let fixture = Self {
++            meta,
++            clock,
++            disks,
++            upload,
++            part,
++            fragments: fragments(CHUNK),
++            tight: false,
++            off_fleet: None,
++        };
++        for (index, &dserver) in PLACEMENT.iter().enumerate() {
++            fixture.place(
++                dserver,
++                frag(CHUNK, index as u16),
++                fixture.fragments[index].clone(),
++            );
++        }
++        fixture
++    }
++
++    /// The fixture over only domains A..C, so the lost fragment can only be rebuilt in place.
++    fn tight() -> Self {
++        Self {
++            tight: true,
++            ..Self::new()
++        }
++    }
++
++    fn place(&self, dserver: DServerId, frag: FragmentId, bytes: Bytes) {
++        self.disks[dserver as usize]
++            .frags
++            .lock()
++            .unwrap()
++            .insert(frag, bytes);
++    }
++
++    fn on_disk(&self, dserver: DServerId, frag: FragmentId) -> Option<Bytes> {
++        self.disks[dserver as usize]
++            .frags
++            .lock()
++            .unwrap()
++            .get(&frag)
++            .cloned()
++    }
++
++    fn remove(&self, dserver: DServerId, frag: FragmentId) {
++        self.disks[dserver as usize]
++            .frags
++            .lock()
++            .unwrap()
++            .remove(&frag);
++    }
++
++    /// Flip one bit of the [`LOST`] fragment on its server.
++    fn rot(&self) {
++        let lost = frag(CHUNK, LOST);
++        let rotten = bit_flipped(&self.on_disk(SOURCE, lost).unwrap());
++        self.place(SOURCE, lost, rotten);
++    }
++
++    /// Delete the [`LOST`] fragment from its server.
++    fn lose(&self) {
++        self.remove(SOURCE, frag(CHUNK, LOST));
++    }
++
++    fn puts(&self, dserver: DServerId) -> Vec<Put> {
++        self.disks[dserver as usize].puts.lock().unwrap().clone()
++    }
++
++    fn all_puts(&self) -> Vec<(DServerId, Put)> {
++        (0..5)
++            .flat_map(|dserver| {
++                self.puts(dserver)
++                    .into_iter()
++                    .map(move |put| (dserver, put))
++            })
++            .collect()
++    }
++
++    fn on_put(&self, dserver: DServerId, hook: impl FnMut(Stage) -> Result<()> + Send + 'static) {
++        *self.disks[dserver as usize].on_put.lock().unwrap() = Some(Box::new(hook));
++    }
++
++    fn part_key(&self) -> Vec<u8> {
++        part_key(&self.upload, part_no(1))
++    }
++
++    fn session_key(&self) -> Vec<u8> {
++        mpu_key(&self.upload)
++    }
++
++    /// The part record the store holds now, decoded, and its chunk's placement.
++    fn placement(&self) -> Vec<DServerId> {
++        let bytes = self.meta.value(&self.part_key()).expect("the part record");
++        let record = decode_part_record(&bytes).expect("the part record decodes");
++        record.chunks()[0].placement.clone()
++    }
++
++    fn mark(&self, dserver: DServerId, frag: FragmentId) -> Option<Bytes> {
++        self.meta.value(&orphan_key(dserver, frag))
++    }
++
++    async fn enqueue(&self, chunk: ChunkId) {
++        repair::enqueue_repair(&*self.meta, chunk, "scrub")
++            .await
++            .unwrap();
++    }
++
++    async fn queued(&self) -> Vec<ChunkId> {
++        repair::queued_repairs(&*self.meta).await.unwrap()
++    }
++
++    fn fleet(&self) -> Vec<(DServerId, &dyn ChunkStore)> {
++        let servers = if self.tight { 3 } else { 5 };
++        self.disks[..servers]
++            .iter()
++            .filter(|disk| Some(disk.id) != self.off_fleet)
++            .map(|disk| (disk.id, disk as &dyn ChunkStore))
++            .collect()
++    }
++
++    /// Domains A..E on servers 0..4 (A..C when `tight`), the source's domain kept busy so the
++    /// rebuild moves to the least-loaded free one when there is one.
++    fn topology(&self) -> Topology {
++        let mut topology = Topology::default();
++        let domains = ["A", "B", "C", "D", "E"];
++        let servers = if self.tight { 3 } else { 5 };
++        for (id, domain) in domains.iter().enumerate().take(servers) {
++            topology.register(id as DServerId, *domain);
++        }
++        topology.set_utilization(SOURCE, 100);
++        topology
++    }
++
++    /// One reconstruction pass at `now`, its audit events captured.
++    async fn reconstruct(
++        &self,
++        now: u64,
++    ) -> (std::result::Result<Reconciled, ReconcileError>, Audit) {
++        enable_callsites();
++        let audit = Audit::default();
++        let (zone, custodian) = elect().await;
++        let fleet = self.fleet();
++        let topology = self.topology();
++        let ctx = ReconstructionContext {
++            meta: &*self.meta,
++            fleet: &fleet,
++            topology: &topology,
++            unreachable: &[],
++        };
++        let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now)
++            .with_subscriber(tracing_subscriber::registry().with(audit.clone()))
++            .await;
++        (outcome, audit)
++    }
++
++    /// One reconstruction pass at `now` that must succeed.
++    async fn repaired(&self, now: u64) -> Reconciled {
++        self.reconstruct(now)
++            .await
++            .0
++            .unwrap_or_else(|fault| panic!("the reconstruction pass failed: {fault}"))
++    }
++
++    async fn scrub(&self) -> Reconciled {
++        self.scrub_audited().await.0
++    }
++
++    /// One scrub pass that must succeed, its audit events captured.
++    async fn scrub_audited(&self) -> (Reconciled, Audit) {
++        enable_callsites();
++        let audit = Audit::default();
++        let (zone, custodian) = elect().await;
++        let fleet = self.fleet();
++        let ctx = ScrubContext {
++            meta: &*self.meta,
++            fleet: &fleet,
++        };
++        let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, NOW)
++            .with_subscriber(tracing_subscriber::registry().with(audit.clone()))
++            .await
++            .unwrap_or_else(|fault| panic!("the scrub pass failed: {fault}"));
++        (outcome, audit)
++    }
++
++    async fn gc(&self, now: u64) -> Reconciled {
++        let (zone, custodian) = elect().await;
++        let fleet = self.fleet();
++        let ctx = GcContext {
++            meta: &*self.meta,
++            fleet: &fleet,
++            grace_window_millis: GRACE,
++            expired_pending: ExpiredPendingPolicy::Defer,
++        };
++        reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
++            .await
++            .unwrap_or_else(|fault| panic!("the GC pass failed: {fault}"))
++    }
++}
++
++async fn elect() -> (FencedZone, Custodian) {
++    let coord = MemCoordination::new();
++    let custodian = Custodian::elect(&coord, "zone-staged-repair")
++        .await
++        .expect("leader election over the in-memory coordination seam");
++    let mut zone = FencedZone::new();
++    zone.install(custodian.leadership());
++    (zone, custodian)
++}
++
++/// A pre-mark as a write found it: a structured mark this pass stamped at `now`, not `reclaiming`,
++/// naming an event other than `not_event`.
++fn assert_fresh_premark(found: Option<&Bytes>, now: u64, not_event: Option<&str>, what: &str) {
++    let found = found.unwrap_or_else(|| panic!("{what}: no orphan mark covered the destination"));
++    let mark = decode_orphan_mark(found)
++        .unwrap_or_else(|fault| panic!("{what}: the destination mark does not decode: {fault}"));
++    assert!(
++        !mark.is_reclaiming(),
++        "{what}: the pre-mark is `reclaiming`"
++    );
++    assert_eq!(
++        mark.orphaned_at_millis(),
++        now,
++        "{what}: the pre-mark is not stamped by the pass that wrote it: {found:?}"
++    );
++    let event = mark
++        .event()
++        .unwrap_or_else(|| panic!("{what}: the pre-mark names no event: {found:?}"));
++    assert_ne!(
++        Some(event),
++        not_event,
++        "{what}: the pre-mark kept an earlier event's identity"
++    );
++}
++
++/// The destination fragment is the chunk's own fragment at [`LOST`]: intact, and carrying the
++/// chunk's identity and scheme in its header — rebuilt, not merely present.
++fn assert_rebuilt(fixture: &Fixture, dserver: DServerId) {
++    let lost = frag(CHUNK, LOST);
++    let bytes = fixture
++        .on_disk(dserver, lost)
++        .unwrap_or_else(|| panic!("server {dserver} holds no fragment {lost:?}"));
++    let decoded = wyrd_chunk_format::decode(&bytes)
++        .unwrap_or_else(|fault| panic!("the rebuilt fragment does not decode: {fault}"));
++    assert!(
++        header_matches_identity(&decoded.header, lost, RS_2_1),
++        "the rebuilt fragment's header does not carry the chunk's identity: {:?}",
++        decoded.header
++    );
++    assert_eq!(
++        bytes,
++        fixture.fragments[usize::from(LOST)],
++        "the rebuilt fragment is not the chunk's original fragment, byte for byte"
++    );
++}
++
++// ---- (A) scrub verifies committed-part fragments ------------------------------------------------
++
++/// **(A)** A committed part's fragment carrying a single bit flip results, after one scrub pass, in
++/// a queued repair for its chunk. On the base scrub never reads a part record.
++#[tokio::test]
++async fn a_scrub_queues_repair_for_a_bit_flipped_committed_part_fragment() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    assert_eq!(fixture.scrub().await, Reconciled::Changed);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++}
++
++/// **(A)** A committed part's fragment missing from its placed server results in a queued repair.
++#[tokio::test]
++async fn a_scrub_queues_repair_for_a_missing_committed_part_fragment() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    assert_eq!(fixture.scrub().await, Reconciled::Changed);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++}
++
++/// **(A)** A still-streaming chunk — named by an owned `sidx:` entry, by no part record — missing a
++/// fragment queues nothing: it is expected to be incomplete, and the scheme to verify it by is the
++/// one its part record will carry (`0016:824`). Beside it, the committed part's bit-flipped
++/// fragment IS queued, so the pass verified staged bytes and chose not to flag this one.
++#[tokio::test]
++async fn a_scrub_queues_nothing_for_a_still_streaming_chunk() {
++    const IN_FLIGHT: ChunkId = 0x664;
++    let fixture = Fixture::new();
++    fixture.rot();
++    let key = sidx_key(&fixture.upload, part_no(2), IN_FLIGHT);
++    let staged = StagedPlacement::new(RS_2_1, PLACEMENT.to_vec()).unwrap();
++    let value =
++        metadata::encode(&OwnedEntry::new(fixture.upload.clone(), NOW * 10, staged).to_pending());
++    decode_owned_entry(&key, &value).expect("the seeded owned entry must decode");
++    fixture.meta.seed(key, value);
++    // Two of its three fragments have landed; the third is still streaming.
++    let streaming = fragments(IN_FLIGHT);
++    fixture.place(0, frag(IN_FLIGHT, 0), streaming[0].clone());
++    fixture.place(2, frag(IN_FLIGHT, 2), streaming[2].clone());
++
++    assert_eq!(fixture.scrub().await, Reconciled::Changed);
++    assert_eq!(
++        fixture.queued().await,
++        vec![CHUNK],
++        "scrub queued the still-streaming chunk, or missed the committed part's rotten fragment"
++    );
++}
++
++/// **(A → B)** End to end: the repair scrub queues for a committed part's rotten fragment is the
++/// one reconstruction resolves and repairs.
++#[tokio::test]
++async fn a_to_b_scrub_then_reconstruction_restore_the_part() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    assert_eq!(fixture.scrub().await, Reconciled::Changed);
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    assert_rebuilt(&fixture, DEST);
++    assert_eq!(fixture.placement(), vec![0, DEST, 2]);
++    assert!(fixture.queued().await.is_empty());
++    // Scrubbed again, the part is whole: nothing is queued.
++    assert_eq!(fixture.scrub().await, Reconciled::Satisfied);
++    assert!(fixture.queued().await.is_empty());
++}
++
++// ---- (B) reconstruction repairs a staged chunk, the whole protocol ------------------------------
++
++/// **(B)** With a committed part's fragment lost and its repair queued, one reconstruction pass:
++/// the new D server holds the chunk's fragment, intact and scheme-correct; the part record's
++/// placement names that server; the destination's pre-mark is gone; the vacated source carries an
++/// `orphan:` mark GC acts on after grace — and does; the obligation has drained. On the base the
++/// obligation is dropped and nothing is written.
++#[tokio::test]
++async fn b_reconstruction_re_places_a_committed_parts_lost_fragment() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++
++    assert_rebuilt(&fixture, DEST);
++    assert_eq!(
++        fixture.placement(),
++        vec![0, DEST, 2],
++        "the part record does not name the server the fragment was rebuilt on"
++    );
++    let lost = frag(CHUNK, LOST);
++    assert_eq!(
++        fixture.mark(DEST, lost),
++        None,
++        "the destination's pre-mark was not consumed by the adoption"
++    );
++    let vacated = fixture
++        .mark(SOURCE, lost)
++        .expect("the vacated source carries no orphan mark");
++    let vacated = decode_orphan_mark(&vacated).expect("the vacated source's mark decodes");
++    assert!(!vacated.is_reclaiming());
++    assert_eq!(vacated.orphaned_at_millis(), NOW);
++    assert!(
++        fixture.queued().await.is_empty(),
++        "the obligation did not drain"
++    );
++    // Exactly one write, and it landed.
++    let puts = fixture.all_puts();
++    assert_eq!(puts.len(), 1, "{puts:?}");
++    assert!(puts[0].1.landed);
++
++    // GC acts on the vacated source's mark once its grace has passed, and on nothing the part
++    // names.
++    assert_eq!(fixture.gc(NOW + GRACE).await, Reconciled::Changed);
++    assert_eq!(
++        fixture.on_disk(SOURCE, lost),
++        None,
++        "GC kept the vacated source"
++    );
++    assert_eq!(fixture.mark(SOURCE, lost), None);
++    assert_rebuilt(&fixture, DEST);
++}
++
++/// **(B)** The same, for a fragment missing from its server rather than rotten on it.
++#[tokio::test]
++async fn b_reconstruction_re_places_a_committed_parts_missing_fragment() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    assert_rebuilt(&fixture, DEST);
++    assert_eq!(fixture.placement(), vec![0, DEST, 2]);
++    assert_eq!(fixture.mark(DEST, frag(CHUNK, LOST)), None);
++    assert!(fixture.mark(SOURCE, frag(CHUNK, LOST)).is_some());
++    assert!(fixture.queued().await.is_empty());
++}
++
++/// **(B)** With no free domain but the lost fragment's own, the rebuild goes back to the same
++/// server: the position stays named, its pre-mark is consumed, and nothing is vacated.
++#[tokio::test]
++async fn b_a_fragment_rebuilt_in_place_consumes_its_pre_mark() {
++    let fixture = Fixture::tight();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    assert_rebuilt(&fixture, SOURCE);
++    assert_eq!(fixture.placement(), PLACEMENT.to_vec());
++    assert_eq!(fixture.mark(SOURCE, frag(CHUNK, LOST)), None);
++    assert!(fixture.queued().await.is_empty());
++}
++
++// ---- (C) the losing branch leaves nothing stranded ----------------------------------------------
++
++/// What a lost re-place must leave: no adoption, the part record as it was, the pre-mark standing
++/// over the written fragment, the obligation queued — and GC reclaiming that fragment once the
++/// pre-mark's grace has passed, so it is never stranded.
++async fn assert_lost_cleanly(fixture: &Fixture, part_now: &Bytes, what: &str) {
++    let lost = frag(CHUNK, LOST);
++    assert_eq!(
++        fixture.meta.value(&fixture.part_key()).as_ref(),
++        Some(part_now),
++        "{what}: the part record changed"
++    );
++    assert!(
++        fixture.on_disk(DEST, lost).is_some(),
++        "{what}: the fragment was never written — this leg fenced nothing"
++    );
++    assert_fresh_premark(fixture.mark(DEST, lost).as_ref(), NOW, None, what);
++    assert_eq!(
++        fixture.queued().await,
++        vec![CHUNK],
++        "{what}: the obligation did not stay queued"
++    );
++    fixture.gc(NOW + GRACE).await;
++    assert_eq!(
++        fixture.on_disk(DEST, lost),
++        None,
++        "{what}: GC did not reclaim the written fragment under its pre-mark"
++    );
++    assert_eq!(fixture.mark(DEST, lost), None);
++}
++
++/// **(C, X29 `0016:888`)** The D server's hook fences the session — `Open@E` to `Aborting@E+1` —
++/// after the destination fragment is written and before the adoption CAS. The re-place adopts
++/// nothing, the part record is byte-identical, the pre-mark stands so GC reclaims the written
++/// fragment, and the obligation stays queued.
++#[tokio::test]
++async fn c_a_session_fence_after_the_write_strands_nothing() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++    let meta = Arc::clone(&fixture.meta);
++    let session_key = fixture.session_key();
++    fixture.on_put(DEST, move |stage| {
++        if stage == Stage::Written {
++            let fence = WriteBatch::new()
++                .require(session_key.clone(), open())
++                .put(session_key.clone(), aborting());
++            assert_eq!(meta.apply(fence), CommitOutcome::Committed);
++        }
++        Ok(())
++    });
++
++    let outcome = fixture.repaired(NOW).await;
++    assert_ne!(
++        outcome,
++        Reconciled::Changed,
++        "a lost re-place reported a repair"
++    );
++    assert_lost_cleanly(&fixture, &fixture.part.clone(), "session fenced").await;
++}
++
++/// **(C)** The same, with the part record rewritten instead of the session fenced:
++/// `require(part == prior)` loses.
++#[tokio::test]
++async fn c_a_part_rewrite_after_the_write_strands_nothing() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++    let rewritten = part(&[chunk_ref(CHUNK, &PLACEMENT)], 801);
++    let meta = Arc::clone(&fixture.meta);
++    let (key, prior, next) = (fixture.part_key(), fixture.part.clone(), rewritten.clone());
++    fixture.on_put(DEST, move |stage| {
++        if stage == Stage::Written {
++            let rewrite = WriteBatch::new()
++                .require(key.clone(), prior.clone())
++                .put(key.clone(), next.clone());
++            assert_eq!(meta.apply(rewrite), CommitOutcome::Committed);
++        }
++        Ok(())
++    });
++
++    let outcome = fixture.repaired(NOW).await;
++    assert_ne!(
++        outcome,
++        Reconciled::Changed,
++        "a lost re-place reported a repair"
++    );
++    assert_lost_cleanly(&fixture, &rewritten, "part rewritten").await;
++}
++
++// ---- (D) the pre-mark and write-deadline rules --------------------------------------------------
++
++/// **(D)(i)** The pre-mark is durable BEFORE the destination write: when the write reaches the D
++/// server, the metadata store already holds a fresh pre-mark for exactly that position.
++#[tokio::test]
++async fn d_i_the_pre_mark_is_durable_before_the_destination_write() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    let puts = fixture.puts(DEST);
++    assert_eq!(
++        puts.len(),
++        1,
++        "the destination write never arrived: {puts:?}"
++    );
++    assert_eq!(puts[0].frag, frag(CHUNK, LOST));
++    assert_fresh_premark(puts[0].mark_on_arrival.as_ref(), NOW, None, "on arrival");
++}
++
++/// **(D)(ii)** A destination position already carrying a mark from another event, or a legacy
++/// mark, is RE-STAMPED fresh before the write — never reused as the pre-mark with its old stamp,
++/// which GC's sweep of fragment-less marks could take before the write lands.
++#[tokio::test]
++async fn d_ii_an_existing_destination_mark_is_re_stamped_fresh() {
++    for (label, existing, event) in [
++        ("legacy", Bytes::from_static(b"5"), None),
++        (
++            "another event",
++            structured_mark(5, "move-elsewhere"),
++            Some("move-elsewhere"),
++        ),
++    ] {
++        let fixture = Fixture::new();
++        fixture.lose();
++        fixture.enqueue(CHUNK).await;
++        let lost = frag(CHUNK, LOST);
++        fixture.meta.seed(orphan_key(DEST, lost), existing);
++
++        assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed, "{label}");
++        let puts = fixture.puts(DEST);
++        assert_eq!(puts.len(), 1, "{label}: {puts:?}");
++        assert_fresh_premark(puts[0].mark_on_arrival.as_ref(), NOW, event, label);
++        assert_eq!(
++            fixture.mark(DEST, lost),
++            None,
++            "{label}: the pre-mark was not adopted"
++        );
++        assert_eq!(fixture.placement(), vec![0, DEST, 2], "{label}");
++    }
++}
++
++/// **(D)(iii)** A destination carrying a `reclaiming` mark is never used: nothing is written there,
++/// its mark is left byte for byte, and the rebuild goes to the next free domain.
++#[tokio::test]
++async fn d_iii_a_reclaiming_destination_is_never_used() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    let lost = frag(CHUNK, LOST);
++    let reclaiming =
++        Bytes::from_static(br#"{"orphaned_at_millis":5,"event":"gone","reclaiming":true}"#);
++    decode_orphan_mark(&reclaiming).expect("the seeded mark must decode");
++    fixture
++        .meta
++        .seed(orphan_key(DEST, lost), reclaiming.clone());
++
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    assert!(
++        fixture.puts(DEST).is_empty(),
++        "a write reached the reclaiming position"
++    );
++    assert_eq!(fixture.mark(DEST, lost), Some(reclaiming));
++    assert_rebuilt(&fixture, SPARE);
++    assert_eq!(fixture.placement(), vec![0, SPARE, 2]);
++    assert!(fixture.queued().await.is_empty());
++}
++
++/// **(D)(iv)** The destination write carries an authorization deadline — one the pre-mark's grace
++/// still covers at the deployed window — and when the D server refuses it as expired the re-place
++/// aborts: no adoption, the pre-mark standing, the obligation queued.
++#[tokio::test]
++async fn d_iv_a_write_refused_past_its_deadline_aborts_the_re_place() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    fixture.clock.store(NOW + ONE_DAY, Ordering::SeqCst);
++
++    let outcome = fixture.repaired(NOW).await;
++    assert_ne!(outcome, Reconciled::Changed);
++    let puts = fixture.puts(DEST);
++    assert_eq!(
++        puts.len(),
++        1,
++        "the destination write never arrived: {puts:?}"
++    );
++    assert!(
++        !puts[0].landed,
++        "the D server accepted a write past its deadline"
++    );
++    let deadline = puts[0]
++        .deadline
++        .expect("the destination write carried no deadline");
++    assert!(
++        deadline > NOW && deadline < NOW + DEPLOYED_GRACE,
++        "the write's deadline {deadline} does not fall inside its pre-mark's grace"
++    );
++    let lost = frag(CHUNK, LOST);
++    assert_eq!(fixture.on_disk(DEST, lost), None);
++    assert_eq!(
++        fixture.meta.value(&fixture.part_key()),
++        Some(fixture.part.clone())
++    );
++    assert_fresh_premark(
++        fixture.mark(DEST, lost).as_ref(),
++        NOW,
++        None,
++        "after the refusal",
++    );
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++}
++
++/// **(D)(v)** No write is authorized on a stale pre-mark (`0016:1338-1346`). A hook advances the
++/// clock a day past the pre-mark between the pre-mark commit and the write: the write's
++/// authorization was fixed at the pre-mark's own stamp, so the D server refuses it and nothing
++/// lands on the stale pre-mark. The next pass restarts from a FRESH pre-mark, and only that write
++/// is taken.
++#[tokio::test]
++async fn d_v_no_write_is_authorized_on_a_stale_pre_mark() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    let lost = frag(CHUNK, LOST);
++    let premark = orphan_key(DEST, lost);
++    let clock = Arc::clone(&fixture.clock);
++    fixture.meta.after_commit(move |_meta, batch| {
++        if batch.puts.iter().any(|(key, _)| *key == premark) {
++            clock.fetch_add(ONE_DAY, Ordering::SeqCst);
++        }
++    });
++
++    let stale = fixture.repaired(NOW).await;
++    assert_ne!(stale, Reconciled::Changed);
++    let puts = fixture.puts(DEST);
++    assert_eq!(puts.len(), 1, "{puts:?}");
++    assert!(!puts[0].landed, "a write landed on a pre-mark a day old");
++    assert_eq!(fixture.on_disk(DEST, lost), None);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++
++    let later = NOW + ONE_DAY;
++    fixture.meta.after_commit(|_meta, _batch| {});
++    assert_eq!(fixture.repaired(later).await, Reconciled::Changed);
++    let puts = fixture.puts(DEST);
++    assert_eq!(puts.len(), 2, "{puts:?}");
++    assert!(puts[1].landed);
++    assert_fresh_premark(puts[1].mark_on_arrival.as_ref(), later, None, "the retry");
++    assert!(puts[1].deadline.is_some_and(|deadline| deadline > later));
++    assert_rebuilt(&fixture, DEST);
++    assert_eq!(fixture.placement(), vec![0, DEST, 2]);
++    assert!(fixture.queued().await.is_empty());
++}
++
++/// **(D)(v)** A pre-mark an earlier attempt left standing is never the one a later write is
++/// authorized on: the first pass pre-marks and its write fails; the next pass, past the stale
++/// pre-mark's window, re-stamps the position before it writes.
++#[tokio::test]
++async fn d_v_a_pre_mark_left_by_an_earlier_attempt_is_re_stamped_before_the_write() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    let mut failed = false;
++    fixture.on_put(DEST, move |stage| {
++        if stage == Stage::Arrived && !failed {
++            failed = true;
++            return Err(BoxError::from("injected: the D server is unreachable"));
++        }
++        Ok(())
++    });
++
++    let (first, _) = fixture.reconstruct(NOW).await;
++    assert!(
++        first.is_err(),
++        "the injected transport fault did not fail the pass"
++    );
++    let lost = frag(CHUNK, LOST);
++    let left = fixture.mark(DEST, lost);
++    assert_fresh_premark(left.as_ref(), NOW, None, "the first attempt's pre-mark");
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++
++    let later = NOW + ONE_DAY;
++    fixture.clock.store(later, Ordering::SeqCst);
++    assert_eq!(fixture.repaired(later).await, Reconciled::Changed);
++    let puts = fixture.puts(DEST);
++    assert_eq!(puts.len(), 2, "{puts:?}");
++    assert!(puts[1].landed);
++    assert_ne!(
++        puts[1].mark_on_arrival, left,
++        "the retry wrote on the stale pre-mark"
++    );
++    assert_fresh_premark(puts[1].mark_on_arrival.as_ref(), later, None, "the retry");
++    assert_rebuilt(&fixture, DEST);
++    assert!(fixture.queued().await.is_empty());
++}
++
++/// **(D)(vi)** A vacated source whose `orphan:` value decodes as none of the three shapes makes the
++/// move stop before it writes anything: it never overwrites metadata it cannot parse (ADR-0045),
++/// the obligation stays queued, and the fault is surfaced — the pass does not certify, and the
++/// mark is named on the audit seam.
++#[tokio::test]
++async fn d_vi_an_unreadable_vacated_source_mark_withholds_the_move() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    let lost = frag(CHUNK, LOST);
++    let source = orphan_key(SOURCE, lost);
++    let unreadable = Bytes::from_static(b"not a mark");
++    assert!(decode_orphan_mark(&unreadable).is_err());
++    fixture.meta.seed(source.clone(), unreadable.clone());
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Blocked);
++    assert_eq!(fixture.mark(SOURCE, lost), Some(unreadable));
++    assert!(fixture.all_puts().is_empty(), "the move wrote a fragment");
++    assert_eq!(
++        fixture.mark(DEST, lost),
++        None,
++        "the move pre-marked a destination"
++    );
++    assert_eq!(
++        fixture.meta.value(&fixture.part_key()),
++        Some(fixture.part.clone())
++    );
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++    assert!(
++        audit.named(RECONSTRUCTION_AUDIT, "withheld-staged-repair", &source),
++        "the unreadable mark was not surfaced"
++    );
++}
++
++// ---- (E) the destination is fenced against a drain ----------------------------------------------
++
++/// **(E)** A draining server is never chosen as the destination: the rebuild goes elsewhere.
++#[tokio::test]
++async fn e_a_draining_server_is_never_the_destination() {
++    let fixture = Fixture::new();
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++    set_lifecycle(&*fixture.meta, DEST, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Changed);
++    assert!(
++        fixture.puts(DEST).is_empty(),
++        "a write reached the draining server"
++    );
++    assert_rebuilt(&fixture, SPARE);
++    assert_eq!(fixture.placement(), vec![0, SPARE, 2]);
++}
++
++/// **(E, `0016:885`)** A drain recorded between the destination's choice and the adoption CAS makes
++/// that CAS lose on `require_absent(desired:dserver:<S_new>)`: the destination is not adopted, and
++/// its pre-mark stands over the fragment written there.
++#[tokio::test]
++async fn e_a_drain_recorded_after_the_choice_loses_the_adoption() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++    let meta = Arc::clone(&fixture.meta);
++    fixture.on_put(DEST, move |stage| {
++        if stage == Stage::Written {
++            let drain = WriteBatch::new().put(
++                desired_key(DEST),
++                DServerLifecycle::Draining.label().as_bytes().to_vec(),
++            );
++            assert_eq!(meta.apply(drain), CommitOutcome::Committed);
++        }
++        Ok(())
++    });
++
++    let outcome = fixture.repaired(NOW).await;
++    assert_ne!(
++        outcome,
++        Reconciled::Changed,
++        "the draining destination was adopted"
++    );
++    assert_lost_cleanly(&fixture, &fixture.part.clone(), "drain recorded").await;
++}
++
++// ---- resolution: an obligation is kept until it can be repaired ---------------------------------
++
++/// A chunk only an owned entry names is still streaming: its obligation is kept, not drained, and
++/// nothing is written.
++#[tokio::test]
++async fn a_still_streaming_chunks_obligation_is_kept() {
++    const IN_FLIGHT: ChunkId = 0x665;
++    let fixture = Fixture::new();
++    let key = sidx_key(&fixture.upload, part_no(2), IN_FLIGHT);
++    let staged = StagedPlacement::new(RS_2_1, PLACEMENT.to_vec()).unwrap();
++    let value =
++        metadata::encode(&OwnedEntry::new(fixture.upload.clone(), NOW * 10, staged).to_pending());
++    decode_owned_entry(&key, &value).expect("the seeded owned entry must decode");
++    fixture.meta.seed(key, value);
++    fixture.enqueue(IN_FLIGHT).await;
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Satisfied);
++    assert_eq!(
++        fixture.queued().await,
++        vec![IN_FLIGHT],
++        "the obligation was dropped"
++    );
++    assert!(fixture.all_puts().is_empty());
++    assert!(audit.named(RECONSTRUCTION_AUDIT, "staged-deferred", b"in-flight"));
++}
++
++/// A committed part whose session is fenced — here `Completing` — is not repointed: its obligation
++/// is kept for after publication, and nothing is written.
++#[tokio::test]
++async fn a_fenced_sessions_part_keeps_its_obligation() {
++    let fixture = Fixture::new();
++    fixture.meta.seed(fixture.session_key(), completing());
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Satisfied);
++    assert_eq!(
++        fixture.queued().await,
++        vec![CHUNK],
++        "the obligation was dropped"
++    );
++    assert!(fixture.all_puts().is_empty());
++    assert_eq!(
++        fixture.meta.value(&fixture.part_key()),
++        Some(fixture.part.clone())
++    );
++    assert!(audit.named(RECONSTRUCTION_AUDIT, "staged-deferred", b"session-fenced"));
++}
++
++/// A session record that will not decode leaves the repair withheld: nothing written, the
++/// obligation kept, the record named, and the pass not certified.
++#[tokio::test]
++async fn an_unreadable_session_record_withholds_the_repair() {
++    let fixture = Fixture::new();
++    fixture.meta.seed(
++        fixture.session_key(),
++        Bytes::from_static(b"{\"kind\":\"Open\"}"),
++    );
++    fixture.lose();
++    fixture.enqueue(CHUNK).await;
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Blocked);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++    assert!(fixture.all_puts().is_empty());
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "withheld-staged-repair",
++        &fixture.session_key()
++    ));
++}
++
++/// A staged record the pass cannot read may stage any chunk, so while one exists the pass drains
++/// no obligation — even one no readable record names — names the record, and does not certify:
++/// a part record that will not decode, a session key that names no upload, and an owned key that
++/// names no chunk.
++#[tokio::test]
++async fn an_unreadable_staged_record_drains_no_obligation() {
++    const UNNAMED: ChunkId = 0x666;
++    let other = upload("67");
++    for (label, key, value) in [
++        (
++            "an undecodable part record",
++            part_key(&other, part_no(1)),
++            Bytes::from_static(b"{\"chunks\":\"not a chunk list\"}"),
++        ),
++        (
++            "a session key naming no upload",
++            b"mpu:not-an-upload-id".to_vec(),
++            open(),
++        ),
++        (
++            "an owned key naming no chunk",
++            format!("sidx:{other}:000002:no-chunk").into_bytes(),
++            Bytes::from_static(b"{}"),
++        ),
++    ] {
++        let fixture = Fixture::new();
++        fixture.meta.seed(mpu_key(&other), open());
++        fixture.meta.seed(key.clone(), value);
++        fixture.enqueue(UNNAMED).await;
++
++        let (outcome, audit) = fixture.reconstruct(NOW).await;
++        assert_eq!(outcome.unwrap(), Reconciled::Blocked, "{label}");
++        assert_eq!(
++            fixture.queued().await,
++            vec![UNNAMED],
++            "{label}: the obligation was dropped"
++        );
++        assert!(
++            audit.named(RECONSTRUCTION_AUDIT, "unresolvable-staged-record", &key),
++            "{label}: the record was not named"
++        );
++    }
++}
++
++/// An owned entry whose value will not decode still names its chunk through its key: the chunk is
++/// staged, so its obligation is kept rather than drained, and nothing is written.
++#[tokio::test]
++async fn a_damaged_owned_entry_still_holds_its_chunks_obligation() {
++    const STREAMING: ChunkId = 0x66a;
++    let fixture = Fixture::new();
++    fixture.meta.seed(
++        sidx_key(&fixture.upload, part_no(2), STREAMING),
++        Bytes::from_static(b"{\"lease_expiry_millis\":\"torn\"}"),
++    );
++    fixture.enqueue(STREAMING).await;
++    let (outcome, _audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Satisfied);
++    assert_eq!(
++        fixture.queued().await,
++        vec![STREAMING],
++        "the obligation was dropped"
++    );
++    assert!(fixture.all_puts().is_empty());
++}
++
++/// A staged chunk the pass finds already whole drains its obligation, as a committed one does, and
++/// nothing is written.
++#[tokio::test]
++async fn a_staged_chunk_already_whole_drains_its_obligation() {
++    let fixture = Fixture::new();
++    fixture.enqueue(CHUNK).await;
++    assert_eq!(fixture.repaired(NOW).await, Reconciled::Satisfied);
++    assert!(fixture.queued().await.is_empty());
++    assert!(fixture.all_puts().is_empty());
++}
++
++/// A staged chunk the pass cannot repair keeps its obligation and writes nothing: below `k` intact
++/// fragments it is lost (the data-loss signal), and when its only free domain is draining the
++/// rebuild has nowhere to go.
++#[tokio::test]
++async fn a_staged_chunk_it_cannot_repair_keeps_its_obligation() {
++    let below_k = Fixture::new();
++    below_k.lose();
++    below_k.remove(2, frag(CHUNK, 2));
++    below_k.enqueue(CHUNK).await;
++    let (outcome, audit) = below_k.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Satisfied);
++    assert_eq!(below_k.queued().await, vec![CHUNK]);
++    assert!(below_k.all_puts().is_empty());
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "data-loss",
++        wyrd_traits::chunk_hex(CHUNK).as_bytes()
++    ));
++
++    let nowhere = Fixture::tight();
++    nowhere.lose();
++    nowhere.enqueue(CHUNK).await;
++    set_lifecycle(&*nowhere.meta, SOURCE, DServerLifecycle::Draining)
++        .await
++        .unwrap();
++    assert_eq!(nowhere.repaired(NOW).await, Reconciled::Satisfied);
++    assert_eq!(nowhere.queued().await, vec![CHUNK]);
++    assert!(nowhere.all_puts().is_empty());
++}
++
++/// A committed part's chunk whose placement is not one D server per fragment is never rebuilt over
++/// (it is flagged for a human), and a single-copy staged chunk has no redundancy to rebuild from:
++/// both keep their obligations, and nothing is written.
++#[tokio::test]
++async fn a_staged_chunk_with_a_malformed_placement_or_no_redundancy_keeps_its_obligation() {
++    const SHORT: ChunkId = 0x668;
++    const SINGLE: ChunkId = 0x669;
++    let fixture = Fixture::new();
++    let single = ChunkRef {
++        id: SINGLE,
++        scheme: EcScheme::None,
++        len: 5,
++        placement: vec![0],
++    };
++    fixture.meta.seed(
++        part_key(&fixture.upload, part_no(2)),
++        part(&[chunk_ref(SHORT, &[0, 1]), single], 800),
++    );
++    fixture.enqueue(SHORT).await;
++    fixture.enqueue(SINGLE).await;
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Satisfied);
++    assert_eq!(fixture.queued().await, vec![SHORT, SINGLE]);
++    assert!(fixture.all_puts().is_empty());
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "needs-human",
++        wyrd_traits::chunk_hex(SHORT).as_bytes()
++    ));
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "data-loss",
++        wyrd_traits::chunk_hex(SINGLE).as_bytes()
++    ));
++}
++
++/// **(B)** A vacated source already carrying a mark: one another event wrote is re-stamped with this
++/// move's identity and a fresh stamp (`0016:1216-1224`); a `reclaiming` one is left byte for byte —
++/// no writer replaces it, and GC finishes that reclaim once nothing names the position.
++#[tokio::test]
++async fn b_a_vacated_sources_existing_mark_is_re_stamped_or_left_reclaiming() {
++    let lost = frag(CHUNK, LOST);
++
++    let stale = Fixture::new();
++    stale.rot();
++    stale.enqueue(CHUNK).await;
++    stale.meta.seed(
++        orphan_key(SOURCE, lost),
++        structured_mark(5, "move-elsewhere"),
++    );
++    assert_eq!(stale.repaired(NOW).await, Reconciled::Changed);
++    assert_eq!(stale.placement(), vec![0, DEST, 2]);
++    assert_fresh_premark(
++        stale.mark(SOURCE, lost).as_ref(),
++        NOW,
++        Some("move-elsewhere"),
++        "the vacated source",
++    );
++
++    let reclaiming = Fixture::new();
++    reclaiming.rot();
++    reclaiming.enqueue(CHUNK).await;
++    let decided =
++        Bytes::from_static(br#"{"orphaned_at_millis":5,"event":"gone","reclaiming":true}"#);
++    reclaiming
++        .meta
++        .seed(orphan_key(SOURCE, lost), decided.clone());
++    assert_eq!(reclaiming.repaired(NOW).await, Reconciled::Changed);
++    assert_eq!(reclaiming.placement(), vec![0, DEST, 2]);
++    assert_eq!(reclaiming.mark(SOURCE, lost), Some(decided));
++    assert!(reclaiming.queued().await.is_empty());
++}
++
++/// **(D)(iii)** With every free position `reclaiming` — both free domains', and the source's own —
++/// there is no usable destination: the re-place writes nothing, leaves every mark as it was, and
++/// keeps the obligation.
++#[tokio::test]
++async fn d_iii_with_no_usable_destination_the_re_place_writes_nothing() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    fixture.enqueue(CHUNK).await;
++    let lost = frag(CHUNK, LOST);
++    let decided =
++        Bytes::from_static(br#"{"orphaned_at_millis":5,"event":"gone","reclaiming":true}"#);
++    for dserver in [DEST, SPARE, SOURCE] {
++        fixture
++            .meta
++            .seed(orphan_key(dserver, lost), decided.clone());
++    }
++
++    let (outcome, audit) = fixture.reconstruct(NOW).await;
++    assert_ne!(outcome.unwrap(), Reconciled::Changed);
++    assert!(
++        fixture.all_puts().is_empty(),
++        "a write reached a reclaiming position"
++    );
++    for dserver in [DEST, SPARE, SOURCE] {
++        assert_eq!(fixture.mark(dserver, lost), Some(decided.clone()));
++    }
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "staged-aborted",
++        b"no-usable-destination"
++    ));
++}
++
++/// A destination the topology lists but this pass's fleet view left out is never written to, and
++/// neither is one whose mark cannot be read — that mark is left for a human, byte for byte, and
++/// named. Either way the rebuild goes to the next free domain.
++#[tokio::test]
++async fn a_destination_off_the_fleet_or_with_an_unreadable_mark_is_passed_over() {
++    let lost = frag(CHUNK, LOST);
++
++    let off_fleet = Fixture {
++        off_fleet: Some(DEST),
++        ..Fixture::new()
++    };
++    off_fleet.lose();
++    off_fleet.enqueue(CHUNK).await;
++    assert_eq!(off_fleet.repaired(NOW).await, Reconciled::Changed);
++    assert!(off_fleet.puts(DEST).is_empty());
++    assert_rebuilt(&off_fleet, SPARE);
++    assert_eq!(off_fleet.placement(), vec![0, SPARE, 2]);
++
++    let unreadable = Fixture::new();
++    unreadable.lose();
++    unreadable.enqueue(CHUNK).await;
++    let garbage = Bytes::from_static(b"not a mark");
++    unreadable
++        .meta
++        .seed(orphan_key(DEST, lost), garbage.clone());
++    let (outcome, audit) = unreadable.reconstruct(NOW).await;
++    assert_eq!(outcome.unwrap(), Reconciled::Changed);
++    assert!(unreadable.puts(DEST).is_empty());
++    assert_eq!(unreadable.mark(DEST, lost), Some(garbage));
++    assert_rebuilt(&unreadable, SPARE);
++    assert_eq!(unreadable.placement(), vec![0, SPARE, 2]);
++    assert!(audit.named(
++        RECONSTRUCTION_AUDIT,
++        "unusable-destination",
++        &orphan_key(DEST, lost)
++    ));
++}
++
++// ---- scrub: what it cannot read or trust, it names ----------------------------------------------
++
++/// **(A)** Scrub over committed parts it cannot use: a part record that will not decode and a
++/// session key that names no upload leave it unable to verify what they stage, so it names each and
++/// refuses to certify; a part whose chunk placement is not one D server per fragment is named and
++/// never expanded into a phantom repair. The healthy part's rotten fragment is still queued.
++#[tokio::test]
++async fn a_scrub_names_committed_parts_it_cannot_read_or_trust() {
++    const SHORT: ChunkId = 0x667;
++    let fixture = Fixture::new();
++    fixture.rot();
++    let damaged = part_key(&fixture.upload, part_no(2));
++    fixture.meta.seed(
++        damaged.clone(),
++        Bytes::from_static(b"{\"chunks\":\"not a chunk list\"}"),
++    );
++    let short = part_key(&fixture.upload, part_no(3));
++    fixture
++        .meta
++        .seed(short.clone(), part(&[chunk_ref(SHORT, &[0, 1])], 800));
++    let unnamed = b"mpu:not-an-upload-id".to_vec();
++    fixture.meta.seed(unnamed.clone(), open());
++
++    let (outcome, audit) = fixture.scrub_audited().await;
++    assert_eq!(outcome, Reconciled::Blocked);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++    assert!(audit.named(SCRUB_AUDIT, "unresolvable-staged-record", &damaged));
++    assert!(audit.named(SCRUB_AUDIT, "unresolvable-staged-record", &unnamed));
++    assert!(audit.named(SCRUB_AUDIT, "malformed-staged-placement", &short));
++}
++
++/// **(A)** A chunk named both by a committed chunk map — published — and by its part record is
++/// verified once, against the committed map, not once per record.
++#[tokio::test]
++async fn a_scrub_verifies_a_chunk_named_by_both_classes_once() {
++    let fixture = Fixture::new();
++    fixture.rot();
++    let published = InodeRecord {
++        size: DATA.len() as u64,
++        chunk_map: vec![chunk_ref(CHUNK, &PLACEMENT)].into(),
++        state: InodeState::Committed,
++        version: 1,
++        ..Default::default()
++    };
++    let created = metadata::create(&*fixture.meta, PARENT, OBJECT, 7, &published).await;
++    assert_eq!(created.unwrap(), CommitOutcome::Committed);
++
++    let (outcome, audit) = fixture.scrub_audited().await;
++    assert_eq!(outcome, Reconciled::Changed);
++    assert_eq!(fixture.queued().await, vec![CHUNK]);
++    assert_eq!(
++        audit.count(SCRUB_AUDIT, "corruption", &wyrd_traits::chunk_hex(CHUNK)),
++        1,
++        "the rotten fragment was verified more than once"
++    );
++}
