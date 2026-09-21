@@ -1,0 +1,5 @@
+No introduced correctness bugs found within the diff's stated scope.
+
+- NEEDS-HUMAN [impl] — `crates/custodian/src/scrub.rs:200` — Low priority, efficiency: the new `fragments` map copies every included fragment before immediately regrouping it into `by_dserver`. Both input collections already deduplicate `(DServerId, FragmentId)`, and the staged filter at `crates/custodian/src/scrub.rs:220` excludes every chunk represented by the committed input. Populate `by_dserver` directly from those two loops, preserving that filter, to remove an unnecessary O(number of fragments) hash table and traversal on every scrub pass, including stores without multipart uploads.
+
+Frozen gate evidence reviewed; no builds rerun. The two T4 reports do not establish additional in-scope defects: absent-fleet servers are expressly excluded by the brief; the malformed-part outcome at `crates/custodian/tests/staged_scrub.rs:1091` follows the existing audit-and-skip convention asserted at `crates/custodian/tests/scrub.rs:824` and specified by ADR-0040 decision 4.
