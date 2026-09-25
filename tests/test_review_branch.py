@@ -143,6 +143,36 @@ class Rejections(unittest.TestCase):
         self.assertFalse(rb.is_rejected(
             _f("f.rs:112", "BUG", "null deref when the map is empty"), rej))
 
+    def test_a_generic_phrase_clears_only_the_nearest_site(self):
+        """#251 review: MATCH phrases are mostly short words, so a decision must not
+        become a file-wide wildcard — a second same-class site sharing the phrase
+        still blocks."""
+        rej = [("f.rs:100", "BUG", "DST")]
+        shifted = _f("f.rs:112", "BUG", "DST model drops the timeout")
+        other = _f("f.rs:400", "BUG", "DST seed leaks across runs")
+        batch = [shifted, other]
+        self.assertTrue(rb.is_rejected(shifted, rej, batch))
+        self.assertFalse(rb.is_rejected(other, rej, batch))
+
+    def test_every_wording_at_the_anchored_line_is_cleared(self):
+        rej = [("f.rs:100", "BUG", "stalls repairs")]
+        a = _f("f.rs:112", "BUG", "keeping only the first part stalls repairs")
+        b = _f("f.rs:112", "BUG", "later parts: this stalls repairs permanently")
+        self.assertTrue(rb.is_rejected(a, rej, [a, b]))
+        self.assertTrue(rb.is_rejected(b, rej, [a, b]))
+
+    def test_two_decisions_follow_their_own_findings(self):
+        rej = [("f.rs:100", "BUG", "heap"), ("f.rs:300", "BUG", "heap")]
+        a = _f("f.rs:120", "BUG", "heap grows per chunk")
+        b = _f("f.rs:320", "BUG", "heap grows per part")
+        self.assertTrue(rb.is_rejected(a, rej, [a, b]))
+        self.assertTrue(rb.is_rejected(b, rej, [a, b]))
+
+    def test_a_bare_file_decision_matches_only_a_bare_file_finding(self):
+        rej = [("f.rs", "CONVENTION", "naming")]
+        self.assertTrue(rb.is_rejected(_f("f.rs", "CONVENTION", "naming"), rej))
+        self.assertFalse(rb.is_rejected(_f("f.rs:10", "CONVENTION", "naming"), rej))
+
     def test_same_defect_in_another_file_is_not_cleared(self):
         rej = [("a/f.rs:100", "BUG", "off-by-one in the range check")]
         self.assertFalse(rb.is_rejected(
