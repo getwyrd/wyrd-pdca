@@ -2061,3 +2061,97 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - codex-pr:bug-silently
 - codex-pr:bug-crashes
 - codex-pr:bug-regression
+
+# Act review — 2026-09-20 (cont.) — cycles considered: issue_637, issue_655, issue_661, issue_662, issue_663, issue_664, issue_681, issue_685, issue_691, issue_692, issue_693, issue_695, issue_696, issue_697, issue_710, issue_715, issue_716, issue_717, issue_771, issue_772, issue_800, issue_803, issue_804, issue_808, issue_813, issue_814
+
+> Frozen-bundle sweep of the 26 cycles frozen after the 2026-08-02 review (the 09-11 and
+> 09-20 entries were out-of-band and did not sweep bundles). Decided with Eduard Ralph in
+> session: one delta applied, two issues filed. No contribution disposition is re-decided.
+>
+> Flow (getwyrd/wyrd-pdca#244 header, not yet adopted — recorded early): getwyrd/wyrd
+> 2026-09-11..09-24 — issues opened **12**, closed **11**, non-bot PRs merged **13**;
+> bundles PLANNED — **not recorded** (Act does not run `pdca status`; the human did not
+> supply it). Closed < opened by one: not yet passing #244's bar.
+
+## What the cycles' records exposed
+
+- **The size backstop fired on 16 of the 17 bundles that built a patch, and the human
+  cleared it every time without a split.** (808 is the one it missed; 710 carried it in a
+  T2 row.) Half of those firings (655, 691, 693, 695, 696, 697, 715, 716) came from the
+  `rounds = 2` trigger alone, on patches of 40–84 KB. The other eight crossed 100 KB
+  (661, 771, 772, 800, 803, 804, 813, 814), and several were already split children that
+  wyrd-pdca#239's "one split, ever" rule keeps from splitting again. So the recommendation
+  it prints (`iterate-plan`, split) matched none of the 16 decisions.
+- **The `rounds` trigger also contradicts the 09-20 builder ladder.** A size item is
+  HUMAN, and a HUMAN item disqualifies auto-iterate (`src/pdca_harness/size_signal.py:40-44`,
+  `flow.py:353-362`). With the default `rounds = 2`, the unattended loop stops at round 2,
+  before the opus attempts 2–4 and the fable attempts 5–6 that `max_auto_iters = 5`
+  (`pdca.toml:79`) was set to budget on 09-20. The comment above the threshold still said
+  "max_auto_iters defaults to 3" — stale since that change.
+- **Settled review findings come back when the patch shifts lines.** `scripts/review-branch`
+  binds a recorded rejection to its exact `file:line` (`scripts/review-branch:352-357`).
+  issue_697 re-argued the same decided finding across rounds 6–11 (its own §10), and
+  issue_716 hit the same stale-line shape (`multipart.rs:1578`, its §10).
+- **The prior-art check cannot be done by the reviewer on any bundle with a patch.** Since
+  harness#419 the reviewer's `$PDCA_TARGET` is a throwaway copy with one synthetic commit
+  and no remote (`src/pdca_harness/leaves.py` `_reviewer_repo`), so merged and
+  closed/rejected history for the affected paths is absent. T5 went to §6 on 693, 772
+  (twice), 803 and 813, and was cleared by assertion ("no known conflicting prior work").
+  This is a new shape: #277 (network grant) closed in July, and #403/#401 (the August
+  "scripts absent" T4 variant, still seen on 695/697/710) closed in August.
+- **The 08-02 RED-leg guard is working, and its §6 cost is the honest kind.** PASS lines now
+  carry the count (808: 7, 800: 16, 814: 30 "test(s) ran red"). The new UNVERIFIABLE cell
+  fired on net-new-API bundles (655, 716, 771, 772), all "the test calls code the patch
+  adds, so it cannot compile on the base" — the expected cost. None was a green that would
+  otherwise have been banked falsely. Keep the cell.
+- **The 09-20 deltas are taking effect (early read, two bundles).** 813 and 814 carry all three
+  advisory artifacts (`check-review.md`, `check-advisory-adversary.md`,
+  `check-advisory-code-review.md`). Their `loop-telemetry.json` shows the ladder tiers per
+  attempt (sonnet or the `opus-max` pin → opus/xhigh ×3 → fable/xhigh at attempt 5).
+- **Split parents still cost a full Plan-advisory pass and a §6 item with no patch** (637,
+  662, 663, 664, 681, 692, 717, 4–5 advisory findings each). Already owned by
+  getwyrd/wyrd-pdca#239 and eduralph/pdca-harness#545, both open — no new delta.
+- **Validation fitness-to-purpose and the sandbox-caused C4 failures/flakes** recur as before.
+  The first is always a human call by design; the second is already routed. No delta.
+
+## Process deltas
+
+- Gates: **size backstop's round-count trigger switched off** — `[driver.size_signal]`
+  is now a live table setting only `rounds = 0`; `patch_kb = 100` and `patch_files = 20`
+  stay at their calibrated defaults (kept below it as the commented reference block that
+  `tests/test_size_signal.py` checks), so a large patch is still flagged. The round budget
+  is now owned only by `soft_auto_iters = 3` / `max_auto_iters = 5`. The stale comment is
+  rewritten to say why. Verified: the effective thresholds (`size_signal._thresholds`)
+  are `{'patch_kb': 100, 'patch_files': 20, 'rounds': 0}` and `oversize_reasons` skips a
+  threshold at 0 (`size_signal.py:370`); unit suite 2073 OK, 1 skipped.
+  (`pdca.toml:346-363` `[driver.size_signal]`)
+  *Freeze (wyrd-pdca#243):* config-only; the bundles it stops unattended are the multipart
+  critical-path chain.
+
+## Follow-ups routed (not process deltas — work handed to an owner)
+
+- This repo: **getwyrd/wyrd-pdca#248** — `review-branch` binds a recorded rejection to its
+  exact line, so a line shift re-blocks a settled finding (697, 716).
+  <https://github.com/getwyrd/wyrd-pdca/issues/248>
+- Harness/driver (upstream): **eduralph/pdca-harness#575** — the reviewer's disposable target
+  (#419) has one synthetic commit and no remote, so prior art is NEEDS-HUMAN on every bundle
+  with a patch (693, 772, 803, 813). <https://github.com/eduralph/pdca-harness/issues/575>
+- Still open, carried: wyrd-pdca#239 (split parents), #241 (sizer recalibration — this
+  period's frozen data cuts against its premise for the *a-priori* sizer: "oversized"
+  estimates built ≥100 KB in 8 of 10 cases, "watch"/"ok" in 0 of 8; read that before
+  retuning), #244 (flow header), harness#435, #544, #545.
+
+## How effectiveness will be judged
+
+- **The round trigger is gone.** For the next five bundles that build, no §6 size item may
+  read "round(s) already spent". A size item that does appear must name a patch size or a
+  file count.
+- **The ladder now climbs unattended.** For the next bundle that needs more than two rounds
+  and has a patch under 100 KB, `loop-telemetry.json` must show attempts 3+ that ran without
+  a sign-off between them. If the flow still stops at round 2, read its stderr "not
+  auto-iterating" line to find which rule stopped it.
+- **Big patches are still caught.** The next bundle over 100 KB must still carry a size item
+  in §6 — if not, the table edit broke the size triggers too.
+- **The routed issues.** At the next review, read the state of wyrd-pdca#248 and
+  harness#575, not just that they exist. Until #575 lands, a prior-art T5 row on a patched
+  bundle is expected.
