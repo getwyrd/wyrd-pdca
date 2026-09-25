@@ -129,6 +129,25 @@ class Rejections(unittest.TestCase):
         rej = [("x.rs:10", "CONVENTION", "naming")]
         self.assertFalse(rb.is_rejected(_f("x.rs:10", "BUG", "naming"), rej))
 
+    def test_decision_survives_a_line_shift(self):
+        """#248: an edit above the finding moves it from :100 to :112 — the recorded
+        decision still binds (issue_697 rounds 6-11 re-blocked on exactly this)."""
+        rej = [("f.rs:100", "BUG", "off-by-one in the range check")]
+        self.assertTrue(rb.is_rejected(
+            _f("f.rs:112", "BUG", "There is an off-by-one in the range check here"), rej))
+        self.assertTrue(rb.is_rejected(
+            _f("f.rs:90-96", "BUG", "off-by-one in the range check"), rej))
+
+    def test_new_defect_in_the_same_file_still_blocks(self):
+        rej = [("f.rs:100", "BUG", "off-by-one in the range check")]
+        self.assertFalse(rb.is_rejected(
+            _f("f.rs:112", "BUG", "null deref when the map is empty"), rej))
+
+    def test_same_defect_in_another_file_is_not_cleared(self):
+        rej = [("a/f.rs:100", "BUG", "off-by-one in the range check")]
+        self.assertFalse(rb.is_rejected(
+            _f("b/f.rs:100", "BUG", "off-by-one in the range check"), rej))
+
 
 class RunPassUsability(unittest.TestCase):
     """A pass is usable only with a parseable finding or the sentinel; it runs
