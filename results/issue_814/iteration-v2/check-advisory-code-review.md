@@ -1,0 +1,5 @@
+No new in-scope correctness defect found. One efficiency finding:
+
+- NEEDS-HUMAN [impl] — `crates/custodian/src/reconstruction/staged.rs:589` and `crates/custodian/src/reconstruction.rs:445`: after a placement-changing adoption, later plans for that same part still reconstruct the entire chunk and encode every shard before their pre-mark CAS rejects the now-stale part bytes (`staged.rs:617`). With N degraded chunks that must move, this performs N(N+1)/2 rebuilds across N passes for N adopted repairs. Track which part snapshots this pass has superseded and skip their remaining plans before erasure work. This preserves the accepted one-chunk-per-part-per-pass behavior; an in-place repair that leaves the part bytes unchanged should not invalidate other plans.
+
+Reviewed the frozen CI, red/green, coverage, mutation and batch-review evidence; no gates were rerun. The single-copy classification flagged by T4 at `crates/custodian/src/reconstruction/staged.rs:280` is explicitly accepted in the brief, and pre-mark settlement is deferred to #825; neither is re-raised here.

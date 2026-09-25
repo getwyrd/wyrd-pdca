@@ -1,0 +1,8 @@
+# Batched review — 3 passes, union of findings
+
+- [ ] `crates/custodian/src/reconstruction/staged.rs:212` **BUG** (seen by 1 pass): Keeping only the first part referencing a chunk permanently stalls repairs for later parts after the first is repointed: scrub continues enqueueing their missing positions, but reconstruction sees the first part at full redundancy and drains the obligation without repairing the others.
+- [ ] `crates/custodian/src/reconstruction/staged.rs:212` **BUG** (seen by 1 pass): Keeping only the first part referencing a chunk leaves subsequent parts permanently degraded after that first part is repointed, because later repair passes inspect the now-healthy first placement and drain obligations for the still-missing placements.
+- [ ] `crates/custodian/src/reconstruction/staged.rs:343` **BUG** (seen by 1 pass): Retaining a complete rewritten part record per queued chunk multiplies assessment memory by the number of degraded chunks per part, allowing valid large backlogs to consume tens of gigabytes before any repair executes.
+- [ ] `crates/custodian/src/reconstruction/staged.rs:212` **BUG** (seen by 1 pass): Keeping only the first part referencing a chunk leaves subsequent parts permanently degraded after that first part is repointed, because later passes find the first part intact and drain every repair obligation scrub enqueues for the other parts’ missing fragments.
+
+Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale — not re-reviewed to silence. The gate blocks while any finding here is unchecked.
