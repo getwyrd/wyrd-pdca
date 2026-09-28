@@ -86,6 +86,11 @@ class MergeWave(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         self.cfg = _cfg(self.tmp)
+        # A green rollup is confirmed one interval later (eduralph/pdca-harness#582), so
+        # every merge here would otherwise sleep for real: no test in this class may.
+        sleeper = mock.patch.object(merge, "_sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -324,7 +329,9 @@ class MergeWave(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             rc = merge.merge_wave(self.cfg, [b], method="merge")
         self.assertEqual(rc, 0)
-        self.assertEqual(reads["n"], 3)               # pending, pending, then green
+        # pending, pending, green — and the instance's confirm read of that green
+        # (eduralph/pdca-harness#582); upstream alone reads three times.
+        self.assertEqual(reads["n"], 4)
         self.assertTrue(sleep.called)                 # the wait actually slept in between
         self.assertIn(["gh", "pr", "merge", "https://gh/pr/1", "--merge"], calls)
         self.assertNotIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
@@ -348,9 +355,11 @@ class MergeWave(unittest.TestCase):
         gh = [c[:3] for c in calls if c[:2] == ["gh", "pr"]]
         # `view` is the #531 behind-check. Order is the contract: the rollup is read AFTER
         # the ready-mark, and AFTER the sync read — so it describes the tree being merged
-        # into, not the one the branch was cut from.
+        # into, not the one the branch was cut from. The second `checks` is the confirm read
+        # of the green (eduralph/pdca-harness#582).
         self.assertEqual(gh, [["gh", "pr", "ready"], ["gh", "pr", "view"],
-                              ["gh", "pr", "checks"], ["gh", "pr", "merge"]])
+                              ["gh", "pr", "checks"], ["gh", "pr", "checks"],
+                              ["gh", "pr", "merge"]])
 
     def test_empty_rollup_refuses_under_the_default(self) -> None:
         # Absence of evidence is not green: nothing reported ⇒ nothing verified.
@@ -496,10 +505,90 @@ class MergeWave(unittest.TestCase):
         self.assertIn("merge_wait_secs", err.getvalue())
 
 
+class WaitForGreenConfirms(unittest.TestCase):
+    """`_wait_for_green` confirms a green once before believing it — the instance delta
+    over upstream #462 (eduralph/pdca-harness#582, PR #224 review re-raised on PR #253)."""
+
+    def _wait(self, verdicts: list[str], wait_secs: int):
+        seen: list[str] = []
+        sleeps: list[int] = []
+        script = iter(verdicts)
+
+        def read(_url):
+            v = next(script, verdicts[-1])
+            seen.append(v)
+            return v, v
+        with mock.patch.object(merge, "_check_rollup", side_effect=read), \
+                mock.patch.object(merge, "_sleep", side_effect=sleeps.append):
+            out = merge._wait_for_green("https://gh/pr/1", wait_secs)
+        return out, seen, sleeps
+
+    def test_a_first_read_green_is_confirmed_not_trusted(self):
+        (v, _), seen, sleeps = self._wait(["green", "green"], 300)
+        self.assertEqual(v, "green")
+        self.assertEqual(seen, ["green", "green"])
+        self.assertEqual(len(sleeps), 1)
+
+    def test_a_check_registering_after_a_green_is_caught(self):
+        # green, then the slow check appears (pending), then it passes: confirmed at the end.
+        (v, _), seen, _ = self._wait(["green", "pending", "green", "green"], 300)
+        self.assertEqual(v, "green")
+        self.assertEqual(seen, ["green", "pending", "green", "green"])
+
+    def test_a_check_registering_red_after_a_green_refuses(self):
+        (v, _), seen, _ = self._wait(["green", "failing"], 300)
+        self.assertEqual(v, "failing")
+        self.assertEqual(seen, ["green", "failing"])
+
+    def test_a_green_reached_through_the_loop_is_confirmed_too(self):
+        (v, _), seen, _ = self._wait(["empty", "green", "green"], 300)
+        self.assertEqual(v, "green")
+        self.assertEqual(seen, ["empty", "green", "green"])
+
+    def test_zero_budget_is_a_single_read_green_included(self):
+        (v, _), seen, sleeps = self._wait(["green"], 0)
+        self.assertEqual((v, seen, sleeps), ("green", ["green"], []))
+
+    def test_the_confirm_is_charged_to_the_budget(self):
+        for budget in (1, 5, 14):
+            with self.subTest(budget=budget):
+                (v, _), _seen, sleeps = self._wait(["green", "green"], budget)
+                self.assertEqual(v, "green")
+                self.assertLessEqual(sum(sleeps), budget)
+
+    def test_an_exhausted_budget_returns_an_unconfirmed_green_as_it_stands(self):
+        # Budget spent before the confirm read could happen: the green stands (it is the
+        # last evidence), never a fabricated refusal.
+        (v, _), seen, _ = self._wait(["pending", "green"], 15)
+        self.assertEqual(v, "green")
+        self.assertEqual(seen, ["pending", "green"])
+
+
+class MergeWaitCap(unittest.TestCase):
+    """`merge_wait_secs` keeps its four-hour ceiling (eduralph/pdca-harness#581)."""
+
+    def test_a_huge_value_is_clamped_with_a_message(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "pdca.toml").write_text(
+            '[paths]\nbundle_root = "results"\n[driver]\nmerge_wait_secs = 86400\n',
+            encoding="utf-8")
+        with redirect_stderr(io.StringIO()) as err:
+            cfg = Config.load(tmp)
+        self.assertEqual(cfg.merge_wait_secs, 14400)
+        self.assertIn("exceeds the 14400s cap", err.getvalue())
+
+
 class SyncBaseBeforeGate(unittest.TestCase):
     """`merge_sync_base` — the #531 delta. A wave's second merge must not be gated on a
     rollup computed before its sibling landed, so a behind PR is brought up to date BEFORE
     the rollup gate reads anything."""
+
+    def setUp(self) -> None:
+        # The post-sync wait confirms its green one interval later (#582): never for real.
+        sleeper = mock.patch.object(merge, "_sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
 
     def _drive(self, name, *, behind, cfg_kw=None, update_rc=0, view_rc=0, cmp_rc=0,
                stays_behind=False, owner="org", checks=None):

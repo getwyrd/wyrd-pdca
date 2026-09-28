@@ -210,14 +210,30 @@ def _wait_for_green(pr_url: str, wait_secs: int, *, poll_interval: int = 15) -> 
     behaviour, for a host whose checks are known to already be in by the time the wave
     boundary fires. Sleeps go through the module-level ``_sleep`` so a test can make the
     whole loop cost no real time.
+
+    **A green is confirmed once before it is believed** (INSTANCE DELTA,
+    eduralph/pdca-harness#582 — PR #224 review, re-raised on PR #253). While a new PR's
+    checks are registering the rollup does not say "incomplete": it reports whatever has
+    registered SO FAR, so one fast check that already passed reads as a clean green while
+    the slow job that matters has not created its check run yet. A green — first read or
+    reached through the loop — is re-read one interval later and believed only if it held;
+    a re-read that went pending/empty falls back into the wait, and a red or unreadable one
+    returns at once. The confirm is charged to the budget, so a small ``wait_secs`` never
+    sleeps longer than the operator allowed, and an exhausted budget returns the last read
+    as it stands. ``wait_secs <= 0`` does not confirm either: one read, upstream exactly.
     """
     verdict, detail = _check_rollup(pr_url)
     waited = 0
-    while verdict in ("pending", "empty") and waited < wait_secs:
+    held = False  # the last read was a green that a green one interval earlier preceded
+    while waited < wait_secs and verdict not in ("failing", "unreadable"):
+        if verdict == "green" and held:
+            break
         step = min(poll_interval, wait_secs - waited)
         _sleep(step)
         waited += step
-        verdict, detail = _check_rollup(pr_url)
+        again, again_detail = _check_rollup(pr_url)
+        held = verdict == "green" and again == "green"
+        verdict, detail = again, again_detail
     return verdict, detail
 
 

@@ -85,6 +85,11 @@ def _parse_opt_in(value, name: str) -> bool:
 #
 # ----------------------------------------------------------------------------
 
+#: Ceiling for ``[driver].merge_wait_secs`` (INSTANCE DELTA, eduralph/pdca-harness#581 —
+#: PR #224 review). Four hours is longer than any honest CI run on a target this harness
+#: drives; past that a batch is not waiting, it is stuck, and the STOP is the useful outcome.
+_MERGE_WAIT_CAP_SECS = 14400
+
 @dataclass
 class LeafConfig:
     """How one model leaf (planner, Do builder, Check reviewer, sign-off, Act) runs.
@@ -872,6 +877,14 @@ class Config:
             print(f"config: [driver].merge_wait_secs must be >= 0, got {merge_wait_secs} — "
                   "using the default 300", file=sys.stderr)
             merge_wait_secs = 300
+        if merge_wait_secs > _MERGE_WAIT_CAP_SECS:
+            # INSTANCE DELTA (eduralph/pdca-harness#581, with the OverflowError above): an
+            # uncapped budget polls GitHub every 15s for as long as it is given; a batch
+            # left waiting a day has failed in a way no one is watching for (PR #224
+            # review, re-raised on PR #253).
+            print(f"config: [driver].merge_wait_secs {merge_wait_secs} exceeds the "
+                  f"{_MERGE_WAIT_CAP_SECS}s cap — using the cap.", file=sys.stderr)
+            merge_wait_secs = _MERGE_WAIT_CAP_SECS
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.

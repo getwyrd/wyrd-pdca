@@ -98,11 +98,12 @@
     red, an unreadable rollup, or an exhausted budget still refuses and still STOPs; waiting
     can only turn a refusal into a merge a later read would have permitted anyway. **Upstream
     since v0.58.0** (#462): the instance's own `_await_rollup` delta (2026-08-16) was retired
-    at that upgrade, and with it two things it did that upstream's does not — it re-read a
-    green once before believing it (PR #224 review: a fast check can register and pass before
-    the slow `gate` has created its check run), and it printed a heartbeat while waiting. The
-    first is covered on this target by branch protection: `gate` and `dco` are required, so
-    `gh pr merge` refuses an early green and the run STOPs rather than merging. Also upstream
+    at that upgrade. One thing it did that upstream's does not is kept as a marked delta: a
+    green is re-read once before it is believed (PR #224 review, re-raised on PR #253: a fast
+    check can register and pass before the slow `gate` has created its check run) —
+    eduralph/pdca-harness#582. The heartbeat it printed while waiting was not kept. The value
+    also keeps its four-hour ceiling (eduralph/pdca-harness#581, with the `inf` guard). Also
+    upstream
     since v0.58.0: every refusal after the ready-mark returns the PR to draft
     (`gh pr ready --undo`), so a stopped wave never leaves a PR advertising a readiness no
     human granted. The instance value stays 1800 (upstream default 300) for a cold
