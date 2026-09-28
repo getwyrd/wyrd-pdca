@@ -2155,3 +2155,52 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - **The routed issues.** At the next review, read the state of wyrd-pdca#248 and
   harness#575, not just that they exist. Until #575 lands, a prior-art T5 row on a patched
   bundle is expected.
+
+# Act review — 2026-09-28 — builder baseline sonnet/xhigh → opus/medium (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act: a configuration decision, applied in getwyrd/wyrd-pdca#254. No frozen
+> bundle is re-read and no contribution disposition is re-decided.
+
+## What the records exposed
+
+- **The sonnet first tier bought a rebuild, not a result.** Of the 100 bundles with a
+  `loop-telemetry.json`, five record a sonnet first attempt (#655, #661, #693, #740, #813 —
+  sonnet/high before 2026-09-20, sonnet/xhigh after). All five escalated, at 3 to 5 attempts
+  each. The opus/max first attempts (10 bundles, the old `opus-xhigh`/`opus-max` pin) escalated
+  in 5 of 10. The other 81 predate per-attempt model telemetry and say nothing either way.
+- **The 09-20 ladder climbed by model first.** Tier 1 sonnet/xhigh, tier 2 opus/xhigh: the first
+  step up was a bigger model at the same effort, so a sonnet miss cost one full build and Check
+  before the model that ends up doing the work ran at all.
+- **Sign-off and publish ran the mechanical prose steps on sonnet/medium.** Nothing in the
+  record faults them; they move with the baseline so one model family's judgment reads the
+  builder's output end to end.
+
+## Process deltas
+
+- Gates / leaves: **builder tier 1 is opus/medium** — the biggest current model at a moderate
+  effort, instead of a smaller model at full effort. The ladder now climbs by effort first
+  (tier 2 opus/xhigh, attempts 2 to 4) and by family second (tier 3 fable/xhigh, attempt 5 on).
+  `Do model:` pins are unchanged (`sonnet` stays as an explicit pin for a knowingly small slice;
+  `opus` pins tier 2 as the first attempt; `opus-max`, `fable` as before) and set the first
+  attempt only.   (`pdca.toml` `[leaves.builder]`, `[[leaves.builder_escalation]]`,
+  `[[leaves.builder_variant]]`)
+- Gates / leaves: **sign-off and publisher on opus/medium** (were sonnet/medium).
+  (`pdca.toml` `[leaves.signoff]`, `[leaves.publisher]`)
+- Verified: `select_builder` resolves attempts 1..6 as opus/medium, opus/xhigh ×3, fable/xhigh
+  ×2 for an unpinned bundle; a `sonnet`, `opus-max` or `fable` pin sets attempt 1 only.
+  *Freeze (wyrd-pdca#243):* config-only.
+
+## How effectiveness will be judged
+
+- **Fewer escalations.** Of the next ten unpinned bundles that build, at most five reach
+  attempt 2 (the sonnet baseline: five of five). If the rate is unchanged, the first tier's
+  effort is the next knob (opus/high), not the model.
+- **Attempt 1 costs less than a sonnet attempt 1 plus an opus attempt 2 did.** Read the
+  per-attempt duration and token fields in `loop-telemetry.json` where present; the baseline
+  is not a saving if a medium-effort opus build routinely runs longer than the two builds it
+  replaces.
+- **Telemetry matches the ladder.** `loop-telemetry.json` for the next five bundles that
+  iterate records attempt 1 as opus/medium (or the brief's pin), attempts 2 to 4 as
+  opus/xhigh, attempt 5 on as fable/xhigh — never a tier the ladder does not assign.
+- **No new fault class in sign-off or publish prose.** The next five `pr-description.md` and
+  `commit-msg.txt` pass `T4-contribution` first time, as they did on sonnet.
