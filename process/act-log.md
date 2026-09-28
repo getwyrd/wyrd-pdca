@@ -2163,11 +2163,14 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 
 ## What the records exposed
 
-- **The sonnet first tier bought a rebuild, not a result.** Of the 100 bundles with a
-  `loop-telemetry.json`, five record a sonnet first attempt (#655, #661, #693, #740, #813 —
-  sonnet/high before 2026-09-20, sonnet/xhigh after). All five escalated, at 3 to 5 attempts
-  each. The opus/max first attempts (10 bundles, the old `opus-xhigh`/`opus-max` pin) escalated
-  in 5 of 10. The other 81 predate per-attempt model telemetry and say nothing either way.
+- **The sonnet first tier bought a rebuild, not a result.** Of the 96 bundles in the record
+  with a `loop-telemetry.json`, four record a sonnet first attempt (#655, #661, #693 on
+  sonnet/high before 2026-09-20; #813 on sonnet/xhigh after). All four escalated, at 3, 4, 3
+  and 5 attempts (mean 3.75). The opus/max first attempts (9 bundles, the old
+  `opus-xhigh`/`opus-max` pin) escalated in 5 of 9; the two opus/xhigh first attempts (#771,
+  #772) both escalated. The other 81 predate per-attempt model telemetry and say nothing
+  either way. (An in-flight, unrecorded bundle, #740, is a fifth sonnet-first escalation;
+  it is not in the record and is not counted here.)
 - **The 09-20 ladder climbed by model first.** Tier 1 sonnet/xhigh, tier 2 opus/xhigh: the first
   step up was a bigger model at the same effort, so a sonnet miss cost one full build and Check
   before the model that ends up doing the work ran at all.
@@ -2193,14 +2196,19 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 ## How effectiveness will be judged
 
 - **Fewer escalations.** Of the next ten unpinned bundles that build, at most five reach
-  attempt 2 (the sonnet baseline: five of five). If the rate is unchanged, the first tier's
+  attempt 2 (the sonnet baseline: four of four). If the rate is unchanged, the first tier's
   effort is the next knob (opus/high), not the model.
-- **Attempt 1 costs less than a sonnet attempt 1 plus an opus attempt 2 did.** Read the
-  per-attempt duration and token fields in `loop-telemetry.json` where present; the baseline
-  is not a saving if a medium-effort opus build routinely runs longer than the two builds it
-  replaces.
+- **Fewer attempts per bundle.** The mean length of `attempts` in `loop-telemetry.json` over
+  those ten bundles is at or below 3 (the four sonnet-first bundles: 3.75). Attempt count is
+  the only cost the harness records per attempt — there are no duration or token fields —
+  so cost is judged by it and by nothing finer.
 - **Telemetry matches the ladder.** `loop-telemetry.json` for the next five bundles that
   iterate records attempt 1 as opus/medium (or the brief's pin), attempts 2 to 4 as
   opus/xhigh, attempt 5 on as fable/xhigh — never a tier the ladder does not assign.
-- **No new fault class in sign-off or publish prose.** The next five `pr-description.md` and
-  `commit-msg.txt` pass `T4-contribution` first time, as they did on sonnet.
+- **No new fault class in sign-off or publish prose.** The harness records no first-attempt
+  outcome for either leaf (`T4-contribution` is deferred at Check and only printed at
+  publish; a sign-off re-prompt leaves no artifact), so the measure is what the record does
+  keep: over the next five COMPLETE bundles, no `SUMMARY.malformed-*` quarantine file, and
+  no §10 Act-candidate line naming a sign-off or publisher prose fault (a hand-edited
+  `commit-msg.txt` / `pr-description.md`, a decision the human had to re-state). The
+  sign-off human records such a fault in §10 when it happens; that is the observation.

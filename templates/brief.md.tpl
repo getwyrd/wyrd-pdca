@@ -44,10 +44,12 @@
   adversary and code-review lenses run on every bundle, so a `high` rating buys no stronger
   first build by itself — pin `Do model:` below for that. Optional; absent skips nothing.>
 - **Do model:** <optional — the builder for the FIRST attempt, by `[[leaves.builder_variant]]`
-  `model` name: `sonnet` (tier 1, the default), `opus` (tier 2 from the start — the pin for a
-  brief rated `high`), `fable` (start on the other lineage), `opus-max` (max effort), `codex`
-  (cross-vendor, best-effort). The escalation ladder overrides from attempt 2 regardless. A
-  name matching no variant falls back to tier 1 silently — spell it exactly. Absent ⇒ tier 1;
+  `model` name: `opus` (opus/xhigh, tier 2 from the start — the pin for a brief rated `high`),
+  `fable` (start on the other lineage), `opus-max` (max effort), `codex` (cross-vendor,
+  best-effort), `sonnet` (the pre-2026-09-28 tier, sonnet/xhigh — only for a slice judged
+  genuinely small). Absent ⇒ the default first tier, opus/medium (2026-09-28); do not write
+  `sonnet` to mean the default. The escalation ladder overrides from attempt 2 regardless. A
+  name matching no variant falls back to the default tier silently — spell it exactly;
   issue #167.>
 - **Scope:** <the defect to remove — one logical fix. MUST NOT name a probe/guard/helper
   (a capability check, `hasattr`, `try/except import`): naming a mechanism seats the fix
