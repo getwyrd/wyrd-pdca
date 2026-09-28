@@ -49,6 +49,11 @@ LINEAGE = "split-lineage.json"
 LINEAGE_VERSION = 1
 
 _VERSION_RE = re.compile(r"<!--\s*pdca:split-proposal\s+v(\d+)\s*-->")
+#: Written into a proposal by `leaves._stub_split` itself (#466), so the provenance
+#: SURVIVES the process boundary between `do_split` and `--accept` — those run in
+#: different invocations, where an in-memory "this came from a stub" flag could not
+#: reach the filing branch. See `is_stub_proposal`.
+_STUB_RE = re.compile(r"<!--\s*pdca:split-proposal-stub\s*-->")
 _OPEN_RE = re.compile(r"^\s*<!--\s*pdca:child\s+(\S+)\s*-->\s*$")
 _CLOSE_RE = re.compile(r"^\s*<!--\s*pdca:end\s+(\S+)\s*-->\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -121,6 +126,19 @@ class Child:
                     continue
                 return [t.strip() for t in value.split(",") if t.strip()]
         return found or []
+
+
+def is_stub_proposal(text: str) -> bool:
+    """Whether `text` carries the OFFLINE STUB splitter's on-disk provenance (#466).
+
+    A stub proposal is otherwise byte-identical in SHAPE to a real one — same header,
+    same delimiters — so this marker is the only thing that lets a reader who never saw
+    `do_split` run (the process `--accept` runs in) tell them apart. Checked by the
+    filing branch of `cli._split` BEFORE `split.can_file` is consulted and before any
+    `gh issue create`: an irreversible tracker write must never be taken on an artifact
+    no model authored.
+    """
+    return bool(_STUB_RE.search(text))
 
 
 def parse(text: str) -> list[Child]:
@@ -301,6 +319,10 @@ def preflight(parent: Path, children: list[Child], cfg) -> None:
             "second acceptance would create a duplicate set of children and leave the "
             "first orphaned from the parent's breadcrumb. Reopen it first if that is what "
             "you want")
+    # Whether accept can leave the parent a Plan artifact (issue #481). It needs no ids, so
+    # it is asked HERE too: `accept` refusing it alone would come after the CLI had filed
+    # the children as real tracker issues.
+    _parent_plan(parent, cfg)
     _validate_ordering(children)
     _emit_convergence_report(parent, children, cfg)
 
@@ -731,6 +753,107 @@ def _rollback(created: list[Path]) -> None:
                    "will refuse them as existing bundles.")
 
 
+def _parent_plan(parent: Path, cfg) -> tuple[str, str, str] | None:
+    """What :func:`accept` rebuilds a briefless parent's Plan artifact from (issue #481).
+
+    ``None`` when the parent has its own ``brief.md``: accept never opens it. Otherwise
+    ``(the archived brief's path relative to the parent, its Slug, its Repo + branch
+    target)``.
+
+    A split parent is terminal, and a terminal bundle must have a Plan artifact:
+    `state.state` reads the close marker as "past Do". The realistic briefless parent is one
+    an iterate-to-Plan sent back BEFORE anyone split it — its brief was archived
+    (``driver.py:140``), not lost — so the fields that identify the slice are copied from
+    that archive rather than invented: the brief of the LATEST re-plan
+    (:func:`state.replan_archives`, the same reader `size_signal` draws its re-plan
+    boundary from). The archive is held to the Plan exit contract's fields
+    (``handoff.check_planner``: slug, success criterion, repo + branch target), because an
+    unfilled field in the source would be copied straight into the result.
+
+    Raises :class:`SplitError` when nothing authored can be rebuilt from. Both callers
+    refuse while refusing is still free: :func:`preflight` before the CLI files a single
+    tracker issue, :func:`accept` before its first write.
+    """
+    if (parent / "brief.md").exists():
+        return None
+    remedy = (f"Write {parent.name}/brief.md (slug, success criterion, repo + branch "
+              "target), then re-run: a parent with its own brief.md keeps it as it is")
+    replans = state.replan_archives(parent)
+    if not replans:
+        raise SplitError(
+            f"{parent.name} has no brief.md and no iterate-to-Plan archive "
+            "(iteration-v<N>/brief.md) to rebuild one from — refusing to split. A split "
+            f"parent is terminal, and a terminal bundle needs a Plan artifact. {remedy}")
+    source = replans[-1][1] / "brief.md"
+    rel = source.relative_to(parent).as_posix()
+    from . import brief as _brief, handoff   # lazy, like `validate`'s
+    try:
+        # The fields only, not the dependency clause: the rebuilt brief declares no
+        # external dependency (:func:`_split_parent_brief`), so the archive's declarations
+        # never reach it — one this host no longer registers or provides must not refuse
+        # the split.
+        problems = handoff.check_planner(source.parent, cfg, dependencies=False)
+        slug = _brief.whole_field(source, "slug")
+        target = _brief.whole_field(source, "repo + branch target")
+    except (OSError, ValueError) as exc:   # ValueError: bytes that are not UTF-8
+        raise SplitError(
+            f"{parent.name} has no brief.md, and {rel} cannot be read to rebuild one "
+            f"({exc}) — refusing to split. {remedy}") from exc
+    if problems:
+        raise SplitError(
+            f"{parent.name} has no brief.md, and {rel}, the brief it would be rebuilt "
+            f"from, is incomplete: {'; '.join(problems)} — refusing to split. {remedy}")
+    return rel, slug, target
+
+
+def _field(label: str, value: str) -> str:
+    """One ``- **Label:** value`` bullet with its continuation lines indented under it, so
+    `brief.whole_field` reads ``value`` back unchanged."""
+    first, *rest = value.split("\n")
+    return f"- **{label}:** {first}\n" + "".join(
+        f"  {line}\n" if line.strip() else "\n" for line in rest)
+
+
+def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
+                        children: list[str]) -> str:
+    """The Plan artifact :func:`accept` writes for a parent that has none (issue #481).
+
+    It describes the split — why the slice was decomposed, which child bundles carry
+    it — and nothing else. Slug and Repo + branch target are the archived original's
+    (:func:`_parent_plan`); the original defect and scope stay in that archive, which the
+    brief names. No test, dependency or ordering field: this bundle builds nothing, and a
+    `Depends on` here would hold a parent that only goes to sign-off. `Disposition hint`
+    is read by SUMMARY §2 alone — routing follows the close marker
+    (`driver._close_class`), and `split` is deliberately not a close class (config.py).
+    """
+    rel, slug, target = plan
+    title = slug.split("\n")[0]
+    kids = ", ".join(children)
+    return (
+        f"# Brief — issue {_bundle_id(parent)} / {title} (split parent)\n\n"
+        "> The Plan artifact (docs 02 §PLAN), written by `split --accept` (issue #481):\n"
+        "> this bundle had no brief.md when its split was accepted — an iterate-to-Plan\n"
+        f"> had archived it to `{rel}`.\n\n"
+        + _field("Slug", slug)
+        + _field("Defect", (
+            "decomposed instead of built as one cycle: the slice was judged to be more\n"
+            f"than one shippable outcome. The seams are set out in `{PROPOSAL}`; the\n"
+            f"original defect and scope are in `{rel}`."))
+        + _field("Success criterion", (
+            "the slice is decomposed, not built here — the child bundles\n"
+            f"{kids} each carry their own brief, and together they cover\n"
+            f"the goal of `{rel}`. No patch lands in this bundle; each child is verified\n"
+            "by its own cycle."))
+        + _field("Repo + branch target", target)
+        + _field("Scope", (
+            "decomposition only: no patch, test or gate run belongs to this bundle. / out\n"
+            "of scope: building any part of the original slice here — the child bundles\n"
+            "carry that work."))
+        + _field("External dependencies", "none")
+        + _field("Disposition hint", "split")
+    )
+
+
 def accept(parent: Path, ids: list[str], cfg) -> list[Path]:
     """Materialise a parent's proposal into child bundles. Returns the created dirs.
 
@@ -777,6 +900,15 @@ def accept(parent: Path, ids: list[str], cfg) -> list[Path]:
             "record this run cannot read is one it cannot restore if the accept fails, so "
             "the parent could be left describing children that were rolled back. Fix or "
             "remove it, then re-run") from exc
+
+    # The parent's Plan artifact, settled in the same pre-write phase (issue #481). A
+    # parent with no brief.md — the realistic one, whose brief an iterate-to-Plan archived
+    # before the slice was split — gets one rebuilt from that archive, as text, now: a
+    # source that cannot supply it refuses the accept here, before anything is staged.
+    # `None` means the parent keeps its own brief.md, and nothing below opens it.
+    plan = _parent_plan(parent, cfg)
+    new_brief = (None if plan is None else
+                 _split_parent_brief(parent, plan, [cfg.bundle(i).name for i in ids]))
 
     staging = parent / ".split-staging"
     shutil.rmtree(staging, ignore_errors=True)
@@ -841,6 +973,10 @@ def accept(parent: Path, ids: list[str], cfg) -> list[Path]:
             "The human confirms the split at sign-off; reopening to a fix path (iterate-to-Do) "
             "archives this marker and re-enables the full Do+Check band.\n",
             encoding="utf-8")
+        # The parent's Plan artifact, when it had none (issue #481): the LAST write before
+        # the marker, so the parent can only turn terminal with a brief already beside it.
+        if new_brief is not None:
+            (parent / "brief.md").write_text(new_brief, encoding="utf-8")
         (parent / state.CLOSE_MARKER).write_text("split\n", encoding="utf-8")
     except Exception:
         _rollback(created)
@@ -856,6 +992,22 @@ def accept(parent: Path, ids: list[str], cfg) -> list[Path]:
             (parent / state.CLOSE_MARKER).unlink(missing_ok=True)
         except OSError:
             pass
+        # Then the brief this run set out to write, whichever write failed. The parent had
+        # none when the accept began, so anything at that path now is this run's — whole,
+        # or torn by the very write that raised. Hence NOT gated on that write having
+        # returned: a write can create the file and then raise (a full disk), and a torn
+        # brief left behind would be kept by the retry as the parent's own (#481 review).
+        # After the marker, so the parent is never terminal without a brief, not even
+        # mid-rollback.
+        if new_brief is not None:
+            brief_path = parent / "brief.md"
+            try:
+                brief_path.unlink(missing_ok=True)
+            except OSError as exc:
+                advisory(f"split: could not remove {brief_path} while rolling back ({exc}). "
+                         "Delete it by hand before retrying: a retry keeps an existing "
+                         "brief.md as the parent's own, and this one names children that "
+                         "were rolled back.")
         raise
     return created
 
@@ -965,16 +1117,43 @@ def child_title(child: Child, parent: Path) -> str:
     return f"{parent.name} — {child.label}"
 
 
-def _create_issue(repo: str, title: str, body: str, parent_no: str, root: Path) -> str:
+def _gh_label_value(name: str) -> str:
+    """``name`` as ONE CSV field — the format gh parses every ``--label`` value in.
+
+    gh registers ``--label`` as a string slice, and pflag parses EVERY occurrence of such a
+    flag with Go's ``encoding/csv``, so one ``--label`` per name does not protect a name by
+    itself: ``--label area,backend`` asks for two labels, ``area`` and ``backend``, and a
+    bare ``"`` is a parse error that fails the whole ``gh issue create`` (issue #467). A
+    name holding a comma, a double quote or a line break is therefore quoted, with its
+    quotes doubled; any other name (``bug``, ``help wanted``) goes out byte-for-byte.
+    """
+    if any(c in name for c in ',"\r\n'):
+        return '"' + name.replace('"', '""') + '"'
+    return name
+
+
+def _create_issue(repo: str, title: str, body: str, parent_no: str, root: Path, *,
+                  milestone: str = "", labels: list[str] | None = None) -> str:
     """File ONE child issue; return its number. Raises SplitError naming the failure.
 
     ``--parent`` makes this a real tracker sub-issue rather than a convention in the body
     text, so the parent becomes an umbrella and each child gets its own PR — which is what
     the one-PR-per-issue rule requires.
+
+    ``milestone``/``labels`` are keyword-only with defaults so `triage.py`'s own call
+    (`triage.py:530-535`, five positional args, no metadata) keeps working unchanged
+    (issue #467). ``labels`` are label NAMES: each gets its own ``--label``, encoded by
+    :func:`_gh_label_value` so gh reads it back as that one name. ``--milestone`` is a
+    plain string flag, so the title goes out verbatim — quoting it would put the quotes
+    into the name gh looks up.
     """
     cmd = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body]
     if parent_no:
         cmd += ["--parent", parent_no]
+    if milestone:
+        cmd += ["--milestone", milestone]
+    for name in labels or ():
+        cmd += ["--label", _gh_label_value(name)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(root))
     except OSError as exc:
@@ -992,6 +1171,50 @@ def _create_issue(repo: str, title: str, body: str, parent_no: str, root: Path) 
             "`gh issue create` exited 0 but printed no issue URL, so the new issue's "
             f"number could not be read from: {(proc.stdout or '').strip()!r}")
     return matches[-1]
+
+
+def _parent_metadata(repo: str, parent_no: str, root: Path) -> tuple[str, list[str], bool]:
+    """The parent issue's milestone TITLE and label NAMES, looked up once (issue #467).
+
+    ``gh issue create --milestone`` takes the milestone by NAME, not by number, so the
+    title is what a caller needs, even though ``gh issue view`` also hands back the
+    milestone's number.
+
+    Mirrors the best-effort lookup at ``sources.tracker_issue_reopened``
+    (`sources.py:150-176`): the repo is always passed explicitly, a non-zero exit or a
+    raised exception means unknown, ``json.loads`` is guarded, and a non-object result
+    (``gh``, or a shim, emitting ``null`` or ``[]``) is treated as unknown rather than
+    crashing ``.get``. The returned ``bool`` is False exactly when the metadata could not
+    be determined, so the caller can warn without confusing that with a parent that
+    genuinely carries neither a milestone nor a label — the ordinary, silent case.
+
+    ``Exception``, not ``BaseException``: Ctrl-C here is the operator stopping the split,
+    not a failed lookup. Nothing has been filed yet, so it propagates and ends the run
+    before the first irreversible ``gh issue create`` instead of being swallowed on the
+    way to one.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "issue", "view", parent_no, "--json", "milestone,labels",
+             "--repo", repo],
+            capture_output=True, text=True, cwd=str(root))
+    except Exception:  # noqa: BLE001 — best-effort: a failed lookup never stops filing
+        return "", [], False
+    if proc.returncode != 0:
+        return "", [], False
+    try:
+        data = json.loads(proc.stdout or "")
+    except ValueError:
+        return "", [], False
+    if not isinstance(data, dict):
+        return "", [], False
+    milestone = data.get("milestone")
+    title = milestone.get("title") if isinstance(milestone, dict) else None
+    labels = data.get("labels") if isinstance(data.get("labels"), list) else []
+    names = [label["name"] for label in labels
+             if isinstance(label, dict) and isinstance(label.get("name"), str)
+             and label["name"]]
+    return (title if isinstance(title, str) else ""), names, True
 
 
 def file_children(parent: Path, children: list[Child], cfg, *,
@@ -1021,6 +1244,18 @@ def file_children(parent: Path, children: list[Child], cfg, *,
         # quietly producing a flat set of unrelated issues.
         advisory(f"split: {parent.name} carries no numeric tracker id — filing the "
                  "children as standalone issues, NOT as sub-issues")
+    # Looked up ONCE, before the filing loop — the parent's milestone/labels cannot
+    # change between children in a single batch, so a per-child lookup would only add a
+    # round trip for the same answer. A parent with no number (above) has no issue to
+    # look up either. Best-effort (issue #467): a lookup that fails — a non-zero exit, an
+    # error, output that is not a JSON object — still files every child, just without
+    # the metadata, and says so exactly once.
+    milestone_title, label_names = "", []
+    if parent_no:
+        milestone_title, label_names, lookup_ok = _parent_metadata(why, parent_no, cfg.root)
+        if not lookup_ok:
+            advisory(f"split: could not read #{parent_no}'s milestone/labels — filing the "
+                     "children WITHOUT them; set them on the tracker by hand")
     body_head = (f"Child slice of #{parent_no}, split during Plan.\n\n"
                  if parent_no else "Child slice, split during Plan.\n\n")
     created: list[str] = []
@@ -1031,7 +1266,9 @@ def file_children(parent: Path, children: list[Child], cfg, *,
                 title=child_title(child, parent),
                 body=body_head + child.body.strip() + "\n",
                 parent_no=parent_no,
-                root=cfg.root))
+                root=cfg.root,
+                milestone=milestone_title,
+                labels=label_names))
         except BaseException as exc:
             # `BaseException`, not `Exception`. Ctrl-C during a run that has already filed
             # issues is an ordinary operator action, and `KeyboardInterrupt` is not an

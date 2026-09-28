@@ -84,11 +84,11 @@ def _parse_opt_in(value, name: str) -> bool:
 # LeafConfig
 #
 # ----------------------------------------------------------------------------
-#: Ceiling for ``[driver].merge_wait_secs`` (PR #224 review). Four hours is longer than any
-#: honest CI run on a target this harness drives; past that a batch is not waiting, it is
-#: stuck, and the STOP is the useful outcome.
-_MERGE_WAIT_CAP_SECS = 14400
 
+#: Ceiling for ``[driver].merge_wait_secs`` (INSTANCE DELTA, eduralph/pdca-harness#581 —
+#: PR #224 review). Four hours is longer than any honest CI run on a target this harness
+#: drives; past that a batch is not waiting, it is stuck, and the STOP is the useful outcome.
+_MERGE_WAIT_CAP_SECS = 14400
 
 @dataclass
 class LeafConfig:
@@ -426,20 +426,14 @@ class Config:
     # merge`'s own enforcement (whatever branch protection marks required — possibly
     # nothing) decide, including merging with an empty rollup. [driver].merge_requires.
     merge_requires: str = "all"
-    # How long to WAIT for a non-final wave's PR checks to settle before the rollup gate
-    # above decides (eduralph/pdca-harness#462 — INSTANCE DELTA, still OPEN at v0.57.0).
-    # `merge_requires` reads the rollup once, immediately before the merge — at which point
-    # the PR is SECONDS old, publish having opened it just before the wave boundary — so its
-    # checks are still registering, the honest verdict is "pending", the merge refuses, and
-    # the run STOPs. (Upstream attributes this to `ready_for_review` CI triggered by the
-    # ready-mark; that does not hold on this target, where drafts already run CI and no
-    # workflow lists that event — PR #224 review. The PR's age is the real cause.) Correct, but it makes
-    # the boundary stop the routine outcome of EVERY multi-wave batch, which is the very
-    # thing merge mode exists to avoid. Wait instead: poll while the rollup is pending or
-    # empty, up to this budget, then let the same gate decide on a SETTLED rollup. 0 (the
-    # default, and upstream's behaviour) does not wait at all. Waiting never weakens the
-    # gate — a red or a timeout still refuses and STOPs. [driver].merge_wait_secs.
-    merge_wait_secs: int = 0
+    # Bounded wait for that same non-final check-rollup gate (issue #462). A wave boundary
+    # fires SECONDS after `_publish_bundle` opens the PR — its checks are routinely still
+    # queued or not yet registered, so a rollup read that moment is `pending` or `empty`:
+    # absence of evidence, not a verdict. `_merge_one` re-reads the rollup until it resolves
+    # or this many wall-clock seconds elapse; only an unresolved rollup at the bound (or a
+    # genuinely failing/unreadable one) refuses. `0` performs no wait at all — a single
+    # read, the original immediate-refusal behaviour. [driver].merge_wait_secs.
+    merge_wait_secs: int = 300
     # INSTANCE DELTA (eduralph/pdca-harness#531). In merge mode a wave's PRs are merged
     # back to back, and nothing verifies the COMBINATION: each PR's rollup describes the
     # base as it stood before its siblings landed. Whether that matters is decided entirely
@@ -450,7 +444,7 @@ class Config:
     # its base is brought up to date BEFORE the rollup gate, so the checks the gate reads
     # describe the tree the PR actually merges into. It composes with `merge_wait_secs`
     # rather than duplicating it: the sync makes the rollup empty for the new head, and
-    # `_await_rollup` already polls on empty. False reproduces upstream exactly.
+    # `_wait_for_green` already polls on empty. False reproduces upstream exactly.
     # [driver].merge_sync_base.
     merge_sync_base: bool = True
     # Optional integration re-gate (#wave-model): after each wave folds onto the
@@ -857,30 +851,6 @@ class Config:
         # Check-rollup policy for merge mode (issue #413). An unknown value falls back to
         # "all" with a note — the fail-safe direction is the STRICTER reading (verify the
         # rollup ourselves), never a typo silently buying host-config-only semantics.
-        # `OverflowError` alongside the obvious two, for the reason `size_signal` already
-        # wrote down: `int(float("inf"))` raises it, TOML writes `inf` as a bare literal, and
-        # `merge_wait_secs = inf` is the natural way to try to say "wait as long as it takes".
-        # Uncaught it aborted EVERY driver command, `pdca status` included (PR #224 review) —
-        # a config typo taking down the tool rather than falling back.
-        _raw_wait = driver_cfg.get("merge_wait_secs", 0)
-        try:
-            merge_wait_secs = int(_raw_wait)
-        except (TypeError, ValueError, OverflowError):
-            print(f"config: [driver].merge_wait_secs '{_raw_wait}' is not a non-negative "
-                  "integer — treating it as 0 (no wait).", file=sys.stderr)
-            merge_wait_secs = 0
-        if merge_wait_secs < 0:
-            # Say so rather than clamping in silence: the operator asked for something the
-            # message above calls invalid, and a silent 0 reads as "the knob did nothing".
-            print(f"config: [driver].merge_wait_secs '{_raw_wait}' is negative — treating it "
-                  "as 0 (no wait).", file=sys.stderr)
-            merge_wait_secs = 0
-        if merge_wait_secs > _MERGE_WAIT_CAP_SECS:
-            # An uncapped budget polls GitHub every 30s for as long as it is given; a batch
-            # left waiting a day has failed in a way no one is watching for.
-            print(f"config: [driver].merge_wait_secs {merge_wait_secs} exceeds the "
-                  f"{_MERGE_WAIT_CAP_SECS}s cap — using the cap.", file=sys.stderr)
-            merge_wait_secs = _MERGE_WAIT_CAP_SECS
         # INSTANCE DELTA (eduralph/pdca-harness#531). Default ON: the failure it prevents is
         # a silently-unverified combination landing on the real base, which is worse than the
         # cost of a redundant no-op check per merge.
@@ -890,6 +860,31 @@ class Config:
             print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
                   "all | required; using 'all'", file=sys.stderr)
             merge_requires = "all"
+        # Bounded wait for the rollup gate above (issue #462). A bad value degrades to the
+        # DEFAULT wait (300s), never to 0 — a typo must not silently buy back the old
+        # immediate-refusal race.
+        # `OverflowError` too (INSTANCE DELTA, eduralph/pdca-harness#581): TOML writes
+        # `inf` as a bare literal and `int(float("inf"))` raises it; uncaught, a config
+        # typo aborted EVERY driver command, `pdca status` included (PR #224 review).
+        try:
+            merge_wait_secs = int(driver_cfg.get("merge_wait_secs", 300))
+        except (TypeError, ValueError, OverflowError):
+            print(f"config: [driver].merge_wait_secs must be an integer number of seconds, "
+                  f"got {driver_cfg.get('merge_wait_secs')!r} — using the default 300",
+                  file=sys.stderr)
+            merge_wait_secs = 300
+        if merge_wait_secs < 0:
+            print(f"config: [driver].merge_wait_secs must be >= 0, got {merge_wait_secs} — "
+                  "using the default 300", file=sys.stderr)
+            merge_wait_secs = 300
+        if merge_wait_secs > _MERGE_WAIT_CAP_SECS:
+            # INSTANCE DELTA (eduralph/pdca-harness#581, with the OverflowError above): an
+            # uncapped budget polls GitHub every 15s for as long as it is given; a batch
+            # left waiting a day has failed in a way no one is watching for (PR #224
+            # review, re-raised on PR #253).
+            print(f"config: [driver].merge_wait_secs {merge_wait_secs} exceeds the "
+                  f"{_MERGE_WAIT_CAP_SECS}s cap — using the cap.", file=sys.stderr)
+            merge_wait_secs = _MERGE_WAIT_CAP_SECS
         regate_between_waves = bool(driver_cfg.get("regate_between_waves", False))
         act_cadence = max(1, int(driver_cfg.get("act_cadence", 5)))  # issue #109
         # Scratch root for throwaway heavy leaf work (issue #134); env wins for one run.

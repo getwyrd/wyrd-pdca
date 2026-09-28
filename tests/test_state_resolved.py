@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import fnmatch
 import inspect
+import io
 import json
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 from unittest import mock
@@ -201,8 +203,11 @@ class PlanNeverReopensResolved(unittest.TestCase):
                                         encoding="utf-8")
 
         # No gh on PATH → the reopen revalidation stays conservative (False) offline.
+        # The fake session names no work through /handoff, so the reap reports that on
+        # stderr (#534): captured, never printed to the real stderr.
         with mock.patch.object(leaves, "_invoke", side_effect=fake_invoke), \
-                mock.patch.object(sources.shutil, "which", return_value=None):
+                mock.patch.object(sources.shutil, "which", return_value=None), \
+                redirect_stderr(io.StringIO()):
             leaves.do_plan_batch(self.cfg)
         self.assertFalse((d / "brief.md").exists())
         self.assertTrue((d / "brief.superseded-by-resolution.md").exists())  # kept, aside
@@ -210,7 +215,8 @@ class PlanNeverReopensResolved(unittest.TestCase):
         # A second offending session gets its own destination (#302 review round 3) —
         # the first rejection artifact is never overwritten.
         with mock.patch.object(leaves, "_invoke", side_effect=fake_invoke), \
-                mock.patch.object(sources.shutil, "which", return_value=None):
+                mock.patch.object(sources.shutil, "which", return_value=None), \
+                redirect_stderr(io.StringIO()):
             leaves.do_plan_batch(self.cfg)
         self.assertTrue((d / "brief.superseded-by-resolution.md").exists())
         self.assertTrue((d / "brief.superseded-by-resolution-2.md").exists())
@@ -233,9 +239,11 @@ class PlanNeverReopensResolved(unittest.TestCase):
 
         gh_open = SimpleNamespace(returncode=0, stdout=json.dumps({"state": "OPEN"}),
                                   stderr="")
+        # The reap reports the session that named no work (#534): captured, not printed.
         with mock.patch.object(leaves, "_invoke", side_effect=fake_invoke), \
                 mock.patch.object(sources.subprocess, "run", return_value=gh_open), \
-                mock.patch.object(sources.shutil, "which", return_value="/usr/bin/gh"):
+                mock.patch.object(sources.shutil, "which", return_value="/usr/bin/gh"), \
+                redirect_stderr(io.StringIO()):
             leaves.do_plan_batch(self.cfg)
         self.assertFalse((d / "brief.md").exists())         # stale-context brief aside
         self.assertTrue((d / "brief.stale-reopen-context.md").exists())
@@ -535,7 +543,9 @@ class InstanceEvidencePins(unittest.TestCase):
             (d / artifact).write_text("x\n", encoding="utf-8")
             self._resolved_notes(d)
             self.assertFalse(state.is_resolved(d), f"{artifact} present must block RESOLVED")
-            self.assertEqual(state.state(d), state.UNPLANNED)
+            # Not terminal — never RESOLVED. Which pre-terminal state it reads is upstream's
+            # call (since #481 a briefless bundle past Do reads BUILT, not UNPLANNED).
+            self.assertNotIn(state.state(d), state.TERMINAL)
 
     def test_briefless_with_a_glob_matched_artifact_is_not_resolved(self) -> None:
         # Glob-matched artifacts are cycle evidence by the same argument — including the
@@ -549,7 +559,9 @@ class InstanceEvidencePins(unittest.TestCase):
             target.write_text("x\n", encoding="utf-8")
             self._resolved_notes(d)
             self.assertFalse(state.is_resolved(d), f"{artifact} present must block RESOLVED")
-            self.assertEqual(state.state(d), state.UNPLANNED)
+            # Not terminal — never RESOLVED. Which pre-terminal state it reads is upstream's
+            # call (since #481 a briefless bundle past Do reads BUILT, not UNPLANNED).
+            self.assertNotIn(state.state(d), state.TERMINAL)
 
     def test_archive_globs_are_the_shared_source_of_truth(self) -> None:
         # The archive reads state.DOWNSTREAM_GLOBS rather than repeating the globs, so the
@@ -569,7 +581,9 @@ class InstanceEvidencePins(unittest.TestCase):
             (d / artifact).write_text("{}\n", encoding="utf-8")
             self._resolved_notes(d)
             self.assertFalse(state.is_resolved(d), f"{artifact} present must block RESOLVED")
-            self.assertEqual(state.state(d), state.UNPLANNED)
+            # Not terminal — never RESOLVED. Which pre-terminal state it reads is upstream's
+            # call (since #481 a briefless bundle past Do reads BUILT, not UNPLANNED).
+            self.assertNotIn(state.state(d), state.TERMINAL)
 
     def test_the_accumulators_are_evidence_but_never_archived(self) -> None:
         """The asymmetry IS the fix (#170), so pin it in both directions."""

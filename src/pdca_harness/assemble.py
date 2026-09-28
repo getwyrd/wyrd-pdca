@@ -106,6 +106,25 @@ _IMPL_MARKER_RE = re.compile(r"^\[impl\]\s*[—:-]*\s*", re.IGNORECASE)
 # blocking box the human must clear twice (PR #168 review).
 _HUMAN_MARKER_RE = re.compile(r"^\[human\]\s*[—:-]*\s*", re.IGNORECASE)
 
+# Where a `- NEEDS-HUMAN` bullet's continuation ENDS (issue #527), mirroring the
+# membership rule `brief._block_for` already uses for a wrapped field value
+# (`brief.py:91-98`): a line indented deeper than the bullet is prose that keeps
+# going, until one of these signals the block is over — a new list item at ANY
+# indent (so an indented `  - NEEDS-HUMAN …` sub-bullet is still its own item), a
+# heading, a table row, or a code fence.
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+_CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _ends_needs_human_continuation(line: str) -> bool:
+    s = line.strip()
+    return bool(
+        _LIST_ITEM_RE.match(line)
+        or s.startswith("#")
+        or s.startswith("|")
+        or _CODE_FENCE_RE.match(line)
+    )
+
 # The one STANDING row (#293) — recognised by the canonical label, not a hardcoded string, so
 # it cannot drift from the matrix the reviewer's table mirrors. `V` is the only element the
 # reviewer's prompt hard-codes to NEEDS-HUMAN on every cycle; C5/T5 are judgment too, but the
@@ -148,14 +167,21 @@ def _normalized_item_label(cell: str) -> str:
 # the §6 row must not conflate them: a transient blip is safe to re-run as-is, while a leaf
 # whose command could never be launched will fail identically until that command is fixed —
 # telling the operator "safe to re-run" there would be a false instruction (PR #285 review).
+# A third infra shape (issue #526): the leaf's command launched, but the vendor sandbox the
+# harness seeded it with could not start on this host, so no command the leaf tried ever ran.
+# Its action differs from both others — neither a re-run nor a config fix helps until the HOST
+# can start that sandbox — so it gets its own marker rather than borrowing one's instruction.
 LEAF_STATUS_INFRA = "infra-empty"      # ran, died with no output — a transient blip
 LEAF_STATUS_STARTUP = "startup-empty"  # never launched — binary absent / not executable
+LEAF_STATUS_SANDBOX = "sandbox-empty"  # launched, but its seeded sandbox could not start
 LEAF_STATUS_HUMAN = "human-empty"      # ran, but yielded no usable verdict
 _LEAF_STATUS_RE = re.compile(r"<!--\s*pdca:leaf-status\s+(\S+)\s*-->")
 _LEAF_STATUS_LABEL = {
     LEAF_STATUS_INFRA: "leaf did not run (transient infra — safe to re-run)",
     LEAF_STATUS_STARTUP: ("leaf did not run (its command could not be launched — fix the "
                           "leaf's config, then re-run)"),
+    LEAF_STATUS_SANDBOX: ("leaf could not work (the vendor sandbox it was seeded with could "
+                          "not start on this host — fix the host, then re-run)"),
     LEAF_STATUS_HUMAN: "leaf produced no usable verdict (needs a human)",
 }
 
@@ -512,8 +538,20 @@ def _plan_advisory_act_lines(d: Path) -> list[str]:
     benefit = _plan_advisory_benefit(d)
     if not benefit:
         return []
-    return [f"- Plan advisory: {benefit.get('findings', 0)} finding(s); brief revised: "
-            f"{'yes' if benefit.get('revised') else 'no'} (plan-advisory-*.md)"]
+    counts = (f"{benefit.get('findings', 0)} finding(s); brief revised: "
+              f"{'yes' if benefit.get('revised') else 'no'}")
+    missing = benefit.get("not_completed")
+    if benefit.get("completed") is False and isinstance(missing, dict) and missing:
+        # #526: a review that never completed must not read as "ran, found nothing" — its
+        # counts measure the run, not the brief. The status leads the line because
+        # `act` groups §10 lines by their first words: a recurring environment fault then
+        # collects under one key instead of hiding among real zero-finding reviews.
+        statuses = ", ".join(sorted({str(s) for s in missing.values()}))
+        why = "; ".join(f"{leaf} — {_LEAF_STATUS_LABEL.get(str(s), str(s))}"
+                        for leaf, s in missing.items())
+        return [f"- Plan advisory NOT completed ({statuses}): {why}. Its counts ({counts}) "
+                "say nothing about the brief (plan-advisory-*.md)"]
+    return [f"- Plan advisory: {counts} (plan-advisory-*.md)"]
 
 
 def _gate_lines(gates: dict, *, prefix: str) -> str:
@@ -594,14 +632,17 @@ def _missing_review_text(d: Path) -> str:
     """Placeholder when ``check-review.md`` is absent — flags a §6 NEEDS-HUMAN so the
     bundle assembles and reaches sign-off but cannot be accepted without a review.
 
-    Two wordings (#369), split on the error log — the engine's failed-leaf
-    discriminator (#138: a reviewer that ran and FAILED wrote
+    Two wordings (#369), split on ``state.leaf_ran_and_failed`` — the engine's failed-leaf
+    discriminator (#138: a reviewer that ran and SPENT its attempts left a settled
     ``state.REVIEW_ERROR_LOG``; a successful run removed any stale one). Without the
     split, a reviewer that NEVER RAN (the beat died between the gate write and the
     leaf) read exactly like one that ran and failed, and the record could not
-    distinguish "not yet run" from "ran and yielded nothing".
+    distinguish "not yet run" from "ran and yielded nothing". The second wording names
+    BOTH unfinished shapes (#540): no log at all, and an unsettled log left by a death
+    inside the leaf's retry loop — the discriminator treats them alike, so the prose must
+    not assert only one of them.
     """
-    if (d / state.REVIEW_ERROR_LOG).exists():
+    if state.leaf_ran_and_failed(d / state.REVIEW_ERROR_LOG):
         return (
             "# Advisory review MISSING — the reviewer RAN AND FAILED\n\n"
             "- NEEDS-HUMAN — no check-review.md was produced: the reviewer leaf ran "
@@ -610,12 +651,15 @@ def _missing_review_text(d: Path) -> str:
             "accepting.\n"
         )
     return (
-        "# Advisory review MISSING — the reviewer NEVER RAN\n\n"
-        "- NEEDS-HUMAN — no check-review.md was produced and no "
-        f"`{state.REVIEW_ERROR_LOG}` exists: the reviewer leaf NEVER RAN (the Check "
-        "beat was interrupted before it), it did not run-and-fail. The driver "
-        "recovers a never-ran reviewer on the next `advance` (#369); if this text "
-        "persists, re-run the Check reviewer before accepting.\n"
+        "# Advisory review MISSING — the reviewer NEVER RAN or was INTERRUPTED\n\n"
+        "- NEEDS-HUMAN — no check-review.md was produced and no *settled* "
+        f"`{state.REVIEW_ERROR_LOG}`: either the reviewer leaf NEVER RAN (the Check "
+        "beat was interrupted before it), or it was interrupted INSIDE its retry loop "
+        f"and the `{state.REVIEW_ERROR_LOG}` in this bundle is the unfinished account of "
+        "the attempts it had made by then (#540) — read it for the post-mortem. Neither "
+        "shape is a leaf that ran and exhausted its attempts. The driver recovers both on "
+        "the next `advance` (#369); if this text persists, re-run the Check reviewer "
+        "before accepting.\n"
     )
 
 
@@ -638,7 +682,12 @@ def _needs_human(review_text: str) -> list[_ReviewFinding]:
 
     The reviewer always emits the 5/5/1 verdict table (see leaves._REVIEW_PROMPT);
     a table row whose verdict cell is NEEDS-HUMAN becomes a §6 item (Item — Basis).
-    Legacy ``- NEEDS-HUMAN — …`` bullet lines are still honoured.
+    Legacy ``- NEEDS-HUMAN — …`` bullet lines are still honoured, continuation lines
+    included (issue #527): a bullet's text is its first line plus every following line
+    indented deeper than the bullet, space-joined into one line (never a newline — a
+    second physical line would lose its §6 checkbox), until a blank line, a line no
+    deeper than the bullet, a new list item at any indent, a heading, a table row, or a
+    code fence ends it (see :func:`_ends_needs_human_continuation`).
 
     The second element says whether the item IS the canonical standing row — the one the prompt
     hard-codes every cycle. It demands an **exact** match on the row's *Item cell* against the
@@ -682,23 +731,42 @@ def _needs_human(review_text: str) -> list[_ReviewFinding]:
         items[seen[key]] = _ReviewFinding(
             prev.text, prev.standing and standing, prev.tagged_impl and tagged_impl)
 
-    for i, line in enumerate(lines):
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
         s = line.strip()
         if s.startswith("- NEEDS-HUMAN"):
-            # A bullet's `[impl]` rides in the TEXT and is read by `_classify_finding`'s
-            # marker strip — the advisory contract, unchanged.
-            add(s[len("- NEEDS-HUMAN"):].lstrip(" —:-").strip(), standing=False)
+            bullet_indent = len(line) - len(line.lstrip())
+            parts = [s[len("- NEEDS-HUMAN"):].lstrip(" —:-").strip()]
+            j = i + 1
+            while j < n:
+                cont = lines[j]
+                cont_s = cont.strip()
+                if not cont_s:
+                    break  # blank line ends the item (out of scope: multi-paragraph bullets)
+                cont_indent = len(cont) - len(cont.lstrip())
+                if cont_indent <= bullet_indent:
+                    break  # not indented deeper than the bullet
+                if _ends_needs_human_continuation(cont):
+                    break  # a new list item, heading, table row, or code fence
+                parts.append(cont_s)
+                j += 1
+            add(" ".join(p for p in parts if p), standing=False)
+            i = j
+            continue
         elif s.startswith("|") and "needs-human" in s.lower():
             cells = [c.strip() for c in s.strip("|").split("|")]
-            vi = next((j for j, c in enumerate(cells) if "needs-human" in c.lower()), None)
-            if vi is None:
-                continue
-            label = cells[0] if cells else ""
-            basis = cells[vi + 1] if vi + 1 < len(cells) else ""
-            add(f"{label} — {basis}" if basis else label,
-                standing=(i in verdict_table
-                          and _normalized_item_label(label).casefold() == _V_LABEL.casefold()),
-                tagged_impl=bool(_VERDICT_IMPL_RE.search(cells[vi])))
+            vi = next((k for k, c in enumerate(cells) if "needs-human" in c.lower()), None)
+            if vi is not None:
+                label = cells[0] if cells else ""
+                basis = cells[vi + 1] if vi + 1 < len(cells) else ""
+                add(f"{label} — {basis}" if basis else label,
+                    standing=(i in verdict_table
+                              and _normalized_item_label(label).casefold()
+                              == _V_LABEL.casefold()),
+                    tagged_impl=bool(_VERDICT_IMPL_RE.search(cells[vi])))
+        i += 1
 
     # FAIL CLOSED on ambiguity. The template row is a CONSTANT — it occurs exactly once. If two
     # survive (a second verdict-shaped table, a duplicated row), at least one of them is not the

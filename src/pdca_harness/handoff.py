@@ -10,20 +10,25 @@ cause. This module gives each interactive leaf a *checked* boundary:
   contract for ONE named id and report PASS/FAIL. Ids are REQUIRED — there is no scan
   mode (prototype finding, getwyrd/wyrd-pdca#166: a scan judges old bundles against a
   contract that postdates them; a named id only ever judges what this session worked).
-* :func:`stop_problems` — the artifact verdict that makes the check non-optional: which
-  contract artifacts are missing or malformed, unless the session deliberately abandons
-  (:func:`record_abandon`). Read on disk, so it needs nothing from the live session.
-* :func:`_report_reap` — WHERE that verdict is enforced (issue #534): the driver, after
-  the leaf exits. The ``Stop`` hook (``.claude/hooks/handoff_guard.py``) also calls
-  :func:`stop_problems`, but only as a one-turn reminder — ``Stop`` fires at the end of
-  every assistant turn, so on an interactive leaf it cannot tell a question to the human
-  from a session ending, and its feedback goes to the model, not the human.
+* :func:`stop_problems` — the session-end verdict, judged when the driver REAPS the
+  leaf's process (:func:`session`) and reported to the human on stderr
+  (:func:`report_at_reap`). It re-reads the artifacts of every bundle the driver
+  registered. A planner session the driver registered none for (the CSV/default batch
+  Plan, which picks its issues mid-session) has every brief it created or changed since
+  spawn re-read instead (issue #549). Where that leaves nothing to re-read (Act, or a
+  batch Plan that changed no brief) it requires a passing ``/handoff``. The report
+  never blocks, never reopens the session and never changes bundle state; a deliberate
+  abandon (:func:`record_abandon`) is printed first and hides nothing. It is not a
+  turn-end check (issue #534): #331 ran it as a Claude Code ``Stop`` hook, but Stop
+  fires every time the agent finishes a TURN, and a Stop hook's exit 2 sends its text
+  back to the model instead of handing the turn to the human, so a leaf that asked the
+  human a question could never reach them.
 * :func:`session` — the driver-side registration: env for the spawned leaf naming its
   role and a session-state scratch file (the act-log baseline where authorship must be
-  distinguished, the abandon channel, the record of passed ``/handoff`` runs). The
-  scratch file lives OUTSIDE the bundle: the gate's verdict is exit status + report,
-  never a bundle artifact (prototype finding — no ``handoff.json``). Its exit is the
-  reap above.
+  distinguished, the spawn-time brief fingerprints of a planner session with no
+  registered bundle set, the abandon channel, the record of passed ``/handoff`` runs).
+  The scratch file lives OUTSIDE the bundle: the gate's verdict is exit status +
+  report, never a bundle artifact (prototype finding — no ``handoff.json``).
 
 Which contract applies is derived from the RENDER — the ``interactive = true`` leaves
 and their ``agent`` names in ``pdca.toml`` (:func:`contracts`) — not from a hardcoded
@@ -43,6 +48,7 @@ import json
 import os
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 from .config import Config, LeafConfig
@@ -96,15 +102,23 @@ def _unfilled(value: str) -> bool:
     return not v or v.startswith("<")
 
 
-def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False) -> list[str]:
+def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False,
+                  dependencies: bool = True) -> list[str]:
     """The Plan exit contract: an AUTHORED ``brief.md`` whose declared external
     dependencies are registered AND present (#333/#340 — the same probe the
     pre-dispatch guard runs, so the two verdicts cannot drift apart).
 
     ``allow_absent`` is the id-seeded batch wrinkle: the batch prompt documents "leave
-    it UNPLANNED (write no brief.md) and say why" as a legitimate outcome, so at the
-    Stop boundary a wholly-absent brief passes there — a brief that EXISTS malformed
-    never does.
+    it UNPLANNED (write no brief.md) and say why" as a legitimate outcome, so the
+    session-end check (:func:`stop_problems`, reported when the driver reaps the
+    session) passes a wholly-absent brief — a brief that EXISTS malformed never does.
+
+    ``dependencies=False`` skips the dependency clause and nothing else. Two callers pass
+    it. The reap does, when the ``[[doctor.checks]]`` table the clause reads cannot be read
+    (:func:`stop_problems` reports that once for the session). ``split._parent_plan`` does,
+    because it checks an ARCHIVED brief only for the fields it copies into a split
+    parent's new brief, and that brief declares no dependency of its own (#481).
+    ``/handoff`` always checks the whole contract.
     """
     from . import brief as _brief  # local: keep this module import-light for the hook
     from . import doctor as _doctor
@@ -119,7 +133,9 @@ def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False) -> list[s
     problems: list[str] = []
     # The fields EVERY brief template mandates and the measured corpus satisfies —
     # read via whole_field (multi-line values, #336), never line-based parse_fields.
-    # `defect` and `scope` joined the set with #214: they were only ever missing
+    # `defect` and `scope` joined the set with #214 (INSTANCE DELTA,
+    # eduralph/pdca-harness#580 — upstream requires only the other three; its
+    # shipped test fixtures carry a Scope line here for that reason): they were only ever missing
     # because the splitter/pointer templates spelled their labels differently and
     # the exact lookup read "" — under the shared synonym tuples the whole corpus
     # (112/112 briefs, measured 2026-08-15) resolves both, and the gate now covers
@@ -132,8 +148,9 @@ def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False) -> list[s
     # The dependency clause (#331 layer over #333/#340): every backticked token must
     # name a registered [[doctor.checks]] row whose detect cmd exits 0; an annotated
     # `(no-check: …)` token yields no token at all and is exempt by construction.
-    problems += _doctor.unregistered_dependencies(bp, cfg)
-    problems += _doctor.failing_dependencies(bp, cfg)
+    if dependencies:
+        problems += _doctor.unregistered_dependencies(bp, cfg)
+        problems += _doctor.failing_dependencies(bp, cfg)
     return problems
 
 
@@ -176,13 +193,43 @@ def check_publisher(d: Path, cfg: Config) -> list[str]:
     return problems
 
 
+def _is_pure_insertion(baseline: str, text: str) -> bool:
+    """True when ``text`` can be produced from ``baseline`` by inserting ONE
+    contiguous block somewhere — every character ``baseline`` had is still present,
+    unmodified, just not (only) trailing it. Distinguishes "the new entry landed
+    somewhere other than the end" (prepended, or spliced between existing entries)
+    from "text that was in the log at session start was itself changed or removed" —
+    the append-only rule ``check_act`` enforces (issue #528).
+
+    Computed as the longest common prefix plus the longest common suffix of the two
+    strings (the suffix comparison bounded to the part of ``baseline`` the prefix
+    didn't already cover, so the two never double-count the same character): if
+    together they account for the whole of ``baseline``, nothing inside it was
+    touched — whatever changed is new material inserted between the matched prefix
+    and suffix.
+    """
+    if len(text) < len(baseline):
+        return False
+    lcp = 0
+    while lcp < len(baseline) and baseline[lcp] == text[lcp]:
+        lcp += 1
+    remaining = len(baseline) - lcp
+    lcs = 0
+    while lcs < remaining and baseline[len(baseline) - 1 - lcs] == text[len(text) - 1 - lcs]:
+        lcs += 1
+    return lcp + lcs >= len(baseline)
+
+
 def check_act(cfg: Config, entry: str, baseline: dict) -> list[str]:
-    """The Act exit contract: the session NAMES the act-log entry it wrote.
+    """The Act exit contract: the log is append-only, and the session NAMES the
+    entry it appended.
 
     ``entry`` is the id the session hands ``/handoff`` (the entry's date). ``baseline``
     is the driver's session-start snapshot of ``process/act-log.md`` — supplied by the
     driver because an end-of-session command structurally cannot take one — and is what
-    distinguishes an entry THIS session wrote from one that predates it.
+    distinguishes text THIS session wrote from text that predates it. A session passes
+    only when the baseline text is unchanged and the named entry is in what the session
+    added AFTER it (i.e. appended at the end, never prepended or spliced in between).
     """
     if not entry.strip():
         return ["an entry id is required — run `/handoff <entry-date>` naming the "
@@ -195,7 +242,13 @@ def check_act(cfg: Config, entry: str, baseline: dict) -> list[str]:
     if entry not in text:
         return [f"process/act-log.md has no entry containing '{entry}' — append the "
                 "dated entry (even a 'no delta warranted' one) and name it here"]
-    if baseline:
+    if not baseline:
+        return []
+    prev_text = baseline.get("act_log_text")
+    if prev_text is None:
+        # A baseline built from length + sha alone (e.g. a caller that predates the
+        # full-text capture, or constructs the dict by hand): the cheaper unchanged /
+        # stale-suffix checks this replaced, kept for that shape.
         if _sha(text) == baseline.get("act_log_sha"):
             return ["process/act-log.md is unchanged since this session started — the "
                     f"entry '{entry}' predates the session; append THIS session's entry"]
@@ -204,7 +257,22 @@ def check_act(cfg: Config, entry: str, baseline: dict) -> list[str]:
                 and entry not in text[prev_len:]:
             return [f"'{entry}' appears only in act-log text that predates this session "
                     "— name the entry THIS session appended"]
-    return []
+        return []
+    if text == prev_text:
+        return ["process/act-log.md is unchanged since this session started — the "
+                f"entry '{entry}' predates the session; append THIS session's entry"]
+    if text.startswith(prev_text):
+        if entry not in text[len(prev_text):]:
+            return [f"'{entry}' appears only in act-log text that predates this session "
+                    "— name the entry THIS session appended"]
+        return []
+    if _is_pure_insertion(prev_text, text):
+        return ["process/act-log.md was not appended at the end — the log is "
+                "append-only: entries must be appended at the end of the log, never "
+                "prepended or inserted between existing entries"]
+    return ["process/act-log.md's text from before this session started was changed "
+            "or removed — the log is append-only: existing entries must not be "
+            "edited or deleted, only appended to"]
 
 
 _BUNDLE_CONTRACTS = {
@@ -228,6 +296,47 @@ def check_bundle(role: str, d: Path, cfg: Config, **kw) -> list[str]:
 # ----------------------------------------------------------------------------
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _brief_fingerprints(cfg: Config) -> dict[str, str]:
+    """``{bundle name: fingerprint}`` for every ``issue_*`` bundle under
+    ``cfg.bundle_root`` whose ``brief.md`` exists (issue #549).
+
+    The fingerprint is the sha256 of the brief's bytes: the content-hash rule
+    ``leaves._fresh_plan_briefs`` uses (matched, not imported — this module is kept
+    import-light for the hook). A brief that exists but cannot be read (no read
+    permission, a directory in its place) is fingerprinted by its read error instead,
+    so one such brief never stops the others from being fingerprinted. Never raises
+    for any one brief.
+    """
+    out: dict[str, str] = {}
+    for d in cfg.bundle_root.glob("issue_*"):
+        bp = d / "brief.md"
+        try:
+            if bp.exists():
+                out[d.name] = hashlib.sha256(bp.read_bytes()).hexdigest()
+        except Exception as exc:  # noqa: BLE001 — one brief must not hide the rest
+            out[d.name] = f"unreadable ({_error_text(exc)})"
+    return out
+
+
+def _changed_briefs(cfg: Config, baseline: object) -> list[Path]:
+    """The bundles whose ``brief.md`` a planner session created or changed: every
+    brief whose fingerprint now (:func:`_brief_fingerprints`) differs from the one
+    :func:`session` recorded at spawn, or that had none then (issue #549).
+
+    A brief that predates the session and is byte-unchanged is not this session's
+    work, even if malformed, and is left out. So is one that fails to read the same way
+    it did at spawn: its bytes cannot be compared, and nothing shows the session
+    touched it. With no spawn snapshot in ``baseline`` there is nothing to diff
+    against, so the result is empty: this never turns into a scan of every bundle.
+    """
+    before = baseline.get("briefs") if isinstance(baseline, dict) else None
+    if not isinstance(before, dict):
+        return []
+    return [cfg.bundle_root / name
+            for name, now in sorted(_brief_fingerprints(cfg).items())
+            if now != before.get(name)]
 
 
 def _read_json(path: Path | None) -> dict:
@@ -267,28 +376,83 @@ def record_pass(path: Path, ident: str) -> None:
 
 
 def record_abandon(path: Path, reason: str) -> None:
-    """The deliberate-abandon escape hatch: a TYPED reason, recorded in the driver's
-    session channel (never the bundle). Both the Stop hook and the driver's reap then
-    treat the contract as settled, and the driver reports the reason."""
+    """The deliberate abandon: a TYPED reason why the session stops with its contract
+    unmet, recorded in the driver's session channel (never the bundle). When the driver
+    reaps the session it prints the reason first and then everything
+    :func:`stop_problems` finds. Nothing blocks at the session end, so an abandon
+    explains the gap to the human and never hides it (#534)."""
     _update_state(path, abandoned=reason.strip() or "(no reason given)")
 
 
-def record_reminded(path: Path) -> None:
-    """Cap the Stop hook's reminder at one per SESSION, not one per block (#534 review).
+def _abandon_reason(state: dict) -> str:
+    """The abandon reason recorded in ``state``, stripped; ``""`` means not abandoned.
 
-    ``stop_hook_active`` bounds only the immediate model continuation of a block. After
-    the human replies, the next assistant turn arrives with a fresh envelope where the
-    flag is false again — so a multi-turn Plan or sign-off, held before its contract
-    artifact exists, would be blocked and re-reminded on EVERY turn. That is the same
-    closed loop the cap exists to prevent, and it would make the hook's own promise
-    ("this reminder will not repeat") false.
-
-    This marker lives in the driver's session channel, which outlives the turn, so the
-    reminder survives exactly once per spawned leaf. Best-effort, like every write here:
-    if it cannot be persisted the hook declines to block at all rather than risk the
-    loop — the driver's reap is the enforcement either way.
+    This is the ONE "was the session abandoned" test (:func:`report_at_reap` uses it),
+    and all it decides is whether the reap prints an abandon line. It never decides
+    whether the problem list is printed: :func:`stop_problems` does not look at
+    ``abandoned`` at all. The session can write its scratch file itself, so a blank
+    ``abandoned`` can get there without :func:`record_abandon`; a blank value is no
+    reason and prints no abandon line.
     """
-    _update_state(path, reminded=True)
+    return str(state.get("abandoned") or "").strip()
+
+
+def _error_text(exc: Exception) -> str:
+    """``Type: message`` on one line: how the reap names a check that raised — one
+    bundle's (:func:`stop_problems`), the ``[[doctor.checks]]`` table
+    (:func:`_doctor_table_problem`), or the whole check (:func:`report_at_reap`).
+    """
+    return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+def _printable(text: str) -> str:
+    """``text`` with every non-printable character escaped: ``\\x1b``, ``\\n``,
+    ``\\u202e`` (#534).
+
+    The reap prints text a session controls — its abandon reason, and problem items that
+    quote a brief (a dependency token) or an error message. Printed raw, a terminal
+    escape such as ``ESC[8m`` (conceal) could hide every line after it, and a newline
+    could forge a report line. :meth:`str.isprintable` decides: control and format
+    characters and every separator but the space are escaped.
+    """
+    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
+                   for c in text)
+
+
+def _emit(lines: list[str]) -> None:
+    """Print the reap's ``lines`` to stderr, each through :func:`_printable`. Never
+    raises: a stderr that cannot be written leaves nowhere to report anything."""
+    try:
+        for line in lines:
+            print(_printable(line), file=sys.stderr)
+    except Exception:  # noqa: BLE001 — the report must never break the leaf
+        pass
+
+
+def _doctor_table_problem(cfg: Config) -> str:
+    """One report item when the ``[[doctor.checks]]`` table cannot be read, else ``""``.
+
+    The planner contract's dependency clause reads that table from ``pdca.toml`` as it
+    is NOW (:func:`doctor.registered_ids`), and the session may have edited it. The reap
+    reads it the same way, once, so :func:`stop_problems` knows whether the clause can
+    run: the item names the file, the table and the error, and says the clause was not
+    checked — nothing more is skipped. A file that exists but does not parse counts as
+    unreadable too: ``registered_ids`` would quietly fall back to the rows loaded when
+    the run started, and a check against those is not a check of the table the session
+    left behind.
+    """
+    from . import doctor as _doctor  # local: keep this module import-light for the hook
+    toml = cfg.root / "pdca.toml"
+    try:
+        if toml.exists():
+            tomllib.loads(toml.read_text(encoding="utf-8"))
+        _doctor.registered_ids(cfg)
+    except Exception as exc:  # noqa: BLE001 — any failure: the clause cannot run
+        return (f"{toml}: the [[doctor.checks]] table could not be read "
+                f"({_error_text(exc)}), so the dependency clause was not checked — no "
+                "brief's External dependencies were matched to a registered row or "
+                "probed")
+    return ""
 
 
 @contextlib.contextmanager
@@ -298,17 +462,29 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
 
     Yields the env to merge into the spawn: the role and a session-state scratch file
     (created in ``cfg.root`` with the gitignored :data:`STATE_PREFIX`, removed on exit).
-    Captures the session-start act-log baseline for the act role. Yields ``{}`` — no
-    contract — when the render does not mark the leaf interactive (criterion f), and on
-    ANY setup failure (a checked exit contract must never break the leaf it checks).
+    Captures the session-start act-log baseline for the act role. For a planner session
+    with NO registered bundle set (the CSV/default batch Plan, issue #549), it records a
+    fingerprint of every existing ``issue_*/brief.md`` (:func:`_brief_fingerprints`),
+    which the reap diffs to find the briefs the session created or changed. Every brief
+    is fingerprinted, placeholder or not. That differs from ``leaves._brief_snapshot``,
+    which leaves placeholders out of its before picture: here a brief the session did
+    not touch is never re-read, whatever it holds. A brief that cannot be read is
+    fingerprinted by its read error, so it does not fail the setup. A planner session
+    with registered bundles takes no snapshot. Yields ``{}`` — no contract — when the
+    render does not mark the leaf interactive (criterion f), and on ANY setup failure
+    (a checked exit contract must never break the leaf it checks).
 
-    ``outcome``, when a dict is passed, receives ``{"discharged": bool}`` at reap — for
-    the caller whose OWN side effect must not fire on an undischarged session (#534
-    review, P1). Most callers need nothing: their side effect is the artifact itself, so
-    a missing one already stops the state machine. Act is the exception —
-    ``mark_reviewed`` advances a global frontier that no artifact gates. It is ``True``
-    on every no-contract path (non-interactive leaf, setup failure, a broken check): a
-    contract that was never established must not withhold a caller's work.
+    On exit, which is the driver reaping the leaf's process, the contract is judged and
+    the verdict reported to the human (:func:`report_at_reap`, issue #534).
+
+    ``outcome`` (INSTANCE DELTA, eduralph/pdca-harness#579), when a dict is
+    passed, receives ``{"discharged": bool}`` at reap — for the caller whose OWN side
+    effect must not fire on an undischarged session (#233 review, P1). Most callers need
+    nothing: their side effect is the artifact itself, so a missing one already stops the
+    state machine. Act is the exception — ``mark_reviewed`` advances a global frontier
+    that no artifact gates. It is ``True`` on every no-contract path (non-interactive
+    leaf, setup failure, a broken check) and on a deliberate abandon: a contract that was
+    never established must not withhold a caller's work.
     """
     if outcome is not None:
         outcome["discharged"] = True
@@ -322,83 +498,112 @@ def session(cfg: Config, role: str, bundles: list[Path] | None = None, *,
         if role == "act":
             log = cfg.process_dir / "act-log.md"
             text = log.read_text(encoding="utf-8") if log.exists() else ""
-            baseline = {"act_log_len": len(text), "act_log_sha": _sha(text)}
+            # `act_log_text` carries the FULL session-start text (not just its length
+            # and hash): the append-only check needs the actual content to tell "the
+            # new entry landed somewhere other than the end" apart from "existing text
+            # was edited or removed" (issue #528). `act_log_len`/`act_log_sha` stay for
+            # callers that only need the cheap unchanged/changed signal.
+            baseline = {"act_log_len": len(text), "act_log_sha": _sha(text),
+                        "act_log_text": text}
+        elif role == "planner" and not bundles:
+            # No bundle set to register: the CSV/default batch Plan picks its issues
+            # mid-session (#549). What every brief looked like at spawn, so the reap
+            # can re-read exactly the briefs this session created or changed. A
+            # registered planner takes no snapshot: its reap re-reads its bundles.
+            baseline = {"briefs": _brief_fingerprints(cfg)}
+        registered = {
+            "role": role,
+            "bundles": [str(b) for b in (bundles or [])],
+            "require_artifact": bool(require_artifact),
+            "baseline": baseline,
+        }
         fh = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=cfg.root,
             prefix=STATE_PREFIX, suffix=".json", delete=False)
         with fh:
-            json.dump({
-                "role": role,
-                "bundles": [str(b) for b in (bundles or [])],
-                "require_artifact": bool(require_artifact),
-                "baseline": baseline,
-                "passed": [],
-            }, fh, indent=2)
+            json.dump({**registered, "passed": []}, fh, indent=2)
         path = Path(fh.name)
         env = {ENV_ROLE: role, ENV_STATE: str(path)}
     except OSError as exc:
         print(f"handoff: could not register the {role} session state ({exc}) — the "
-              "exit contract is unenforced for this session", file=sys.stderr)
+              "exit contract is unchecked for this session", file=sys.stderr)
         yield {}
         return
     try:
         yield env
     finally:
+        # The reap (#534); nothing in it may raise out of this context manager. The
+        # session writes `passed` / `abandoned` into the scratch file; what the driver
+        # registered is taken from here, so the report names the bundles the driver
+        # actually handed the leaf even if the file was rewritten or lost.
         try:
-            discharged = _report_reap(cfg, role, _read_json(path))
-        except Exception as exc:  # noqa: BLE001 — a broken check must not mask the leaf
-            print(f"handoff: contract check unavailable at reap ({exc}) — the {role} "
-                  "session's exit contract is unverified", file=sys.stderr)
-            discharged = True  # unverified is not "failed": never withhold on a crash
+            state = {**_read_json(path), **registered}
+        except Exception:  # noqa: BLE001 — e.g. JSON nested too deep to parse
+            state = dict(registered)
+        problems = report_at_reap(cfg, role, state)
         if outcome is not None:
-            outcome["discharged"] = discharged
-        path.unlink(missing_ok=True)
+            # INSTANCE DELTA (eduralph/pdca-harness#579): the one caller whose
+            # own side effect is not artifact-backed (Act's frontier advance) needs the
+            # verdict, not just the report. An abandon is settled, not undischarged.
+            outcome["discharged"] = not problems or bool(_abandon_reason(state))
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            _emit([f"handoff: could not remove the {role} session's scratch file "
+                   f"({_error_text(exc)})"])
 
 
-def _report_reap(cfg: Config, role: str, state: dict) -> bool:
-    """Report one interactive leaf's exit contract when the DRIVER reaps it (#534).
+def report_at_reap(cfg: Config, role: str, state: dict) -> list[str]:
+    """Report, never enforce, a session's exit contract when the driver reaps it (#534).
 
-    This is where enforcement lives. :func:`stop_problems` re-verifies artifacts on
-    disk and needs nothing from the live session, so the driver can check them here,
-    after the leaf exits — which is the only place the two events the Stop hook cannot
-    tell apart ("the human is being asked a question" / "the leaf is finishing") are
-    already distinct. The hook stays, capped, as an in-session reminder only.
+    Printed to the human on stderr, in this order: the typed abandon reason, if one was
+    recorded (:func:`_abandon_reason`); then everything :func:`stop_problems` finds,
+    under one header naming the role. An abandon hides none of it: nothing is blocked
+    here, so hiding it would only keep it from the human. Nothing found and no abandon
+    ⇒ nothing printed.
 
-    Mostly reporting: for the artifact-backed roles an undischarged contract means the
-    artifact the state machine reads is missing or malformed, so the driver does not
-    advance on it anyway, and what this adds is that the human is TOLD, naming each item,
-    at the moment the session ends rather than at the next state read.
+    It covers what :func:`stop_problems` covers and no more: the artifacts of every
+    bundle the driver registered for the session; where the driver registered none, the
+    briefs a planner session created or changed (the CSV/default batch Plan, #549), and,
+    when that leaves nothing to re-read (Act, or a batch Plan that changed no brief),
+    whether the session named its work through a passing ``/handoff``; and, for a
+    planner session, whether the ``[[doctor.checks]]`` table can be read.
 
-    Returns True when the contract is SETTLED — discharged, or deliberately abandoned —
-    and False when the session ended undischarged. :func:`session` relays that through
-    its ``outcome`` argument, because one caller's side effect is NOT artifact-backed and
-    so is not self-gating: Act's ``mark_reviewed`` advances the review frontier and would
-    otherwise retire cycles a session never reviewed (#534 review, P1).
+    Every printed line goes through :func:`_printable`, because the reason and many
+    items quote text the session wrote, and a raw terminal escape in it could hide the
+    lines that follow.
 
-    It deliberately does NOT claim "nothing was advanced" — that is the caller's fact to
-    report, not this function's to assert; the Act path says it for itself.
+    REPORT ONLY: it writes no bundle file, moves or deletes no artifact, does not reopen
+    the session, and never raises, because a checked exit contract must never break the
+    leaf it checks. A check that fails for one bundle is that bundle's item; a failure
+    outside any bundle's check is one line, after the abandon reason.
+
+    The absent-artifact cases are also handled by the driver after the session (no
+    brief, no decision, no publish artifacts). What only this report catches is an
+    artifact that is present but malformed: a brief whose Success criterion is empty, an
+    iterate/discontinue decision with no rationale.
     """
-    reason = str(state.get("abandoned") or "").strip()
-    if reason:
-        print(f"handoff: the {role} session was deliberately abandoned — {reason}",
-              file=sys.stderr)
-        return True
-    problems = stop_problems(cfg, role, state)
-    if not problems:
-        return True
-    print(f"handoff: the {role} session ended with its exit contract UNDISCHARGED:",
-          file=sys.stderr)
-    for p in problems:
-        print(f"  - {p}", file=sys.stderr)
-    print(f"handoff: re-run the {role} leaf, or record a deliberate abandon next time "
-          '(`python3 .claude/hooks/handoff_guard.py --abandon "<why>"`).',
-          file=sys.stderr)
-    return False
+    lines: list[str] = []
+    problems: list[str] = []
+    try:
+        reason = _abandon_reason(state)
+        if reason:
+            lines.append(f"handoff: the {role} session was deliberately abandoned — "
+                         f"{reason}")
+        problems = stop_problems(cfg, role, state)
+        if problems:
+            lines.append(f"handoff: the {role} session ended; checking its exit contract "
+                         "found (a report only, the driver carries on as usual):")
+            lines += [f"  - {p}" for p in problems]
+    except Exception as exc:  # noqa: BLE001 — the report must never break the leaf
+        lines.append(f"handoff: could not check the {role} session's exit contract "
+                     f"({_error_text(exc)}) — no contract item was reported")
+    _emit(lines)
+    return problems
 
 
 # ----------------------------------------------------------------------------
-# The two verdicts: /handoff (ergonomics) and the artifact check (enforcement at the
-# driver's reap, a capped reminder in the Stop hook — #534).
+# The two verdicts: /handoff (the session's self-check) and the reap report.
 # ----------------------------------------------------------------------------
 def resolve_bundle(cfg: Config, ident: str) -> Path:
     """``issue_331`` / ``331`` → the bundle dir, matching ``cfg.bundle`` keying."""
@@ -449,16 +654,37 @@ def run_check(cfg: Config, ident: str, *, role: str | None = None,
 
 
 def stop_problems(cfg: Config, role: str, state: dict) -> list[str]:
-    """The artifact verdict: why this session's contract is not discharged (empty ⇒ it is).
+    """The session-end verdict: what the driver can still find unmet or unchecked in
+    this session's exit contract (empty ⇒ nothing to report). The driver reports it
+    when it reaps the session (:func:`report_at_reap`); nothing blocks on it. The name
+    is historical: the #331 Stop hook that consumed it is retired (#534).
 
-    Re-verifies the ARTIFACTS for every bundle the driver registered at spawn — the
-    contract is the artifacts, so a session that discharged them without ever typing
-    ``/handoff`` still ends cleanly. Where the driver could not register the work set
-    (the CSV-batch planner, Act), the session must have named its work through a
-    passing ``/handoff``. A recorded abandonment always allows the stop.
+    What it covers, and no more:
+
+    * **Every bundle the driver registered** at spawn (a single Plan, sign-off or
+      publish bundle; each bundle of an id-seeded batch Plan or a batch sign-off): its
+      ARTIFACTS are re-read — the contract is the artifacts, so a session that
+      discharged them without ever typing ``/handoff`` is discharged too. A bundle whose
+      check raises (a decision file that is not UTF-8, a directory where a file should
+      be) is listed as ``<bundle>: could not check (<error>)`` and every other bundle is
+      still checked.
+    * **A planner session with no registered bundle set** (the CSV/default batch Plan,
+      which picks its issues mid-session, #549): every brief under ``cfg.bundle_root``
+      it created or changed since spawn (:func:`_changed_briefs`) is re-read and
+      reported the same way, whether or not a ``/handoff`` passed. A brief that
+      predates the session and is unchanged is not re-read, even if malformed. When
+      the session changed no brief, the next rule applies.
+    * **No registered bundle set and nothing re-read** (Act, which has no brief to
+      re-read; a batch Plan that changed no brief): the session must have named its
+      work through a passing ``/handoff``.
+    * **Every planner session**, bundles registered or not, briefs present or not: the
+      ``[[doctor.checks]]`` table the dependency clause reads is read first
+      (:func:`_doctor_table_problem`). If it cannot be read, that is ONE item for the
+      whole session, and every brief is still checked without the dependency clause.
+
+    ``abandoned`` is not read here: an abandon changes nothing in this list, and
+    :func:`report_at_reap` prints the typed reason above it, never in place of it.
     """
-    if state.get("abandoned"):
-        return []
     if role not in contracts(cfg):
         return []
     if role == "act":
@@ -467,15 +693,29 @@ def stop_problems(cfg: Config, role: str, state: dict) -> list[str]:
         return ["the act session has not verified its exit contract — append the dated "
                 "act-log entry (even a 'no delta warranted' one) and run "
                 "`/handoff <entry-date>` naming it"]
+    out: list[str] = []
+    table_problem = _doctor_table_problem(cfg) if role == "planner" else ""
+    if table_problem:
+        out.append(table_problem)
     bundles = [Path(b) for b in (state.get("bundles") or [])]
+    kw: dict = {}
+    if role == "planner":
+        kw = {"allow_absent": not state.get("require_artifact", True),
+              "dependencies": not table_problem}
+        if not bundles:
+            # No registered bundle set: the CSV/default batch Plan (#549). Its work set
+            # is every brief it created or changed since spawn, re-read like a
+            # registered bundle's whether or not a `/handoff` passed.
+            bundles = _changed_briefs(cfg, state.get("baseline"))
     if bundles:
-        allow_absent = role == "planner" and not state.get("require_artifact", True)
-        out: list[str] = []
         for d in bundles:
-            kw = {"allow_absent": allow_absent} if role == "planner" else {}
-            out += [f"{d.name}: {p}" for p in check_bundle(role, d, cfg, **kw)]
+            try:
+                found = check_bundle(role, d, cfg, **kw)
+            except Exception as exc:  # noqa: BLE001 — one bundle must not hide the rest
+                found = [f"could not check ({_error_text(exc)})"]
+            out += [f"{d.name}: {p}" for p in found]
         return out
     if state.get("passed"):
-        return []
-    return [f"the {role} session registered no bundle set at spawn and verified none — "
-            "run `/handoff issue_<id>` for each bundle this session worked"]
+        return out
+    return out + [f"the {role} session registered no bundle set at spawn and verified "
+                  "none — run `/handoff issue_<id>` for each bundle this session worked"]
