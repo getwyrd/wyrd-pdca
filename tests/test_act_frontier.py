@@ -194,9 +194,9 @@ class MarkerFormat(unittest.TestCase):
         return err.getvalue()
 
     def test_undischarged_act_session_does_not_advance_the_frontier(self) -> None:
-        # #534 review P1: the capped Stop hook lets an undischarged session EXIT, and
-        # the reap only reported it — so `mark_reviewed` still ran and retired cycles
-        # nothing had reviewed. A frontier advance is irreversible in practice: those
+        # #233 review P1 (instance delta over upstream #534, whose reap only reports):
+        # an undischarged session EXITS and the reap reports it — without this
+        # `mark_reviewed` still ran and retired cycles nothing had reviewed. A frontier advance is irreversible in practice: those
         # bundles never come back into Act's scope.
         _freeze(self.cfg, "70")
         _freeze(self.cfg, "80")
@@ -209,14 +209,14 @@ class MarkerFormat(unittest.TestCase):
         self.assertIn("issue_70", names)
         self.assertIn("issue_80", names)
         self.assertFalse(act.has_frontier(self.cfg))
-        self.assertIn("UNDISCHARGED", err)
+        self.assertIn("checking its exit contract found", err)
         self.assertIn("frontier is NOT advanced", err)
 
     def test_discharged_act_session_still_advances_the_frontier(self) -> None:
         # The other half: the gate must not withhold a review that DID happen.
         _freeze(self.cfg, "90")
 
-        def wrote_and_verified(_leaf, _root, _prompt, cfg=None, env=None):
+        def wrote_and_verified(_leaf, _root, _prompt, cfg=None, env=None, **_kw):
             handoff.record_pass(Path(env[handoff.ENV_STATE]), "2026-07-19")
 
         self._command_act(wrote_and_verified)
@@ -228,12 +228,12 @@ class MarkerFormat(unittest.TestCase):
         # failure — but it is still not a review, so the frontier stays put.
         _freeze(self.cfg, "95")
 
-        def abandoned(_leaf, _root, _prompt, cfg=None, env=None):
+        def abandoned(_leaf, _root, _prompt, cfg=None, env=None, **_kw):
             handoff.record_abandon(Path(env[handoff.ENV_STATE]), "no maintainer time")
 
         err = self._command_act(abandoned)
         self.assertIn("deliberately abandoned", err)
-        self.assertNotIn("UNDISCHARGED", err)
+        self.assertNotIn("frontier is NOT advanced", err)
         self.assertTrue(act.has_frontier(self.cfg))
 
     def test_unmark_serializes_with_the_first_frontier_write(self) -> None:

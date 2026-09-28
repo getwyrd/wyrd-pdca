@@ -83,7 +83,8 @@
   - **Why it was off, and why flipping the flag alone would not have fixed it.** On 2026-08-08
     the driver merged wyrd #703 six seconds after opening it, before the required `gate`
     context had reported; `gh pr merge` refused and the wave stopped with #703 readied and
-    #704–706 untouched (getwyrd/pdca-harness#462, **still OPEN at v0.57.0**). Turning
+    #704–706 untouched (eduralph/pdca-harness#462, closed — upstream shipped its wait in
+    v0.58.0). Turning
     `auto_merge` back on by itself reproduces that one layer up: #413's rollup gate reads the
     checks once, immediately before the merge, when the PR is *seconds old* — publish opened
     it just before this boundary — finds them still registering, and refuses. Same boundary
@@ -91,13 +92,21 @@
     triggered by the ready-mark. That does **not** hold here: no `getwyrd/wyrd` workflow
     lists `ready_for_review` and none guards on draft, so drafts already run CI and `gh pr
     ready` triggers nothing — verified 2026-08-16. The PR's age is the cause.)
-  - **What makes it safe: `merge_wait_secs = 1800`.** The rollup gate now decides on a
-    **settled** rollup rather than an early one — `_await_rollup` polls while the rollup is
+  - **What makes it safe: `merge_wait_secs = 1800`.** The rollup gate decides on a
+    **settled** rollup rather than an early one — `_wait_for_green` polls while the rollup is
     `pending` or `empty`, up to the budget, then hands the result to the unchanged gate. A
     red, an unreadable rollup, or an exhausted budget still refuses and still STOPs; waiting
-    can only turn a refusal into a merge a later read would have permitted anyway. This is an
-    **instance delta** in `src/pdca_harness/merge.py`, marked as such, on the same footing as
-    the #371 confirm-once delta in `gates.py` — it goes away when #462 lands upstream.
+    can only turn a refusal into a merge a later read would have permitted anyway. **Upstream
+    since v0.58.0** (#462): the instance's own `_await_rollup` delta (2026-08-16) was retired
+    at that upgrade, and with it two things it did that upstream's does not — it re-read a
+    green once before believing it (PR #224 review: a fast check can register and pass before
+    the slow `gate` has created its check run), and it printed a heartbeat while waiting. The
+    first is covered on this target by branch protection: `gate` and `dco` are required, so
+    `gh pr merge` refuses an early green and the run STOPs rather than merging. Also upstream
+    since v0.58.0: every refusal after the ready-mark returns the PR to draft
+    (`gh pr ready --undo`), so a stopped wave never leaves a PR advertising a readiness no
+    human granted. The instance value stays 1800 (upstream default 300) for a cold
+    `cargo xtask ci`.
   - **What makes the *combination* safe: `merge_sync_base = true`** (2026-08-16, #228;
     upstream eduralph/pdca-harness#531). The rollup gate above is honest about whichever tree
     a PR's checks last ran on — which, for every wave member after the first, is the tree
@@ -112,8 +121,9 @@
     gate — which empties its rollup and lets the existing `merge_wait_secs` wait do the rest,
     so the gate decides on checks for the tree the PR actually merges into. Fail-closed: an
     unreadable behind-state or a failed sync STOPs rather than merging on the older evidence.
-    An **instance delta** in `src/pdca_harness/merge.py`, on the same footing as the #462
-    wait above and the #371 confirm-once delta in `gates.py`; it goes away when #531 lands.
+    An **instance delta** in `src/pdca_harness/merge.py`, on the same footing as the #371
+    confirm-once delta in `gates.py`; it goes away when #531 lands. Since v0.58.0 its four
+    STOP paths also return the PR to draft, like upstream's own refusal paths.
     **Not** the same as host strictness — `strict = true` alone would make `gh pr merge`
     refuse every wave member after the first and stop the batch, since upstream has no
     `update-branch` path at all.
@@ -396,7 +406,7 @@ declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`
 | Act tooling (L4) | `src/pdca_harness/act.py` | `pdca act index`, `pdca act log --date <d>` | [built] |
 | PR-review triage | `src/pdca_harness/triage.py` | `pdca triage <pr>` (gh-paginated ingest → 4-class routing → `codex-pr:` ledger signals) | [built — v0.57.0; replaced `scripts/triage-pr-findings`] |
 | Bundle recording | `src/pdca_harness/record.py` | `pdca record [<ids>…]` (terminal bundles only; publish triggers it) | [built — v0.57.0; `[records] mode = "commit"`] |
-| Leaf exit contract | `src/pdca_harness/handoff.py` + `.claude/hooks/handoff_guard.py` | `/handoff <issue_id>` in an interactive leaf; enforced by the `Stop` hook | [built — v0.57.0; replaced `scripts/handoff-check`] |
+| Leaf exit contract | `src/pdca_harness/handoff.py` + `.claude/hooks/handoff_guard.py` | `/handoff <issue_id>` in an interactive leaf (the session's self-check); the driver re-checks and REPORTS at reap — no `Stop` hook since v0.58.0 (#534) | [built — v0.57.0; replaced `scripts/handoff-check`; v0.58.0 retired the instance's #233 hook cap for upstream's reap report. Instance delta kept: an undischarged Act session does not advance the review frontier (eduralph/pdca-harness#579)] |
 | Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca gates [<id>] [--working-tree]` | [built — stub fallback; fill checks] |
 | Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex, `.claude/agents/reviewer.md` is the Claude packaging) | (model leaf) | [built — contract; wire command mode] |
 | Builder role prompt | `agents/builder.md` (canonical body); `.claude/agents/builder.md` (Claude wrapper) + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |

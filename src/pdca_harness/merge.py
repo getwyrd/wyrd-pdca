@@ -35,22 +35,16 @@ rollup refuses too (absence of evidence is not green); skipped/neutral checks ar
 completed non-failures and do not block. ``[driver].merge_requires = "required"``
 (default ``"all"``) opts back into host-config-only semantics, skipping the gate.
 
-**INSTANCE DELTA — ``[driver].merge_wait_secs`` (eduralph/pdca-harness#462, OPEN at
-v0.57.0).** Reading the rollup once, immediately before the merge, is honest but early: at
-that instant the PR is SECONDS OLD — publish opened it and the wave boundary follows
-straight on — so its checks are still registering, the verdict is ``pending``, and the run
-STOPs. That makes the wave-boundary stop the routine outcome of every multi-wave batch,
-which is what merge mode exists to avoid. :func:`_await_rollup` waits for the rollup to
-SETTLE and then hands it to the same gate, unchanged: a red, an unreadable rollup, or an
-exhausted budget still refuses and still STOPs. ``merge_wait_secs = 0`` reproduces upstream
-exactly.
-
-Note the paragraph above attributes the early rollup to ``ready_for_review`` CI triggered by
-the ready-mark. That is upstream's general case and it does NOT hold on this instance's
-target: no workflow in ``getwyrd/wyrd`` lists ``ready_for_review``, and none carries a draft
-guard, so drafts already run CI and ``gh pr ready`` triggers nothing (verified 2026-08-16,
-PR #224 adversarial review). The wait is still needed — the PR's age, not the ready-mark, is
-what makes the rollup incomplete — but do not reason from the trigger when tuning it here.
+A wave boundary fires SECONDS after the PR was opened (issue #462: getwyrd/wyrd#703, six
+seconds between create and ready_for_review), so the FIRST rollup read above is routinely
+``pending`` or ``empty`` — not a verdict, just evidence that has not arrived yet.
+``_wait_for_green`` re-reads the rollup until it resolves or ``[driver].merge_wait_secs``
+(default 300; ``0`` disables the wait — the original immediate-refusal behaviour) of
+wall-clock time elapses, through the patchable ``_sleep`` below so a test costs no real
+time. Whichever way ``_merge_one`` declines to merge a PR it already readied — the rollup
+never resolving green, a failing ``gh pr merge`` — ``_undo_ready`` marks it back to draft
+(``gh pr ready --undo``) before returning, so a stopped wave never leaves a PR advertising
+a readiness no human granted (``docs/INTEGRATION.md`` §10).
 
 **INSTANCE DELTA — ``[driver].merge_sync_base`` (eduralph/pdca-harness#531, OPEN).** The
 rollup gate above is honest about whichever tree the PR's checks last ran on — which, for
@@ -69,7 +63,7 @@ host configuration: a PR found behind is brought up to date first, which empties
 and lets the *existing* wait-and-gate decide on checks for the tree it really merges into.
 
 Three things the PR #230 review corrected, each of which would have left the delta broken in
-a way its own tests did not see. The check **loops**: ``_await_rollup`` may wait up to
+a way its own tests did not see. The check **loops**: ``_wait_for_green`` may wait up to
 ``merge_wait_secs``, and a sibling landing during that wait leaves the head behind again with
 a green rollup for the pre-move tree — the original failure in a smaller window — so the base
 is re-read after every gate, bounded by :data:`_MAX_SYNC_ROUNDS`. The post-sync wait runs
@@ -96,6 +90,10 @@ from pathlib import Path
 
 from . import merged, publish, state
 from .config import Config
+
+# Patchable indirection so a test can drive the wait loop below with no real wall-clock
+# cost (issue #462) — tests replace this, never `time.sleep` itself.
+_sleep = time.sleep
 
 # `gh pr checks --json name,bucket` classifies every check into one of five buckets:
 # pass | fail | pending | skipping | cancel (`gh pr checks --help`). "pass" and "skipping"
@@ -203,82 +201,39 @@ def _names(checks: list) -> str:
         for c in checks)
 
 
-#: How often :func:`_await_rollup` re-reads the rollup while it is unsettled. Not configurable
-#: — the budget is (``[driver].merge_wait_secs``); a knob for the interval would only tune how
-#: hard we poll GitHub for the same answer.
-_POLL_INTERVAL_SECS = 30
+def _wait_for_green(pr_url: str, wait_secs: int, *, poll_interval: int = 15) -> tuple[str, str]:
+    """Re-read ``pr_url``'s check rollup (``_check_rollup``) until it clears ``pending``/
+    ``empty`` or ``wait_secs`` of (patchable) wall-clock time is exhausted (issue #462).
+    Returns the final ``(verdict, detail)`` unchanged — this never itself decides to merge.
 
-
-def _await_rollup(pr_url: str, budget_secs: int, *,
-                  sleep=time.sleep, now=time.monotonic) -> tuple[str, str]:
-    """:func:`_check_rollup`, but WAIT for an unsettled rollup to settle first.
-
-    INSTANCE DELTA (eduralph/pdca-harness#462, still OPEN at v0.57.0). Upstream reads the
-    rollup once, immediately before the merge. At that instant the PR is seconds old — the
-    publisher opened it and the wave boundary follows straight on — so the checks are still
-    registering, the honest verdict is ``pending``, the merge refuses, and the run STOPs.
-    That makes the boundary stop the ROUTINE outcome of every multi-wave batch, which is
-    the one thing merge mode exists to avoid.
-
-    So: poll while the rollup is ``pending`` or ``empty``, up to ``budget_secs``, and hand
-    the SETTLED verdict to the same gate.
-
-    **A GREEN IS ALWAYS CONFIRMED, wherever it appears.** This is the subtle half. During
-    the seconds in which a new PR's checks are registering, the rollup does not report
-    "incomplete" — it reports whatever has registered SO FAR. One fast workflow that has
-    already passed reads as a clean green while the slow one that matters (`gate` here) has
-    not created its check run yet. So a green is re-read one interval later and only
-    believed if it holds; if the remaining checks registered in the gap it goes ``pending``
-    and falls back into the wait, and if they registered RED it refuses. Confirming only
-    the first read — as the first cut of this did — left every green reached *through* the
-    loop unconfirmed, so `empty → green` merged what `budget = 0` would have refused
-    (PR #224 adversarial review).
-
-    What this does NOT do is weaken the gate. ``failing`` and ``unreadable`` return at once
-    (a red is settled; an unreadable rollup is an auth/`gh` problem waiting cannot fix), and
-    exhausting the budget returns the last unsettled verdict, which still refuses and still
-    STOPs.
-
-    ``budget_secs <= 0`` reproduces upstream exactly: one read, no wait, no confirmation.
+    ``wait_secs <= 0`` performs exactly one read and returns immediately: the original
+    behaviour, for a host whose checks are known to already be in by the time the wave
+    boundary fires. Sleeps go through the module-level ``_sleep`` so a test can make the
+    whole loop cost no real time.
     """
     verdict, detail = _check_rollup(pr_url)
-    if budget_secs <= 0 or verdict in ("failing", "unreadable"):
-        return verdict, detail                       # settled, or not ours to wait out
-    deadline = now() + budget_secs
-
-    def _nap() -> bool:
-        """Sleep one interval, clamped to what is left of the budget. False when spent.
-
-        Prints a heartbeat, because `progress` says why: "without a heartbeat the flow looks
-        hung and the human kills a job that is [working]". A 30-minute budget is 60 silent
-        polls otherwise (PR #224 review).
-        """
-        left = deadline - now()
-        if left <= 0:
-            return False
-        print(f"   … {int(left)}s of the check-wait budget left", flush=True)
-        sleep(min(_POLL_INTERVAL_SECS, max(1, int(left))))
-        return True
-
-    while True:
-        if verdict == "green":
-            # Confirm, don't trust. Charged to the budget like any other wait, so a small
-            # `merge_wait_secs` can no longer sleep longer than the operator allowed.
-            if not _nap():
-                return verdict, detail               # budget spent; the green stands
-            again, again_detail = _check_rollup(pr_url)
-            if again == "green":
-                return again, again_detail           # held across an interval — believe it
-            verdict, detail = again, again_detail
-            if verdict in ("failing", "unreadable"):
-                return verdict, detail
-            continue                                 # went pending/empty — keep waiting
-        if not _nap():
-            return verdict, detail                   # budget spent, still unsettled
+    waited = 0
+    while verdict in ("pending", "empty") and waited < wait_secs:
+        step = min(poll_interval, wait_secs - waited)
+        _sleep(step)
+        waited += step
         verdict, detail = _check_rollup(pr_url)
-        if verdict in ("failing", "unreadable"):
-            return verdict, detail
+    return verdict, detail
 
+
+def _undo_ready(pr_url: str) -> None:
+    """Return ``pr_url`` to draft (issue #462): the documented inverse of the ``gh pr
+    ready`` call in ``_merge_one``, run on every path where that function declines to merge
+    a PR it already readied, so a stopped wave never leaves a PR advertising a readiness no
+    human granted. Its own failure is reported — never masking the real reason the wave
+    stopped — but does not change the caller's already-decided non-zero return."""
+    print(f"→ gh pr ready {pr_url} --undo")
+    undo = subprocess.run(["gh", "pr", "ready", str(pr_url), "--undo"],
+                          capture_output=True, text=True)
+    if undo.returncode != 0:
+        print((undo.stderr or undo.stdout).strip(), file=sys.stderr)
+        print(f"!!! merge: could not return {pr_url} to draft after declining to merge it "
+              "— it is left marked ready; a human must re-draft it.", file=sys.stderr)
 
 
 #: How many times :func:`_merge_one` will sync a PR onto a base that keeps moving before it
@@ -334,7 +289,7 @@ def _sync_base(pr_url: str) -> bool:
     (eduralph/pdca-harness#531, OPEN).
 
     The push re-triggers CI, so the rollup for the new head is EMPTY — which is precisely
-    what :func:`_await_rollup` already polls on. The sync therefore needs no waiting of its
+    what :func:`_wait_for_green` already polls on. The sync therefore needs no waiting of its
     own; it hands the existing gate a rollup that describes the tree the PR merges into.
     """
     print(f"→ gh pr update-branch {pr_url}")
@@ -389,12 +344,13 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # (eduralph/pdca-harness#531, OPEN). Without this the gate is honest about the wrong
     # tree: a wave's second merge reads a rollup computed before its sibling landed, so the
     # combination is never verified. Ordering is the whole trick — the sync's push empties
-    # the rollup for the new head, and `_await_rollup` already polls on empty, so the gate
+    # the rollup for the new head, and `_wait_for_green` already polls on empty, so the gate
     # below decides on checks that describe the tree this PR actually merges into.
     # Fail-closed on an unreadable behind-state, on the same principle the rollup gate uses:
     # absence of evidence is not green.
-    # LOOPS, deliberately. Checking once is not enough: `_await_rollup` below may wait for
-    # up to `merge_wait_secs` (1800 here), and a sibling landing on the base during that wait
+    # LOOPS, deliberately. Checking once is not enough: `_wait_for_green` below may wait for
+    # up to `merge_wait_secs` (1800 here; the wait itself is upstream since v0.58.0, #462),
+    # and a sibling landing on the base during that wait
     # leaves the head behind again — with a green rollup for the pre-move tree, which
     # non-strict protection will happily merge. That is the very failure this exists to
     # prevent, in a smaller window (PR #230 review). So: re-read after every gate, and stop
@@ -409,6 +365,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                       "would merge into is unknown. STOP: later waves are NOT run; resolve "
                       "at the PR, then re-run (or set [driver] merge_sync_base = false to "
                       "merge without the check).\n", file=sys.stderr)
+                _undo_ready(pr_url)
                 return 1
             if not behind:
                 break
@@ -419,6 +376,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                       "already merged, or no write access. Merging now would verify a tree "
                       "this PR is not merging into. STOP: later waves are NOT run; resolve "
                       "at the PR, then re-run.\n", file=sys.stderr)
+                _undo_ready(pr_url)
                 return 1
             # The sync invalidated whatever checks existed, so wait for the new head's —
             # ALWAYS, including under `merge_requires = "required"`. That mode skips the
@@ -426,12 +384,13 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
             # required checks are pending, so merging straight after a sync would fail every
             # wave at its second PR (PR #230 review).
             print(f"→ gh pr checks {pr_url}  (after sync)")
-            verdict, detail = _await_rollup(str(pr_url), cfg.merge_wait_secs)
+            verdict, detail = _wait_for_green(str(pr_url), cfg.merge_wait_secs)
             if cfg.merge_requires != "required" and verdict != "green":
                 print(f"\n!!! merge: {d.name} ({pr_url}) was NOT merged — after syncing onto "
                       f"its base the checks are {verdict} ({detail}). This is the combination "
                       "check: each fix was green alone, and this is the first time they were "
                       "verified together. STOP: later waves are NOT run.\n", file=sys.stderr)
+                _undo_ready(pr_url)
                 return 1
             if verdict == "green":
                 print(f"   post-sync rollup green ({detail})")
@@ -442,6 +401,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
                   "merge. Merging now would verify a tree it is not merging into. STOP: "
                   "later waves are NOT run; merge by hand when the base is quiet, then "
                   "re-run.\n", file=sys.stderr)
+            _undo_ready(pr_url)
             return 1
 
     # Full check-rollup gate (issue #413), read AFTER the ready-mark and immediately before
@@ -454,21 +414,27 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # merge past a red rollup).
     if cfg.merge_requires != "required" and not synced_and_gated:
         print(f"→ gh pr checks {pr_url}")
-        verdict, detail = _await_rollup(str(pr_url), cfg.merge_wait_secs)
+        # A wave boundary fires seconds after the PR opened (issue #462), so the first read
+        # is routinely pending/empty — not a verdict yet. Wait for it to resolve, bounded by
+        # [driver].merge_wait_secs, before treating an unresolved rollup as a refusal.
+        verdict, detail = _wait_for_green(str(pr_url), cfg.merge_wait_secs)
         if verdict != "green":
             why = {
                 "failing": f"a check is FAILING — {detail}",
-                "pending": f"a check has not finished — {detail}",
-                "empty": f"the check rollup is EMPTY — {detail}; absence of evidence is "
-                         "not green",
+                "pending": f"a check has not finished within {cfg.merge_wait_secs}s — "
+                           f"{detail}",
+                "empty": f"the check rollup was still EMPTY after {cfg.merge_wait_secs}s "
+                         f"— {detail}; absence of evidence is not green",
                 "unreadable": f"the check rollup could not be read — {detail}",
             }[verdict]
             print(f"\n!!! merge: {d.name} ({pr_url}) was NOT merged — {why}. The host's "
                   "required-checks config is not enough: this wave's base must be green "
                   "before the next wave builds on it. STOP: later waves are NOT run; "
-                  "re-run once the checks are green (the run resumes idempotently — the "
-                  "PR stays ready), or set [driver] merge_requires = \"required\" to "
-                  "merge on the host's required checks alone.\n", file=sys.stderr)
+                  "re-run once the checks are green (the run resumes idempotently), or set "
+                  "[driver] merge_requires = \"required\" to merge on the host's required "
+                  "checks alone, or raise [driver] merge_wait_secs if the checks just take "
+                  "longer than that to report.\n", file=sys.stderr)
+            _undo_ready(pr_url)
             return 1
         # Positive evidence in the run log that this merge was gated, not merged blind.
         print(f"   check rollup green ({detail})")
@@ -481,6 +447,7 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
               "rights on the base, or a host-required check that failed or started after "
               "the rollup gate above. STOP: later waves are NOT run; resolve at the PR, "
               "then re-run.\n", file=sys.stderr)
+        _undo_ready(pr_url)
         return 1
     # Refresh the base so the NEXT wave's worktree resets to the merged result.
     if repo_spec and repo_spec not in fetched:
