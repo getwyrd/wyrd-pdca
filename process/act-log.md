@@ -2156,3 +2156,60 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - **The routed issues.** At the next review, read the state of wyrd-pdca#248 and
   harness#575, not just that they exist. Until #575 lands, a prior-art T5 row on a patched
   bundle is expected.
+
+# Act review — 2026-09-28 — builder baseline sonnet/xhigh → opus/medium (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act: a configuration decision, applied in getwyrd/wyrd-pdca#254. No frozen
+> bundle is re-read and no contribution disposition is re-decided.
+
+## What the records exposed
+
+- **The sonnet first tier bought a rebuild, not a result.** Of the 96 bundles in the record
+  with a `loop-telemetry.json`, four record a sonnet first attempt (#655, #661, #693 on
+  sonnet/high before 2026-09-20; #813 on sonnet/xhigh after). All four escalated, at 3, 4, 3
+  and 5 attempts (mean 3.75). The opus/max first attempts (9 bundles, the old
+  `opus-xhigh`/`opus-max` pin) escalated in 5 of 9; the two opus/xhigh first attempts (#771,
+  #772) both escalated. The other 81 predate per-attempt model telemetry and say nothing
+  either way. (An in-flight, unrecorded bundle, #740, is a fifth sonnet-first escalation;
+  it is not in the record and is not counted here.)
+- **The 09-20 ladder climbed by model first.** Tier 1 sonnet/xhigh, tier 2 opus/xhigh: the first
+  step up was a bigger model at the same effort, so a sonnet miss cost one full build and Check
+  before the model that ends up doing the work ran at all.
+- **Sign-off and publish ran the mechanical prose steps on sonnet/medium.** Nothing in the
+  record faults them; they move with the baseline so one model family's judgment reads the
+  builder's output end to end.
+
+## Process deltas
+
+- Gates / leaves: **builder tier 1 is opus/medium** — the biggest current model at a moderate
+  effort, instead of a smaller model at full effort. The ladder now climbs by effort first
+  (tier 2 opus/xhigh, attempts 2 to 4) and by family second (tier 3 fable/xhigh, attempt 5 on).
+  `Do model:` pins are unchanged (`sonnet` stays as an explicit pin for a knowingly small slice;
+  `opus` pins tier 2 as the first attempt; `opus-max`, `fable` as before) and set the first
+  attempt only.   (`pdca.toml` `[leaves.builder]`, `[[leaves.builder_escalation]]`,
+  `[[leaves.builder_variant]]`)
+- Gates / leaves: **sign-off and publisher on opus/medium** (were sonnet/medium).
+  (`pdca.toml` `[leaves.signoff]`, `[leaves.publisher]`)
+- Verified: `select_builder` resolves attempts 1..6 as opus/medium, opus/xhigh ×3, fable/xhigh
+  ×2 for an unpinned bundle; a `sonnet`, `opus-max` or `fable` pin sets attempt 1 only.
+  *Freeze (wyrd-pdca#243):* config-only.
+
+## How effectiveness will be judged
+
+- **Fewer escalations.** Of the next ten unpinned bundles that build, at most five reach
+  attempt 2 (the sonnet baseline: four of four). If the rate is unchanged, the first tier's
+  effort is the next knob (opus/high), not the model.
+- **Fewer attempts per bundle.** The mean length of `attempts` in `loop-telemetry.json` over
+  those ten bundles is at or below 3 (the four sonnet-first bundles: 3.75). Attempt count is
+  the only cost the harness records per attempt — there are no duration or token fields —
+  so cost is judged by it and by nothing finer.
+- **Telemetry matches the ladder.** `loop-telemetry.json` for the next five bundles that
+  iterate records attempt 1 as opus/medium (or the brief's pin), attempts 2 to 4 as
+  opus/xhigh, attempt 5 on as fable/xhigh — never a tier the ladder does not assign.
+- **No new fault class in sign-off or publish prose.** The harness records no first-attempt
+  outcome for either leaf (`T4-contribution` is deferred at Check and only printed at
+  publish; a sign-off re-prompt leaves no artifact), so the measure is what the record does
+  keep: over the next five COMPLETE bundles, no `SUMMARY.malformed-*` quarantine file, and
+  no §10 Act-candidate line naming a sign-off or publisher prose fault (a hand-edited
+  `commit-msg.txt` / `pr-description.md`, a decision the human had to re-state). The
+  sign-off human records such a fault in §10 when it happens; that is the observation.
