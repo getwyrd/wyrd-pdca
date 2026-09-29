@@ -1,0 +1,4 @@
+- Correctness: no findings in this diff. The placement move preserves the root and segment CAS pins, checks replacement length and version exhaustion, and handles malformed records and boundary chunks consistently (`crates/core/src/metadata.rs:3232`, `crates/core/src/metadata.rs:3346`, `crates/core/src/metadata.rs:3359`).
+- Reuse / simplification / efficiency: no actionable findings. The implementation reuses the ceiling check and retirement arbiter, reads only candidate segments, and consumes the decoded segment without cloning its chunks (`crates/core/src/metadata.rs:3272`, `crates/core/src/metadata.rs:3312`, `crates/core/src/metadata.rs:3331`).
+
+Validation: all patch hunks match the read-only target. Frozen evidence records passing CI, including the seeded race campaign, and 36 mutants tested: 27 caught, 9 unviable, none missed. C4-verify is green-only as declared in the brief. Tests were not rerun during this advisory review.
