@@ -375,9 +375,9 @@ class AdoptSplitChildren(unittest.TestCase):
         real_fold = flow.integrate.fold
 
         def spy_fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
-                     locks=None):
+                     locks=None, run_key: str = ""):
             folds.append([d.name for d in accepted])
-            return real_fold(cfg, accepted, dry_run=dry_run, locks=locks)
+            return real_fold(cfg, accepted, dry_run=dry_run, locks=locks, run_key=run_key)
 
         flow.integrate.fold = spy_fold
         self.addCleanup(setattr, flow.integrate, "fold", real_fold)

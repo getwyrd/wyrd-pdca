@@ -1948,7 +1948,12 @@ def _drive_and_act(
                 stop_wave = False
                 with contextlib.ExitStack() as locks:
                     try:
-                        folded = integrate.fold(cfg, accepted, dry_run=dry, locks=locks)
+                        # INSTANCE DELTA (eduralph/pdca-harness#591): this batch's own
+                        # integration branch, so a concurrent run on the same base (another
+                        # track) cannot overwrite it. Keyed on the ids the run SET OUT to
+                        # drive, so a re-run of the same batch rebuilds the same branch.
+                        folded = integrate.fold(cfg, accepted, dry_run=dry, locks=locks,
+                                                run_key=integrate.run_key_for(named))
                     except integrate.IntegrationError as exc:
                         print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
                               f"later waves not run.", file=sys.stderr)

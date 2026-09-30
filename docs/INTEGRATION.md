@@ -128,6 +128,18 @@
     **Not** the same as host strictness — `strict = true` alone would make `gh pr merge`
     refuse every wave member after the first and stop the batch, since upstream has no
     `update-branch` path at all.
+  - **Integration branch per batch** (2026-10-01; upstream eduralph/pdca-harness#591). In
+    stack mode the fold branch is `pdca-integration/<base>-r<key>`, where `<key>` is a short
+    hash of the batch's named ids (`integrate.run_key_for`), not the shared
+    `pdca-integration/<base>`. Two concurrent stack-mode runs on one base (parallel tracks)
+    therefore fold onto their own branches; before this, each fold force-pushed its own run's
+    patches over the other's, so the next wave, its C4-verify base and its stacked PRs could
+    read the other run's work. The key is deterministic, so a re-run of the same batch
+    rebuilds the same branch. The branch reaches Do, C4-verify and publish through the
+    bundle's `stack-base` file, as before. **Instance delta** in `src/pdca_harness/integrate.py`
+    and the `fold` call in `flow.py`; it goes away when #591 lands. Cost: one integration
+    branch per batch accumulates on `origin` — delete a batch's branch once its stacked PRs
+    are merged.
   - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
     vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
     whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker
