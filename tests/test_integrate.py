@@ -72,6 +72,30 @@ class FoldDryAndUnit(unittest.TestCase):
         self.assertNotEqual(integrate.integration_branch(self.cfg, "a-/b"),
                             integrate.integration_branch(self.cfg, "a/-b"))
 
+    def test_run_key_is_stable_order_free_and_injective_with_the_base(self) -> None:
+        # #591: a re-run of the same batch rebuilds the SAME branch.
+        self.assertEqual(integrate.run_key_for(["issue_2", "issue_1"]),
+                         integrate.run_key_for(["issue_1", "issue_2", "issue_1"]))
+        self.assertEqual(integrate.run_key_for([]), "")
+        self.assertEqual(integrate.integration_branch(self.cfg, "main", ""),
+                         "pdca-integration/main")          # empty key = upstream name
+        # The key is its own ref component, so the base component keeps its length, and
+        # `r-<key>` can never equal a flattened base (its `-` would be escaped).
+        keyed = integrate.integration_branch(self.cfg, "main", "abc")
+        self.assertEqual(keyed, "pdca-integration/r-abc/main")
+        self.assertNotEqual(integrate.integration_branch(self.cfg, "r-abc"),
+                            "pdca-integration/r-abc")
+        long_base = "b" * 245   # valid under the upstream name; must stay valid keyed
+        self.assertEqual(integrate.integration_branch(self.cfg, long_base, "abc").split("/")[-1],
+                         long_base)
+
+    def test_run_key_does_not_collide_on_the_reviewed_pair(self) -> None:
+        # PR #265 review: 32-bit keys collided on these two ordinary id sets.
+        a = integrate.run_key_for(["issue_1000181", "issue_181"])
+        b = integrate.run_key_for(["issue_1025538", "issue_25538"])
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(a), 32)
+
     def test_nothing_to_fold(self) -> None:
         self.assertEqual(integrate.fold(self.cfg, []), {})
         no_patch = self._bundle("NP", patch=None)            # close/no-fix: nothing to ship
@@ -183,6 +207,29 @@ class FoldGit(unittest.TestCase):
             ["git", "-C", str(wt), "log", "-1", "--format=%(trailers:key=Signed-off-by,valueonly)"],
             capture_output=True, text=True).stdout.strip()
         self.assertEqual(trailer, "Tester <t@example.com>")
+
+    def test_two_batches_fold_onto_their_own_branches(self) -> None:
+        """#591: two concurrent stack-mode runs on one base (two parallel tracks) must not
+        share an integration branch — each fold rebuilds its branch with only ITS batch's
+        patches and force-pushes it, so a shared branch hands one run the other's work."""
+        a = self._bundle("A1", self._modify_patch("track a\n"))
+        b = self._bundle("B1", self._add_patch("b.txt", "track b\n"))
+        key_a, key_b = integrate.run_key_for(["issue_A1"]), integrate.run_key_for(["issue_B1"])
+        self.assertNotEqual(key_a, key_b)
+        branch_a, _ = integrate.fold(self.cfg, [a], run_key=key_a)[("org/repo", "main")]
+        branch_b, wt = integrate.fold(self.cfg, [b], run_key=key_b)[("org/repo", "main")]
+        self.assertEqual(branch_a, f"pdca-integration/r-{key_a}/main")
+        self.assertNotEqual(branch_a, branch_b)
+        self.assertTrue(self._pushed(branch_a) and self._pushed(branch_b))
+        # B's fold left A's branch as A built it: A's change, not B's file.
+        show = lambda ref, path: subprocess.run(
+            ["git", "-C", str(self.primary), "show", f"origin/{ref}:{path}"],
+            capture_output=True, text=True)
+        self._git(self.primary, "fetch", "-q", "origin")
+        self.assertEqual(show(branch_a, "base.txt").stdout, "track a\n")
+        self.assertNotEqual(show(branch_a, "b.txt").returncode, 0)
+        self.assertEqual(show(branch_b, "b.txt").stdout, "track b\n")
+        self.assertEqual(show(branch_b, "base.txt").stdout, "base\n")
 
     def test_multi_disjoint_fold_carries_all(self) -> None:
         # A modify + an add (disjoint) both land on the branch — the multi-parent fold

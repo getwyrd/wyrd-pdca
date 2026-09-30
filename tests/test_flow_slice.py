@@ -1151,11 +1151,14 @@ class WaveModel(unittest.TestCase):
         self._brief("WA")
         self._brief("WB", depends_on="WA")
         calls: list[list[str]] = []
+        keys: list[str] = []
         real = flow.integrate.fold
 
-        def spy(cfg: Config, accepted: list, *, dry_run: bool = False, locks=None):
+        def spy(cfg: Config, accepted: list, *, dry_run: bool = False, locks=None,
+                run_key: str = ""):
             calls.append([d.name for d in accepted])
-            return real(cfg, accepted, dry_run=dry_run, locks=locks)
+            keys.append(run_key)
+            return real(cfg, accepted, dry_run=dry_run, locks=locks, run_key=run_key)
 
         flow.integrate.fold = spy
         try:
@@ -1165,6 +1168,9 @@ class WaveModel(unittest.TestCase):
         self.assertEqual(results.get("WA"), state.COMPLETE)
         self.assertEqual(results.get("WB"), state.COMPLETE)   # completes in one run
         self.assertEqual(calls, [["issue_WA"]])               # folded once, after wave 0
+        # #591: the fold is keyed to THIS batch, so a concurrent run on the same base
+        # (another track) folds onto its own branch.
+        self.assertEqual(keys, [flow.integrate.run_key_for(["issue_WA", "issue_WB"])])
 
     def test_single_wave_folds_nothing(self) -> None:
         # No deps → one wave → the last wave, which never folds (STOP discipline holds).

@@ -35,13 +35,38 @@ class IntegrationError(RuntimeError):
     than build the next wave on an incomplete base."""
 
 
-def integration_branch(cfg: Config, base: str) -> str:
+def integration_branch(cfg: Config, base: str, run_key: str = "") -> str:
     """The run-scoped integration branch for a target ``base`` — deterministic (a resumed run
     rebuilds the same branch) and **injective in the base** (#187): the base is flattened to a
     single ref segment under ``pdca-integration/`` via :func:`_flatten_base`, so two bases that
     differ only by ``/`` vs ``-`` (``release/2.0`` → ``release-s2.0`` vs ``release-2.0`` →
     ``release-h2.0``) never collide onto one branch and force-push over each other's fold."""
+    # INSTANCE DELTA (eduralph/pdca-harness#591): ``run_key`` scopes the branch to one
+    # batch, so two concurrent stack-mode runs on one base (parallel tracks) never fold onto
+    # — and force-push over — the same branch. The key is its OWN ref component,
+    # ``pdca-integration/r-<key>/<flattened base>`` (PR #265 review): appended to the base it
+    # could push a long base's component past the 255-byte filesystem limit git needs room
+    # under (the ``.lock`` suffix). ``r-<key>`` can never equal a flattened base (every ``-``
+    # `_flatten_base` emits is ``-h`` or ``-s``), so the names stay injective and no ref is
+    # both a file and a directory. Empty keeps the upstream name exactly.
+    if run_key:
+        return f"pdca-integration/r-{run_key}/" + _flatten_base(base)
     return "pdca-integration/" + _flatten_base(base)
+
+
+def run_key_for(names) -> str:
+    """The ``run_key`` for a batch: a short, stable hash of its named bundle set (#591).
+
+    Deterministic on purpose — the module's contract is that a re-run or resumed batch
+    rebuilds the SAME branch — while two different batches (two tracks) get different
+    branches. 128 bits of SHA-256 (PR #265 review: 32 bits collided on ordinary id sets), so
+    distinct batches cannot feasibly alias. Order-insensitive; an empty set yields ``""``
+    (the upstream name)."""
+    import hashlib
+    names = sorted(set(names))
+    if not names:
+        return ""
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:32]
 
 
 def _flatten_base(base: str) -> str:
@@ -130,7 +155,7 @@ def _targeted(patched: list[Path]) -> list[tuple[Path, str, str]]:
 
 
 def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
-         locks: contextlib.ExitStack | None = None
+         locks: contextlib.ExitStack | None = None, run_key: str = ""
          ) -> dict[tuple[str, str], tuple[str, Path | None]]:
     """Fold the cumulative accepted bundles' patches onto a per-target integration branch.
 
@@ -156,6 +181,11 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
     the fold and ``gates.run_integration`` attesting it. The caller releases every
     lock by exiting the stack; ``None`` keeps the per-group scope (lock released when
     the group's build finishes).
+
+    ``run_key`` (INSTANCE DELTA, eduralph/pdca-harness#591) names the batch the branch
+    belongs to (:func:`run_key_for`). The integration WORKTREE stays one per base and is
+    still serialized by :func:`integ_lock`; only the branch, which is what the next wave, its
+    C4-verify base and its stacked PRs read, is per batch.
     """
     targeted = _targeted([d for d in accepted if _has_patch(d)])
     if not targeted:
@@ -177,7 +207,7 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
     # waiting on target-1). A globally consistent acquisition order makes them
     # serialize instead. Stack order WITHIN each group is untouched.
     for (repo_spec, base), bundles in sorted(groups.items()):
-        branch = integration_branch(cfg, base)
+        branch = integration_branch(cfg, base, run_key)
         repo = publish._checkout_path(cfg, repo_spec)
         if dry_run:
             print(f"integrate --dry-run — fold {len(bundles)} patch(es) onto {branch} "
