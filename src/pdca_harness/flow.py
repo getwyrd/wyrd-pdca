@@ -2224,6 +2224,22 @@ def flow_ids(
                       "named below.", file=sys.stderr)
                 seeds.append(d)
             continue
+        if not (d / "brief.md").exists():
+            # INSTANCE DELTA (eduralph/pdca-harness#597): past Do on a close marker yet
+            # with no brief — a split accepted before #481 wrote parents a brief. Every
+            # step from Check on reads brief.md, so restore it the way `split --accept`
+            # now does, or skip the bundle; never drive it into a crash.
+            try:
+                restored = split.restore_parent_brief(d, cfg)
+            except split.SplitError as exc:
+                print(f"flow: {d.name} — {s} but no brief.md, skipped: {exc}", file=sys.stderr)
+                skipped[iid] = s
+                if claims is not None:
+                    claims.release(d)
+                continue
+            print(f"flow: {d.name} — restored its missing split-parent brief "
+                  f"({restored.relative_to(d)}) from its iterate-to-Plan archive",
+                  file=sys.stderr)
         bundles.append(d)
     if not bundles and not seeds:
         return skipped

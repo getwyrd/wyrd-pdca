@@ -859,7 +859,7 @@ def _field(label: str, value: str) -> str:
 
 
 def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
-                        children: list[str]) -> str:
+                        children: list[str], *, written_by: str = "`split --accept`") -> str:
     """The Plan artifact :func:`accept` writes for a parent that has none (issue #481).
 
     It describes the split — why the slice was decomposed, which child bundles carry
@@ -875,7 +875,7 @@ def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
     kids = ", ".join(children)
     return (
         f"# Brief — issue {_bundle_id(parent)} / {title} (split parent)\n\n"
-        "> The Plan artifact (docs 02 §PLAN), written by `split --accept` (issue #481):\n"
+        f"> The Plan artifact (docs 02 §PLAN), written by {written_by} (issue #481):\n"
         "> this bundle had no brief.md when its split was accepted — an iterate-to-Plan\n"
         f"> had archived it to `{rel}`.\n\n"
         + _field("Slug", slug)
@@ -896,6 +896,40 @@ def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
         + _field("External dependencies", "none")
         + _field("Disposition hint", "split")
     )
+
+
+def restore_parent_brief(parent: Path, cfg) -> Path:
+    """Write the Plan artifact a split parent is missing; return its path.
+
+    INSTANCE DELTA (eduralph/pdca-harness#597). Since #481, :func:`accept` writes a brief
+    for a parent whose own brief an iterate-to-Plan had archived. A split accepted BEFORE
+    that has no brief at all, yet its close marker makes it past Do (BUILT), so ``flow``
+    drives it to Check and sign-off — and every step there reads ``brief.md``. This writes
+    the same brief :func:`accept` would have, from the same archive (:func:`_parent_plan`),
+    naming the children its lineage record lists (or the proposal, for a split older than
+    lineage records).
+
+    Raises :class:`SplitError` when the bundle is not a split parent missing its brief, or
+    has no archive complete enough to rebuild one from; nothing is written then.
+    """
+    bp = parent / "brief.md"
+    if bp.exists():
+        raise SplitError(f"{parent.name} already has a brief.md")
+    try:
+        marker = (parent / state.CLOSE_MARKER).read_text(encoding="utf-8").split()
+    except (OSError, ValueError):
+        marker = []
+    if marker[:1] != ["split"]:
+        raise SplitError(f"{parent.name} has no brief.md and is not a split parent — "
+                         "brief it at Plan")
+    plan = _parent_plan(parent, cfg)
+    if plan is None:   # unreachable: _parent_plan returns None only when brief.md exists
+        raise SplitError(f"{parent.name} already has a brief.md")
+    kids = [cfg.bundle(str(i)).name for i in ((read_lineage(parent) or {}).get("children") or [])]
+    bp.write_text(_split_parent_brief(parent, plan, kids or [f"named in `{PROPOSAL}`"],
+                                      written_by="`flow`, restoring a pre-#481 split"),
+                  encoding="utf-8")
+    return bp
 
 
 def accept(parent: Path, ids: list[str], cfg) -> list[Path]:
