@@ -447,6 +447,44 @@ class AdoptRecovery(unittest.TestCase):
             f"{state.COMPLETE}\t602", f"{state.COMPLETE}\t810",
             "flow: 4/4 complete"]))
 
+    def test_a_named_id_may_depend_on_a_child_the_seed_is_about_to_hand_the_run(
+            self) -> None:
+        """`pdca flow 500 810`, 500 already split and 810 `Depends on: 602` — a child of the
+        seed, re-pointed there when the parent was re-planned (wyrd-pdca: `flow 809 810` with
+        810 `Depends on: 842`). The strict check on the NAMED batch used to run before the
+        seed's children were adopted, so 602 read as neither in the batch nor COMPLETE and
+        the run was refused before any work. The child IS part of this request — its parent
+        was named as the recovery seed — so the run proceeds, and 810 builds AFTER 602
+        (INSTANCE DELTA, eduralph/pdca-harness#590)."""
+        self._strand_a_split()
+        self._briefed("810", "- **Depends on:** 602")
+        self._arm()
+
+        rc = self._cli(["500", "810"])
+
+        self.assertEqual(rc, 0, self.err.getvalue())
+        self.assertNotIn("refused before any work", self.err.getvalue())
+        for iid in ("601", "602", "810"):
+            self.assertEqual(self._state(iid), state.COMPLETE)
+        # 601, then 602 (which depends on 601), then 810 (which depends on 602).
+        self.assertEqual(self.waves_driven,
+                         [["issue_601"], ["issue_602"], ["issue_810"]])
+
+    def test_a_dependency_on_a_bundle_no_seed_offers_is_still_refused(self) -> None:
+        """The acceptance is scoped to the seeds' own children: a named id depending on an
+        unrelated, un-terminal bundle is refused exactly as before (#589's message, rc 2),
+        with a seed named beside it."""
+        self._strand_a_split()
+        self._briefed("810", "- **Depends on:** 999")
+        self._briefed("999")
+        self._arm()
+
+        rc = self._cli(["500", "810"])
+
+        self.assertEqual(rc, 2)
+        self.assertIn("declared dependency '999'", self.err.getvalue())
+        self.assertEqual(self._state("601"), state.PLANNED)   # nothing was driven
+
     def test_the_mid_run_and_recovery_shapes_agree_on_equivalent_disk(self) -> None:
         """One event, one description, one exit code — whether the split happens DURING the
         run or an earlier run left it on disk. Both legs decompose 500 into 601/602 with the

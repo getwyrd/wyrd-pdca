@@ -64,8 +64,15 @@ class DependencyGraphError(ValueError):
         self.cycle = cycle
 
 
-def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
+def check_dep_graph(cfg: Config, bundles: list[Path],
+                    pending: frozenset[str] = frozenset()) -> None:
     """Validate the declared dependency DAG before any build (issue #36).
+
+    ``pending`` (INSTANCE DELTA, eduralph/pdca-harness#590) names bundles the run is about
+    to ADOPT — the children of a recovery seed (#473). A dependency on one of them is part
+    of the request, not an unresolved one: it is accepted here WITHOUT an edge, and the
+    adoption splice that follows re-levels the whole schedule with the child in it, which
+    is where the edge orders anything. Empty by default: every other caller is unchanged.
 
     A dependency that is neither in this batch nor an already-COMPLETE bundle on disk
     is a misconfigured brief; a cycle is unschedulable. Both raise
@@ -85,6 +92,8 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
             if dn in names:
                 edges.append(dn)
                 continue
+            if dn in pending:
+                continue  # about to be adopted into this run (#590); the splice orders it
             # Out-of-batch: an archived (completed/) prereq satisfies Depends on / Depends
             # on (merged) (#171). But a `Stacks on` parent must be an ACTIVE bundle — the
             # dependent bases its worktree + stacked PR on the parent's *live* published
@@ -155,7 +164,8 @@ def _reaches(deps: dict[str, set[str]], src: str, dst: str) -> bool:
     return False
 
 
-def compute_waves(cfg: Config, bundles: list[Path]) -> list[list[Path]]:
+def compute_waves(cfg: Config, bundles: list[Path],
+                  pending: frozenset[str] = frozenset()) -> list[list[Path]]:
     """Partition ``bundles`` into ordered waves.
 
     ``wave[k]`` holds the bundles whose every prerequisite is in an earlier wave; within
@@ -164,7 +174,7 @@ def compute_waves(cfg: Config, bundles: list[Path]) -> list[list[Path]]:
     :func:`check_dep_graph`) on an unschedulable graph — a cycle, or a dependency neither
     in this batch nor already COMPLETE. No fields declared ⇒ one wave, sort-by-name.
     """
-    check_dep_graph(cfg, bundles)  # cycle / unresolved dep → ValueError, before any work
+    check_dep_graph(cfg, bundles, pending)  # cycle / unresolved dep → ValueError, before any work
     by_name = {b.name: b for b in bundles}
 
     # Directed prerequisite edges, restricted to the batch (out-of-batch prereqs are
