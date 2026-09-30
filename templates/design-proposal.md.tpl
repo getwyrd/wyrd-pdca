@@ -13,6 +13,10 @@
 > sign-off, and they are what you carry upstream into any design-proposal process.
 
 - **Slug:** <short-kebab-slug>
+- **Track:** <required — one OPEN track from `[intake].tracks` in pdca.toml (today `alpha`,
+  `blackbox`, `m5`, `m6`; opening another is an Act decision). `/handoff` refuses a missing
+  or unopened one. The intake cap is per track: `scripts/plan-cap --track <this>`
+  (wyrd-pdca-P1, INTEGRATION §11)>
 - **Kind:** enhancement (design proposal)
 - **Goal:** <the capability this adds — the observable new behaviour>
 - **Success criterion:** <the observable condition that means it works — what the shipped test asserts>

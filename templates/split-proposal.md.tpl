@@ -24,6 +24,7 @@
 
 <!-- pdca:child child-1 -->
 - **Slug:** <kebab-case>
+- **Track:** <leave as is — `pdca split --accept` writes the parent's track in>
 - **Defect:** <what is broken / what should exist>
 - **Success criterion:** <the observable condition that means it is fixed>
 - **Repo + branch target:** <owner/repo> @ <branch>
@@ -38,6 +39,7 @@
 
 <!-- pdca:child child-2 -->
 - **Slug:** <kebab-case>
+- **Track:** <leave as is — `pdca split --accept` writes the parent's track in>
 - **Defect:** <what is broken / what should exist>
 - **Success criterion:** <the observable condition that means it is fixed>
 - **Repo + branch target:** <owner/repo> @ <branch>

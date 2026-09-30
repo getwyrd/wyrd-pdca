@@ -61,9 +61,18 @@ The cap is a **budget, not a gate you pass once.** Bundles past Plan and not yet
 off may never number more than 6, so the room you have is `6 − count`, and every brief
 you author and every child a split files spends one of it.
 
-- Run `scripts/plan-cap --need N` **before the batch**, with N the number of briefs the
-  human wants. It prints the count, the room, and whether N fits; it exits non-zero when
-  it does not. A count of 6 leaves room for none — a single brief then exceeds the cap.
+- **The cap is per track** (since 2026-10-01). Every brief names its track in
+  `- **Track:**` — the milestone stream it belongs to, one of the OPEN tracks in
+  `[intake].tracks` (pdca.toml; today `alpha`, `blackbox`, `m5`, `m6`). Ask the human if the
+  tracker milestone does not make it obvious. `/handoff` refuses a brief whose Track is
+  missing or not open, and `plan-cap` refuses an unopened `--track`: work for a milestone
+  with no open track waits for an Act decision to open one — do not invent a name. Always
+  pass it: `--track <track>`.
+- Run `scripts/plan-cap --track <track> --need N` **before the batch**, with N the number
+  of briefs the human wants in that track. It prints the track's count, its room, the other
+  tracks' counts, and whether N fits; it exits non-zero when it does not. A count of 6 leaves
+  room for none — a single brief then exceeds the cap. A batch spanning two tracks checks
+  each track with its own N.
 - Run it again **after each brief** in a batch, and before `pdca split --accept` with
   `--need <children>`. The count only moves when you or a sign-off move it, so the
   check is cheap and the number is always the current one.
@@ -197,7 +206,8 @@ reach — it will say so plainly rather than skipping).
 
 **A split is intake twice over.** Every child `--accept` files is a new bundle past Plan,
 and the proposal itself is the reslicing the cap forbids when there is no room. So, before
-`pdca split <id>`: `scripts/plan-cap --need <children you expect>`. No room means no
+`pdca split <id>`: `scripts/plan-cap --track <the parent's track> --need <children you expect>`
+(children inherit the parent's track). No room means no
 proposal and no accept — not a proposal "for later". The only way past that is the
 explicit per-id override above, recorded at the top of the proposal.
 
