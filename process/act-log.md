@@ -2265,4 +2265,4 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - **Everything lands.** After a run's PRs are merged bottom-up, every accepted bundle's change
   is on `main` (not stranded on an integration branch).
 - **Verification follows the stack.** For the next wave>0 bundle, `gate-logs/C4-verify.log`
-  names its batch's own `origin/pdca-integration/main-r<key>` as the base it reset to.
+  names its batch's own `origin/pdca-integration/r-<key>/main` as the base it reset to.
