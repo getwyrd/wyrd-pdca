@@ -53,7 +53,15 @@ class DependencyGraphError(ValueError):
     that is not COMPLETE, or a cycle. INSTANCE DELTA (eduralph/pdca-harness#589): a named
     type so the ``flow`` command can report it as the operator error it is — one line and
     a way out — instead of a traceback. It subclasses ``ValueError``, so every caller and
-    test that expects ``ValueError`` is unchanged."""
+    test that expects ``ValueError`` is unchanged.
+
+    ``cycle`` says which of the two it is, because the way out differs: an unresolved
+    dependency is fixed by supplying or finishing the prerequisite, a cycle only by
+    correcting one of its edges (PR #257 review)."""
+
+    def __init__(self, message: str, *, cycle: bool = False) -> None:
+        super().__init__(message)
+        self.cycle = cycle
 
 
 def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
@@ -99,7 +107,8 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
         for m in graph[n]:
             if color[m] == GRAY:
                 cyc = path[path.index(m):] + [m]
-                raise DependencyGraphError("dependency cycle: " + " → ".join(cyc))
+                raise DependencyGraphError("dependency cycle: " + " → ".join(cyc),
+                                           cycle=True)
             if color[m] == WHITE:
                 visit(m)
         path.pop()

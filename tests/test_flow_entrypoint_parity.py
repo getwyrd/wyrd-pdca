@@ -299,7 +299,7 @@ class EntrypointParity(unittest.TestCase):
             flow.flow_ids, flow.flow = orig_ids, orig_flow
         self.assertEqual(rcs, [2, 2])
         for err in errs:
-            self.assertIn("refused before any work", err)
+            self.assertIn("refused before any build", err)
             self.assertIn("declared dependency '773'", err)
             self.assertIn("drop the edge", err)
             self.assertNotIn("Traceback", err)
@@ -324,6 +324,31 @@ class EntrypointParity(unittest.TestCase):
             rc = cli._flow(cfg, _args(["A589"]))
         self.assertEqual(rc, 2, err.getvalue())
         self.assertIn("declared dependency '999'", err.getvalue())
+
+    def test_a_dependency_cycle_gets_cycle_advice_not_prerequisite_advice(self) -> None:
+        """A cycle is the other half of `DependencyGraphError` (PR #257 review): adding or
+        finishing a prerequisite cannot fix it, so the message must say to correct an edge
+        in the loop — through the real graph check, unmocked."""
+        from pdca_harness import waves
+
+        cfg = _stub_config(self.tmp)
+        for me, other in (("A257", "B257"), ("B257", "A257")):
+            d = cfg.bundle(me)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "brief.md").write_text(
+                f"# Brief\n\n- **Slug:** {me.lower()}\n- **Defect:** x\n"
+                "- **Success criterion:** y\n- **Repo + branch target:** org/repo @ main\n"
+                f"- **Scope:** z\n- **Depends on:** {other}\n", encoding="utf-8")
+        with self.assertRaises(waves.DependencyGraphError) as caught:
+            waves.check_dep_graph(cfg, [cfg.bundle("A257"), cfg.bundle("B257")])
+        self.assertTrue(caught.exception.cycle)
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli._flow(cfg, _args(["A257", "B257"]))
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("dependency cycle", err.getvalue())
+        self.assertIn("Remove or correct one", err.getvalue())
+        self.assertNotIn("add the prerequisite", err.getvalue())
 
     def test_preflight_error_same_rc_and_message_both_shapes(self) -> None:
         """An error meant to abort a run produces the SAME rc (and message) on both shapes —
