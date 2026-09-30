@@ -274,6 +274,57 @@ class EntrypointParity(unittest.TestCase):
         self.assertEqual(_state_for("AUTH468", out.getvalue()), state.DISCONTINUED)
         self.assertEqual(rc, 1)   # …and the exit code follows the same single value
 
+    def test_dependency_graph_error_is_a_refusal_not_a_traceback_both_shapes(self) -> None:
+        """An unschedulable dependency graph (eduralph/pdca-harness#589) is operator error:
+        both shapes return 2 with the one-line reason and the way out, never a traceback."""
+        from pdca_harness import waves
+
+        def boom(*_a, **_kw):
+            raise waves.DependencyGraphError(
+                "issue_736: declared dependency '773' is neither in this batch nor an "
+                "existing COMPLETE bundle")
+
+        orig_ids, orig_flow = flow.flow_ids, flow.flow
+        flow.flow_ids = boom
+        flow.flow = boom
+        try:
+            cfg = _stub_config(self.tmp)
+            errs, rcs = [], []
+            for ids in (["A589"], ["A589", "B589"]):
+                err = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rcs.append(cli._flow(cfg, _args(ids)))
+                errs.append(err.getvalue())
+        finally:
+            flow.flow_ids, flow.flow = orig_ids, orig_flow
+        self.assertEqual(rcs, [2, 2])
+        for err in errs:
+            self.assertIn("refused before any work", err)
+            self.assertIn("declared dependency '773'", err)
+            self.assertIn("drop the edge", err)
+            self.assertNotIn("Traceback", err)
+
+    def test_an_unresolvable_dependency_is_refused_through_the_real_graph_check(self) -> None:
+        """Unmocked: a briefed bundle naming a dependency that is neither in the batch nor
+        COMPLETE reaches `waves.check_dep_graph` and comes back as rc 2 with the message —
+        the observed crash (`pdca flow 736` over a prerequisite fixed outside the cycle)."""
+        from pdca_harness import waves
+
+        cfg = _stub_config(self.tmp)
+        d = cfg.bundle("A589")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "brief.md").write_text(
+            "# Brief\n\n- **Slug:** a589\n- **Defect:** x\n- **Success criterion:** y\n"
+            "- **Repo + branch target:** org/repo @ main\n- **Scope:** z\n"
+            "- **Depends on:** 999\n", encoding="utf-8")
+        with self.assertRaises(waves.DependencyGraphError):
+            waves.check_dep_graph(cfg, [d])
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli._flow(cfg, _args(["A589"]))
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("declared dependency '999'", err.getvalue())
+
     def test_preflight_error_same_rc_and_message_both_shapes(self) -> None:
         """An error meant to abort a run produces the SAME rc (and message) on both shapes —
         pre-fix the single-id route had no `try/except` at all, so a `PreflightError` escaped

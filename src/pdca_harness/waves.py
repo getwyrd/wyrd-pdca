@@ -48,12 +48,21 @@ def declared_deps(bp: Path) -> list[str]:
     return brief.depends_on(bp) + brief.depends_on_merged(bp) + brief.stacks_on(bp)
 
 
+class DependencyGraphError(ValueError):
+    """The declared dependency graph cannot be scheduled: a dependency outside the batch
+    that is not COMPLETE, or a cycle. INSTANCE DELTA (eduralph/pdca-harness#589): a named
+    type so the ``flow`` command can report it as the operator error it is — one line and
+    a way out — instead of a traceback. It subclasses ``ValueError``, so every caller and
+    test that expects ``ValueError`` is unchanged."""
+
+
 def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
     """Validate the declared dependency DAG before any build (issue #36).
 
     A dependency that is neither in this batch nor an already-COMPLETE bundle on disk
-    is a misconfigured brief; a cycle is unschedulable. Both raise ``ValueError`` so the
-    run aborts before touching any bundle. No deps declared ⇒ no-op.
+    is a misconfigured brief; a cycle is unschedulable. Both raise
+    :class:`DependencyGraphError` (a ``ValueError``) so the run aborts before touching any
+    bundle. No deps declared ⇒ no-op.
     """
     names = {b.name for b in bundles}
     graph: dict[str, list[str]] = {}
@@ -75,7 +84,7 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
             # Stacks on against bundle() (an archived-only stack parent stays rejected).
             resolved = cfg.bundle(dep) if dep in stacks else cfg.find_bundle(dep)
             if state.state(resolved) != state.COMPLETE:
-                raise ValueError(
+                raise DependencyGraphError(
                     f"{b.name}: declared dependency '{dep}' is neither in this batch "
                     f"nor an existing COMPLETE bundle")
         graph[b.name] = edges
@@ -90,7 +99,7 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
         for m in graph[n]:
             if color[m] == GRAY:
                 cyc = path[path.index(m):] + [m]
-                raise ValueError("dependency cycle: " + " → ".join(cyc))
+                raise DependencyGraphError("dependency cycle: " + " → ".join(cyc))
             if color[m] == WHITE:
                 visit(m)
         path.pop()
