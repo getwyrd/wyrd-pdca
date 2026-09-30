@@ -981,10 +981,16 @@ def _inside_bundle_root(cfg: Config, d: Path) -> bool:
 def _seed_offer(cfg: Config, seeds: list[Path]) -> frozenset[str]:
     """The bundle names recovery ``seeds`` may hand this run: their lineage children,
     transitively through a child that is itself terminal on a split — the same walk
-    :func:`_adopt_split_children` takes. Read-only and total (an unreadable lineage offers
-    nothing). INSTANCE DELTA (eduralph/pdca-harness#590): only feeds the strict dependency
-    check, which may then accept an edge to one of these; what is actually adopted is still
-    decided by the splice."""
+    :func:`_adopt_split_children` takes. INSTANCE DELTA (eduralph/pdca-harness#590): only
+    feeds the strict dependency check, which may then accept an edge to one of these; what
+    is actually adopted is still decided by the splice.
+
+    Offered: only a child that is an ACTIVE bundle still in flight — the only kind the splice
+    can adopt. A child archived to ``completed/`` or already terminal is not offered (the
+    normal check judges an edge to it), and neither is one whose state cannot be read. And
+    it is TOTAL (PR #259 review): the per-child probe is contained the way adoption's own
+    ``_isolate`` contains it, so a corrupt child is left for adoption to name, never a
+    traceback out of the pre-scan."""
     offer: set[str] = set()
     queue = list(seeds)
     seen: set[str] = set()
@@ -993,12 +999,23 @@ def _seed_offer(cfg: Config, seeds: list[Path]) -> frozenset[str]:
         if d.name in seen:
             continue
         seen.add(d.name)
-        record = split.read_lineage(d)
+        try:
+            record = split.read_lineage(d)
+        except Exception:  # noqa: BLE001 — an unreadable lineage offers nothing
+            record = None
         for cid in _lineage_children(record) if record else []:
             child = cfg.bundle(cid)
-            offer.add(child.name)
-            if _is_split_parent(child):
+            if not child.is_dir():
+                continue  # archived or never created: nothing the splice can adopt
+            try:
+                s = state.state(child)
+                again = s in _TERMINAL and _is_split_parent(child)
+            except Exception:  # noqa: BLE001 — contained, as `_isolate` does for adoption
+                continue
+            if again:
                 queue.append(child)
+            elif s not in _TERMINAL:
+                offer.add(child.name)
     return frozenset(offer)
 
 
