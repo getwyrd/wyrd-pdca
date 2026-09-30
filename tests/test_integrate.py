@@ -12,9 +12,11 @@ a primary checkout (a clean fold pushes the branch; an undeclared overlap raises
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -173,14 +175,35 @@ class FoldGit(unittest.TestCase):
         (self.primary / name).unlink()
         return diff
 
-    def _bundle(self, iid: str, patch: str) -> Path:
+    def _bundle(self, iid: str, patch: str, *, publish: bool = True) -> Path:
+        """A bundle as `publish` leaves it: its patch, and — the fold merges REAL PR
+        branches since #593 — a signed commit on `fix/<iid>` pushed to origin, recorded
+        in publish.json."""
         d = self.cfg.bundle(iid)
         d.mkdir(parents=True)
         (d / "brief.md").write_text(
             f"- **Slug:** {iid.lower()}\n- **Repo + branch target:** org/repo @ main\n",
             encoding="utf-8")
         (d / "patch.diff").write_text(patch, encoding="utf-8")
+        if publish:
+            branch = f"fix/{iid.lower()}"
+            p = self.primary
+            self._git(p, "fetch", "-q", "origin")
+            self._git(p, "checkout", "-q", "-B", branch, "origin/main")
+            self._git(p, "apply", str((d / "patch.diff").resolve()))
+            self._git(p, "add", "-A")
+            self._git(p, "commit", "-q", "-s", "-m", f"fix {iid}")
+            self._git(p, "push", "-q", "-f", "origin", branch)
+            self._git(p, "checkout", "-q", "main")
+            (d / "publish.json").write_text(json.dumps(
+                {"branch": branch, "repo": "org/repo", "base": "main",
+                 "pr_url": f"https://example/pr/{iid}"}), encoding="utf-8")
         return d
+
+    def _tip(self, branch: str) -> str:
+        return subprocess.run(["git", "-C", str(self.primary), "ls-remote", "origin",
+                               f"refs/heads/{branch}"], capture_output=True,
+                              text=True).stdout.split()[0]
 
     def _pushed(self, branch: str) -> bool:
         out = subprocess.run(
@@ -231,6 +254,48 @@ class FoldGit(unittest.TestCase):
         self.assertEqual(show(branch_b, "b.txt").stdout, "track b\n")
         self.assertEqual(show(branch_b, "base.txt").stdout, "base\n")
 
+    def test_a_later_fold_appends_and_never_rewrites_an_earlier_one(self) -> None:
+        """#593: the wave-1 fold must continue the wave-0 fold, not rebuild it — a PR
+        stacked on the wave-0 fold's commits must still find them as ancestors."""
+        b0 = self._bundle("W0", self._modify_patch("wave0\n"))
+        branch, _ = integrate.fold(self.cfg, [b0], run_key="k")[("org/repo", "main")]
+        tip0 = self._tip(branch)
+        # A second apart, so a REBUILD (the pre-#593 fold) would mint a new commit even
+        # for identical content — same-second rebuilds reproduce the same SHA and hide it.
+        time.sleep(1.1)
+        b1 = self._bundle("W1", self._add_patch("w1.txt", "wave1\n"))
+        integrate.fold(self.cfg, [b0, b1], run_key="k")          # cumulative, as the flow passes
+        tip1 = self._tip(branch)
+        self.assertNotEqual(tip0, tip1)
+        self._git(self.primary, "fetch", "-q", "origin")
+        ancestry = subprocess.run(["git", "-C", str(self.primary), "merge-base", "--is-ancestor",
+                              tip0, tip1])
+        self.assertEqual(ancestry.returncode, 0, "the wave-0 fold was rewritten")
+
+    def test_a_refold_of_the_same_batch_adds_nothing(self) -> None:
+        b = self._bundle("R1", self._modify_patch("one\n"))
+        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
+        tip = self._tip(branch)
+        time.sleep(1.1)   # a rebuild would now mint a new SHA (see the append test above)
+        integrate.fold(self.cfg, [b], run_key="k")
+        self.assertEqual(self._tip(branch), tip)
+
+    def test_the_fold_carries_the_published_commits_themselves(self) -> None:
+        """#593: the stacked branch inherits the predecessor's OWN commit (same SHA), so
+        a dependent PR's diff shrinks to its own change once the predecessor merges."""
+        b = self._bundle("S2", self._modify_patch("one\n"))
+        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
+        self._git(self.primary, "fetch", "-q", "origin")
+        ancestry = subprocess.run(["git", "-C", str(self.primary), "merge-base", "--is-ancestor",
+                              "origin/fix/s2", f"origin/{branch}"])
+        self.assertEqual(ancestry.returncode, 0)
+
+    def test_an_unpublished_bundle_cannot_be_stacked_on(self) -> None:
+        b = self._bundle("U1", self._modify_patch("one\n"), publish=False)
+        with self.assertRaises(integrate.IntegrationError) as caught:
+            integrate.fold(self.cfg, [b])
+        self.assertIn("no published branch", str(caught.exception))
+
     def test_multi_disjoint_fold_carries_all(self) -> None:
         # A modify + an add (disjoint) both land on the branch — the multi-parent fold
         # the old _stack_base_branch parents[0] could not express.
@@ -275,6 +340,16 @@ class FoldGit(unittest.TestCase):
             encoding="utf-8")
         (b_aa / "patch.diff").write_text(self._add_patch("f2.txt", "hi\n"),
                                          encoding="utf-8")
+        # Published off `aa`, as publish would (the fold merges real branches, #593).
+        self._git(self.primary, "fetch", "-q", "origin")
+        self._git(self.primary, "checkout", "-q", "-B", "fix/o2", "origin/aa")
+        self._git(self.primary, "apply", str((b_aa / "patch.diff").resolve()))
+        self._git(self.primary, "add", "-A")
+        self._git(self.primary, "commit", "-q", "-s", "-m", "fix O2")
+        self._git(self.primary, "push", "-q", "-f", "origin", "fix/o2")
+        self._git(self.primary, "checkout", "-q", "main")
+        (b_aa / "publish.json").write_text(json.dumps(
+            {"branch": "fix/o2", "repo": "org/repo", "base": "aa"}), encoding="utf-8")
         order: list[str] = []
         real_lock = integrate.integ_lock
 
