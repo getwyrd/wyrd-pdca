@@ -6,6 +6,9 @@
 > Check tests "did this work" against.
 
 - **Slug:** <short-kebab-slug>
+- **Track:** <the stream this bundle belongs to — `alpha` (0.1 Alpha, the default when the
+  field is absent), `blackbox`, `m5`, `m6`, … one per milestone run in parallel. The intake
+  cap is per track: `scripts/plan-cap --track <this>` (wyrd-pdca-P1, INTEGRATION §11)>
 - **Defect:** <what is wrong — the observable problem>
 - **Success criterion:** <the observable condition that means it is fixed — must be
   demonstrable by C4-verify (the patch applied in isolation at Check). Do NOT scope this

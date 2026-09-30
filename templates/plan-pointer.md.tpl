@@ -11,6 +11,9 @@
 > artifact** as the authoritative plan; this brief does not restate it.
 
 - **Slug:** <short-kebab-slug>
+- **Track:** <the stream this bundle belongs to — `alpha` (0.1 Alpha, the default when the
+  field is absent), `blackbox`, `m5`, `m6`, … one per milestone run in parallel. The intake
+  cap is per track: `scripts/plan-cap --track <this>` (wyrd-pdca-P1, INTEGRATION §11)>
 - **Planning artifact:** <path or URL to the host's ADR / proposal / spec that IS the
   plan — e.g. `docs/adr/0042-thing.md`, or a permalinked spec section. Do treats this
   as authoritative; cite it.>

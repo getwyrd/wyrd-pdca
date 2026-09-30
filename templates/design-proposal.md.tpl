@@ -13,6 +13,9 @@
 > sign-off, and they are what you carry upstream into any design-proposal process.
 
 - **Slug:** <short-kebab-slug>
+- **Track:** <the stream this bundle belongs to — `alpha` (0.1 Alpha, the default when the
+  field is absent), `blackbox`, `m5`, `m6`, … one per milestone run in parallel. The intake
+  cap is per track: `scripts/plan-cap --track <this>` (wyrd-pdca-P1, INTEGRATION §11)>
 - **Kind:** enhancement (design proposal)
 - **Goal:** <the capability this adds — the observable new behaviour>
 - **Success criterion:** <the observable condition that means it works — what the shipped test asserts>

@@ -2266,3 +2266,71 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
   is on `main` (not stranded on an integration branch).
 - **Verification follows the stack.** For the next wave>0 bundle, `gate-logs/C4-verify.log`
   names its batch's own `origin/pdca-integration/r-<key>/main` as the base it reset to.
+
+# Act review — 2026-10-01 (cont.) — parallel milestone tracks (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act: a planning decision on how work flows, from reading the open milestones'
+> proposals. No frozen bundle is re-read and no contribution disposition is re-decided.
+
+## What the records exposed
+
+- **One milestone at a time, and the cap enforces it.** `scripts/plan-cap` read 23 bundles
+  past Plan against the P1 cap of 6: 18 Alpha, 5 blackbox tester. With one global cap, Alpha's
+  backlog closed intake for every other milestone, including ones that do not touch Alpha's
+  code at all.
+- **Several milestones can run beside Alpha without touching its code** (Alpha is
+  custodian/core/dst staged-multipart work):
+  - blackbox tester (proposal 0017): a new `crates/validate` plus `xtask`, out of process over
+    S3, barred from depending on `wyrd-*` crates (0017:559-575); its chain #774 → #775 → #741
+    → #742 is already briefed, and its endurance run is Alpha's release evidence;
+  - M5 internal CA (0011, accepted): M5.1–M5.2 are `traits` plus a new `identity-dev` crate;
+    `core`/`custodian` explicitly unchanged (0011:465-467);
+  - M6 encryption at rest (0012, accepted): M6.1 is `traits` plus a new `keyservice-file`
+    crate.
+- **Others would collide or are not ready:** M6.3/6.4 edit `core/write.rs` and
+  `core/metadata.rs` and change the on-disk format; M7.1 edits custodian `reconcile_step`;
+  M8 needs M7 and board ratification; TiKV is stood down (#443).
+- **Lanes are bounded by memory, not by tracks.** `pdca.toml`'s leaf memory budget is 32G per
+  lane worst case (reviewer 16G + two always-on advisory leaves 8G each). Four lanes would be
+  128G against 122 GiB — the page-cache pressure that let oomd kill the whole driver in
+  August. Three lanes is 96G.
+
+## Process deltas
+
+- Ruleset: **wyrd-pdca-P1 is per track.** Each track (`alpha`, `blackbox`, `m5`, `m6`) has
+  its own cap of 6; an untagged brief counts as `alpha`. (`docs/INTEGRATION.md` §11)
+- Gates: **`scripts/plan-cap --track <t>`** counts only track `t`'s bundles (a brief's
+  `- **Track:**` field) and prints the others for context. (`scripts/plan-cap`,
+  `tests/test_plan_cap.py`)
+- Spec template + agent prompts: **`- **Track:**` field** in the `brief`, `plan-pointer` and
+  `design-proposal` templates; the planner and splitter always pass `--track`, and split
+  children inherit the parent's track. (`templates/*.tpl`, `agents/{planner,splitter}.md` and
+  the `.claude/agents/` copies)
+- Driver: **`lanes = 3`** (was 2), with the budget comment updated to 3 × 32G = 96G.
+  (`pdca.toml` `[driver].lanes`, `leaf_memory_max` comment)
+- Tracks opened now: `blackbox` (#774 → #775 → #741 → #742), `m5` (M5.1 #302, M5.2 #303),
+  `m6` (M6.1 #315). Not now: M6.2+ (needs M5.5), M6.3+ and M7.1+ (Alpha's code), M8 (needs M7).
+  M5.1 and M6.1 both add a trait to `crates/traits` and a crate to the workspace; their
+  briefs declare `Conflicts with` each other.
+
+## Follow-ups routed
+
+- **Concurrent stack-mode runs overwrite each other's fold** (`integrate.integration_branch`
+  depends only on the base, and each fold force-pushes its own run's patches). Until a
+  per-run integration branch lands (separate PR), run the tracks as ONE `pdca flow`, or keep
+  a single multi-wave run going at a time.
+
+## How effectiveness will be judged
+
+- **Tracks move together.** Within two weeks, bundles from at least two non-Alpha tracks reach
+  COMPLETE while Alpha keeps completing its own.
+- **Each track stays under its own cap.** `scripts/plan-cap --track <t>` for every track reads
+  at or under 6 at the next Act review, Alpha excepted until its backlog drains.
+- **No cross-track conflicts.** No fold `IntegrationError` and no conflicted PR between two
+  tracks. One occurrence means a track boundary was drawn wrong; re-read which crates each
+  touches.
+- **Sign-off keeps up.** AWAITING_SIGNOFF never exceeds the lane count for more than a day; if
+  it does, three lanes is more than one human can sign off, and lanes go back to 2.
+- **Memory holds.** No leaf killed at its cap and no oomd kill in the next five multi-lane runs
+  (each leaf's `*.memory.jsonl` shows the peak).
+

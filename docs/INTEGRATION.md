@@ -526,6 +526,16 @@ never weaken one — as running cycles surface them.
   drafting, and the human reads the same line. An explicit per-id override by the human,
   recorded in that brief's ordering note (or at the top of the split proposal) with the
   count, is the only way past a short room.
+  **Per track since 2026-10-01** (Act entry of that date). Work now runs as parallel
+  *tracks* — one per milestone stream that touches its own code (`alpha` = 0.1 Alpha,
+  `blackbox`, `m5`, `m6`). Each track has its own cap of 6, so one track's backlog no longer
+  closes intake for the others; the rule's intent — Plan must not outrun Do — now holds per
+  stream. A brief names its track in `- **Track:**`; an untagged brief counts as `alpha`
+  (everything written before the field existed). `scripts/plan-cap --track <t> --need N`
+  checks track `t` and prints the other tracks' counts for context; the planner and
+  splitter always pass `--track`, and a split's children inherit the parent's track. Which
+  milestones may run as tracks, and which wait (M6.2+, M7, M8 — they edit the code Alpha is
+  changing, or need M5 first), is the 2026-10-01 Act entry's decision.
   *Why:* the cycle has three issue producers (splits, findings filed as tracker items, Act
   follow-ups) and one serial consumer; in August 2026 the host tracker opened 78 issues and
   closed 20, and 63 of the 64 still-open August issues were the cycle's own output
