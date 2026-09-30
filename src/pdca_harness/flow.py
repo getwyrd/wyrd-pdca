@@ -978,6 +978,47 @@ def _inside_bundle_root(cfg: Config, d: Path) -> bool:
     return real is not None and root is not None and real.parent == root
 
 
+def _seed_offer(cfg: Config, seeds: list[Path]) -> frozenset[str]:
+    """The bundle names recovery ``seeds`` may hand this run: their lineage children,
+    transitively through a child that is itself terminal on a split — the same walk
+    :func:`_adopt_split_children` takes. INSTANCE DELTA (eduralph/pdca-harness#590): only
+    feeds the strict dependency check, which may then accept an edge to one of these; what
+    is actually adopted is still decided by the splice.
+
+    Offered: only a child that is an ACTIVE bundle still in flight — the only kind the splice
+    can adopt. A child archived to ``completed/`` or already terminal is not offered (the
+    normal check judges an edge to it), and neither is one whose state cannot be read. And
+    it is TOTAL (PR #259 review): the per-child probe is contained the way adoption's own
+    ``_isolate`` contains it, so a corrupt child is left for adoption to name, never a
+    traceback out of the pre-scan."""
+    offer: set[str] = set()
+    queue = list(seeds)
+    seen: set[str] = set()
+    while queue:
+        d = queue.pop()
+        if d.name in seen:
+            continue
+        seen.add(d.name)
+        try:
+            record = split.read_lineage(d)
+        except Exception:  # noqa: BLE001 — an unreadable lineage offers nothing
+            record = None
+        for cid in _lineage_children(record) if record else []:
+            child = cfg.bundle(cid)
+            if not child.is_dir():
+                continue  # archived or never created: nothing the splice can adopt
+            try:
+                s = state.state(child)
+                again = s in _TERMINAL and _is_split_parent(child)
+            except Exception:  # noqa: BLE001 — contained, as `_isolate` does for adoption
+                continue
+            if again:
+                queue.append(child)
+            elif s not in _TERMINAL:
+                offer.add(child.name)
+    return frozenset(offer)
+
+
 def _is_split_parent(d: Path) -> bool:
     """True iff ``d`` is terminal AND its close marker records a ``split``.
 
@@ -1721,7 +1762,13 @@ def _drive_and_act(
     # `test_a_named_id_in_the_re_scheduled_tail_is_held_not_lost`. An ADOPTED child held by
     # that same re-levelling goes the other way — out of the drive set again, so it is not
     # reported as this run's work (`_adopt_split_children`, `named` above).
-    wave_list = waves.compute_waves(cfg, bundles)  # validates (raises) + levels the batch
+    # INSTANCE DELTA (eduralph/pdca-harness#590): a named id may depend on a seed's child —
+    # `flow 809 810` with 810 `Depends on: 842`, a child of 809's split. That child is part
+    # of this request (its parent was named as a recovery seed), so the strict check accepts
+    # the edge; the `k=-1` splice below schedules the child and re-levels the named ids
+    # behind it. A child adoption then refuses is held by that re-level, never a raise.
+    wave_list = waves.compute_waves(  # validates (raises) + levels the batch
+        cfg, bundles, pending=_seed_offer(cfg, adopt_seeds or []))
     # Recovery (#473): a seed is an id the operator named whose bundle was ALREADY terminal
     # on a split, so an earlier run's children may still be sitting where it left them.
     # `k=-1` makes `wave_list[k+1:]` the WHOLE schedule — the children are levelled in front
