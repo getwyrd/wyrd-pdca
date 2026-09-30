@@ -2213,3 +2213,49 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
   no §10 Act-candidate line naming a sign-off or publisher prose fault (a hand-edited
   `commit-msg.txt` / `pr-description.md`, a decision the human had to re-state). The
   sign-off human records such a fault in §10 when it happens; that is the observation.
+
+# Act review — 2026-10-01 — wave sequencing back to stacked PRs (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act: a configuration decision. No frozen bundle is re-read and no contribution
+> disposition is re-decided.
+
+## What the records exposed
+
+- **Merge mode stops the whole batch on one wave's finding.** Under `wave_mode = "merge"` the
+  driver merges each non-final wave's PRs only on a settled-green full rollup
+  (`merge_requires = "all"`); a finding on those checks refuses the merge, and the run STOPs at
+  that wave boundary with every later wave unbuilt. The current batches are deep chains —
+  #809's split alone is four waves (839/840 → 841 → 842 → 843, with #810 behind 842) — so one
+  red item on wave 0 strands the rest of the chain until a human re-runs it.
+- **The stale-PR cost of stack mode is unchanged.** `integrate.fold` still rebuilds
+  `pdca-integration/<base>` from the base and force-pushes it on every fold
+  (`src/pdca_harness/integrate.py`, `checkout -B` + `push --force`), so a stacked PR still open
+  at the next fold goes stale (wyrd #675/#676, the 2026-08-02 reason for leaving stack mode).
+  Upstream eduralph/pdca-harness#463 is open.
+- **Stack mode's verification gap is closed.** C4-verify now tests a wave>0 bundle against the
+  folded integration branch (`$PDCA_VERIFY_BASE`, eduralph/pdca-harness#273, closed
+  2026-07-12; `engine/scripts/run-verify.sh` resolves it), so the base a stacked PR sits on is
+  the base it was verified against.
+
+## Process deltas
+
+- Gates / driver: **`wave_mode = "stack"`** (was `"merge"` since 2026-08-02). The merge-mode
+  keys (`merge_method`, `auto_merge`, `merge_wait_secs`, `merge_requires`, `merge_sync_base`)
+  are inert under stack and kept as set, so switching back restores them exactly.
+  (`pdca.toml` `[driver].wave_mode`)
+- Docs: `docs/INTEGRATION.md` §2 "Wave sequencing" and §10 "Ready-mark gate" updated (the
+  driver merges nothing again; every PR waits for the human), and the #273 note corrected
+  (closed upstream, honoured by `run-verify.sh`).
+- Operating rule, not config: **merge a run's stacked PRs, bottom-up, before the next
+  multi-wave run folds again**, so no stacked PR is open across a fold.
+
+## How effectiveness will be judged
+
+- **A red finding no longer strands a batch.** The next multi-wave run in which a wave's PR
+  checks raise a finding still builds every later wave and opens its PR (read the run's
+  stderr: no "wave k did not merge; STOPPING").
+- **Stale stacked PRs stay rare.** Over the next three multi-wave runs, count stacked PRs that
+  turned `dco` red or CONFLICTING after a later fold. Any at all means the mitigation is not
+  holding in practice, and the fold fix (#463, or a local delta) moves up.
+- **Verification follows the stack.** For the next wave>0 bundle, `gate-logs/C4-verify.log`
+  names `origin/pdca-integration/main` as the base it reset to.

@@ -64,7 +64,15 @@
   **per-release** branch is now the rule rather than an invention. The distinction that makes
   both true at once: a release branch is cut **at** a release and maintains **that release**;
   it is never a second trunk.
-- **Wave sequencing is `wave_mode = "merge"`** (changed from `"stack"`, 2026-08-02): for a
+- **Wave sequencing is `wave_mode = "stack"` again since 2026-10-01** (Act entry of that
+  date). In merge mode, a finding on a non-final wave's PR checks refused the merge and
+  stopped the run at that wave boundary, so one red item stranded every later wave; stack mode
+  keeps building and the finding is handled on its PR at review. The known cost described
+  below — a stacked PR still open at the next fold goes stale — is unchanged (upstream
+  eduralph/pdca-harness#463, open); the mitigation is to merge a run's stacked PRs,
+  bottom-up, before the next multi-wave run folds again. The merge-mode keys stay configured
+  (inert under `"stack"`) so switching back restores them exactly. The history:
+- **Wave sequencing was `wave_mode = "merge"`** (2026-08-02 .. 2026-10-01): for a
   dependent multi-issue batch, the driver `gh pr merge`s each **non-final** wave's PRs into
   the real base (`main`) before the next wave builds; the final wave's PRs stay the human's
   to merge. `"stack"` folded waves onto the run-scoped `pdca-integration/<base>` branch and
@@ -184,10 +192,11 @@
   told about it — so a wave≥1 dependent is still verified against `origin/<brief base>`.
   That is a different problem from #91 and is tracked upstream as
   **eduralph/pdca-harness#273**; the `$WYRD_VERIFY_BASE` slot above is what a fix would
-  feed. **Mooted here since `wave_mode = "merge"`** (2026-08-02, see "Wave sequencing"
-  above): a wave≥1 bundle now builds on a genuinely merged `origin/<brief base>`, so the
-  ref C4-verify resolves IS the base the PR opens against. The gap stays live upstream for
-  `"stack"`-mode instances.
+  feed. **Closed upstream (2026-07-12):** the driver now exports the wave's folded
+  integration branch to the per-fix verifier as `$PDCA_VERIFY_BASE`, and
+  `engine/scripts/run-verify.sh` resolves it ahead of `$PDCA_BRIEF_BASE`, so under
+  `wave_mode = "stack"` (again since 2026-10-01) a wave≥1 bundle is verified against the
+  branch its PR is stacked on.
 - **Release branches — every release gets one, and it is how the release is maintained**
   (maintainer decision, 2026-08-16). At each release point a branch is cut from `main` and
   named `release/<version>` (e.g. `release/0.1-alpha`). It is the branch the **tag** is cut
@@ -419,8 +428,10 @@ declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`
   three members).
 - **Ready-mark gate:** PRs open as **draft**; the human re-reads and marks ready. The
   builder/publisher leaves never `gh pr ready` / `gh pr merge` (mechanically blocked by
-  `builder_guard.py`). **Scope under `wave_mode = "merge"`** (2026-08-02, see §2 "Wave
-  sequencing"): this gate holds unchanged for the model leaves and for every FINAL-wave PR;
+  `builder_guard.py`). **Under `wave_mode = "stack"` (again since 2026-10-01) this gate
+  holds for EVERY PR**, non-final waves included: the driver merges nothing. The merge-mode
+  exception below applied 2026-08-02 .. 2026-10-01. **Scope under `wave_mode = "merge"`**
+  (see §2 "Wave sequencing"): this gate holds unchanged for the model leaves and for every FINAL-wave PR;
   for a **non-final** wave of a dependent batch, the deterministic driver (not a leaf)
   readies and merges the wave's PRs at the wave boundary — the human's fresh-eyes read for
   those happens at per-bundle sign-off (before publish), not on the open PR. That trade is
