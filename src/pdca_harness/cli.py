@@ -719,6 +719,24 @@ def _flow_claimed(cfg: Config, args: argparse.Namespace, claims: drive_claim.Run
     except flow.PreflightError as exc:
         print(f"flow: {exc}", file=sys.stderr)
         return 1
+    except waves.DependencyGraphError as exc:
+        # INSTANCE DELTA (eduralph/pdca-harness#589): the batch's dependency graph cannot be
+        # scheduled. Refused before anything is built — a Plan session or `--from-briefs`
+        # may already have written a brief (PR #257 review), but no Do or Check has run —
+        # so this is operator error: say what and how out, never a traceback. Reached
+        # through a split parent too: its `flow` adopts the children, whose dependencies
+        # the operator never named.
+        if exc.cycle:
+            way_out = ("  The ordering edges form a loop, so no order exists. Remove or "
+                       "correct one `Depends on` / `Stacks on` edge in the loop above, in "
+                       "the brief of the bundle whose edge is wrong.")
+        else:
+            way_out = ("  Fix one of: add the prerequisite to this run's ids; finish it "
+                       "first; or, if it landed outside the PDCA cycle (its tracker issue is "
+                       "closed), drop the edge from the dependent's brief and record why in "
+                       "its Ordering note.")
+        print(f"flow: refused before any build — {exc}.\n{way_out}", file=sys.stderr)
+        return 2
 
     # Two PRESENTATIONS of that one map — never two drive paths, and never a second source
     # of truth: both read only `results`, so neither can report what the other cannot see.

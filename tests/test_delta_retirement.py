@@ -303,7 +303,7 @@ class LiveTreeDiscipline(unittest.TestCase):
         # carry (marked with #231).
         sites, _ = dr.scan_tree(ROOT)
         found = {n for s in sites for repo, n in s.refs if repo == UPSTREAM}
-        self.assertLessEqual({335, 371, 531, 579, 580, 581, 582}, found)
+        self.assertLessEqual({335, 371, 531, 579, 580, 581, 582, 589, 590}, found)
 
 
 if __name__ == "__main__":

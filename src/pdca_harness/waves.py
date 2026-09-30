@@ -48,12 +48,40 @@ def declared_deps(bp: Path) -> list[str]:
     return brief.depends_on(bp) + brief.depends_on_merged(bp) + brief.stacks_on(bp)
 
 
-def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
+class DependencyGraphError(ValueError):
+    """The declared dependency graph cannot be scheduled: a dependency outside the batch
+    that is not COMPLETE, or a cycle. INSTANCE DELTA (eduralph/pdca-harness#589): a named
+    type so the ``flow`` command can report it as the operator error it is — one line and
+    a way out — instead of a traceback. It subclasses ``ValueError``, so every caller and
+    test that expects ``ValueError`` is unchanged.
+
+    ``cycle`` says which of the two it is, because the way out differs: an unresolved
+    dependency is fixed by supplying or finishing the prerequisite, a cycle only by
+    correcting one of its edges (PR #257 review)."""
+
+    def __init__(self, message: str, *, cycle: bool = False) -> None:
+        super().__init__(message)
+        self.cycle = cycle
+
+
+def check_dep_graph(cfg: Config, bundles: list[Path],
+                    pending: frozenset[str] = frozenset()) -> None:
     """Validate the declared dependency DAG before any build (issue #36).
 
+    ``pending`` (INSTANCE DELTA, eduralph/pdca-harness#590) names bundles the run is about
+    to ADOPT — the children of a recovery seed (#473). A ``Depends on`` a pending child is
+    part of the request, not an unresolved one: it is accepted here, and the adoption splice
+    that follows re-levels the whole schedule with the child in it, which is where the edge
+    orders anything. Two limits (PR #259 review): a ``Stacks on`` a pending child is NOT
+    exempt — it needs the live parent's published branch, which only the normal check
+    vouches for — and the pending children join the CYCLE check with their own edges, so a
+    loop through an adopted child is refused here, not left to degrade later. Empty by
+    default: every other caller is unchanged.
+
     A dependency that is neither in this batch nor an already-COMPLETE bundle on disk
-    is a misconfigured brief; a cycle is unschedulable. Both raise ``ValueError`` so the
-    run aborts before touching any bundle. No deps declared ⇒ no-op.
+    is a misconfigured brief; a cycle is unschedulable. Both raise
+    :class:`DependencyGraphError` (a ``ValueError``) so the run aborts before touching any
+    bundle. No deps declared ⇒ no-op.
     """
     names = {b.name for b in bundles}
     graph: dict[str, list[str]] = {}
@@ -68,17 +96,40 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
             if dn in names:
                 edges.append(dn)
                 continue
+            if dn in pending and dep not in stacks:
+                edges.append(dn)  # adopted into this run (#590); the splice orders it
+                continue
             # Out-of-batch: an archived (completed/) prereq satisfies Depends on / Depends
             # on (merged) (#171). But a `Stacks on` parent must be an ACTIVE bundle — the
             # dependent bases its worktree + stacked PR on the parent's *live* published
             # branch, read from the active bundle by publish._stack_base_branch — so resolve
             # Stacks on against bundle() (an archived-only stack parent stays rejected).
             resolved = cfg.bundle(dep) if dep in stacks else cfg.find_bundle(dep)
-            if state.state(resolved) != state.COMPLETE:
-                raise ValueError(
+            try:
+                dep_state = state.state(resolved)
+            except Exception as exc:  # noqa: BLE001 — a corrupt prerequisite is refused, not a crash
+                # INSTANCE DELTA (eduralph/pdca-harness#589, PR #259 review): e.g. a brief
+                # that is not UTF-8. Unreadable is not COMPLETE; say which and why.
+                raise DependencyGraphError(
+                    f"{b.name}: declared dependency '{dep}' cannot be read "
+                    f"({type(exc).__name__}: {exc})") from exc
+            if dep_state != state.COMPLETE:
+                raise DependencyGraphError(
                     f"{b.name}: declared dependency '{dep}' is neither in this batch "
                     f"nor an existing COMPLETE bundle")
         graph[b.name] = edges
+    # The pending children's own edges, for the cycle check only (#590, PR #259 review):
+    # `810 → 601 → 810` through an adopted child is as unschedulable as one inside the
+    # named batch. Edges leaving the request are not this check's business — adoption
+    # judges each child's other prerequisites itself.
+    for pn in pending - names:
+        pb = cfg.bundle_root / pn / "brief.md"
+        try:
+            deps = declared_deps(pb) if pb.exists() else []
+        except Exception:  # noqa: BLE001 — an unreadable child is adoption's to report
+            deps = []
+        graph[pn] = [m for m in (cfg.bundle(dep).name for dep in deps)
+                     if m in names or m in pending]
 
     WHITE, GRAY, BLACK = 0, 1, 2
     color = dict.fromkeys(graph, WHITE)
@@ -90,7 +141,8 @@ def check_dep_graph(cfg: Config, bundles: list[Path]) -> None:
         for m in graph[n]:
             if color[m] == GRAY:
                 cyc = path[path.index(m):] + [m]
-                raise ValueError("dependency cycle: " + " → ".join(cyc))
+                raise DependencyGraphError("dependency cycle: " + " → ".join(cyc),
+                                           cycle=True)
             if color[m] == WHITE:
                 visit(m)
         path.pop()
@@ -137,7 +189,8 @@ def _reaches(deps: dict[str, set[str]], src: str, dst: str) -> bool:
     return False
 
 
-def compute_waves(cfg: Config, bundles: list[Path]) -> list[list[Path]]:
+def compute_waves(cfg: Config, bundles: list[Path],
+                  pending: frozenset[str] = frozenset()) -> list[list[Path]]:
     """Partition ``bundles`` into ordered waves.
 
     ``wave[k]`` holds the bundles whose every prerequisite is in an earlier wave; within
@@ -146,7 +199,7 @@ def compute_waves(cfg: Config, bundles: list[Path]) -> list[list[Path]]:
     :func:`check_dep_graph`) on an unschedulable graph — a cycle, or a dependency neither
     in this batch nor already COMPLETE. No fields declared ⇒ one wave, sort-by-name.
     """
-    check_dep_graph(cfg, bundles)  # cycle / unresolved dep → ValueError, before any work
+    check_dep_graph(cfg, bundles, pending)  # cycle / unresolved dep → ValueError, before any work
     by_name = {b.name: b for b in bundles}
 
     # Directed prerequisite edges, restricted to the batch (out-of-batch prereqs are
