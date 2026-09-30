@@ -381,7 +381,8 @@ def publish(
 
     record = {
         "mode": "stacked-pr" if stack_branch else "new-pr",
-        "branch": branch, "pr_url": pr_url, "base": pr_base, "repo": repo_spec,
+        "branch": branch, "remote": "origin", "head_sha": _local_head(repo, branch),
+        "pr_url": pr_url, "base": pr_base, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
@@ -510,7 +511,8 @@ def _publish_stacked(
 
     rec = {
         "mode": "stacked",
-        "branch": branch, "pr_url": pr_url, "base": base_ref, "repo": repo_spec,
+        "branch": branch, "remote": remote, "head_sha": _local_head(repo, branch),
+        "pr_url": pr_url, "base": base_ref, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
@@ -528,6 +530,15 @@ def _publish_stacked(
     # this path's publish.json write, best-effort, no-op under mode "off".
     record_mod.after_publish(cfg)
     return 0
+
+
+def _local_head(repo: Path, branch: str) -> str:
+    """The commit local ``branch`` points at — right after a publish, the exact commit just
+    pushed. Recorded as ``head_sha`` so the stack fold merges THAT commit, not whatever the
+    PR branch holds later (INSTANCE DELTA, eduralph/pdca-harness#593). ``""`` if unreadable."""
+    r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q",
+                        f"refs/heads/{branch}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _existing_pr(pr_list_cmd: list[str], branch: str, owner: str) -> str:

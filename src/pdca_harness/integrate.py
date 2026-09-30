@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 from pathlib import Path
 
 from . import publish
@@ -230,9 +231,12 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
             print(f"  git worktree → {_integ_worktree(repo, base)}; continue origin/{branch} "
                   f"if it exists, else start at {base_remote}/{base}")
             for d in bundles:
-                head = _published_branch(d) or "<unpublished>"
-                print(f"  git merge --no-ff --signoff origin/{head}   ({d.name}; skipped "
-                      f"if already in {branch})")
+                rec = publish._publish_record(d) or {}
+                remote = rec.get("remote") or "origin"
+                head = rec.get("branch") or "<unpublished>"
+                pin = rec.get("head_sha") or f"{remote}/{head}"
+                print(f"  git merge --no-ff --signoff {pin}   ({d.name} from {remote}/{head}; "
+                      f"skipped if already in {branch})")
             print(f"  git push origin {branch}   (fast-forward, never forced)")
             result[(repo_spec, base)] = (branch, None)
             continue
@@ -262,28 +266,7 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
             if _git(wt, "checkout", "-B", branch, start) != 0:
                 raise IntegrationError(f"could not start {branch} off {start}")
             for d in bundles:
-                head = _published_branch(d)
-                if not head:
-                    raise IntegrationError(
-                        f"{d.name} has a patch but no published branch (publish.json) — the "
-                        f"stack folds the real PR branches, so it cannot be stacked on; "
-                        f"publish it, then re-run")
-                _git(wt, "fetch", "origin", head)
-                ref = f"refs/remotes/origin/{head}"
-                if _git(wt, "rev-parse", "--verify", "-q", ref) != 0:
-                    raise IntegrationError(
-                        f"{d.name}'s published branch {head} is not on origin — cannot fold it")
-                if _git(wt, "merge-base", "--is-ancestor", ref, "HEAD") == 0:
-                    continue  # already folded (a re-run, or merged into the base already)
-                # `--signoff` (DCO): the host's `dco` check reads EVERY commit a PR carries,
-                # merge commits included, and a stacked PR inherits these merges.
-                if _git(wt, "merge", "--no-ff", "--signoff", "-m",
-                        f"pdca-integrate: {d.name} ({head})", ref) != 0:
-                    _git(wt, "merge", "--abort")
-                    raise IntegrationError(
-                        f"{d.name}'s branch {head} does not merge onto {branch} — an "
-                        f"undeclared cross-wave overlap; declare the conflict / re-order, "
-                        f"then re-run")
+                _fold_one(wt, d, branch)
             # Never forced: the branch only grows. A rejected push means someone else moved
             # it; stop rather than overwrite what an open PR may be based on.
             if _git(wt, "push", "origin", branch) != 0:
@@ -294,11 +277,97 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
     return result
 
 
-def _published_branch(d: Path) -> str | None:
-    """The branch ``publish`` pushed for bundle ``d`` (``publish.json``), or None."""
-    rec = publish._publish_record(d)
-    branch = rec.get("branch") if rec else None
-    return str(branch).strip() or None if branch else None
+def _published(d: Path) -> tuple[str, str, str]:
+    """``(remote, branch, head_sha)`` that ``publish`` recorded for bundle ``d``.
+
+    Raises :class:`IntegrationError` unless the record names a branch AND a PR: publish
+    writes publish.json with an empty ``pr_url`` when the push worked but ``gh pr create``
+    failed, and a predecessor with no PR cannot be merged bottom-up, so nothing may stack on
+    it. ``remote`` is where the branch was pushed (an ``Onto branch`` may name a remote other
+    than origin); ``head_sha`` is the exact commit pushed, or ``""`` on a record written
+    before it was kept."""
+    rec = publish._publish_record(d) or {}
+    branch = str(rec.get("branch") or "").strip()
+    if not branch:
+        raise IntegrationError(
+            f"{d.name} has a patch but no published branch (publish.json) — the stack folds "
+            f"the real PR branches, so it cannot be stacked on; publish it, then re-run")
+    if not str(rec.get("pr_url") or "").strip():
+        raise IntegrationError(
+            f"{d.name}'s branch {branch} was pushed but has no PR (publish.json pr_url is "
+            f"empty) — nothing may stack on a predecessor that cannot be merged; open its "
+            f"PR (re-run publish), then re-run")
+    return (str(rec.get("remote") or "origin").strip(), branch,
+            str(rec.get("head_sha") or "").strip())
+
+
+def _fold_one(wt: Path, d: Path, branch: str) -> None:
+    """Merge bundle ``d``'s published commit onto the checked-out integration ``branch``.
+
+    Merges the EXACT commit publish pushed (``head_sha``), never whatever the PR branch
+    points at now: a branch moved since publish (a bot, another actor) would carry
+    unreviewed commits into every later wave, so that is a STOP. A bundle whose commit is
+    already on the branch is skipped (a re-run, or a resumed flow whose predecessor has
+    since merged and had its branch deleted). A bundle re-published after an earlier fold
+    (``signoff --iterate-do`` rebuilds it off the base, so the new commit is not a
+    descendant of the old) has its earlier fold REVERTED first, then the new commit merged:
+    the branch still only grows (#593)."""
+    remote, head, sha = _published(d)
+    if sha and _git(wt, "merge-base", "--is-ancestor", sha, "HEAD") == 0:
+        return
+    if _git(wt, "fetch", remote, head) != 0:
+        raise IntegrationError(
+            f"could not fetch {d.name}'s branch {head} from {remote} — refusing to fold a "
+            f"possibly stale copy of it")
+    ref = f"refs/remotes/{remote}/{head}"
+    tip = _rev(wt, ref)
+    if not tip:
+        raise IntegrationError(f"{d.name}'s published branch {head} is not on {remote} — "
+                               f"cannot fold it")
+    if not sha:
+        print(f"integrate: {d.name}'s publish.json predates head_sha — folding the current "
+              f"tip of {remote}/{head} ({tip[:12]})", file=sys.stderr)
+        sha = tip
+    elif tip != sha:
+        raise IntegrationError(
+            f"{remote}/{head} is at {tip[:12]}, not the {sha[:12]} publish pushed for "
+            f"{d.name} — the branch moved since Check; re-publish it (or reset the branch), "
+            f"then re-run")
+    if _git(wt, "merge-base", "--is-ancestor", sha, "HEAD") == 0:
+        return
+    earlier = _last_fold(wt, d.name)
+    if earlier:
+        # `--signoff` on the revert and the merge (DCO): the host's `dco` check reads EVERY
+        # commit a PR carries, merge and revert commits included, and a stacked PR inherits
+        # them.
+        if _git(wt, "revert", "--no-edit", "--signoff", "-m", "1", earlier) != 0:
+            _git(wt, "revert", "--abort")
+            raise IntegrationError(
+                f"{d.name} was re-published, and its earlier fold ({earlier[:12]}) no longer "
+                f"reverts cleanly off {branch} — a later wave built on it; rebuild that wave "
+                f"against the revised predecessor, then re-run")
+    if _git(wt, "merge", "--no-ff", "--signoff", "-m",
+            f"pdca-integrate: {d.name} ({head} @ {sha[:12]})", sha) != 0:
+        _git(wt, "merge", "--abort")
+        raise IntegrationError(
+            f"{d.name}'s branch {head} does not merge onto {branch} — an undeclared "
+            f"cross-wave overlap; declare the conflict / re-order, then re-run")
+
+
+def _last_fold(wt: Path, name: str) -> str:
+    """The newest ``pdca-integrate: <name> (`` merge on the checked-out branch, or ``""``.
+    The `` (`` after the name keeps ``issue_1`` from matching ``issue_12``."""
+    r = subprocess.run(["git", "-C", str(wt), "log", "--first-parent", "--merges", "-n", "1",
+                        "--fixed-strings", f"--grep=pdca-integrate: {name} (", "--format=%H",
+                        "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _rev(wt: Path, ref: str) -> str:
+    """The commit ``ref`` names in ``wt``, or ``""``."""
+    r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _prepare_worktree(repo: Path, base_remote: str, base: str) -> Path:
