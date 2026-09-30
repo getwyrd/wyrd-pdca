@@ -324,7 +324,45 @@ def preflight(parent: Path, children: list[Child], cfg) -> None:
     # the children as real tracker issues.
     _parent_plan(parent, cfg)
     _validate_ordering(children)
+    _validate_tracks(parent, children, cfg)
     _emit_convergence_report(parent, children, cfg)
+
+
+def _parent_track(parent: Path, cfg) -> str:
+    """The track a split's children inherit (INSTANCE DELTA, eduralph/pdca-harness#594):
+    the parent brief's ``Track`` — or, for a parent whose brief an iterate-to-Plan
+    archived, the archive's (:func:`_parent_plan`'s source) — else the default track."""
+    from . import tracks as _tracks
+    bp = parent / "brief.md"
+    if not bp.exists():
+        replans = state.replan_archives(parent)
+        if replans:
+            bp = replans[-1][1] / "brief.md"
+    return _tracks.of(bp) or _tracks.settings(cfg.root).default
+
+
+def _validate_tracks(parent: Path, children: list[Child], cfg) -> None:
+    """Every child stays in its parent's intake track (INSTANCE DELTA,
+    eduralph/pdca-harness#594). The cap is counted per track, so a child in another track
+    would spend a budget the split was never checked against. A child that omits the
+    field is fine — :func:`materialise` writes the parent's in. Nothing is enforced when
+    the instance declares no ``[intake].tracks``."""
+    from . import tracks as _tracks
+    tr = _tracks.settings(cfg.root)
+    if not tr.enforced:
+        return
+    want = _parent_track(parent, cfg)
+    if tr.problem(want):
+        raise SplitError(f"{parent.name}'s track {want!r} is not an open track "
+                         f"({', '.join(tr.open)}) — its children would inherit it; fix "
+                         f"the parent brief's Track, then re-run")
+    for child in children:
+        got = _tracks.of_text(child.body)
+        if got and got != want:
+            raise SplitError(
+                f"{child.label} names track {got!r}, but its parent {parent.name} is in "
+                f"{want!r} — every child inherits the parent's track (the intake cap is "
+                f"per track, wyrd-pdca-P1); drop the child's Track field or fix it")
 
 
 def _validate_ordering(children: list[Child]) -> None:
@@ -714,12 +752,17 @@ def materialise(children: list[Child], ids: list[str], cfg, staging: Path, *,
     """
     mapping = {c.label: i for c, i in zip(children, ids)}
     parent_id = _bundle_id(parent)
+    # INSTANCE DELTA (eduralph/pdca-harness#594): each child carries its parent's intake
+    # track (checked to match by `_validate_tracks`), so `plan-cap` charges it there.
+    from . import tracks as _tracks
+    track = _parent_track(parent, cfg) if _tracks.settings(cfg.root).enforced else ""
     depth = _recorded_depth(read_lineage(parent)) + 1
     staged: list[Path] = []
     for child, issue_id in zip(children, ids):
         d = staging / cfg.bundle(issue_id).name
         d.mkdir(parents=True)
-        (d / "brief.md").write_text(rewrite_ordering(child.body, mapping).lstrip("\n"),
+        body = rewrite_ordering(child.body, mapping).lstrip("\n")
+        (d / "brief.md").write_text(_tracks.with_track(body, track) if track else body,
                                     encoding="utf-8")
         _write_lineage(d / LINEAGE, {
             "version": LINEAGE_VERSION,
@@ -792,7 +835,8 @@ def _parent_plan(parent: Path, cfg) -> tuple[str, str, str] | None:
         # external dependency (:func:`_split_parent_brief`), so the archive's declarations
         # never reach it — one this host no longer registers or provides must not refuse
         # the split.
-        problems = handoff.check_planner(source.parent, cfg, dependencies=False)
+        problems = handoff.check_planner(source.parent, cfg, dependencies=False,
+                                         track=False)
         slug = _brief.whole_field(source, "slug")
         target = _brief.whole_field(source, "repo + branch target")
     except (OSError, ValueError) as exc:   # ValueError: bytes that are not UTF-8

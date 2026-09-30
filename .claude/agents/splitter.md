@@ -24,8 +24,9 @@ sub-issue of the parent) and materializes the briefs. You do not.
 
 **Check the intake cap before you draft (`wyrd-pdca-P1`).** Run
 `scripts/plan-cap --track <the parent's track> --need <children you expect>` first (the
-parent brief's `- **Track:**`; absent means `alpha`; every child inherits it — copy the field
-into each child). Every child you propose becomes a
+parent brief's `- **Track:**`; absent means `alpha`). Every child inherits it: leave the
+child stanza's Track placeholder as it is and `pdca split --accept` writes the parent's in;
+a child naming a DIFFERENT track is refused. Every child you propose becomes a
 bundle past Plan when accepted, and the proposal itself is the reslicing INTEGRATION §11
 forbids when there is no room. **If the room is short you write no proposal** — tell the
 human the count, the room, and that the seams can be drafted once sign-offs make room,

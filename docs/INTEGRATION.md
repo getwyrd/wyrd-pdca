@@ -533,9 +533,15 @@ never weaken one — as running cycles surface them.
   stream. A brief names its track in `- **Track:**`; an untagged brief counts as `alpha`
   (everything written before the field existed). `scripts/plan-cap --track <t> --need N`
   checks track `t` and prints the other tracks' counts for context; the planner and
-  splitter always pass `--track`, and a split's children inherit the parent's track. Which
-  milestones may run as tracks, and which wait (M6.2+, M7, M8 — they edit the code Alpha is
-  changing, or need M5 first), is the 2026-10-01 Act entry's decision.
+  splitter always pass `--track`. The OPEN tracks are `[intake].tracks` in `pdca.toml`, one
+  list read by everything (`src/pdca_harness/tracks.py`): `plan-cap` refuses an unopened
+  `--track` (exit 2) instead of giving it a fresh budget; `/handoff` refuses a brief whose
+  Track is missing, a placeholder, or not open; and `pdca split --accept` writes the
+  parent's track into every child and refuses a child naming another. **Instance delta**
+  (eduralph/pdca-harness#594) in `handoff.check_planner`, `split` and `tracks.py`; it goes
+  away when #594 lands. Which milestones may run as tracks, and which wait (M6.2+, M7, M8 —
+  they edit the code Alpha is changing, or need M5 first), is the 2026-10-01 Act entry's
+  decision; opening another means adding it to `[intake].tracks` under a new Act entry.
   *Why:* the cycle has three issue producers (splits, findings filed as tracker items, Act
   follow-ups) and one serial consumer; in August 2026 the host tracker opened 78 issues and
   closed 20, and 63 of the 64 still-open August issues were the cycle's own output

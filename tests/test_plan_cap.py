@@ -126,6 +126,13 @@ class PlanCapTest(unittest.TestCase):
         self.assertIn("planned 5/10 (cap, track alpha)", r.stdout)
         self.assertNotIn("Traceback", r.stderr)
 
+    def test_an_unopened_track_is_refused_not_given_a_fresh_budget(self):
+        # #264 review: only the tracks the Act decision opened ([intake].tracks) have room.
+        r = self.run_cap("--track", "m7")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("'m7' is not open", r.stderr)
+
     def test_bad_need_is_a_usage_error(self):
         self.assertEqual(self.run_cap("--need", "0").returncode, 2)
 

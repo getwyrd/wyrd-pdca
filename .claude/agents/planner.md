@@ -73,9 +73,12 @@ off may never number more than 6, so the room you have is `6 − count`, and eve
 you author and every child a split files spends one of it.
 
 - **The cap is per track** (since 2026-10-01). Every brief names its track in
-  `- **Track:**` — the milestone stream it belongs to: `alpha` (0.1 Alpha; also what an
-  untagged brief counts as), `blackbox`, `m5`, `m6`, … Ask the human if the tracker
-  milestone does not make it obvious. Always pass it: `--track <track>`.
+  `- **Track:**` — the milestone stream it belongs to, one of the OPEN tracks in
+  `[intake].tracks` (pdca.toml; today `alpha`, `blackbox`, `m5`, `m6`). Ask the human if the
+  tracker milestone does not make it obvious. `/handoff` refuses a brief whose Track is
+  missing or not open, and `plan-cap` refuses an unopened `--track`: work for a milestone
+  with no open track waits for an Act decision to open one — do not invent a name. Always
+  pass it: `--track <track>`.
 - Run `scripts/plan-cap --track <track> --need N` **before the batch**, with N the number
   of briefs the human wants in that track. It prints the track's count, its room, the other
   tracks' counts, and whether N fits; it exits non-zero when it does not. A count of 6 leaves

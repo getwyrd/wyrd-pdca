@@ -103,7 +103,7 @@ def _unfilled(value: str) -> bool:
 
 
 def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False,
-                  dependencies: bool = True) -> list[str]:
+                  dependencies: bool = True, track: bool = True) -> list[str]:
     """The Plan exit contract: an AUTHORED ``brief.md`` whose declared external
     dependencies are registered AND present (#333/#340 — the same probe the
     pre-dispatch guard runs, so the two verdicts cannot drift apart).
@@ -119,6 +119,11 @@ def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False,
     because it checks an ARCHIVED brief only for the fields it copies into a split
     parent's new brief, and that brief declares no dependency of its own (#481).
     ``/handoff`` always checks the whole contract.
+
+    ``track=False`` skips the intake-track clause (INSTANCE DELTA,
+    eduralph/pdca-harness#594) and nothing else. ``split._parent_plan`` passes it: the
+    archived brief it checks may predate the Track field, and the brief rebuilt from it
+    takes only the fields it copies.
     """
     from . import brief as _brief  # local: keep this module import-light for the hook
     from . import doctor as _doctor
@@ -145,6 +150,15 @@ def check_planner(d: Path, cfg: Config, *, allow_absent: bool = False,
         if _unfilled(_brief.whole_field(bp, *labels)):
             problems.append(f"brief.md field '{labels[0]}' is empty or an unfilled "
                             "placeholder — it is required by every brief template")
+    # The intake-track clause — INSTANCE DELTA (eduralph/pdca-harness#594): with
+    # [intake].tracks declared, every brief leaving Plan names an OPEN track, because
+    # `scripts/plan-cap` counts the cap per track and a missing or unknown name would be
+    # charged to the wrong one (or given a fresh budget no Act decision opened).
+    if track:
+        from . import tracks as _tracks
+        found = _tracks.settings(cfg.root).problem(_tracks.of(bp))
+        if found:
+            problems.append(found)
     # The dependency clause (#331 layer over #333/#340): every backticked token must
     # name a registered [[doctor.checks]] row whose detect cmd exits 0; an annotated
     # `(no-check: …)` token yields no token at all and is exempt by construction.

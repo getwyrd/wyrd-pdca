@@ -2306,6 +2306,14 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
   `design-proposal` templates; the planner and splitter always pass `--track`, and split
   children inherit the parent's track. (`templates/*.tpl`, `agents/{planner,splitter}.md` and
   the `.claude/agents/` copies)
+- Gates: **the open tracks are one list, and a wrong track is refused, not charged to
+  `alpha`** (PR #264 review; INSTANCE DELTA eduralph/pdca-harness#594). `[intake].tracks` in
+  `pdca.toml`; `plan-cap --track m7` exits 2; `/handoff` requires an open Track on every
+  brief leaving Plan; split children get the parent's track written in, and a child naming
+  another is refused before any sub-issue is filed. The in-flight blackbox briefs (#738,
+  #741, #742, #774, #775) were tagged `blackbox` by hand, since they predate the field.
+  (`src/pdca_harness/{tracks,handoff,split}.py`, `templates/split-proposal.md.tpl`,
+  `tests/test_tracks.py`)
 - Driver: **`lanes = 3`** (was 2), with the budget comment updated to 3 × 32G = 96G.
   (`pdca.toml` `[driver].lanes`, `leaf_memory_max` comment)
 - Tracks opened now: `blackbox` (#774 → #775 → #741 → #742), `m5` (M5.1 #302, M5.2 #303),
@@ -2315,10 +2323,11 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 
 ## Follow-ups routed
 
-- **Concurrent stack-mode runs overwrite each other's fold** (`integrate.integration_branch`
-  depends only on the base, and each fold force-pushes its own run's patches). Until a
-  per-run integration branch lands (separate PR), run the tracks as ONE `pdca flow`, or keep
-  a single multi-wave run going at a time.
+- **Concurrent stack-mode runs overwrote each other's fold** (`integrate.integration_branch`
+  depended only on the base, and each fold force-pushed its own run's patches). Resolved by
+  #265 (one integration branch per batch, eduralph/pdca-harness#591) and #266 (append-only
+  fold over the real PR branches, eduralph/pdca-harness#593), both merged: tracks may run as
+  separate `pdca flow` runs.
 
 ## How effectiveness will be judged
 
