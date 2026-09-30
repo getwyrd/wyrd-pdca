@@ -2227,11 +2227,15 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
   that wave boundary with every later wave unbuilt. The current batches are deep chains —
   #809's split alone is four waves (839/840 → 841 → 842 → 843, with #810 behind 842) — so one
   red item on wave 0 strands the rest of the chain until a human re-runs it.
-- **The stale-PR cost of stack mode is unchanged.** `integrate.fold` still rebuilds
-  `pdca-integration/<base>` from the base and force-pushes it on every fold
-  (`src/pdca_harness/integrate.py`, `checkout -B` + `push --force`), so a stacked PR still open
-  at the next fold goes stale (wyrd #675/#676, the 2026-08-02 reason for leaving stack mode).
-  Upstream eduralph/pdca-harness#463 is open.
+- **Stack mode as shipped could not carry a multi-wave batch here** (PR #262 review, both
+  P1). `integrate.fold` rebuilt `pdca-integration/<base>` from the base and force-pushed it on
+  every fold, so a middle wave's PR — opened against that branch — found its own change in its
+  base after the next fold and went stale inside the same run (the wyrd #675/#676 shape).
+  And `publish` opened wave 1+ PRs against that branch, which nothing merges into `main`, so
+  merging them bottom-up never landed them. Fixed by two instance deltas, landing before this
+  switch: one integration branch per batch (getwyrd/wyrd-pdca#265, eduralph/pdca-harness#591)
+  and an append-only fold over the real PR branches with every wave PR targeting `main`
+  (getwyrd/wyrd-pdca#266, eduralph/pdca-harness#593).
 - **Stack mode's verification gap is closed.** C4-verify now tests a wave>0 bundle against the
   folded integration branch (`$PDCA_VERIFY_BASE`, eduralph/pdca-harness#273, closed
   2026-07-12; `engine/scripts/run-verify.sh` resolves it), so the base a stacked PR sits on is
@@ -2246,16 +2250,19 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - Docs: `docs/INTEGRATION.md` §2 "Wave sequencing" and §10 "Ready-mark gate" updated (the
   driver merges nothing again; every PR waits for the human), and the #273 note corrected
   (closed upstream, honoured by `run-verify.sh`).
-- Operating rule, not config: **merge a run's stacked PRs, bottom-up, before the next
-  multi-wave run folds again**, so no stacked PR is open across a fold.
+- Operating rule, not config: **merge a run's PRs bottom-up, with merge commits** (not
+  squash). A later PR shows its predecessors' changes until they merge, then only its own.
+- Prerequisite: getwyrd/wyrd-pdca#265 and #266 merge BEFORE this switch.
 
 ## How effectiveness will be judged
 
 - **A red finding no longer strands a batch.** The next multi-wave run in which a wave's PR
   checks raise a finding still builds every later wave and opens its PR (read the run's
   stderr: no "wave k did not merge; STOPPING").
-- **Stale stacked PRs stay rare.** Over the next three multi-wave runs, count stacked PRs that
-  turned `dco` red or CONFLICTING after a later fold. Any at all means the mitigation is not
-  holding in practice, and the fold fix (#463, or a local delta) moves up.
+- **No stacked PR goes stale.** Over the next three multi-wave runs, no wave PR turns `dco`
+  red, CONFLICTING or empty after a later fold, and every PR's base is `main`. One occurrence
+  means #266's append-only fold has a hole.
+- **Everything lands.** After a run's PRs are merged bottom-up, every accepted bundle's change
+  is on `main` (not stranded on an integration branch).
 - **Verification follows the stack.** For the next wave>0 bundle, `gate-logs/C4-verify.log`
   names `origin/pdca-integration/main` as the base it reset to.

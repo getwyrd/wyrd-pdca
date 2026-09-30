@@ -67,11 +67,13 @@
 - **Wave sequencing is `wave_mode = "stack"` again since 2026-10-01** (Act entry of that
   date). In merge mode, a finding on a non-final wave's PR checks refused the merge and
   stopped the run at that wave boundary, so one red item stranded every later wave; stack mode
-  keeps building and the finding is handled on its PR at review. The known cost described
-  below — a stacked PR still open at the next fold goes stale — is unchanged (upstream
-  eduralph/pdca-harness#463, open); the mitigation is to merge a run's stacked PRs,
-  bottom-up, before the next multi-wave run folds again. The merge-mode keys stay configured
-  (inert under `"stack"`) so switching back restores them exactly. The history:
+  keeps building and the finding is handled on its PR at review. The stale-stacked-PR cost
+  described below no longer applies: two instance deltas (see "Integration branch per batch"
+  and "Stacked PRs land on the target" under the delta list below; eduralph/pdca-harness#591,
+  #593) give each batch its own append-only integration branch folded from the real PR
+  branches, and every wave PR targets `main`. Merge a run's PRs bottom-up with merge commits.
+  The merge-mode keys stay configured (inert under `"stack"`) so switching back restores them
+  exactly. The history:
 - **Wave sequencing was `wave_mode = "merge"`** (2026-08-02 .. 2026-10-01): for a
   dependent multi-issue batch, the driver `gh pr merge`s each **non-final** wave's PRs into
   the real base (`main`) before the next wave builds; the final wave's PRs stay the human's
@@ -179,12 +181,20 @@
 - **How `C4-verify` resolves the base** (getwyrd/wyrd-pdca#91 is **closed** — the old
   "validates against a hardcoded `origin/main`" caveat no longer applies).
   `engine/scripts/run-verify.sh` (`_resolve_base_ref`) takes the first of:
-  1. **`$WYRD_VERIFY_BASE`** — explicit override, used **verbatim**, so pass the full ref
-     (`origin/<branch>`);
-  2. the **brief's "Repo + branch target"** base, prefixed `origin/` — parsed exactly as
-     `publish._clean_ref` does, so the gate validates against the SAME base the PR is opened
-     against (a stacked slice therefore validates against its own integration branch);
-  3. **`origin/main`**.
+  1. **`$PDCA_BASE`** — the brief's `Onto branch` (the fix is appended to that PR head);
+  2. **`$PDCA_VERIFY_BASE`** — the wave's folded integration branch, set by the driver for a
+     wave≥1 bundle in stack mode (#273);
+  3. **`$WYRD_VERIFY_BASE`** — explicit operator override, used **verbatim**, so pass the full
+     ref (`origin/<branch>`);
+  4. **`$PDCA_BRIEF_BASE`** — the brief's "Repo + branch target" base, resolved by the driver
+     with the same parser publish uses;
+  5. **`origin/main`**.
+
+  So the override applies to wave-0 and non-wave runs, and **a stacked wave cannot be
+  overridden** — deliberately: a wave≥1 bundle was built on the folded branch, and C4-verify
+  must test the tree the patch was written against (PR #262 review). This matches the
+  upstream skeleton's documented order (`PDCA_BASE > PDCA_VERIFY_BASE > override >
+  PDCA_BRIEF_BASE`).
 
   A named base that does not exist on `origin` warns and falls back to `origin/main`.
   *Remaining gap:* a **wave fold** builds the next wave on a driver-generated
@@ -439,8 +449,9 @@ declared with the rest of the executable ruleset in `pdca.toml` `[gates] checks`
   the real gates (`rust`, `gate`, `dco` — as of 2026-08-02 only `docs-check` /
   `require-issue` / `docs-immutability` are required, which would NOT stop a red auto-merge;
   tighten before the first merge-mode batch).
-  **Live again since 2026-08-16** (see §2): `auto_merge = true`, so the driver readies and
-  merges non-final waves, and the trade above is back in force. The guardrail it depended on is
+  *Historical — applied only under `wave_mode = "merge"`, 2026-08-16 .. 2026-10-01; inert in
+  stack mode, where the driver merges nothing:* `auto_merge = true`, so the driver readied and
+  merged non-final waves, and the trade above was in force. The guardrail it depended on is
   in place and re-verified on 2026-08-16 — `main`'s required contexts are `docs-check`,
   `require-issue`, `docs-immutability`, **`gate`**, **`dco`** — and the driver additionally
   refuses to merge on anything but a settled-green FULL rollup (`merge_requires = "all"` plus
