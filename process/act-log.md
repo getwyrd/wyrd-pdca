@@ -2213,3 +2213,56 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
   no §10 Act-candidate line naming a sign-off or publisher prose fault (a hand-edited
   `commit-msg.txt` / `pr-description.md`, a decision the human had to re-state). The
   sign-off human records such a fault in §10 when it happens; that is the observation.
+
+# Act review — 2026-10-01 — wave sequencing back to stacked PRs (no new frozen cycles; decided by Eduard Ralph in session)
+
+> Out-of-band Act: a configuration decision. No frozen bundle is re-read and no contribution
+> disposition is re-decided.
+
+## What the records exposed
+
+- **Merge mode stops the whole batch on one wave's finding.** Under `wave_mode = "merge"` the
+  driver merges each non-final wave's PRs only on a settled-green full rollup
+  (`merge_requires = "all"`); a finding on those checks refuses the merge, and the run STOPs at
+  that wave boundary with every later wave unbuilt. The current batches are deep chains —
+  #809's split alone is four waves (839/840 → 841 → 842 → 843, with #810 behind 842) — so one
+  red item on wave 0 strands the rest of the chain until a human re-runs it.
+- **Stack mode as shipped could not carry a multi-wave batch here** (PR #262 review, both
+  P1). `integrate.fold` rebuilt `pdca-integration/<base>` from the base and force-pushed it on
+  every fold, so a middle wave's PR — opened against that branch — found its own change in its
+  base after the next fold and went stale inside the same run (the wyrd #675/#676 shape).
+  And `publish` opened wave 1+ PRs against that branch, which nothing merges into `main`, so
+  merging them bottom-up never landed them. Fixed by two instance deltas, landing before this
+  switch: one integration branch per batch (getwyrd/wyrd-pdca#265, eduralph/pdca-harness#591)
+  and an append-only fold over the real PR branches with every wave PR targeting `main`
+  (getwyrd/wyrd-pdca#266, eduralph/pdca-harness#593).
+- **Stack mode's verification gap is closed.** C4-verify now tests a wave>0 bundle against the
+  folded integration branch (`$PDCA_VERIFY_BASE`, eduralph/pdca-harness#273, closed
+  2026-07-12; `engine/scripts/run-verify.sh` resolves it), so the base a stacked PR sits on is
+  the base it was verified against.
+
+## Process deltas
+
+- Gates / driver: **`wave_mode = "stack"`** (was `"merge"` since 2026-08-02). The merge-mode
+  keys (`merge_method`, `auto_merge`, `merge_wait_secs`, `merge_requires`, `merge_sync_base`)
+  are inert under stack and kept as set, so switching back restores them exactly.
+  (`pdca.toml` `[driver].wave_mode`)
+- Docs: `docs/INTEGRATION.md` §2 "Wave sequencing" and §10 "Ready-mark gate" updated (the
+  driver merges nothing again; every PR waits for the human), and the #273 note corrected
+  (closed upstream, honoured by `run-verify.sh`).
+- Operating rule, not config: **merge a run's PRs bottom-up, with merge commits** (not
+  squash). A later PR shows its predecessors' changes until they merge, then only its own.
+- Prerequisite: getwyrd/wyrd-pdca#265 and #266 merge BEFORE this switch.
+
+## How effectiveness will be judged
+
+- **A red finding no longer strands a batch.** The next multi-wave run in which a wave's PR
+  checks raise a finding still builds every later wave and opens its PR (read the run's
+  stderr: no "wave k did not merge; STOPPING").
+- **No stacked PR goes stale.** Over the next three multi-wave runs, no wave PR turns `dco`
+  red, CONFLICTING or empty after a later fold, and every PR's base is `main`. One occurrence
+  means #266's append-only fold has a hole.
+- **Everything lands.** After a run's PRs are merged bottom-up, every accepted bundle's change
+  is on `main` (not stranded on an integration branch).
+- **Verification follows the stack.** For the next wave>0 bundle, `gate-logs/C4-verify.log`
+  names its batch's own `origin/pdca-integration/r-<key>/main` as the base it reset to.
