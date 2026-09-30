@@ -12,17 +12,28 @@ reviewable PR stack the human merges bottom-up — generalising the single-chain
 ``Stacks on`` (#123) to whole waves, and fixing its multi-parent gap (the branch carries
 *all* prerequisites, not just ``parents[0]``).
 
-Idempotent + resumable: :func:`fold` rebuilds the branch from the target base every call,
-applying the **cumulative** accepted patches (waves 0..k) in order — so a re-run
-reproduces the same branch, and a patch that no longer applies (an undeclared cross-wave
-overlap) is a loud :class:`IntegrationError` that stops the run before the next wave
-builds on a broken base. Mechanics are deterministic ``git`` subprocesses (no model).
+INSTANCE DELTA (eduralph/pdca-harness#593) — how the fold builds the branch. Upstream
+rebuilt it from the base on every fold, re-applying each accepted ``patch.diff`` as a new
+``pdca-integrate:*`` commit, and force-pushed it. That rewrote the base of every stacked PR
+still open — including the wave the run had JUST published, whose own patch then appeared in
+its base — so middle-wave PRs went empty, conflicting or DCO-red within the same run. Here
+the fold is APPEND-ONLY and merges the REAL published PR branches: it continues from the
+branch's current tip (or starts at the target base the first time), ``git merge --no-ff
+--signoff``s each accepted bundle's published branch that is not already in it, and pushes
+without force. Nothing an open PR is based on is ever rewritten, and every commit a stacked
+branch inherits is the predecessor's own (same SHA), so once a predecessor merges into the
+target base the dependent PR's diff shrinks to its own change. Idempotent + resumable: a
+bundle whose branch is already an ancestor of the tip is skipped, so re-running a batch
+re-folds nothing; a branch that no longer merges (an undeclared cross-wave overlap) is a loud
+:class:`IntegrationError` that stops the run before the next wave builds on a broken base.
+Mechanics are deterministic ``git`` subprocesses (no model).
 """
 
 from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 from pathlib import Path
 
 from . import publish
@@ -174,6 +185,11 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
     git plan and returns the branches with ``None`` worktrees — no worktree, no push — so the
     next wave falls back to the target base, which is what an offline rehearse wants.
 
+    Each bundle is folded by merging its PUBLISHED branch (``publish.json``'s ``branch``,
+    fetched from origin) — append-only, never a rebuild (see the module docstring, #593).
+    A bundle with a patch but no published branch cannot be stacked on and raises
+    :class:`IntegrationError`.
+
     ``locks`` (#297 review round 10): when the caller passes an ``ExitStack``, each
     target's :func:`integ_lock` is entered on IT and stays held after fold returns —
     covering the caller's re-gate window, so no gap exists in which another flow's
@@ -212,11 +228,16 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
         if dry_run:
             print(f"integrate --dry-run — fold {len(bundles)} patch(es) onto {branch} "
                   f"(off {base_remote}/{base} on {repo_spec}):")
-            print(f"  git worktree → {_integ_worktree(repo, base)} @ {base_remote}/{base}; "
-                  f"checkout -B {branch}")
+            print(f"  git worktree → {_integ_worktree(repo, base)}; continue origin/{branch} "
+                  f"if it exists, else start at {base_remote}/{base}")
             for d in bundles:
-                print(f"  git apply {(d / 'patch.diff')}  &&  git commit   ({d.name})")
-            print(f"  git push --force origin {branch}")
+                rec = publish._publish_record(d) or {}
+                remote = rec.get("remote") or "origin"
+                head = rec.get("branch") or "<unpublished>"
+                pin = rec.get("head_sha") or f"{remote}/{head}"
+                print(f"  git merge --no-ff --signoff {pin}   ({d.name} from {remote}/{head}; "
+                      f"skipped if already in {branch})")
+            print(f"  git push origin {branch}   (fast-forward, never forced)")
             result[(repo_spec, base)] = (branch, None)
             continue
 
@@ -236,28 +257,117 @@ def fold(cfg: Config, accepted: list[Path], *, dry_run: bool = False,
                     f"{_integ_worktree(repo, base).name} — fix the checkout's parent "
                     f"directory (permissions?), then re-run")
             wt = _prepare_worktree(repo, base_remote, base)
-            if _git(wt, "checkout", "-B", branch, f"{base_remote}/{base}") != 0:
-                raise IntegrationError(f"could not start {branch} off {base_remote}/{base}")
+            # APPEND-ONLY (#593): continue the branch as it stands on origin, so no commit an
+            # open stacked PR is based on is ever rewritten; start at the target base only
+            # the first time this batch folds.
+            start = (f"origin/{branch}"
+                     if _git(wt, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}") == 0
+                     else f"{base_remote}/{base}")
+            if _git(wt, "checkout", "-B", branch, start) != 0:
+                raise IntegrationError(f"could not start {branch} off {start}")
             for d in bundles:
-                patch = (d / "patch.diff").resolve()
-                if _git(wt, "apply", str(patch)) != 0:
-                    raise IntegrationError(
-                        f"{d.name}'s patch does not apply onto {branch} — an undeclared "
-                        f"cross-wave overlap; declare the conflict / re-order, then re-run")
-                _git(wt, "add", "--all")
-                # `-s` adds the Signed-off-by trailer (DCO) — same as publish (#81): the
-                # branch is rebuilt each fold, so a stacked PR cut from an EARLIER fold
-                # carries these commits outside the base's ancestry, where a DCO-gated
-                # host inspects them (#405).
-                if _git(wt, "commit", "-s", "-m", f"pdca-integrate: {d.name}") != 0:
-                    raise IntegrationError(f"could not commit {d.name} onto {branch}")
-            # A harness-owned, rebuilt-each-run branch: a plain force is correct (every fold
-            # rewrites it off the base), and it isn't a human PR branch needing lease safety.
-            if _git(wt, "push", "--force", "origin", branch) != 0:
+                _fold_one(wt, d, branch)
+            # Never forced: the branch only grows. A rejected push means someone else moved
+            # it; stop rather than overwrite what an open PR may be based on.
+            if _git(wt, "push", "origin", branch) != 0:
                 raise IntegrationError(
-                    f"could not push {branch} to origin — the next wave cannot stack on it")
+                    f"could not push {branch} to origin (not a fast-forward? another run "
+                    f"moved it) — the next wave cannot stack on it")
         result[(repo_spec, base)] = (branch, wt)
     return result
+
+
+def _published(d: Path) -> tuple[str, str, str]:
+    """``(remote, branch, head_sha)`` that ``publish`` recorded for bundle ``d``.
+
+    Raises :class:`IntegrationError` unless the record names a branch AND a PR: publish
+    writes publish.json with an empty ``pr_url`` when the push worked but ``gh pr create``
+    failed, and a predecessor with no PR cannot be merged bottom-up, so nothing may stack on
+    it. ``remote`` is where the branch was pushed (an ``Onto branch`` may name a remote other
+    than origin); ``head_sha`` is the exact commit pushed, or ``""`` on a record written
+    before it was kept."""
+    rec = publish._publish_record(d) or {}
+    branch = str(rec.get("branch") or "").strip()
+    if not branch:
+        raise IntegrationError(
+            f"{d.name} has a patch but no published branch (publish.json) — the stack folds "
+            f"the real PR branches, so it cannot be stacked on; publish it, then re-run")
+    if not str(rec.get("pr_url") or "").strip():
+        raise IntegrationError(
+            f"{d.name}'s branch {branch} was pushed but has no PR (publish.json pr_url is "
+            f"empty) — nothing may stack on a predecessor that cannot be merged; open its "
+            f"PR (re-run publish), then re-run")
+    return (str(rec.get("remote") or "origin").strip(), branch,
+            str(rec.get("head_sha") or "").strip())
+
+
+def _fold_one(wt: Path, d: Path, branch: str) -> None:
+    """Merge bundle ``d``'s published commit onto the checked-out integration ``branch``.
+
+    Merges the EXACT commit publish pushed (``head_sha``), never whatever the PR branch
+    points at now: a branch moved since publish (a bot, another actor) would carry
+    unreviewed commits into every later wave, so that is a STOP. A bundle whose commit is
+    already on the branch is skipped (a re-run, or a resumed flow whose predecessor has
+    since merged and had its branch deleted). A bundle re-published after an earlier fold
+    (``signoff --iterate-do`` rebuilds it off the base, so the new commit is not a
+    descendant of the old) has its earlier fold REVERTED first, then the new commit merged:
+    the branch still only grows (#593)."""
+    remote, head, sha = _published(d)
+    if sha and _git(wt, "merge-base", "--is-ancestor", sha, "HEAD") == 0:
+        return
+    if _git(wt, "fetch", remote, head) != 0:
+        raise IntegrationError(
+            f"could not fetch {d.name}'s branch {head} from {remote} — refusing to fold a "
+            f"possibly stale copy of it")
+    ref = f"refs/remotes/{remote}/{head}"
+    tip = _rev(wt, ref)
+    if not tip:
+        raise IntegrationError(f"{d.name}'s published branch {head} is not on {remote} — "
+                               f"cannot fold it")
+    if not sha:
+        print(f"integrate: {d.name}'s publish.json predates head_sha — folding the current "
+              f"tip of {remote}/{head} ({tip[:12]})", file=sys.stderr)
+        sha = tip
+    elif tip != sha:
+        raise IntegrationError(
+            f"{remote}/{head} is at {tip[:12]}, not the {sha[:12]} publish pushed for "
+            f"{d.name} — the branch moved since Check; re-publish it (or reset the branch), "
+            f"then re-run")
+    if _git(wt, "merge-base", "--is-ancestor", sha, "HEAD") == 0:
+        return
+    earlier = _last_fold(wt, d.name)
+    if earlier:
+        # `--signoff` on the revert and the merge (DCO): the host's `dco` check reads EVERY
+        # commit a PR carries, merge and revert commits included, and a stacked PR inherits
+        # them.
+        if _git(wt, "revert", "--no-edit", "--signoff", "-m", "1", earlier) != 0:
+            _git(wt, "revert", "--abort")
+            raise IntegrationError(
+                f"{d.name} was re-published, and its earlier fold ({earlier[:12]}) no longer "
+                f"reverts cleanly off {branch} — a later wave built on it; rebuild that wave "
+                f"against the revised predecessor, then re-run")
+    if _git(wt, "merge", "--no-ff", "--signoff", "-m",
+            f"pdca-integrate: {d.name} ({head} @ {sha[:12]})", sha) != 0:
+        _git(wt, "merge", "--abort")
+        raise IntegrationError(
+            f"{d.name}'s branch {head} does not merge onto {branch} — an undeclared "
+            f"cross-wave overlap; declare the conflict / re-order, then re-run")
+
+
+def _last_fold(wt: Path, name: str) -> str:
+    """The newest ``pdca-integrate: <name> (`` merge on the checked-out branch, or ``""``.
+    The `` (`` after the name keeps ``issue_1`` from matching ``issue_12``."""
+    r = subprocess.run(["git", "-C", str(wt), "log", "--first-parent", "--merges", "-n", "1",
+                        "--fixed-strings", f"--grep=pdca-integrate: {name} (", "--format=%H",
+                        "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _rev(wt: Path, ref: str) -> str:
+    """The commit ``ref`` names in ``wt``, or ``""``."""
+    r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _prepare_worktree(repo: Path, base_remote: str, base: str) -> Path:

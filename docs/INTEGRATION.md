@@ -140,6 +140,28 @@
     and the `fold` call in `flow.py`; it goes away when #591 lands. Cost: one integration
     branch per batch accumulates on `origin` — delete a batch's branch once its stacked PRs
     are merged.
+  - **Stacked PRs land on the target, and a fold never rewrites them** (2026-10-01; upstream
+    eduralph/pdca-harness#593). Upstream stack mode rebuilt the integration branch from the
+    base on every fold (re-applied patches, force-push), so a middle wave's PR went empty or
+    conflicting inside the same run, and it opened wave 1+ PRs against the integration branch,
+    so merging them bottom-up never reached `main`. Here the fold is **append-only over the
+    real PR branches** — it continues the branch from its tip and `git merge --no-ff
+    --signoff`s each accepted bundle's published branch not already in it, and pushes without
+    force — and **every wave PR targets `main`** (`publish._pr_base`). A wave≥1 bundle is still
+    built and verified on the integration branch; its PR shows its predecessors' changes too
+    until they merge, then (same SHAs) only its own. Merge a run's PRs bottom-up with merge
+    commits (not squash). A hand-declared `Stacks on:` parent keeps its PR-branch base (#123).
+    The fold merges the **exact commit publish pushed** (`publish.json` `head_sha`, fetched
+    from the `remote` it was pushed to) and stops if the branch has moved since, if the fetch
+    fails, or if the bundle has no PR (`pr_url` empty). A bundle re-published after it was
+    folded (`signoff --iterate-do`) has its earlier fold reverted, then the new commit merged —
+    still append-only. **A wave with two or more independent predecessors:** once they have
+    all merged, `main` and the dependent share no single common ancestor, so its PR diff can
+    still show a predecessor's change. Merge `main` into the dependent's branch
+    (`git merge --signoff origin/main`, then push; not GitHub's "Update branch" button, which
+    doesn't sign off for `dco`) and the diff drops to its own change (automating it: #267).
+    **Instance delta** in `src/pdca_harness/integrate.py` (`fold`) and `publish.py`
+    (`_pr_base`); it goes away when #593 lands.
   - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
     vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
     whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker

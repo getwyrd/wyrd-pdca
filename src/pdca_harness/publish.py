@@ -245,18 +245,18 @@ def publish(
     # `gh --base` gets — and it MUST be a branch in the upstream (`--repo`) repo.
     checkout_base = f"origin/{stack_branch}" if stack_branch else f"{base_remote}/{base}"
     # Own-repo (base on origin): the integration/parent branch IS an upstream branch, so
-    # `--base` it for a clean, increment-only stacked PR. Fork (base on a separate upstream a
-    # fork contributor can't push to): that branch lives on origin (the fork) and can't be a
-    # `--base`, so the PR opens against the upstream base and carries the CUMULATIVE stacked
-    # diff (predecessors + this fix). It still merges cleanly bottom-up — once a prerequisite
-    # is merged, its identical content re-merges as a no-op — but the displayed diff does NOT
-    # auto-reduce on merge: the fold's `pdca-integrate:*` commits aren't ancestors of the
-    # prereq's PR-merge, so the PR merge-base doesn't advance; the diff clears only when the
-    # dependent is rebuilt off the merged base (a later `pdca flow` run). That visible overlap
-    # is the cost of fork wave-stacking (#185). The dependent's branch is cut off the parent
-    # branch either way.
+    # `--base` it for a clean, increment-only stacked PR — but ONLY for a hand-declared
+    # `Stacks on:` parent (#123), a real PR branch GitHub retargets when the parent merges.
+    # A WAVE stack (the driver's integration branch) is never a PR base (INSTANCE DELTA,
+    # eduralph/pdca-harness#593): nothing merges that branch into the target, so a PR merged
+    # into it never lands. The PR opens against the target base and carries the CUMULATIVE
+    # diff (predecessors + this fix) until its predecessors merge; because the fold merges
+    # the predecessors' REAL branches (same SHAs), the diff shrinks to this fix as soon as
+    # they do. Fork (base on a separate upstream a fork contributor can't push to): always the
+    # upstream base (#185). The dependent's branch is cut off the parent / integration branch
+    # either way.
     own_repo = base_remote == "origin"
-    pr_base = stack_branch if (stack_branch and own_repo) else base
+    pr_base = _pr_base(d, base, stack_branch, own_repo)
     # Merge-mode base guard (#411) — fail-closed, BEFORE any branch/push/PR work. Under
     # `[driver].wave_mode = "merge"` the driver merges each accepted bundle's PR "into its
     # base" (merge.py:32-33), unattended, mid-flow — whatever base that PR happens to carry.
@@ -381,7 +381,8 @@ def publish(
 
     record = {
         "mode": "stacked-pr" if stack_branch else "new-pr",
-        "branch": branch, "pr_url": pr_url, "base": pr_base, "repo": repo_spec,
+        "branch": branch, "remote": "origin", "head_sha": _local_head(repo, branch),
+        "pr_url": pr_url, "base": pr_base, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
@@ -510,7 +511,8 @@ def _publish_stacked(
 
     rec = {
         "mode": "stacked",
-        "branch": branch, "pr_url": pr_url, "base": base_ref, "repo": repo_spec,
+        "branch": branch, "remote": remote, "head_sha": _local_head(repo, branch),
+        "pr_url": pr_url, "base": base_ref, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
@@ -528,6 +530,15 @@ def _publish_stacked(
     # this path's publish.json write, best-effort, no-op under mode "off".
     record_mod.after_publish(cfg)
     return 0
+
+
+def _local_head(repo: Path, branch: str) -> str:
+    """The commit local ``branch`` points at — right after a publish, the exact commit just
+    pushed. Recorded as ``head_sha`` so the stack fold merges THAT commit, not whatever the
+    PR branch holds later (INSTANCE DELTA, eduralph/pdca-harness#593). ``""`` if unreadable."""
+    r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q",
+                        f"refs/heads/{branch}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _existing_pr(pr_list_cmd: list[str], branch: str, owner: str) -> str:
@@ -605,6 +616,18 @@ def _publish_record(d: Path) -> dict | None:
         return json.loads(pj.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
+
+
+def _pr_base(d: Path, base: str, stack_branch: str | None, own_repo: bool) -> str:
+    """The ``gh pr create --base`` for bundle ``d`` (INSTANCE DELTA, eduralph/pdca-harness#593).
+
+    A hand-declared ``Stacks on:`` parent in an own-repo target is the PR base (#123) — a
+    real PR branch that GitHub retargets when the parent merges. A WAVE stack (the bundle's
+    ``stack-base`` marker, the driver's integration branch) is never one: the PR targets the
+    real base so merging it bottom-up lands it. Everything else: the target base."""
+    if stack_branch and own_repo and not _read_stack_base(d):
+        return stack_branch
+    return base
 
 
 def write_stack_base(d: Path, branch: str) -> None:
