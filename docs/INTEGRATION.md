@@ -172,6 +172,14 @@
     doesn't sign off for `dco`) and the diff drops to its own change (automating it: #267).
     **Instance delta** in `src/pdca_harness/integrate.py` (`fold`) and `publish.py`
     (`_pr_base`); it goes away when #593 lands.
+  - **`flow` restores a pre-#481 split parent's missing brief** (2026-10-01; upstream
+    eduralph/pdca-harness#597). A split accepted before #481 left its parent with a `split`
+    close marker and no `brief.md` (an iterate-to-Plan had archived it). The marker reads as
+    past Do, so `flow` drove the parent and crashed on the first brief read, killing the whole
+    run (issue_654). At intake, `flow` now writes the brief `split --accept` writes since
+    #481, from the same archive (`split.restore_parent_brief`), or skips the bundle with the
+    reason. **Instance delta** in `src/pdca_harness/flow.py` (`flow_ids`) and `split.py`; it
+    goes away when #597 lands.
   - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
     vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
     whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker
