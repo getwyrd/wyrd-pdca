@@ -129,8 +129,8 @@
     refuse every wave member after the first and stop the batch, since upstream has no
     `update-branch` path at all.
   - **Integration branch per batch** (2026-10-01; upstream eduralph/pdca-harness#591). In
-    stack mode the fold branch is `pdca-integration/<base>-r<key>`, where `<key>` is a short
-    hash of the batch's named ids (`integrate.run_key_for`), not the shared
+    stack mode the fold branch is `pdca-integration/r-<key>/<base>`, where `<key>` is 128 bits
+    of a hash of the batch's named ids (`integrate.run_key_for`), not the shared
     `pdca-integration/<base>`. Two concurrent stack-mode runs on one base (parallel tracks)
     therefore fold onto their own branches; before this, each fold force-pushed its own run's
     patches over the other's, so the next wave, its C4-verify base and its stacked PRs could

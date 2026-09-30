@@ -79,10 +79,22 @@ class FoldDryAndUnit(unittest.TestCase):
         self.assertEqual(integrate.run_key_for([]), "")
         self.assertEqual(integrate.integration_branch(self.cfg, "main", ""),
                          "pdca-integration/main")          # empty key = upstream name
-        # `-r` never occurs in a flattened base, so a keyed name cannot equal another base's.
+        # The key is its own ref component, so the base component keeps its length, and
+        # `r-<key>` can never equal a flattened base (its `-` would be escaped).
         keyed = integrate.integration_branch(self.cfg, "main", "abc")
-        self.assertEqual(keyed, "pdca-integration/main-rabc")
-        self.assertNotEqual(keyed, integrate.integration_branch(self.cfg, "main-rabc"))
+        self.assertEqual(keyed, "pdca-integration/r-abc/main")
+        self.assertNotEqual(integrate.integration_branch(self.cfg, "r-abc"),
+                            "pdca-integration/r-abc")
+        long_base = "b" * 245   # valid under the upstream name; must stay valid keyed
+        self.assertEqual(integrate.integration_branch(self.cfg, long_base, "abc").split("/")[-1],
+                         long_base)
+
+    def test_run_key_does_not_collide_on_the_reviewed_pair(self) -> None:
+        # PR #265 review: 32-bit keys collided on these two ordinary id sets.
+        a = integrate.run_key_for(["issue_1000181", "issue_181"])
+        b = integrate.run_key_for(["issue_1025538", "issue_25538"])
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(a), 32)
 
     def test_nothing_to_fold(self) -> None:
         self.assertEqual(integrate.fold(self.cfg, []), {})
@@ -206,7 +218,7 @@ class FoldGit(unittest.TestCase):
         self.assertNotEqual(key_a, key_b)
         branch_a, _ = integrate.fold(self.cfg, [a], run_key=key_a)[("org/repo", "main")]
         branch_b, wt = integrate.fold(self.cfg, [b], run_key=key_b)[("org/repo", "main")]
-        self.assertEqual(branch_a, f"pdca-integration/main-r{key_a}")
+        self.assertEqual(branch_a, f"pdca-integration/r-{key_a}/main")
         self.assertNotEqual(branch_a, branch_b)
         self.assertTrue(self._pushed(branch_a) and self._pushed(branch_b))
         # B's fold left A's branch as A built it: A's change, not B's file.

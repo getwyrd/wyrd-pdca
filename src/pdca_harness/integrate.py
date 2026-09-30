@@ -43,11 +43,15 @@ def integration_branch(cfg: Config, base: str, run_key: str = "") -> str:
     ``release-h2.0``) never collide onto one branch and force-push over each other's fold."""
     # INSTANCE DELTA (eduralph/pdca-harness#591): ``run_key`` scopes the branch to one
     # batch, so two concurrent stack-mode runs on one base (parallel tracks) never fold onto
-    # — and force-push over — the same branch. ``-r`` cannot occur in `_flatten_base`'s output
-    # (every ``-`` it emits is ``-h`` or ``-s``), so the name stays injective. Empty keeps the
-    # upstream name exactly.
-    suffix = f"-r{run_key}" if run_key else ""
-    return "pdca-integration/" + _flatten_base(base) + suffix
+    # — and force-push over — the same branch. The key is its OWN ref component,
+    # ``pdca-integration/r-<key>/<flattened base>`` (PR #265 review): appended to the base it
+    # could push a long base's component past the 255-byte filesystem limit git needs room
+    # under (the ``.lock`` suffix). ``r-<key>`` can never equal a flattened base (every ``-``
+    # `_flatten_base` emits is ``-h`` or ``-s``), so the names stay injective and no ref is
+    # both a file and a directory. Empty keeps the upstream name exactly.
+    if run_key:
+        return f"pdca-integration/r-{run_key}/" + _flatten_base(base)
+    return "pdca-integration/" + _flatten_base(base)
 
 
 def run_key_for(names) -> str:
@@ -55,12 +59,14 @@ def run_key_for(names) -> str:
 
     Deterministic on purpose — the module's contract is that a re-run or resumed batch
     rebuilds the SAME branch — while two different batches (two tracks) get different
-    branches. Order-insensitive; an empty set yields ``""`` (the upstream name)."""
+    branches. 128 bits of SHA-256 (PR #265 review: 32 bits collided on ordinary id sets), so
+    distinct batches cannot feasibly alias. Order-insensitive; an empty set yields ``""``
+    (the upstream name)."""
     import hashlib
     names = sorted(set(names))
     if not names:
         return ""
-    return hashlib.sha1(",".join(names).encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:32]
 
 
 def _flatten_base(base: str) -> str:
