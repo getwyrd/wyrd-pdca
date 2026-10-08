@@ -1,0 +1,1991 @@
+diff --git a/crates/validate/src/s3.rs b/crates/validate/src/s3.rs
+index 16b2f83..2a87203 100644
+--- a/crates/validate/src/s3.rs
++++ b/crates/validate/src/s3.rs
+@@ -4,7 +4,7 @@
+ //! SigV4 credentials, a plain-HTTP connector (TLS is terminated in front of the gateway,
+ //! proposal 0017 §10), and retries and stalled-stream protection **off**, so every request
+ //! the validator reports on is exactly one request on the wire. On top of the SDK it adds
+-//! three things:
++//! four things:
+ //!
+ //! * a typed error, [`S3Error`], whose every fact is the server's or the client's own
+ //!   measurement — in particular the request id is read from the `x-amz-request-id` header
+@@ -13,23 +13,35 @@
+ //! * bounded waits ([`Deadlines`]): connect, operation, and body-idle, each expiring as a
+ //!   typed timeout naming its phase;
+ //! * bodies that stream both ways ([`PutSource`], [`ObjectBody`]), so what the client holds
+-//!   of an object is bounded independently of the object's size.
++//!   of an object is bounded independently of the object's size;
++//! * PUTs that end with their call ([`S3Client::put_object`]): a receipt only when the source
++//!   had ended before the answer, and neither the source nor the connection left behind when
++//!   the call returns.
+ 
+ mod body;
+ mod error;
+ 
++use std::future::Future;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use aws_sdk_s3::config::http::HttpResponse;
++use aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef;
+ use aws_sdk_s3::config::retry::RetryConfig;
+ use aws_sdk_s3::config::timeout::TimeoutConfig;
+-use aws_sdk_s3::config::{Credentials as SdkCredentials, Region, StalledStreamProtectionConfig};
+-use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
++use aws_sdk_s3::config::{
++    ConfigBag, Credentials as SdkCredentials, Intercept, Region, RuntimeComponents,
++    StalledStreamProtectionConfig,
++};
++use aws_sdk_s3::error::{BoxError, DisplayErrorContext, ProvideErrorMetadata, SdkError};
+ use aws_sdk_s3::primitives::ByteStream;
++use futures_util::future::{self, Either};
+ 
+ pub use body::{ObjectBody, PutSource};
+ pub use error::{BodyError, ErrorCode, Phase, S3Error};
+ 
++use body::Upload;
++
+ use crate::ResolvedConfig;
+ 
+ /// The response header the request id is read from. The name is AWS's; the Wyrd gateway
+@@ -38,8 +50,11 @@ const REQUEST_ID_HEADER: &str = "x-amz-request-id";
+ 
+ /// The bound on every wait for the endpoint. All three run on tokio's runtime clock: the
+ /// SDK's connect and operation timeouts sleep on its default tokio sleep, and the body-idle
+-/// deadline is a `tokio::time::timeout`. The SDK also reads the wall clock, to date SigV4
+-/// signatures; that stamp belongs to the server's freshness check, not to any deadline here.
++/// deadline is a `tokio::time::timeout`. A PUT's two deadlines sleep on the timer of the
++/// PUT's own runtime ([`S3Client::put_object`]), which reads the same monotonic clock, so
++/// every deadline of one request still has one source. The SDK also reads the wall clock,
++/// to date SigV4 signatures; that stamp belongs to the server's freshness check, not to any
++/// deadline here.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Deadlines {
+     /// Establishing a TCP connection.
+@@ -74,6 +89,9 @@ pub struct PutOutcome {
+ #[derive(Debug, Clone)]
+ pub struct S3Client {
+     sdk: aws_sdk_s3::Client,
++    /// The same configuration without an idle-connection pool, for PUTs: a PUT's connection
++    /// is closed when the PUT returns ([`S3Client::put_object`]), so none is kept for reuse.
++    uploads: aws_sdk_s3::Client,
+     bucket: String,
+     deadlines: Deadlines,
+ }
+@@ -108,14 +126,24 @@ impl S3Client {
+             .region(Region::new(config.args.region.clone()))
+             .endpoint_url(config.args.endpoint.as_str())
+             .credentials_provider(credentials)
+-            .http_client(aws_smithy_http_client::Builder::new().build_http())
+             .force_path_style(true)
+             .retry_config(RetryConfig::disabled())
+             .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+-            .timeout_config(timeouts)
++            .timeout_config(timeouts);
++        let sdk = sdk_config
++            .clone()
++            .http_client(aws_smithy_http_client::Builder::new().build_http())
++            .build();
++        let uploads = sdk_config
++            .http_client(
++                aws_smithy_http_client::Builder::new()
++                    .pool_max_idle_per_host(0)
++                    .build_http(),
++            )
+             .build();
+         Self {
+-            sdk: aws_sdk_s3::Client::from_conf(sdk_config),
++            sdk: aws_sdk_s3::Client::from_conf(sdk),
++            uploads: aws_sdk_s3::Client::from_conf(uploads),
+             bucket: config.args.bucket.clone(),
+             deadlines,
+         }
+@@ -123,6 +151,61 @@ impl S3Client {
+ 
+     /// PUT `key` from `source`, streaming it: the source is pulled only as fast as the
+     /// connection drains.
++    ///
++    /// **A receipt.** The PUT is a receipt only if the source had **ended** when the response
++    /// head arrived: it had given its whole declared length and then reported its end. For
++    /// the client the response arrives at the moment hyper reads it off the socket and hands
++    /// it over. A success that arrives sooner is [`BodyError::AcknowledgedEarly`], carrying
++    /// the answer's request id. Having given the whole declared length is not enough: until
++    /// the source reports its end, the SDK has not written the body's final chunk and
++    /// checksum trailer and may still be holding the last bytes back, and the source may
++    /// still run past its declared length. From the moment hyper hands the response over the
++    /// source is not polled again, so whatever it would have done after that moment (reported
++    /// its end, given another piece, failed, run past its declared length) counts for nothing.
++    /// A source that runs past its declared length before the response arrives is still
++    /// [`BodyError::SourceLength`].
++    ///
++    /// **The limit.** The client sees two things: what it handed to the HTTP stack, and the
++    /// moment hyper reads the answer off the socket. It cannot see whether the server read
++    /// the bytes it was handed: when the source ended first, a success is a receipt even if
++    /// some of those bytes were still in the client's or the kernel's buffers as the server
++    /// answered, or the server read them and threw them away. And it cannot see an answer
++    /// that has reached its own kernel's receive buffer but that hyper has not read yet: a
++    /// source that ends inside that window turns an answer the server sent early into a
++    /// receipt. Closing the window needs the socket, which the SDK's connector does not
++    /// expose.
++    ///
++    /// Nothing detects a false receipt of either kind today: no scenario drives this client
++    /// yet. Once scenarios do, the read-back check of proposal 0017's oracle will catch one
++    /// only on a single-writer key that is read back before its next successful overwrite.
++    /// That read hashes to a prior generation, or is a `404`: a fatal `integrity` or `oracle`
++    /// failure. It will not catch every one. On the contention pool a read may return any
++    /// value written to the key, and the key may settle on any of them, so a concurrent PUT
++    /// the server never got can leave another permitted value and no mismatch. A
++    /// single-writer write that is overwritten before anything reads it back leaves no trace
++    /// either.
++    ///
++    /// **Nothing outlives the call.** When this returns, the source has been dropped and the
++    /// connection closed, whatever the server did: answered early, stopped reading, or both.
++    /// If the future is dropped instead, both are released promptly after. The request runs
++    /// on a current-thread runtime of its own, on a thread of its own, and that runtime is
++    /// shut down before the outcome is handed back. Shutting it down drops every task on it,
++    /// hyper's connection task among them, and with that task its socket and the request
++    /// body. Nothing else can release a connection blocked mid-write: it waits only for its
++    /// socket to drain, never polls the body again, and the SDK's connector exposes neither
++    /// the socket nor the task.
++    ///
++    /// **The cost, per PUT.** One thread for its length, and a fresh TCP connection that the
++    /// client closes: no connection is reused across PUTs, and each one leaves a client
++    /// socket in `TIME_WAIT`. That caps sustained PUTs between one client address and one
++    /// gateway address at about the number of ephemeral ports divided by the `TIME_WAIT`
++    /// time: about 470 a second with Linux's defaults (28,232 ports, 60 s). Past that,
++    /// `connect` fails and the PUT is [`S3Error::NoResponse`], which proposal 0017's taxonomy
++    /// would count against the server as `availability`. The cap is a default of the host,
++    /// not a hard ceiling. It holds per pair of client address and gateway address, shared by
++    /// every worker on that client, and an operator raises it with more client or gateway
++    /// addresses, a wider `net.ipv4.ip_local_port_range`, or `net.ipv4.tcp_tw_reuse = 1`
++    /// (Linux's default, `2`, reuses ports on loopback only).
+     pub async fn put_object(&self, key: &str, source: PutSource) -> Result<PutOutcome, S3Error> {
+         let length = i64::try_from(source.length()).map_err(|_| S3Error::RequestNotBuilt {
+             detail: format!(
+@@ -130,23 +213,29 @@ impl S3Client {
+                 source.length()
+             ),
+         })?;
+-        let (body, source_failure) = source.into_body();
+-        let sent = self
+-            .sdk
++        let (body, upload) = source.into_body();
++        let request = self
++            .uploads
+             .put_object()
+             .bucket(&self.bucket)
+             .key(key)
+             .content_length(length)
+             .body(ByteStream::from_body_1_x(body))
+-            .send()
+-            .await;
++            .customize()
++            .interceptor(ResponseArrival(Arc::clone(&upload)))
++            .send();
++        let sent = on_own_runtime(upload.request_first(request)).await?;
++        // The source has been dropped and the connection closed by here.
++        if sent.is_ok() {
++            if let Some(early) = upload.acknowledged_early() {
++                return Err(S3Error::Body(early));
++            }
++        }
+         // A failure of the caller's source outranks however the SDK and hyper reported the
+         // aborted request: it is the cause, and the server never saw a complete body.
+-        if let Some(failure) = source_failure.get() {
++        if let Some(failure) = upload.failure() {
+             return Err(S3Error::Body(failure.clone()));
+         }
+-        // deferred: #854 — a peer that answers before it has read the whole body (or stops
+-        // reading) is not detected here; an early success is reported as success.
+         match sent {
+             Ok(output) => Ok(PutOutcome {
+                 etag: output.e_tag().map(str::to_owned),
+@@ -262,3 +351,93 @@ impl S3Client {
+ fn request_id(raw: &HttpResponse) -> Option<String> {
+     raw.headers().get(REQUEST_ID_HEADER).map(str::to_owned)
+ }
++
++/// Run `request` on a current-thread runtime of its own, on a thread of its own, and shut
++/// that runtime down before handing back the outcome. hyper spawns each connection's task
++/// onto the runtime it is called from (the SDK's connector hands it tokio's executor), so the
++/// task lands on this runtime, and shutting it down drops the task, its socket and whatever
++/// request body it holds, on this thread, before the outcome is sent.
++///
++/// If this future is dropped first, the thread sees its abandon signal close, stops polling
++/// `request` and shuts the runtime down all the same.
++///
++/// On every path `request`, and the body it owns, is dropped before the outcome is handed
++/// back: if the runtime cannot be built, the thread drops `request` before it reports that;
++/// if the thread cannot be started, `std` has dropped the thread's closure, `request` with
++/// it, by the time `spawn` returns the error.
++///
++/// The runtime is built on that thread, never here: dropping a runtime that never ran, on
++/// the error path of a thread that failed to start, would happen inside the caller's async
++/// context, where tokio refuses to drop one.
++async fn on_own_runtime<F>(request: F) -> Result<F::Output, S3Error>
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
++    // Never sent on: the receiver resolves when this future, and the sender with it, drops.
++    let (_abandon, abandoned) = tokio::sync::oneshot::channel::<()>();
++    std::thread::Builder::new()
++        .name("wyrd-validate-put".to_owned())
++        .spawn(move || {
++            let runtime = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(runtime) => runtime,
++                Err(e) => {
++                    // Released first: the caller returns as soon as the error arrives.
++                    drop(request);
++                    let _ = outcome_tx.send(Err(format!("cannot start the PUT's runtime: {e}")));
++                    return;
++                }
++            };
++            let outcome = runtime.block_on(async move {
++                match future::select(std::pin::pin!(request), abandoned).await {
++                    Either::Left((outcome, _)) => Some(outcome),
++                    Either::Right(_) => None,
++                }
++            });
++            // Drops every task on the runtime before returning. Blocking work (a DNS lookup
++            // still in `getaddrinfo`) is left to finish on its own rather than waited for.
++            runtime.shutdown_background();
++            if let Some(outcome) = outcome {
++                let _ = outcome_tx.send(Ok(outcome));
++            }
++        })
++        .map_err(|e| S3Error::RequestNotBuilt {
++            detail: format!("cannot start the PUT's thread: {e}"),
++        })?;
++    // The thread sends unless it was abandoned, which needs `_abandon` dropped, or it
++    // panicked, in which case the panic has been reported on that thread already.
++    outcome_rx
++        .await
++        .expect("the PUT's thread panicked before it had an outcome")
++        .map_err(|detail| S3Error::RequestNotBuilt { detail })
++}
++
++/// Records on a PUT's [`Upload`] that its request has seen the response head. The SDK calls
++/// `read_after_transmit` in the same poll in which the connector's future yields the
++/// response, with no await in between, and before it reads the response body
++/// (`aws-smithy-runtime` 1.15.0, `client/orchestrator.rs:504-511`). The body takes nothing
++/// from hyper's handing the response over until this poll ends ([`Upload::request_first`]),
++/// so what is recorded here, whether the source had ended, is how it stood at the response's
++/// arrival.
++#[derive(Debug)]
++struct ResponseArrival(Arc<Upload>);
++
++impl Intercept for ResponseArrival {
++    fn name(&self) -> &'static str {
++        "wyrd-validate PUT response arrival"
++    }
++
++    fn read_after_transmit(
++        &self,
++        context: &BeforeDeserializationInterceptorContextRef<'_>,
++        _runtime_components: &RuntimeComponents,
++        _cfg: &mut ConfigBag,
++    ) -> Result<(), BoxError> {
++        self.0.answered(request_id(context.response()));
++        Ok(())
++    }
++}
+diff --git a/crates/validate/src/s3/body.rs b/crates/validate/src/s3/body.rs
+index 7223aed..ae60898 100644
+--- a/crates/validate/src/s3/body.rs
++++ b/crates/validate/src/s3/body.rs
+@@ -7,16 +7,20 @@
+ //! `collect`, no aggregation, and no growing buffer in either path.
+ 
+ use std::error::Error;
++use std::future::Future;
+ use std::pin::Pin;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, OnceLock};
+-use std::task::{ready, Context, Poll};
++use std::task::{ready, Context, Poll, Wake, Waker};
+ use std::time::Duration;
+ 
+ use aws_sdk_s3::error::{BoxError, DisplayErrorContext};
+ use aws_sdk_s3::primitives::ByteStream;
+ use bytes::Bytes;
+ use futures_util::stream::{Stream, StreamExt};
++use futures_util::task::AtomicWaker;
+ use http_body::Frame;
++use tokio::task::Unconstrained;
+ 
+ use super::error::{BodyError, Phase, S3Error};
+ 
+@@ -52,19 +56,200 @@ impl PutSource {
+         self.length
+     }
+ 
+-    /// The request body handed to the SDK, plus the slot it records its own failure in.
+-    /// The slot is how a source failure reaches the caller as itself, whatever the SDK and
+-    /// hyper wrap it in on the way out.
+-    pub(super) fn into_body(self) -> (DeclaredLengthBody, Arc<OnceLock<BodyError>>) {
+-        let failure = Arc::new(OnceLock::new());
++    /// The request body handed to the SDK, plus the [`Upload`] record it keeps. The record is
++    /// how a source failure reaches the caller as itself, whatever the SDK and hyper wrap it
++    /// in on the way out, and how the caller learns whether the source had ended when the
++    /// response arrived.
++    pub(super) fn into_body(self) -> (DeclaredLengthBody, Arc<Upload>) {
++        let upload = Arc::new(Upload {
++            declared: self.length,
++            produced: AtomicU64::new(0),
++            ended: AtomicBool::new(false),
++            failure: OnceLock::new(),
++            answer: OnceLock::new(),
++            turn: Arc::new(Turn::default()),
++        });
+         let body = DeclaredLengthBody {
+             pieces: self.pieces,
+-            declared: self.length,
+-            produced: 0,
+-            ended: false,
+-            failure: Arc::clone(&failure),
++            upload: Arc::clone(&upload),
+         };
+-        (body, failure)
++        (body, upload)
++    }
++}
++
++/// What one PUT's body has done, shared between the body, the request that carries it
++/// ([`Upload::request_first`]), the hook that sees the response arrive, and
++/// [`super::S3Client::put_object`], which judges the outcome on it.
++#[derive(Debug)]
++pub(super) struct Upload {
++    declared: u64,
++    /// Bytes the source has given, all of them handed on to the SDK. Only the body writes it.
++    produced: AtomicU64,
++    /// The source has ended: it gave its whole declared length and then reported its end.
++    /// Only the body writes it, and it never polls the source again after.
++    ended: AtomicBool,
++    /// The source's first failure; the body never polls the source again after one.
++    failure: OnceLock<BodyError>,
++    /// Set once, when the request sees the response head.
++    answer: OnceLock<Answer>,
++    /// Keeps the body from running ahead of the request.
++    turn: Arc<Turn>,
++}
++
++/// The response head as the request first saw it.
++#[derive(Debug)]
++struct Answer {
++    /// Whether the source had ended when hyper handed the response over.
++    source_ended: bool,
++    /// The response's `x-amz-request-id` header.
++    request_id: Option<String>,
++}
++
++impl Upload {
++    /// Wrap a PUT's request future so its body never runs ahead of it ([`Turn`]).
++    pub(super) fn request_first<F: Future>(&self, request: F) -> RequestFirst<F> {
++        RequestFirst {
++            request: Box::pin(tokio::task::unconstrained(request)),
++            waker: Waker::from(Arc::clone(&self.turn)),
++            turn: Arc::clone(&self.turn),
++        }
++    }
++
++    /// Record that the request has seen the response head. From here on the body takes
++    /// nothing more from the source, so whether it has ended by now is final for judging the
++    /// outcome.
++    pub(super) fn answered(&self, request_id: Option<String>) {
++        // This runs inside a poll of the request, and the body takes nothing until that poll
++        // has ended ([`Turn`]), so `ended` still stands as it did when hyper handed the
++        // response over.
++        let _ = self.answer.set(Answer {
++            source_ended: self.ended.load(Ordering::SeqCst),
++            request_id,
++        });
++    }
++
++    /// The source's own failure, if it failed.
++    pub(super) fn failure(&self) -> Option<&BodyError> {
++        self.failure.get()
++    }
++
++    /// The error for a success that arrived before the source had ended; `None` when the
++    /// source had ended first, which makes the success a receipt. Having given its whole
++    /// declared length is not enough: a source that has not reported its end may still run
++    /// past that length, and until it does report it the SDK has not written the body's
++    /// final chunk.
++    ///
++    /// A success with no record of its arrival is not a receipt either, since nothing then
++    /// shows that the source had ended first. The SDK calls the hook that makes the record
++    /// for every response it hands back ([`Upload::answered`]), so that is not expected.
++    ///
++    /// The byte count in the error is read now. It is still the count at the response's
++    /// arrival: the body takes nothing from the source once the response has arrived
++    /// ([`DeclaredLengthBody`]).
++    pub(super) fn acknowledged_early(&self) -> Option<BodyError> {
++        let answer = self.answer.get();
++        if answer.is_some_and(|answer| answer.source_ended) {
++            return None;
++        }
++        Some(BodyError::AcknowledgedEarly {
++            declared: self.declared,
++            produced: self.produced.load(Ordering::SeqCst),
++            request_id: answer.and_then(|answer| answer.request_id.clone()),
++        })
++    }
++}
++
++/// The order between a PUT's request and its body.
++///
++/// hyper reads the response in its connection task. When the response head arrives it hands
++/// the response to the request and wakes it, and then, in the same poll of the connection,
++/// asks the body for more. Left alone, the body would take from the source after the
++/// response had arrived and before the request had seen it, and a source that ended in that
++/// gap would turn an early answer into a receipt.
++///
++/// So the request is polled with a waker that counts its wakes ([`RequestFirst`]). While the
++/// request has a wake it has not finished a poll for, the body takes nothing: it waits for
++/// that poll to end. The response's wake is one of them, so the request has always seen the
++/// response, and recorded it ([`Upload::answered`]), before the body can take another piece.
++/// A wake for anything else (a deadline, say) only makes the body wait one poll of the
++/// request. The connection task is also the only one that polls the body, so a response
++/// cannot arrive in the middle of a body poll.
++#[derive(Debug, Default)]
++struct Turn {
++    /// How many times the request has been woken.
++    wakes: AtomicU64,
++    /// `wakes` as it stood when the request's latest finished poll began: that poll saw
++    /// everything those wakes were for.
++    seen: AtomicU64,
++    /// The waker of the task that polls the request.
++    request: AtomicWaker,
++    /// The body's waker while it waits for the request.
++    body: AtomicWaker,
++}
++
++impl Turn {
++    /// Whether the request has finished a poll since its latest wake.
++    fn caught_up(&self) -> bool {
++        // `seen` first: it never runs ahead of `wakes`, so equal means caught up when `seen`
++        // was read.
++        let seen = self.seen.load(Ordering::SeqCst);
++        seen == self.wakes.load(Ordering::SeqCst)
++    }
++
++    /// Whether the body has to wait for the request, in which case it is woken when the
++    /// request's next poll ends.
++    fn body_waits(&self, cx: &Context<'_>) -> bool {
++        if self.caught_up() {
++            return false;
++        }
++        self.body.register(cx.waker());
++        // The request may have finished a poll between the check and the registration.
++        !self.caught_up()
++    }
++}
++
++impl Wake for Turn {
++    fn wake(self: Arc<Self>) {
++        self.wake_by_ref();
++    }
++
++    fn wake_by_ref(self: &Arc<Self>) {
++        self.wakes.fetch_add(1, Ordering::SeqCst);
++        self.request.wake();
++    }
++}
++
++/// A PUT's request future, polled so its body never runs ahead of it ([`Turn`]).
++///
++/// The request is polled unconstrained by tokio's cooperative budget. An exhausted budget
++/// makes a ready resource return pending and defers its wake-up, and the request would then
++/// end a poll with the response in hand, unrecorded, and no wake counted yet.
++///
++/// A wake that comes after the request has finished is never caught up with, so the body
++/// would wait for good. It never gets the chance: the request's runtime is shut down as soon
++/// as the request finishes, before any task polls the body again (`put_object`).
++pub(super) struct RequestFirst<F> {
++    request: Pin<Box<Unconstrained<F>>>,
++    /// Counts into `turn` and passes the wake on to the task that polls this.
++    waker: Waker,
++    turn: Arc<Turn>,
++}
++
++impl<F: Future> Future for RequestFirst<F> {
++    type Output = F::Output;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
++        let this = self.get_mut();
++        // Registered before the count is read, so a wake from here on reaches this task.
++        this.turn.request.register(cx.waker());
++        let wakes = this.turn.wakes.load(Ordering::SeqCst);
++        let polled = this
++            .request
++            .as_mut()
++            .poll(&mut Context::from_waker(&this.waker));
++        this.turn.seen.store(wakes, Ordering::SeqCst);
++        this.turn.body.wake();
++        polled
+     }
+ }
+ 
+@@ -72,7 +257,16 @@ impl PutSource {
+ ///
+ /// Each piece is handed on by value as it arrives. After the declared length is reached the
+ /// source is polled once more, so excess bytes in a separate piece are caught before the
+-/// body reports its end.
++/// body reports its end. Only that poll, answered with the source's end, makes the source
++/// ended ([`Upload::acknowledged_early`]). The SDK always asks for it: its aws-chunked layer,
++/// which wraps this body, polls it until it reports its end, because only then can it write
++/// the final chunk and the checksum trailer (`aws-runtime` 1.10.0,
++/// `content_encoding/body/http_body_1_x.rs:56-83`).
++///
++/// From the moment hyper hands the response over, the source is not polled again and the
++/// body sends nothing more: until the request has seen the response the body waits for it
++/// ([`Turn`]), and once the request has recorded it ([`Upload::answered`]) the body stops for
++/// good. The outcome is judged on whether the source had ended by then.
+ ///
+ /// One poll handles at most one item of the source, so the work a poll does is bounded
+ /// whatever the source yields. That is what lets the operation deadline and a cancellation
+@@ -83,10 +277,7 @@ impl PutSource {
+ /// body's own hint only when that header is absent.
+ pub(super) struct DeclaredLengthBody {
+     pieces: Pieces,
+-    declared: u64,
+-    produced: u64,
+-    ended: bool,
+-    failure: Arc<OnceLock<BodyError>>,
++    upload: Arc<Upload>,
+ }
+ 
+ impl http_body::Body for DeclaredLengthBody {
+@@ -98,12 +289,27 @@ impl http_body::Body for DeclaredLengthBody {
+         cx: &mut Context<'_>,
+     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+         let this = self.get_mut();
+-        if let Some(failure) = this.failure.get() {
++        let upload = &*this.upload;
++        if let Some(failure) = upload.failure.get() {
+             return Poll::Ready(Some(Err(failure.clone())));
+         }
+-        if this.ended {
++        if upload.ended.load(Ordering::SeqCst) {
+             return Poll::Ready(None);
+         }
++        // The request has seen the response: take nothing more from the source and send
++        // nothing more. Pending, not an error, because an error makes hyper fail the
++        // connection, and with it a response body the SDK may still be reading. Nothing wakes
++        // this poll again; the connection ends with the PUT's runtime (`put_object`).
++        if upload.answer.get().is_some() {
++            return Poll::Pending;
++        }
++        // The request has a wake it has not been polled for, perhaps the response: let it see
++        // that first.
++        if upload.turn.body_waits(cx) {
++            return Poll::Pending;
++        }
++        let declared = upload.declared;
++        let given = upload.produced.load(Ordering::SeqCst);
+         let failure = match ready!(this.pieces.as_mut().poll_next(cx)) {
+             // An empty piece carries nothing to send, and it is not skipped in a loop either:
+             // a source that is always ready with empty pieces would then spin inside this one
+@@ -116,31 +322,28 @@ impl http_body::Body for DeclaredLengthBody {
+                 return Poll::Pending;
+             }
+             Some(Ok(piece)) => {
+-                let produced = this.produced.saturating_add(piece.len() as u64);
+-                if produced <= this.declared {
+-                    this.produced = produced;
++                let produced = given.saturating_add(piece.len() as u64);
++                if produced <= declared {
++                    upload.produced.store(produced, Ordering::SeqCst);
+                     return Poll::Ready(Some(Ok(Frame::data(piece))));
+                 }
+-                BodyError::SourceLength {
+-                    declared: this.declared,
+-                    produced,
+-                }
++                BodyError::SourceLength { declared, produced }
+             }
+             Some(Err(e)) => BodyError::SourceFailed {
+-                produced: this.produced,
++                produced: given,
+                 detail: error_chain(e.as_ref()),
+             },
+-            None if this.produced == this.declared => {
+-                this.ended = true;
++            None if given == declared => {
++                upload.ended.store(true, Ordering::SeqCst);
+                 return Poll::Ready(None);
+             }
+             None => BodyError::SourceLength {
+-                declared: this.declared,
+-                produced: this.produced,
++                declared,
++                produced: given,
+             },
+         };
+         // First failure wins; the body never polls its source again after one.
+-        let failure = this.failure.get_or_init(|| failure).clone();
++        let failure = upload.failure.get_or_init(|| failure).clone();
+         Poll::Ready(Some(Err(failure)))
+     }
+ }
+diff --git a/crates/validate/src/s3/error.rs b/crates/validate/src/s3/error.rs
+index cb099ec..173d9b5 100644
+--- a/crates/validate/src/s3/error.rs
++++ b/crates/validate/src/s3/error.rs
+@@ -46,7 +46,9 @@ pub enum S3Error {
+         /// The limit that was exceeded.
+         limit: Duration,
+     },
+-    /// The SDK refused to build the request (an empty key, for one). Nothing was sent.
++    /// The request was never started: the SDK refused to build it (an empty key, for one),
++    /// or the client could not start the thread or the runtime a PUT runs on. Nothing was
++    /// sent.
+     RequestNotBuilt {
+         /// What the SDK reported, with its source chain.
+         detail: String,
+@@ -90,6 +92,20 @@ pub enum BodyError {
+     SourceLength { declared: u64, produced: u64 },
+     /// PUT: the caller's source failed after yielding `produced` bytes.
+     SourceFailed { produced: u64, detail: String },
++    /// PUT: the endpoint answered with success before the caller's source had ended, that is,
++    /// before it had yielded its whole declared length and then reported its end. It had
++    /// yielded `produced` of its `declared` bytes by then. Never a receipt, even when
++    /// `produced` equals `declared`: until the source reports its end the body's final chunk
++    /// has not been written, so the server cannot hold the object the caller sent. The source
++    /// is not polled again once the client has the answer, so a source that would have
++    /// reported its end, given its last piece, failed, or run past its declared length after
++    /// that is reported here too.
++    AcknowledgedEarly {
++        declared: u64,
++        produced: u64,
++        /// The answer's `x-amz-request-id` header.
++        request_id: Option<String>,
++    },
+     /// GET: reading the body failed after `received` of its `declared` bytes (a cut
+     /// connection, a framing error).
+     Transport {
+@@ -178,6 +194,18 @@ impl fmt::Display for BodyError {
+                 f,
+                 "the PUT source failed after yielding {produced} bytes: {detail}"
+             ),
++            Self::AcknowledgedEarly {
++                declared,
++                produced,
++                request_id,
++            } => {
++                write!(
++                    f,
++                    "the endpoint acknowledged the PUT before its source had ended, when it had \
++                     yielded {produced} of {declared} bytes"
++                )?;
++                write_request_id(f, request_id.as_deref())
++            }
+             Self::Transport {
+                 declared,
+                 received,
+diff --git a/crates/validate/tests/s3_client_upload_peers.rs b/crates/validate/tests/s3_client_upload_peers.rs
+new file mode 100644
+index 0000000..0dd6eb3
+--- /dev/null
++++ b/crates/validate/tests/s3_client_upload_peers.rs
+@@ -0,0 +1,1283 @@
++//! Issue #854: the S3 client's PUT against a peer that answers before it has the whole body,
++//! or that stops reading. The production [`S3Client`] drives the real `aws-sdk-s3` over real
++//! loopback TCP into a scripted peer: a listener that reads the request head and then does
++//! exactly what its script says, nothing more.
++//!
++//! # The lifetime contract
++//!
++//! One contract, with fixed bounds, holds for every PUT here. The operation deadline is
++//! `T_OP = 3 s`, and the test wraps each call in a `T_OP + 1 s` timeout of its own:
++//!
++//! * the call returns within `T_OP + 1 s`; not returning is a failure with a message, never a
++//!   hang;
++//! * at return the source has **already been dropped**: the test's own source type records
++//!   when it is dropped, and the record is read in the very poll in which the call returns,
++//!   with no grace period ([`AtReturn`]);
++//! * the connection is **closed** within 1 s of the call's **actual return**, seen twice. The
++//!   test stamps the return in that same poll and hands the stamp to the peer, which derives
++//!   one absolute deadline from it, `return + 1 s`, for both sightings; a close seen after
++//!   that deadline fails, an EOF or a reset included. First the client's own socket, in
++//!   `/proc/net/tcp`, must leave `ESTABLISHED` while the peer still reads nothing: draining
++//!   first would unblock a client stuck mid-write and let it finish on its own, which is not
++//!   the client closing. Then the peer reads, discarding whatever the client had queued ahead
++//!   of its FIN, until it hits EOF or a reset.
++//!
++//! A PUT the caller drops instead of awaiting is held to the same release: its source is
++//! dropped, and its connection closed, within 1 s of the drop.
++//!
++//! # The scenarios
++//!
++//! 1. **No receipt while the source had not ended.** The peer answers `200` with
++//!    `x-amz-request-id: early` as soon as it has read the request head, and stops reading.
++//!    A 64 MiB source has not given its whole length by then: the PUT is the body error, and
++//!    the error carries the acknowledgement's request id. More cases pin the moment the
++//!    answer is read ([`Hold`]). A 10-byte source gives 4 bytes and is held; the peer answers;
++//!    the source is ready to go on at its first poll after the client has read the answer off
++//!    the socket. Ready to fail, it is "a source that fails after the acknowledgement"; ready
++//!    to give its last 6 bytes, it is a final piece that is ready once the client has the
++//!    answer. Both are the body error with the answer's request id, never a receipt, and the
++//!    source is never polled past its hold. Each case runs twice: with an answer that has no
++//!    body, and with one whose body the peer sends [`LATE_BODY_DELAY`] after its head, so the
++//!    client is still reading the response, and hyper still polling the request body, after
++//!    the request has seen the answer. A rejection whose body arrives late, to a source ready
++//!    to fail, is the server's error, not the source's.
++//! 2. **Early acknowledgement under backpressure.** The peer reads the head, waits until the
++//!    client's writes back up (the client socket's send queue, read from `/proc/net/tcp`, is
++//!    non-empty and has stopped moving), then answers `200`, keeps the socket open and never
++//!    reads again. The source yields 32 MiB pieces of a 512 MiB object. The connection is then
++//!    blocked mid-write, where hyper never polls the request body again, so waking the body is
++//!    not enough to release it: the body error, plus the lifetime contract.
++//! 3. **Stops reading, never answers.** The peer reads the head, stops reading, never answers
++//!    and keeps the socket open; the same 32 MiB pieces. The typed operation timeout, plus the
++//!    lifetime contract.
++//! 4. **The receipt rule.** A receipt requires that the source had **ended** before the client
++//!    read the answer: it gave its whole declared length and then reported its end. Three
++//!    10-byte PUTs pin the boundary from both sides:
++//!    * the source has reported its end before the peer answers `200`: a receipt
++//!      ([`a_source_that_ended_before_the_acknowledgement_is_a_receipt`]);
++//!    * the source has given all 10 bytes and holds its end when the peer answers: not a
++//!      receipt, the body error with the answer's request id
++//!      ([`a_source_that_gave_its_whole_length_but_held_its_end_is_not_a_receipt`]);
++//!    * the source has given its declared 10 bytes and holds an 11th when the peer answers:
++//!      not a receipt, the same body error. The extra byte is never taken, so the overrun is
++//!      never seen
++//!      ([`a_source_that_gave_its_declared_length_and_held_an_extra_byte_is_not_a_receipt`]).
++//!
++//!    The two held cases use the same [`Hold`] as scenario 1, so what releases the source is
++//!    what the client has read, never what the peer has sent. The client takes nothing from
++//!    its source once it has read the answer, so a source held that way is never polled past
++//!    its hold while the call runs, and each case has one legal outcome whatever the
++//!    scheduling.
++//! 5. **Dropped mid-write.** The blocked connection of scenario 3, with no answer, is dropped
++//!    by its caller, under an operation deadline far past anything the test waits for: the
++//!    source and the connection are released within 1 s of the drop, so a dropped PUT does
++//!    not run on until its deadline.
++//!
++//! # The stated limit, not tested
++//!
++//! The client sees what it handed to the HTTP stack and the moment it reads the answer off
++//! the socket. It cannot see whether the peer read the bytes it was handed, and it cannot see
++//! an answer that has reached its own kernel's receive buffer but that hyper has not read yet.
++//! A source that ends inside that second window gets a receipt for an answer the peer sent
++//! early. No test here asserts on that window, in either direction: the held cases release
++//! their source only on what the client has read, which keeps them out of it.
++//!
++//! # Base compatibility
++//!
++//! The file names only #852's public API and dev-dependencies, so it compiles against #852's
++//! client unchanged. That is why the body error is recognised without naming its variant,
++//! which #852 does not have: the variant is read from the error's `Debug` text, and its
++//! request id from its `Display`, which prints every request id the same way
++//! (`x-amz-request-id <id>`).
++
++#![forbid(unsafe_code)]
++
++use std::ffi::OsString;
++use std::net::SocketAddr;
++use std::pin::Pin;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, OnceLock};
++use std::task::{Context, Poll};
++use std::time::{Duration, Instant};
++
++use bytes::Bytes;
++use futures_util::stream::Stream;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpSocket, TcpStream};
++use tokio::sync::oneshot;
++use tokio::task::JoinHandle;
++use tokio::time::{sleep, timeout, timeout_at};
++use wyrd_validate::{
++    resolve_config, Deadlines, ErrorCode, Phase, PutOutcome, PutSource, ResolvedConfig, S3Client,
++    S3Error,
++};
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++const BUCKET: &str = "validate";
++const KEY: &str = "upload-peers";
++
++/// The operation deadline every PUT here runs under, but the one the test drops.
++const T_OP: Duration = Duration::from_secs(3);
++/// The operation deadline of the PUT the test drops: far past anything the test waits for,
++/// so whatever releases that PUT's source and connection within `CLOSE_BOUND` of the drop is
++/// the drop, never the deadline, however long the client takes to back up.
++const DROPPED_T_OP: Duration = Duration::from_secs(60);
++/// The test's own bound on one call: `T_OP + 1 s`.
++const CALL_BOUND: Duration = Duration::from_secs(4);
++/// How long after the call returns, or is dropped, the source may still be alive and the
++/// connection open: zero for the source of a call that returned, this for everything else.
++const CLOSE_BOUND: Duration = Duration::from_secs(1);
++
++/// The request id every answer of the peer carries.
++const REQUEST_ID: &str = "early";
++/// The peer's acknowledgement: a success with no body.
++const ACK: Reply = Reply {
++    status: "200 OK",
++    body: "",
++};
++/// An acknowledgement whose body arrives `LATE_BODY_DELAY` after its head.
++const ACK_BODY_LATE: Reply = Reply {
++    status: "200 OK",
++    body: "ok",
++};
++/// A rejection whose `<Error>` document arrives `LATE_BODY_DELAY` after its head.
++const REJECTION_BODY_LATE: Reply = Reply {
++    status: "403 Forbidden",
++    body: "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code>\
++           <Message>Access Denied</Message><RequestId>early</RequestId></Error>",
++};
++/// How long after an answer's head the peer sends its body. Far longer than the client takes
++/// to read the head and poll the request body again, hold check included ([`Hold`]), so a
++/// source polled after the request has seen the answer is polled while the body is still on
++/// its way. A check that outlasts it finds the body unread and holds the source, which can
++/// only hide a source polled too late, never fail a client that polls it right.
++const LATE_BODY_DELAY: Duration = Duration::from_millis(500);
++// The peer does not hear that the call has ended while it waits out this delay, so a call
++// that ends meanwhile is watched late. Kept to half of `CLOSE_BOUND`, the delay still leaves
++// the peer half the bound to see the close; a longer one could fail a client that closed in
++// time.
++const _: () = assert!(LATE_BODY_DELAY.as_millis() * 2 <= CLOSE_BOUND.as_millis());
++
++/// The held cases' 10-byte source and where scenario 1 holds it: 4 bytes in, 6 left.
++const HELD_TOTAL: u64 = 10;
++const HELD_AT: u64 = 4;
++
++/// The piece size of the backpressure scenarios.
++const LARGE_PIECE: usize = 32 * 1024 * 1024;
++/// The object size of the backpressure scenarios: sixteen large pieces, far more than every
++/// buffer between the source and the peer can hold.
++const LARGE_OBJECT: u64 = 512 * 1024 * 1024;
++/// `SO_RCVBUF` on the peer's sockets: small, so its receive window closes early (the kernel
++/// doubles it, and setting it turns receive autotuning off).
++const PEER_RCVBUF: u32 = 64 * 1024;
++/// How long the client socket's send queue must hold still, non-empty, to count as backed
++/// up, and how often it is sampled.
++const BACKED_UP_STEADY: Duration = Duration::from_millis(200);
++const BACKED_UP_SAMPLE: Duration = Duration::from_millis(25);
++/// The longest the peer waits for the client's writes to back up before going on anyway.
++/// Well inside `T_OP`, so an answer still arrives before the operation deadline.
++const BACKED_UP_WAIT: Duration = Duration::from_secs(2);
++/// The same for the PUT the test drops, which has no answer to deliver in time.
++const DROPPED_BACKED_UP_WAIT: Duration = Duration::from_secs(10);
++/// The longest the peer waits for a held source to reach its hold before answering anyway.
++const PARK_WAIT: Duration = Duration::from_secs(2);
++/// The longest a held source waits, inside one poll, for the peer's write of its answer to
++/// return once the peer has started it ([`Hold::answer_read`]).
++const ANSWER_WRITE_WAIT: Duration = Duration::from_millis(100);
++
++// --- the client ------------------------------------------------------------------------------
++
++/// A resolved configuration for `endpoint`, through the production argument parser and
++/// credential resolution.
++fn resolved(endpoint: SocketAddr) -> ResolvedConfig {
++    let endpoint = format!("http://{endpoint}");
++    let pairs = [
++        ("--endpoint", endpoint.as_str()),
++        ("--region", REGION),
++        ("--bucket", BUCKET),
++        ("--scenario", "smoke"),
++        ("--duration", "1m"),
++        ("--workers", "1"),
++        ("--seed", "854"),
++        ("--out", "unused"),
++        ("--run-id", "s3-client-upload-peers"),
++        ("--driver-placement", "loopback"),
++    ];
++    let args: Vec<String> = pairs
++        .iter()
++        .flat_map(|(flag, value)| [flag.to_string(), value.to_string()])
++        .collect();
++    let lookup = |name: &str| -> Option<OsString> {
++        match name {
++            "AWS_ACCESS_KEY_ID" => Some(ACCESS_KEY.into()),
++            "AWS_SECRET_ACCESS_KEY" => Some(SECRET_KEY.into()),
++            _ => None,
++        }
++    };
++    resolve_config(&args, &lookup).expect("the configuration resolves")
++}
++
++/// A client for `endpoint` whose operation deadline is `operation`.
++fn client(endpoint: SocketAddr, operation: Duration) -> S3Client {
++    let deadlines = Deadlines {
++        connect: Duration::from_secs(2),
++        operation,
++        body_idle: Duration::from_secs(2),
++    };
++    S3Client::with_deadlines(&resolved(endpoint), deadlines)
++}
++
++// --- the source ------------------------------------------------------------------------------
++
++/// What the test sees of its source from outside.
++#[derive(Debug, Default)]
++struct Probe {
++    /// Bytes the source has given.
++    given: AtomicU64,
++    /// The source has reported its end.
++    exhausted: AtomicBool,
++    /// When the source was dropped.
++    dropped_at: OnceLock<Instant>,
++}
++
++impl Probe {
++    fn dropped(&self) -> bool {
++        self.dropped_at.get().is_some()
++    }
++}
++
++/// Where a held source stops, and what lets it go on.
++///
++/// Once the source has given the bytes before its hold, every poll asks whether the client
++/// has **read** the peer's answer off the socket: the peer has written it, the client's
++/// kernel has acknowledged every byte of it (the peer socket's send queue is empty), and
++/// after that the client socket's receive queue is empty. Until then the poll is pending; the
++/// first poll that finds the answer read goes on.
++///
++/// A pending poll arranges no wake of its own, and needs none. While the body waits, hyper is
++/// waiting on the socket for the response, so the answer's arrival wakes the connection. In
++/// that poll hyper reads the answer, parses it and hands it to the request in one go, and only
++/// then polls the body (`hyper-1.10.1/src/proto/h1/io.rs:183-219`, `dispatch.rs:173-174`).
++/// Only hyper reads that socket. So the source goes on only after hyper has handed the
++/// response over, at the first poll of the body after that: the moment the receipt rule turns
++/// on, reached without any timing. A poll that comes sooner, for any other reason, is
++/// harmless: it finds the answer unread and stays pending.
++///
++/// The source does not wake itself to be polled sooner: that would keep the client's runtime
++/// busy polling it, each poll reading `/proc/net/tcp`, and tokio looks at the socket's events
++/// only between runs of such polls.
++///
++/// The source can still be polled after the answer has arrived and before hyper has read it:
++/// another wake of the connection (its socket turning writable, say) can run it before tokio
++/// has seen the answer arrive. That check finds the answer unread, and while it runs hyper
++/// cannot read either, since both run on the client's one thread. A check reads the kernel's
++/// whole table of TCP sockets, so its cost grows with the table. The checks keep that cost
++/// small: the first read stops a check that finds the answer unread, and the peer closes every
++/// connection with a reset ([`serve`]), so the test leaves none of its sockets in the table.
++///
++/// Where `/proc/net/tcp` cannot be read the source never goes on, which still holds an
++/// answer to a source with bytes left.
++#[derive(Debug, Default)]
++struct Hold {
++    /// The client's and the peer's ends of the connection, set as the peer accepts it.
++    link: OnceLock<(SocketAddr, SocketAddr)>,
++    /// The source has reached its hold.
++    parked: AtomicBool,
++    /// The peer has started writing its answer.
++    answering: AtomicBool,
++    /// The peer's write of its answer has returned.
++    answered: AtomicBool,
++    /// The source went on past its hold.
++    went_on: AtomicBool,
++}
++
++impl Hold {
++    /// Whether the client has read the peer's answer off the socket.
++    fn answer_read(&self) -> bool {
++        if !self.answering.load(Ordering::SeqCst) {
++            return false;
++        }
++        // The peer's write goes into an empty send buffer and returns at once. When the client
++        // runs on a thread of its own, wait for that return here rather than end this poll:
++        // ending it now would let the request see the answer before the source had its turn.
++        // On a thread shared with the peer the wait cannot succeed and ends at its bound.
++        let started = Instant::now();
++        while !self.answered.load(Ordering::SeqCst) {
++            if started.elapsed() >= ANSWER_WRITE_WAIT {
++                return false;
++            }
++            std::thread::yield_now();
++        }
++        let Some(&(client, peer)) = self.link.get() else {
++            return false;
++        };
++        // Bytes waiting in the client's receive queue can only be the answer, unread: one
++        // table read settles it. That is the usual finding when the source is polled after the
++        // answer has arrived but before hyper has read it.
++        if tcp_socket(client, peer).is_none_or(|end| end.recv_queue > 0) {
++            return false;
++        }
++        // Delivered first, then read: one table read for each, in that order, so an empty
++        // receive queue is never mistaken for an answer not yet arrived.
++        let delivered = tcp_socket(peer, client).is_some_and(|end| end.send_queue == 0);
++        delivered && tcp_socket(client, peer).is_some_and(|end| end.recv_queue == 0)
++    }
++}
++
++/// A source's hold, and what it does once it goes on.
++struct Held {
++    /// Bytes given before the hold.
++    at: u64,
++    hold: Arc<Hold>,
++    /// Going on, it fails rather than giving the rest.
++    then_fail: bool,
++}
++
++/// A source of `total` bytes in pieces of up to `piece.len()`, each a slice of one shared
++/// buffer, so a large piece costs no allocation. Dropping it is recorded on the probe.
++struct Source {
++    total: u64,
++    piece: Bytes,
++    given: u64,
++    held: Option<Held>,
++    probe: Arc<Probe>,
++}
++
++impl Source {
++    fn new(total: u64, piece: usize) -> (Self, Arc<Probe>) {
++        let probe = Arc::new(Probe::default());
++        let source = Self {
++            total,
++            piece: Bytes::from(vec![0x5a; piece]),
++            given: 0,
++            held: None,
++            probe: Arc::clone(&probe),
++        };
++        (source, probe)
++    }
++
++    /// Hold after `at` bytes until the client has read the answer ([`Hold`]), then fail if
++    /// `then_fail`, else give the rest.
++    fn held_at(mut self, at: u64, hold: &Arc<Hold>, then_fail: bool) -> Self {
++        self.held = Some(Held {
++            at,
++            hold: Arc::clone(hold),
++            then_fail,
++        });
++        self
++    }
++}
++
++impl Stream for Source {
++    type Item = Result<Bytes, std::io::Error>;
++
++    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++        let this = self.get_mut();
++        let mut limit = this.total;
++        if let Some(held) = &this.held {
++            let hold = &held.hold;
++            if this.given < held.at {
++                limit = held.at;
++            } else if !hold.went_on.load(Ordering::SeqCst) {
++                hold.parked.store(true, Ordering::SeqCst);
++                if !hold.answer_read() {
++                    // No wake of its own: see `Hold`.
++                    return Poll::Pending;
++                }
++                hold.went_on.store(true, Ordering::SeqCst);
++                if held.then_fail {
++                    return Poll::Ready(Some(Err(std::io::Error::other(
++                        "the source failed after the acknowledgement",
++                    ))));
++                }
++            }
++        }
++        let left = limit - this.given;
++        if left == 0 {
++            this.probe.exhausted.store(true, Ordering::SeqCst);
++            return Poll::Ready(None);
++        }
++        let len = left.min(this.piece.len() as u64) as usize;
++        this.given += len as u64;
++        this.probe.given.store(this.given, Ordering::SeqCst);
++        Poll::Ready(Some(Ok(this.piece.slice(..len))))
++    }
++}
++
++impl Drop for Source {
++    fn drop(&mut self) {
++        let _ = self.probe.dropped_at.set(Instant::now());
++    }
++}
++
++// --- the scripted peer -----------------------------------------------------------------------
++
++/// An answer of the peer: its head, written at once, then its body, if any, written
++/// `LATE_BODY_DELAY` later. The head declares the body's length and carries
++/// `x-amz-request-id: early`.
++#[derive(Debug, Clone, Copy)]
++struct Reply {
++    status: &'static str,
++    body: &'static str,
++}
++
++impl Reply {
++    fn head(&self) -> Vec<u8> {
++        format!(
++            "HTTP/1.1 {}\r\nContent-Length: {}\r\nx-amz-request-id: {REQUEST_ID}\r\n\r\n",
++            self.status,
++            self.body.len()
++        )
++        .into_bytes()
++    }
++}
++
++/// When the peer answers, after it has read the request head. Every script that answers
++/// answers [`ACK`], but the held one, which names its answer.
++enum Answer {
++    /// At once.
++    AtHead,
++    /// Once the held source has reached its hold.
++    WhenHeld(Arc<Hold>, Reply),
++    /// Once the source has given its whole length and reported its end.
++    WhenExhausted(Arc<Probe>),
++    /// Once the client's writes have backed up.
++    WhenBackedUp,
++    /// Never.
++    Never,
++    /// Never; once the client's writes have backed up, it says so on the channel.
++    NeverTellingBackedUp(oneshot::Sender<BackedUp>),
++}
++
++/// Whether the client's writes backed up before the peer answered.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum BackedUp {
++    /// Not asked for by the script.
++    NotWaited,
++    /// The client socket's send queue held this many bytes, unmoving.
++    Yes(u64),
++    /// The send queue never held still within the peer's wait; the last sample.
++    No(Option<u64>),
++    /// `/proc/net/tcp` cannot be read here, so the peer waited a fixed second instead.
++    Unobservable,
++}
++
++/// Whether a held source had reached its hold when the peer answered.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Parked {
++    /// Not asked for by the script.
++    NotWaited,
++    /// It had; the peer wrote its answer after.
++    BeforeAnswer,
++    /// It never did within `PARK_WAIT`.
++    Never,
++}
++
++/// Whether the client closed its end, judged from its socket in `/proc/net/tcp` while the
++/// peer reads nothing. Every duration here and in [`Closed`] counts from the moment the call
++/// ended: its actual return, or its drop, as the test stamped it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ClientClose {
++    /// The socket was seen out of `ESTABLISHED`, or gone, this long after the call ended. The
++    /// sighting may be late: [`assert_connection_closed`] holds it to `CLOSE_BOUND`.
++    After(Duration),
++    /// Still `ESTABLISHED` `CLOSE_BOUND` after the call ended.
++    Not,
++    /// `/proc/net/tcp` cannot be read here.
++    Unobservable,
++}
++
++/// How the peer's connection ended, as seen by reads after the call ended.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Closed {
++    /// EOF, read `after` the call ended, past `drained` bytes the client had queued. The read
++    /// may be late: [`assert_connection_closed`] holds it to `CLOSE_BOUND`.
++    Eof { drained: u64, after: Duration },
++    /// The client reset the connection; the same.
++    Reset { drained: u64, after: Duration },
++    /// Still open `CLOSE_BOUND` after the call ended; `drained` bytes read meanwhile.
++    StillOpen { drained: u64 },
++}
++
++impl Closed {
++    /// How long after the call ended the peer saw its connection closed, if it did.
++    fn closed_after(self) -> Option<Duration> {
++        match self {
++            Self::Eof { after, .. } | Self::Reset { after, .. } => Some(after),
++            Self::StillOpen { .. } => None,
++        }
++    }
++}
++
++/// What the peer observed.
++#[derive(Debug)]
++struct PeerReport {
++    backed_up: BackedUp,
++    parked: Parked,
++    answered: bool,
++    /// `None` when the answer had no body; else whether the peer's late write of it succeeded.
++    late_body_written: Option<bool>,
++    client_close: ClientClose,
++    closed: Closed,
++}
++
++/// A loopback peer serving one connection by its script. Dropping it aborts its task, which
++/// closes whatever socket it still holds.
++struct Peer {
++    addr: SocketAddr,
++    /// Carries the moment the call ended, as the test stamped it.
++    ended: Option<oneshot::Sender<Instant>>,
++    report: Option<oneshot::Receiver<PeerReport>>,
++    task: JoinHandle<()>,
++}
++
++impl Peer {
++    async fn start(answer: Answer) -> Self {
++        let socket = TcpSocket::new_v4().expect("socket");
++        socket.set_recv_buffer_size(PEER_RCVBUF).expect("SO_RCVBUF");
++        socket
++            .bind("127.0.0.1:0".parse().expect("loopback"))
++            .expect("bind");
++        let listener = socket.listen(16).expect("listen");
++        let addr = listener.local_addr().expect("addr");
++        let (ended_tx, ended_rx) = oneshot::channel();
++        let (report_tx, report_rx) = oneshot::channel();
++        let task = tokio::spawn(async move {
++            if let Some(report) = serve(listener, answer, ended_rx).await {
++                let _ = report_tx.send(report);
++            }
++        });
++        Self {
++            addr,
++            ended: Some(ended_tx),
++            report: Some(report_rx),
++            task,
++        }
++    }
++
++    /// Tell the peer the call ended at `ended_at` (it returned, or was dropped), and collect
++    /// what the peer saw. `None` if it never got a connection to watch.
++    async fn after_call(&mut self, ended_at: Instant) -> Option<PeerReport> {
++        if let Some(ended) = self.ended.take() {
++            let _ = ended.send(ended_at);
++        }
++        let report = self.report.take()?;
++        // The peer stops watching at `ended_at + CLOSE_BOUND`; the margin covers scheduling
++        // only, and buys the connection nothing: a close seen past the peer's deadline fails
++        // whenever the report arrives.
++        timeout(CLOSE_BOUND + Duration::from_secs(1), report)
++            .await
++            .ok()?
++            .ok()
++    }
++}
++
++impl Drop for Peer {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++
++/// Serve one connection by `answer`, then watch it close. `None` if the test ended without
++/// saying when its call ended: there is then no moment to measure the close from.
++async fn serve(
++    listener: TcpListener,
++    answer: Answer,
++    ended: oneshot::Receiver<Instant>,
++) -> Option<PeerReport> {
++    let (mut stream, client) = listener.accept().await.expect("accept");
++    // Dropped only once the peer has watched the call end and the connection close, and then
++    // with a reset: neither end stays in `TIME_WAIT`, so the table of TCP sockets every hold
++    // check reads ([`Hold`]) stays small however many PUTs run, here or alongside.
++    stream.set_zero_linger().expect("SO_LINGER 0");
++    let peer = stream.local_addr().expect("peer addr");
++    read_head(&mut stream).await;
++    let mut backed_up = BackedUp::NotWaited;
++    let mut parked = Parked::NotWaited;
++    let mut held = None;
++    let reply = match answer {
++        Answer::AtHead => Some(ACK),
++        Answer::WhenHeld(hold, reply) => {
++            let _ = hold.link.set((client, peer));
++            parked = wait_parked(&hold).await;
++            held = Some(hold);
++            Some(reply)
++        }
++        Answer::WhenExhausted(probe) => {
++            while !probe.exhausted.load(Ordering::SeqCst) {
++                sleep(Duration::from_millis(5)).await;
++            }
++            Some(ACK)
++        }
++        Answer::WhenBackedUp => {
++            backed_up = wait_backed_up(client, peer, BACKED_UP_WAIT).await;
++            Some(ACK)
++        }
++        Answer::Never => None,
++        Answer::NeverTellingBackedUp(tell) => {
++            backed_up = wait_backed_up(client, peer, DROPPED_BACKED_UP_WAIT).await;
++            let _ = tell.send(backed_up);
++            None
++        }
++    };
++    let mut late_body_written = None;
++    if let Some(reply) = reply {
++        if let Some(hold) = &held {
++            hold.answering.store(true, Ordering::SeqCst);
++        }
++        stream
++            .write_all(&reply.head())
++            .await
++            .expect("write the answer's head");
++        if let Some(hold) = &held {
++            hold.answered.store(true, Ordering::SeqCst);
++        }
++        if !reply.body.is_empty() {
++            sleep(LATE_BODY_DELAY).await;
++            // Not unwrapped: a client that has already given up on the answer may have closed
++            // the connection, and the report says so instead of a panic here.
++            late_body_written = Some(stream.write_all(reply.body.as_bytes()).await.is_ok());
++        }
++    }
++    // Stop reading and hold the socket open until the call has ended.
++    let ended_at = ended.await.ok()?;
++    // One absolute deadline for both sightings of the close, counted from the moment the call
++    // ended, not from the moment this task heard of it.
++    let deadline = ended_at + CLOSE_BOUND;
++    let client_close = wait_client_close(client, peer, ended_at, deadline).await;
++    let closed = drain_until_closed(&mut stream, ended_at, deadline).await;
++    Some(PeerReport {
++        backed_up,
++        parked,
++        answered: reply.is_some(),
++        late_body_written,
++        client_close,
++        closed,
++    })
++}
++
++/// Read until the end of the request head. Body bytes that arrive with it are discarded.
++async fn read_head(stream: &mut TcpStream) {
++    let mut seen = Vec::new();
++    let mut buf = [0u8; 4096];
++    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
++        let n = stream.read(&mut buf).await.expect("read the request head");
++        assert!(n > 0, "the client closed before sending a request head");
++        seen.extend_from_slice(&buf[..n]);
++        assert!(seen.len() < 1 << 20, "no end of the request head in 1 MiB");
++    }
++}
++
++/// Wait until the held source has reached its hold.
++async fn wait_parked(hold: &Hold) -> Parked {
++    let deadline = Instant::now() + PARK_WAIT;
++    while !hold.parked.load(Ordering::SeqCst) {
++        if Instant::now() >= deadline {
++            return Parked::Never;
++        }
++        sleep(Duration::from_millis(1)).await;
++    }
++    Parked::BeforeAnswer
++}
++
++/// Wait until the client socket's send queue is non-empty and holds still for
++/// `BACKED_UP_STEADY`: on loopback a queue only stays non-empty while the peer's receive
++/// window is closed, and it only stops growing once the client has stopped writing. Gives up
++/// after `wait`.
++///
++/// Held still is timed by the clock, from the first sample of the unchanged value, not by a
++/// count of samples: one read of the table can take a large part of `BACKED_UP_STEADY` when
++/// it is long and the host busy, and a count would then outlast `wait`.
++async fn wait_backed_up(client: SocketAddr, peer: SocketAddr, wait: Duration) -> BackedUp {
++    if !tcp_table_readable() {
++        sleep(Duration::from_secs(1)).await;
++        return BackedUp::Unobservable;
++    }
++    let deadline = Instant::now() + wait;
++    let mut last = None;
++    let mut since = Instant::now();
++    while Instant::now() < deadline {
++        let queued = tcp_socket(client, peer).map(|socket| socket.send_queue);
++        let sampled = Instant::now();
++        if queued.is_some_and(|q| q > 0) && queued == last {
++            if sampled.duration_since(since) >= BACKED_UP_STEADY {
++                return BackedUp::Yes(queued.unwrap_or_default());
++            }
++        } else {
++            since = sampled;
++        }
++        last = queued;
++        sleep(BACKED_UP_SAMPLE).await;
++    }
++    BackedUp::No(last)
++}
++
++/// Wait, reading nothing, until the client's socket has left `ESTABLISHED` or is gone: the
++/// client has closed its end, whether or not its FIN can reach the peer yet. The sighting is
++/// timed from `ended_at`, and stamped once the table has been read: the socket was closed by
++/// then at the latest.
++async fn wait_client_close(
++    client: SocketAddr,
++    peer: SocketAddr,
++    ended_at: Instant,
++    deadline: Instant,
++) -> ClientClose {
++    if !tcp_table_readable() {
++        return ClientClose::Unobservable;
++    }
++    loop {
++        let socket = tcp_socket(client, peer);
++        let seen = Instant::now();
++        match socket {
++            Some(socket) if socket.state == TCP_ESTABLISHED => {}
++            _ => return ClientClose::After(seen.saturating_duration_since(ended_at)),
++        }
++        if seen >= deadline {
++            return ClientClose::Not;
++        }
++        sleep(Duration::from_millis(10)).await;
++    }
++}
++
++/// The `st` value of an established connection in `/proc/net/tcp`.
++const TCP_ESTABLISHED: u8 = 0x01;
++
++/// One end of a loopback connection as the kernel's table of IPv4 TCP sockets lists it.
++struct TcpEntry {
++    /// The `st` column.
++    state: u8,
++    /// The `tx_queue` column: bytes written and not yet acknowledged by the other end.
++    send_queue: u64,
++    /// The `rx_queue` column: bytes received and not yet read by this end's owner.
++    recv_queue: u64,
++}
++
++fn tcp_table_readable() -> bool {
++    std::fs::read_to_string("/proc/net/tcp").is_ok()
++}
++
++/// The end of a loopback connection at `local` facing `remote`, `None` once the kernel no
++/// longer lists it.
++fn tcp_socket(local: SocketAddr, remote: SocketAddr) -> Option<TcpEntry> {
++    let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
++    let local = format!("0100007F:{:04X}", local.port());
++    let remote = format!("0100007F:{:04X}", remote.port());
++    table.lines().skip(1).find_map(|line| {
++        let fields: Vec<&str> = line.split_whitespace().collect();
++        if *fields.get(1)? != local.as_str() || *fields.get(2)? != remote.as_str() {
++            return None;
++        }
++        let state = u8::from_str_radix(fields.get(3)?, 16).ok()?;
++        let (tx, rx) = fields.get(4)?.split_once(':')?;
++        let send_queue = u64::from_str_radix(tx, 16).ok()?;
++        let recv_queue = u64::from_str_radix(rx, 16).ok()?;
++        Some(TcpEntry {
++            state,
++            send_queue,
++            recv_queue,
++        })
++    })
++}
++
++/// Read, discarding, until EOF or a reset, until `deadline`. The close is timed from
++/// `ended_at` and stamped once the read has returned. A read that is ready is taken even when
++/// the deadline has passed, so the stamp can lie past it; the stamp is what is judged.
++async fn drain_until_closed(
++    stream: &mut TcpStream,
++    ended_at: Instant,
++    deadline: Instant,
++) -> Closed {
++    let deadline = tokio::time::Instant::from_std(deadline);
++    let mut buf = vec![0u8; 256 * 1024];
++    let mut drained = 0u64;
++    loop {
++        let read = timeout_at(deadline, stream.read(&mut buf)).await;
++        let after = Instant::now().saturating_duration_since(ended_at);
++        match read {
++            Ok(Ok(0)) => return Closed::Eof { drained, after },
++            Ok(Ok(n)) => drained += n as u64,
++            Ok(Err(_)) => return Closed::Reset { drained, after },
++            Err(_) => return Closed::StillOpen { drained },
++        }
++    }
++}
++
++// --- one PUT against one peer ----------------------------------------------------------------
++
++/// What the test read in the very poll in which the call returned. No await lies between
++/// the call's return and these reads, so nothing on the test's runtime runs in between and a
++/// source released late gets no time to catch up: the "no grace period" of the lifetime
++/// contract.
++struct AtReturn {
++    /// The call's actual return, the moment the connection's close is timed from.
++    at: Instant,
++    dropped: bool,
++    given: u64,
++    ended: bool,
++}
++
++impl AtReturn {
++    fn read(probe: &Probe) -> Self {
++        Self {
++            at: Instant::now(),
++            dropped: probe.dropped(),
++            given: probe.given.load(Ordering::SeqCst),
++            ended: probe.exhausted.load(Ordering::SeqCst),
++        }
++    }
++}
++
++/// Everything one call was observed to do.
++#[derive(Debug)]
++struct Run {
++    outcome: Result<PutOutcome, S3Error>,
++    declared: u64,
++    elapsed: Duration,
++    /// Whether the source had been dropped when the call returned ([`AtReturn`]).
++    dropped_at_return: bool,
++    /// Bytes the source had given by then.
++    given_at_return: u64,
++    /// Whether the source had reported its end by then.
++    ended_at_return: bool,
++    peer: Option<PeerReport>,
++}
++
++/// PUT `declared` bytes from `source` against a peer playing `answer`, then let the peer
++/// watch for the close.
++async fn put_against(answer: Answer, declared: u64, source: Source, probe: &Probe) -> Run {
++    let mut peer = Peer::start(answer).await;
++    let client = client(peer.addr, T_OP);
++    let started = Instant::now();
++    let call = timeout(CALL_BOUND, async {
++        let outcome = client
++            .put_object(KEY, PutSource::new(declared, source))
++            .await;
++        (outcome, AtReturn::read(probe))
++    })
++    .await;
++    let Ok((outcome, at_return)) = call else {
++        panic!(
++            "put_object did not return within {CALL_BOUND:?} (T_op {T_OP:?} + 1 s); the \
++             source had given {} of {declared} bytes",
++            probe.given.load(Ordering::SeqCst)
++        );
++    };
++    let report = peer.after_call(at_return.at).await;
++    Run {
++        outcome,
++        declared,
++        elapsed: at_return.at.duration_since(started),
++        dropped_at_return: at_return.dropped,
++        given_at_return: at_return.given,
++        ended_at_return: at_return.ended,
++        peer: report,
++    }
++}
++
++/// The lifetime contract: returned in time, source dropped at return, connection closed
++/// within `CLOSE_BOUND` of the return.
++fn assert_lifetime(run: &Run) {
++    assert!(
++        run.elapsed <= CALL_BOUND,
++        "the call took {:?}, past T_op + 1 s: {run:?}",
++        run.elapsed
++    );
++    assert!(
++        run.dropped_at_return,
++        "the source was still alive when put_object returned: the upload outlived its call. \
++         {run:?}"
++    );
++    assert_connection_closed(run.peer.as_ref(), run);
++}
++
++/// The client closed the connection, and the peer saw it closed, within `CLOSE_BOUND` of the
++/// moment the call ended. A close seen later than that fails like no close at all, whether
++/// the peer saw it as an EOF or as a reset.
++fn assert_connection_closed(report: Option<&PeerReport>, context: &dyn std::fmt::Debug) {
++    let report =
++        report.unwrap_or_else(|| panic!("the peer never reported on its connection: {context:?}"));
++    let client_closed_in_time = match report.client_close {
++        ClientClose::After(after) => after <= CLOSE_BOUND,
++        ClientClose::Not => false,
++        ClientClose::Unobservable => true,
++    };
++    assert!(
++        client_closed_in_time,
++        "the client's socket was not seen out of ESTABLISHED within {CLOSE_BOUND:?} of the \
++         call's end: the client had not closed the connection in time. {report:?}; {context:?}"
++    );
++    assert!(
++        report
++            .closed
++            .closed_after()
++            .is_some_and(|after| after <= CLOSE_BOUND),
++        "the peer did not see its connection closed within {CLOSE_BOUND:?} of the call's end. \
++         {report:?}; {context:?}"
++    );
++}
++
++/// Whether the peer answered, as its script says it should have.
++fn assert_answered(run: &Run, expected: bool) {
++    let answered = run.peer.as_ref().map(|report| report.answered);
++    assert_eq!(
++        answered,
++        Some(expected),
++        "the peer's answer is not what its script says: {run:?}"
++    );
++}
++
++/// The fixture of the held cases: the source had reached its hold before the peer answered.
++fn assert_parked_before_answer(run: &Run) {
++    let parked = run.peer.as_ref().map(|report| report.parked);
++    assert_eq!(
++        parked,
++        Some(Parked::BeforeAnswer),
++        "the source never reached its hold, so this run did not answer while the source held \
++         back: {run:?}"
++    );
++}
++
++/// The fixture of the held cases with bytes left: the source had reached its hold, short of
++/// its declared length, before the peer answered.
++fn assert_held_before_answer(run: &Run, at: u64) {
++    assert_parked_before_answer(run);
++    assert!(
++        at < run.declared,
++        "a hold at the declared length holds no bytes back: {run:?}"
++    );
++}
++
++/// The fixture of the late-body cases: the peer wrote its answer's body `LATE_BODY_DELAY`
++/// after the head, so the client was still reading the response well after it had the head.
++fn assert_body_sent_late(run: &Run) {
++    let written = run
++        .peer
++        .as_ref()
++        .and_then(|report| report.late_body_written);
++    assert_eq!(
++        written,
++        Some(true),
++        "the peer never wrote its answer's body after the head, so this run did not answer \
++         with a body still on its way: {run:?}"
++    );
++}
++
++/// From the moment the client had the answer the source was not polled again: it never went
++/// on past its hold, and gave nothing past it.
++fn assert_not_polled_past_the_hold(run: &Run, hold: &Hold, at: u64) {
++    assert!(
++        !hold.went_on.load(Ordering::SeqCst),
++        "the source was polled past its hold, after the client had read the answer: {run:?}"
++    );
++    assert_eq!(
++        run.given_at_return, at,
++        "the source gave bytes past its hold, after the client had read the answer: {run:?}"
++    );
++}
++
++/// The outcome is the body error for an acknowledgement that came before the source had
++/// ended, `BodyError::AcknowledgedEarly`, and carries the acknowledgement's request id. The
++/// variant is read from the error's `Debug` text and the request id from its `Display`: #852's
++/// client has no such variant, and naming it would stop this file compiling there.
++fn assert_body_error_carrying_the_answer(run: &Run) {
++    let Err(err) = &run.outcome else {
++        panic!(
++            "an acknowledgement that arrived before the source had ended must be the body \
++             error carrying request id `{REQUEST_ID}`, never a receipt: {run:?}"
++        );
++    };
++    assert!(
++        format!("{err:?}").starts_with("Body(AcknowledgedEarly {"),
++        "an acknowledgement that arrived before the source had ended must be the body error \
++         for exactly that, `AcknowledgedEarly`: {run:?}"
++    );
++    assert!(
++        err.to_string()
++            .contains(&format!("x-amz-request-id {REQUEST_ID}")),
++        "the body error does not carry the acknowledgement's request id: {err}. {run:?}"
++    );
++}
++
++// --- scenario 1: no receipt while the source had not ended ------------------------------------
++
++#[tokio::test]
++async fn an_acknowledgement_before_the_source_is_done_is_the_body_error() {
++    let declared = 64 * 1024 * 1024;
++    let (source, probe) = Source::new(declared, 1024 * 1024);
++    let run = put_against(Answer::AtHead, declared, source, &probe).await;
++    // The fixture must include the fault: an answer while the source still had bytes.
++    assert_answered(&run, true);
++    assert!(
++        run.given_at_return < run.declared,
++        "the source had given its whole length, so this run did not answer early: {run:?}"
++    );
++    assert_body_error_carrying_the_answer(&run);
++    assert_lifetime(&run);
++}
++
++/// PUT the held cases' source against a peer that answers `reply` once the source is held.
++/// Once the client has read the answer the source is ready to fail if `then_fail`, else to
++/// give its last bytes. The run is checked for the fixture every held case shares; the hold is
++/// handed back for the test's own checks.
++async fn put_held(reply: Reply, then_fail: bool) -> (Run, Arc<Hold>) {
++    let hold = Arc::new(Hold::default());
++    let (source, probe) = Source::new(HELD_TOTAL, HELD_TOTAL as usize);
++    let source = source.held_at(HELD_AT, &hold, then_fail);
++    let answer = Answer::WhenHeld(Arc::clone(&hold), reply);
++    let run = put_against(answer, HELD_TOTAL, source, &probe).await;
++    assert_answered(&run, true);
++    assert_held_before_answer(&run, HELD_AT);
++    (run, hold)
++}
++
++#[tokio::test]
++async fn a_source_that_fails_after_the_acknowledgement_is_the_body_error() {
++    let (run, hold) = put_held(ACK, true).await;
++    // The source was ready to fail at its first poll after the client read the answer; a
++    // failure then is not the outcome, the answer's early success is.
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_AT);
++    assert_lifetime(&run);
++}
++
++#[tokio::test]
++async fn a_final_piece_ready_once_the_client_has_read_the_acknowledgement_is_the_body_error() {
++    let (run, hold) = put_held(ACK, false).await;
++    // The source was ready with its last 6 bytes at its first poll after the client read the
++    // answer; giving them then does not make the answer a receipt.
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_AT);
++    assert_lifetime(&run);
++}
++
++// The same two, with the acknowledgement's body still on its way: the request has seen the
++// answer and goes on reading the response, and hyper goes on polling the request body while
++// it waits. An answer with no body ends the request in the poll that sees it, before hyper
++// polls the request body again, so only these show that the source is not polled once the
++// client has the answer.
++
++#[tokio::test]
++async fn a_source_that_fails_while_the_acknowledgements_body_is_on_its_way_is_the_body_error() {
++    let (run, hold) = put_held(ACK_BODY_LATE, true).await;
++    assert_body_sent_late(&run);
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_AT);
++    assert_lifetime(&run);
++}
++
++#[tokio::test]
++async fn a_final_piece_ready_while_the_acknowledgements_body_is_on_its_way_is_the_body_error() {
++    let (run, hold) = put_held(ACK_BODY_LATE, false).await;
++    assert_body_sent_late(&run);
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_AT);
++    assert_lifetime(&run);
++}
++
++#[tokio::test]
++async fn a_rejection_whose_body_is_on_its_way_is_the_servers_error_not_the_sources() {
++    let (run, hold) = put_held(REJECTION_BODY_LATE, true).await;
++    assert_body_sent_late(&run);
++    // The source was ready to fail once the client had the rejection's head; the server's
++    // rejection is the outcome, whole, request id included.
++    assert_eq!(
++        run.outcome,
++        Err(S3Error::Service {
++            status: 403,
++            code: ErrorCode::Code("AccessDenied".to_owned()),
++            message: Some("Access Denied".to_owned()),
++            request_id: Some(REQUEST_ID.to_owned()),
++        }),
++        "an early rejection must be the server's error, never a source failure that came \
++         after it: {run:?}"
++    );
++    assert_not_polled_past_the_hold(&run, &hold, HELD_AT);
++    assert_lifetime(&run);
++}
++
++// --- scenario 2: early acknowledgement under backpressure ------------------------------------
++
++#[tokio::test]
++async fn an_acknowledgement_under_backpressure_is_the_body_error_and_releases_the_upload() {
++    let (source, probe) = Source::new(LARGE_OBJECT, LARGE_PIECE);
++    let run = put_against(Answer::WhenBackedUp, LARGE_OBJECT, source, &probe).await;
++    // The fixture must include the fault: the peer answered a client blocked mid-write, while
++    // the source still had bytes.
++    let backed_up = run.peer.as_ref().map(|report| report.backed_up);
++    assert!(
++        matches!(
++            backed_up,
++            Some(BackedUp::Yes(_)) | Some(BackedUp::Unobservable)
++        ),
++        "the client's writes never backed up before the peer answered, so this run did not \
++         test backpressure: {run:?}"
++    );
++    assert_answered(&run, true);
++    assert!(
++        run.given_at_return < run.declared,
++        "the source had given its whole length, so this run did not answer early: {run:?}"
++    );
++    assert_body_error_carrying_the_answer(&run);
++    assert_lifetime(&run);
++}
++
++// --- scenario 3: stops reading, never answers -----------------------------------------------
++
++#[tokio::test]
++async fn a_peer_that_stops_reading_and_never_answers_is_the_operation_timeout() {
++    let (source, probe) = Source::new(LARGE_OBJECT, LARGE_PIECE);
++    let run = put_against(Answer::Never, LARGE_OBJECT, source, &probe).await;
++    assert_answered(&run, false);
++    assert_eq!(
++        run.outcome,
++        Err(S3Error::Timeout {
++            phase: Phase::Operation,
++            limit: T_OP,
++        }),
++        "{run:?}"
++    );
++    assert!(run.elapsed >= T_OP, "the deadline ran its course: {run:?}");
++    assert_lifetime(&run);
++}
++
++// --- scenario 4: the receipt rule -------------------------------------------------------------
++
++#[tokio::test]
++async fn a_source_that_ended_before_the_acknowledgement_is_a_receipt() {
++    let (source, probe) = Source::new(HELD_TOTAL, HELD_TOTAL as usize);
++    let run = put_against(
++        Answer::WhenExhausted(Arc::clone(&probe)),
++        HELD_TOTAL,
++        source,
++        &probe,
++    )
++    .await;
++    // The fixture: the peer answers only once the source has reported its end, and it did
++    // answer.
++    assert_answered(&run, true);
++    assert!(
++        run.ended_at_return,
++        "the source never reported its end: {run:?}"
++    );
++    assert_eq!(run.given_at_return, run.declared, "{run:?}");
++    // The source had ended before the answer: a receipt.
++    assert_eq!(run.outcome, Ok(PutOutcome { etag: None }), "{run:?}");
++    assert_lifetime(&run);
++}
++
++/// PUT a source declared at `HELD_TOTAL` bytes that gives them all and then holds until the
++/// client has read the answer ([`Hold`]): it holds its end if `total` is `HELD_TOTAL`, and an
++/// extra byte if `total` is one more. The peer answers `200` once the source holds. The hold
++/// is handed back for the test's checks.
++async fn put_held_at_its_declared_length(total: u64) -> (Run, Arc<Hold>) {
++    let hold = Arc::new(Hold::default());
++    let (source, probe) = Source::new(total, total as usize);
++    let source = source.held_at(HELD_TOTAL, &hold, false);
++    let answer = Answer::WhenHeld(Arc::clone(&hold), ACK);
++    let run = put_against(answer, HELD_TOTAL, source, &probe).await;
++    (run, hold)
++}
++
++#[tokio::test]
++async fn a_source_that_gave_its_whole_length_but_held_its_end_is_not_a_receipt() {
++    let (run, hold) = put_held_at_its_declared_length(HELD_TOTAL).await;
++    // The fixture must include the edge: the answer came while the source held its end.
++    assert_answered(&run, true);
++    assert_parked_before_answer(&run);
++    // All 10 bytes given, the end not yet reported, when the client read the answer: the
++    // source had not ended, so the answer is early, never a receipt.
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_TOTAL);
++    assert!(
++        !run.ended_at_return,
++        "the source reported its end, so this run did not hold it back: {run:?}"
++    );
++    assert_lifetime(&run);
++}
++
++#[tokio::test]
++async fn a_source_that_gave_its_declared_length_and_held_an_extra_byte_is_not_a_receipt() {
++    let (run, hold) = put_held_at_its_declared_length(HELD_TOTAL + 1).await;
++    // The fixture must include the edge: the answer came while the source held its 11th byte.
++    assert_answered(&run, true);
++    assert_parked_before_answer(&run);
++    // The declared 10 bytes given, an 11th held back, when the client read the answer: the
++    // source had not ended, so the answer is early, never a receipt. The 11th byte is never
++    // taken, so the outcome is not the overrun either.
++    assert_body_error_carrying_the_answer(&run);
++    assert_not_polled_past_the_hold(&run, &hold, HELD_TOTAL);
++    assert_lifetime(&run);
++}
++
++// --- scenario 5: a PUT its caller drops while it is blocked mid-write --------------------------
++
++/// What a dropped PUT was observed to do.
++#[derive(Debug)]
++struct Dropped {
++    backed_up: BackedUp,
++    /// When the test dropped the call, counted from its start.
++    dropped_after: Duration,
++    /// Bytes the source had given when the call was dropped.
++    given_at_drop: u64,
++    /// How long after the drop the source was dropped; `None` if it was still alive
++    /// `CLOSE_BOUND` after the drop.
++    source_released: Option<Duration>,
++    peer: Option<PeerReport>,
++}
++
++#[tokio::test]
++async fn a_put_dropped_while_blocked_mid_write_releases_the_upload() {
++    let (source, probe) = Source::new(LARGE_OBJECT, LARGE_PIECE);
++    let (tell, told) = oneshot::channel();
++    let mut peer = Peer::start(Answer::NeverTellingBackedUp(tell)).await;
++    let client = client(peer.addr, DROPPED_T_OP);
++    let started = Instant::now();
++    let mut put = Box::pin(client.put_object(KEY, PutSource::new(LARGE_OBJECT, source)));
++    let backed_up = tokio::select! {
++        outcome = &mut put => panic!("put_object returned before the test dropped it: {outcome:?}"),
++        backed_up = told => backed_up.expect("the peer says whether the client backed up"),
++    };
++    let given_at_drop = probe.given.load(Ordering::SeqCst);
++    // Stamped before the drop, so the bound covers the drop itself too.
++    let dropped = Instant::now();
++    drop(put);
++    let dropped_after = dropped.duration_since(started);
++    let report = peer.after_call(dropped).await;
++    while !probe.dropped() && dropped.elapsed() < CLOSE_BOUND {
++        sleep(Duration::from_millis(5)).await;
++    }
++    let source_released = probe
++        .dropped_at
++        .get()
++        .map(|at| at.saturating_duration_since(dropped));
++    let run = Dropped {
++        backed_up,
++        dropped_after,
++        given_at_drop,
++        source_released,
++        peer: report,
++    };
++    // The fixture must include the fault: a client blocked mid-write with bytes left, dropped
++    // early enough that the operation deadline cannot be what releases it within the bound.
++    assert!(
++        matches!(run.backed_up, BackedUp::Yes(_) | BackedUp::Unobservable),
++        "the client's writes never backed up, so this run did not drop a blocked PUT: {run:?}"
++    );
++    assert!(
++        run.given_at_drop < LARGE_OBJECT,
++        "the source had given its whole length before the drop: {run:?}"
++    );
++    assert!(
++        run.dropped_after + CLOSE_BOUND < DROPPED_T_OP,
++        "the PUT was dropped too close to its operation deadline to tell the drop's release \
++         from the deadline's: {run:?}"
++    );
++    assert!(
++        run.source_released
++            .is_some_and(|after| after <= CLOSE_BOUND),
++        "the source outlived the dropped PUT by more than {CLOSE_BOUND:?}: {run:?}"
++    );
++    assert_connection_closed(run.peer.as_ref(), &run);
++}
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index e3547bb..0310502 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -252,4 +252,4 @@ The Colossus-style bootstrap recursion bottoms out here: etcd depends on nothing
+ 
+ The dependency rule (ADR-0010): implementations and consumers depend on `traits`, never on each other's concretes. Only `server` knows the concrete backends, which is what makes "swap redb for FoundationDB" or "in-memory for etcd" a composition change rather than a refactor. The seam earned its keep in M4: swapping the production backend from TiKV to FoundationDB (ADR-0042) touched the `server` wiring and added a crate, and changed no consumer.
+ 
+-`validate` sits outside that rule on purpose: it is a client of a running deployment, not a part of one, and depends on no `wyrd-*` crate (proposal 0017 §9). Its command-line surface is ten required flags — `--endpoint`, `--region`, `--bucket`, `--scenario`, `--duration`, `--workers`, `--seed`, `--out`, `--run-id`, `--driver-placement` — with S3 credentials taken from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else `WYRD_S3_ACCESS_KEY`/`WYRD_S3_SECRET_KEY`, else refused; half a pair, or a variable whose value is not UTF-8, is refused by name rather than skipped over to the next pair (an empty variable counts as unset). Parsing is strict, unlike `wyrd`'s: an unknown flag, a repeated flag, an empty value, a stray positional, or a `--`-prefixed token in a value slot is refused by name rather than absorbed. The library carries the S3 client every scenario calls through (#852): `aws-sdk-s3` on the `--endpoint`, path-style, with static SigV4 credentials, plain HTTP (TLS is terminated in front of the gateway), and retries and stalled-stream protection off. Its error is typed: HTTP status, `<Code>`, `<Message>`, and the `x-amz-request-id` read from that header itself. Connect, operation, and body-idle deadlines bound every wait, and object bodies stream both ways, so what the client holds of an object does not grow with its size. The AWS SDK is the only shipped dependency `validate` adds; Wyrd crates appear only as dev-dependencies, for the in-process gateway its tests run against. The binary still echoes its resolved configuration (the access-key id, never the secret) and exits without issuing a request; scenarios arrive with #743.
++`validate` sits outside that rule on purpose: it is a client of a running deployment, not a part of one, and depends on no `wyrd-*` crate (proposal 0017 §9). Its command-line surface is ten required flags — `--endpoint`, `--region`, `--bucket`, `--scenario`, `--duration`, `--workers`, `--seed`, `--out`, `--run-id`, `--driver-placement` — with S3 credentials taken from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else `WYRD_S3_ACCESS_KEY`/`WYRD_S3_SECRET_KEY`, else refused; half a pair, or a variable whose value is not UTF-8, is refused by name rather than skipped over to the next pair (an empty variable counts as unset). Parsing is strict, unlike `wyrd`'s: an unknown flag, a repeated flag, an empty value, a stray positional, or a `--`-prefixed token in a value slot is refused by name rather than absorbed. The library carries the S3 client every scenario calls through (#852): `aws-sdk-s3` on the `--endpoint`, path-style, with static SigV4 credentials, plain HTTP (TLS is terminated in front of the gateway), and retries and stalled-stream protection off. Its error is typed: HTTP status, `<Code>`, `<Message>`, and the `x-amz-request-id` read from that header itself. Connect, operation, and body-idle deadlines bound every wait, and object bodies stream both ways, so what the client holds of an object does not grow with its size. A PUT reports a receipt only if the caller's source had ended, that is, had given its whole declared length and then reported its end, by the time the response head was read off the socket; a success that arrives sooner is the typed body error `AcknowledgedEarly`, carrying that response's request id, and from that moment the source is not polled again (#854). The client cannot see what the server read, nor an answer its own kernel has received but the HTTP stack has not yet read, so a receipt says only what the client handed over before it read the answer. No PUT outlives its call: each runs on a runtime and a thread of its own, over a connection that is never pooled, and that runtime is shut down, dropping the source and closing the connection, before the outcome is returned (or promptly after, if the caller drops the call). The price is one thread and one fresh TCP connection per PUT, which the client closes, so each PUT leaves a client socket in `TIME_WAIT`. That caps sustained PUTs between one client address and one gateway address at about the number of ephemeral ports divided by the `TIME_WAIT` time, about 470 a second with Linux's defaults (28,232 ports, 60 s); past that, `connect` fails and the client reports `NoResponse`, which the failure taxonomy (proposal 0017 §7) would count against the server as `availability`. The cap is a host default, not a hard ceiling: it holds per pair of client address and gateway address, shared by every worker on that client, and an operator raises it with more client or gateway addresses, a wider `net.ipv4.ip_local_port_range`, or `net.ipv4.tcp_tw_reuse = 1` (Linux's default, `2`, reuses ports on loopback only). The AWS SDK is the only shipped dependency `validate` adds; Wyrd crates appear only as dev-dependencies, for the in-process gateway its tests run against. The binary still echoes its resolved configuration (the access-key id, never the secret) and exits without issuing a request; scenarios arrive with #743.

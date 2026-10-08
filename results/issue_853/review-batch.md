@@ -1,0 +1,8 @@
+# Batched review — 3 passes, union of findings
+
+- [ ] `crates/validate/src/s3/response.rs:200` **BUG** (seen by 1 pass): A GET response with status 204 and `Transfer-Encoding: chunked` is recorded as chunked and accepted as an empty object even without a terminal chunk, because hyper suppresses bodies for 204 responses; reject this forbidden framing before treating the response as a streaming success.
+- [ ] `crates/validate/src/s3.rs:198` **BUG** (seen by 1 pass): A GET response with status 204 and `Transfer-Encoding: chunked` is accepted as an empty object without a terminal chunk because hyper suppresses bodies for 204 responses, so chunked acceptance must also validate the response status.
+- [ ] `crates/validate/src/s3/response.rs:328` **BUG** (seen by 1 pass): Collecting descendant text turns malformed structured codes such as `<Code>Slow<Unexpected/>Down</Code>` into a clean `SlowDown` service error instead of rejecting nested elements in the scalar field.
+- [ ] `crates/validate/src/s3/response.rs:85` **BUG** (seen by 1 pass): Unicode-aware `trim()` accepts `Transfer-Encoding: chunked\u{00A0}` as chunked although hyper treats that non-ASCII header as close-delimited, allowing a truncated GET to succeed at connection close; restrict trimming to HTTP space and tab and reject non-ASCII coding values.
+
+Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale (a decision follows its finding to the nearest matching line when the line shifts) — not re-reviewed to silence. The gate blocks while any finding here is unchecked.

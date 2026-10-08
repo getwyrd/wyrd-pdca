@@ -1,0 +1,3 @@
+- NEEDS-HUMAN [impl] — `crates/custodian/tests/segmented_map_repoint.rs:421`: The success case checks only that one orphan mark exists. It still passes if repair marks the survivor, the rebuilt destination, or another fragment instead of the displaced position. Compare the complete returned key list with the expected orphan key for `(LOST, FragmentId { chunk: CHUNK, index: 1 })`; this proves the identity claimed by the assertion and excludes extra marks.
+
+No additional introduced correctness bugs or actionable reuse, simplification, or efficiency issues identified. Reviewed against the read-only target and supplied frozen gate evidence; no builds rerun.

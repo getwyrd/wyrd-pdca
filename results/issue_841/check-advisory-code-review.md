@@ -1,0 +1,5 @@
+No findings. The diff is clean on both advisory lenses: no introduced correctness bugs or actionable reuse, simplification, or efficiency issues found.
+
+Reviewed the atomic fence and conflict handling (`crates/custodian/src/restore.rs:754`), shared paging (`crates/custodian/src/gc.rs:1734`), teardown construction and codec compatibility (`crates/core/src/multipart.rs:2264`), and bounded CLI reporting (`crates/server/src/cli.rs:1389`). The earlier incomplete-run verdict defect is fixed (`crates/custodian/src/restore.rs:1320`) and covered by an otherwise-clean failure test (`crates/custodian/tests/restore_open_fence.rs:816`); the public teardown API now directly tests non-Open states and epoch exhaustion (`crates/core/src/multipart.rs:5084`).
+
+Validation used the frozen gate evidence: CI passed, all nine regression tests ran red before the fix and green afterward, and mutation testing reported 20 caught and 24 unviable mutants, with none surviving. Diff coverage was not measured because its gate could not apply the patch to origin/main. No tests were re-run and no target files were changed.

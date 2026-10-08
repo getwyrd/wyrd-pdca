@@ -1,0 +1,15 @@
+Reviewing the fix that lets reconstruction complete a queued repair by repointing a `ChunkRef` stored in a segmented `seg:` metadata record.
+
+| Item | Verdict | Basis |
+|------|---------|-------|
+| C1 Spec | PASS | The brief gives a falsifiable failure, atomicity/race outcomes, the V/2 ceiling decision, and explicit scope boundaries (`brief.md:13`). |
+| C2 Reproduction (red pre-fix) | PASS | An independent tracked-change stash made 3 of 7 discriminator tests fail, including the binding segmented repair, and restoring the patch made all 7 pass (`crates/custodian/tests/segmented_map_repoint.rs:496`). |
+| C3 Change | PASS | The core prepares the root-plus-segment CAS and the custodian adds obligation deletion and orphan evidence before one commit, matching the requested lifecycle change (`crates/core/src/metadata.rs:2912`, `crates/custodian/src/reconstruction.rs:939`). |
+| C4 Verification (red→green) | NEEDS-HUMAN | The human must decide how to clear or waive the unrelated locked `h2` advisory: red→green, fmt, clippy, tests, typos and machete pass, but full CI stops at `cargo deny` on `h2 0.4.15` (`gate-logs/C4-ci.log:5222`, `Cargo.lock:1536`). |
+| C5 Causal adequacy | PASS | The change removes the refusal by addressing the covering record with byte offset plus exact prior-reference equality, and the mutation gate reports no surviving viable mutant (`crates/core/src/metadata.rs:2781`, `crates/core/src/metadata.rs:2932`, `gate-logs/C5-mutants.log:13`). |
+| T1 Structure | PASS | Metadata owns CAS preparation while custodian owns repair evidence and commit, preserving the existing seam and dependency direction (`crates/core/src/metadata.rs:2816`, `crates/custodian/src/reconstruction.rs:916`). |
+| T2 Shape | FAIL | The 107,031-byte `patch.diff` exceeds the explicit 95 KB cap, although it stays within four files and 192 added semantic non-test lines (`brief.md:199`). |
+| T3 Runtime | PASS | The repoint reads only the covering segment, race losses write no repair metadata, and the metadata trait assigns network termination to bounded backend adapters (`crates/core/src/metadata.rs:2867`, `crates/traits/src/lib.rs:1337`). |
+| T4 Contribution | N/A | Contribution artifacts are absent by design at Check; their substantive audit is mandatory at publish, exactly as the deferred gate records (`gate-logs/T4-contribution.log:10`). |
+| T5 Judgment | NEEDS-HUMAN | The human must confirm prior art across merged and closed/rejected work: the supplied target has only one synthetic commit and no remote, so the affected-path history claim cannot be independently settled; the batch-review classes are otherwise settled under #698/#722 or contradicted by the backend timeout contract (`brief.md:311`, `crates/traits/src/lib.rs:1337`). |
+| Validation — fitness-to-purpose | NEEDS-HUMAN | The human must decide whether the in-memory red→green and race evidence is sufficient for production durability fitness, because automation establishes mechanics but not operational fitness (`crates/custodian/tests/segmented_map_repoint.rs:492`). |

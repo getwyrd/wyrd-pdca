@@ -1,0 +1,2529 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 02e5f14..ba5c0fd 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5278,6 +5278,10 @@ dependencies = [
+  "bytes",
+ ]
+ 
++[[package]]
++name = "wyrd-validate"
++version = "0.0.0"
++
+ [[package]]
+ name = "xml"
+ version = "1.3.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index ea0db39..d81e0b8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,10 @@ members = [
+     "crates/gateway-core",
+     "crates/gateway-s3",
+     "crates/server",
++    # The blackbox validator (proposal 0017 §9): a workspace member so fmt/clippy/deny
++    # and the `forbid(unsafe_code)` scan cover it — but never a dependency of one, and
++    # never a consumer of one (`xtask::repo_guard::BLACKBOX_GUARD_TARGETS`).
++    "crates/validate",
+     "crates/dst",
+     "xtask",
+ ]
+diff --git a/crates/validate/Cargo.toml b/crates/validate/Cargo.toml
+new file mode 100644
+index 0000000..0b16473
+--- /dev/null
++++ b/crates/validate/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "wyrd-validate"
++description = "Blackbox S3-surface validator (proposal 0017): a client of Wyrd's S3 wire surface, never a consumer of its internal crates — enforced by xtask::repo_guard's dependency-closure guard, not a doc comment."
++version.workspace = true
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++repository.workspace = true
++publish.workspace = true
++
++# No [dependencies] table: this crate is the one workspace member whose whole point is
++# staying OUTSIDE the `wyrd-*` dependency closure (proposal 0017 §9). Anything added here
++# is exactly what xtask::repo_guard::scan_blackbox_dependency_closure exists to catch —
++# see issue #740's "no new dependency" scope note before adding one. Dev-dependencies are
++# deliberately unconstrained (normal, not total): what a test harness links never ships in
++# the binary.
++
++# Inherit the workspace lint policy (single source of truth in the root
++# Cargo.toml [workspace.lints.*]).
++[lints]
++workspace = true
+diff --git a/crates/validate/src/lib.rs b/crates/validate/src/lib.rs
+new file mode 100644
+index 0000000..968592b
+--- /dev/null
++++ b/crates/validate/src/lib.rs
+@@ -0,0 +1,458 @@
++//! `wyrd-validate` — the blackbox S3-surface validator (proposal 0017,
++//! `docs/design/proposals/draft/0017-blackbox-validation-tool.md`).
++//!
++//! This slice (#740) lands only the crate skeleton: the argument surface every later
++//! slice parses (`--endpoint --region --bucket --scenario --duration --workers --seed
++//! --out --run-id --driver-placement`), credential resolution over
++//! `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` falling back to
++//! `WYRD_S3_ACCESS_KEY`/`WYRD_S3_SECRET_KEY`, and a resolved-configuration echo. No S3
++//! call is made here (#741); no scenario/oracle/pool/verdict logic exists yet (#743+).
++//!
++//! **Pure decisions, injected I/O** (proposal 0017 §2, the same convention
++//! `xtask/src/consistency_run_runner.rs:8-12` and `xtask/src/main.rs:1519` follow):
++//! [`resolve_credentials`] takes a lookup CLOSURE rather than reading `std::env`
++//! directly, so the fallback ordering is unit-testable without mutating process-global
++//! state (shared across parallel test threads — a read/write race the injected form
++//! cannot have). Only the thin `main` in `src/main.rs` touches the real environment, and
++//! it does so by handing [`run`] a closure over `std::env::var_os`.
++//!
++//! **Every input surface fails closed, and says which token it refused.** The three
++//! surfaces are the argument vector, the environment, and the record this tool prints
++//! back; each one can misreport a run if it is liberal:
++//!
++//! * arguments — an unrecognised flag, a `--`-prefixed token where a value belongs, an
++//!   empty value, a repeated flag, or an argument that is not valid UTF-8
++//!   ([`utf8_args`], [`ParsedArgs::parse`]);
++//! * environment — half a credential pair, an exported-but-empty name, or a name set to
++//!   bytes that are not valid UTF-8 ([`EnvValue`], [`resolve_credentials`]). "Set to
++//!   something unreadable" is NOT "absent": treating it as absent would silently sign the
++//!   run with the *other* pair's identity;
++//! * output — every operator-supplied value is printed quoted and escaped
++//!   ([`render_config_block`]), so a value carrying a newline or a terminal control
++//!   sequence cannot forge a configuration line that misstates the run.
++//!
++//! **The boundary this crate exists to keep**: `wyrd-validate`'s whole point is
++//! answering "is Wyrd correct" the way an external S3 client does, so it must never link
++//! a `wyrd-*` crate — `xtask::repo_guard::scan_blackbox_dependency_closure` (a workspace
++//! `cargo xtask ci` gate, not a doc comment) enforces that this crate's own `Cargo.toml`
++//! never grows a `[dependencies]` table that violates it.
++//!
++//! The operator-facing description of this surface — the flag table, the credential
++//! precedence, and the enforced boundary — is the living architecture doc,
++//! `docs/design/architecture/05-building-block-view.md` §5.4.
++
++#![forbid(unsafe_code)]
++
++use std::collections::BTreeMap;
++use std::ffi::OsString;
++use std::fmt;
++
++/// The complete CLI surface this slice parses. Order here is the order a missing-flag
++/// error is reported in ([`resolve_config`]) and the order the echoed configuration
++/// block prints in ([`Config::entries`]).
++pub const REQUIRED_FLAGS: &[&str] = &[
++    "endpoint",
++    "region",
++    "bucket",
++    "scenario",
++    "duration",
++    "workers",
++    "seed",
++    "out",
++    "run-id",
++    "driver-placement",
++];
++
++/// `--flag value` pairs only — no positionals, no valueless flags (every flag in
++/// [`REQUIRED_FLAGS`] takes a value). Mirrors the SHAPE of `ParsedArgs`
++/// (`crates/server/src/cli.rs:2495-2532`): a `--flag` walk collecting into a map, and
++/// "a flag needs a value" wording that matches so the two binaries feel like one
++/// product.
++///
++/// Deliberately does **not** mirror `ParsedArgs::parse`'s one silently-accepting
++/// behaviour: an unrecognised `--flag` here is a hard error naming it, not a value
++/// quietly recorded and never read. `wyrd-validate` is a brand-new binary an operator
++/// points at their own cluster; a typo'd flag silently ignored (`--duration 7d`
++/// misspelled) misreports the run it claims to have measured (issue #740 Design /
++/// Plan-review response).
++///
++/// That refusal holds in **both token positions**, which is the whole of it: rejecting
++/// an unknown token only where a flag is expected still lets the typo through one slot
++/// to the left. `--endpoint --totally-bogus …` would otherwise parse as "the endpoint is
++/// the string `--totally-bogus`", exit 0, and echo the typo back as configuration — the
++/// misreported run the strict policy exists to prevent, arrived at by a different route.
++/// So a value slot refuses:
++///
++/// * a `--`-prefixed token ([`ParsedArgs::FLAG_PREFIX`]) — no flag's value legitimately
++///   begins with `--` (endpoints, regions, buckets, paths, ids, counts), whereas a single
++///   `-` can legitimately lead one (a negative `--seed -12345`), so the check is on the
++///   flag prefix itself and not on `-`;
++/// * an empty string — `--endpoint ""` is not a configured endpoint, and echoing one back
++///   as resolved configuration is the same silent misreport.
++///
++/// A flag given **twice** is refused for the third form of the same hazard: `--duration
++/// 30s --duration 30m` silently keeping one of the two would report a run that is not the
++/// one the operator asked for.
++pub struct ParsedArgs {
++    flags: BTreeMap<String, String>,
++}
++
++impl ParsedArgs {
++    /// What makes a token a flag — and, by the same constant, what a value slot refuses:
++    /// a value is rejected *because* it would otherwise read as a flag. One spelling, so
++    /// the two positions cannot drift apart into a hole between them.
++    pub const FLAG_PREFIX: &'static str = "--";
++
++    /// Parse `--flag value` pairs, refusing anything else. See the type docs for why each
++    /// refusal is a refusal rather than a liberal read.
++    pub fn parse(args: &[String]) -> Result<Self, String> {
++        let mut flags = BTreeMap::new();
++        let mut i = 0;
++        while i < args.len() {
++            let Some(name) = args[i].strip_prefix(Self::FLAG_PREFIX) else {
++                return Err(format!(
++                    "unrecognised argument {} — wyrd-validate takes only `--flag value` \
++                     pairs",
++                    quoted(&args[i])
++                ));
++            };
++            if !REQUIRED_FLAGS.contains(&name) {
++                return Err(format!(
++                    "unrecognised flag {} — wyrd-validate accepts only: --{}",
++                    quoted(&args[i]),
++                    REQUIRED_FLAGS.join(", --")
++                ));
++            }
++            let value = args
++                .get(i + 1)
++                .ok_or_else(|| format!("flag `--{name}` needs a value"))?;
++            if value.starts_with(Self::FLAG_PREFIX) {
++                return Err(format!(
++                    "flag `--{name}` needs a value, but the next argument is {} — \
++                     wyrd-validate never consumes a `{}`-prefixed token as a value (a \
++                     mistyped flag would otherwise be swallowed as one)",
++                    quoted(value),
++                    Self::FLAG_PREFIX
++                ));
++            }
++            if value.is_empty() {
++                return Err(format!("flag `--{name}` needs a non-empty value"));
++            }
++            if let Some(previous) = flags.insert(name.to_string(), value.clone()) {
++                return Err(format!(
++                    "flag `--{name}` given more than once ({}, then {}) — \
++                     wyrd-validate refuses rather than silently keeping one",
++                    quoted(&previous),
++                    quoted(value)
++                ));
++            }
++            i += 2;
++        }
++        Ok(Self { flags })
++    }
++
++    /// The value given for `name`, or `None` if the flag was not given.
++    pub fn flag(&self, name: &str) -> Option<&str> {
++        self.flags.get(name).map(String::as_str)
++    }
++}
++
++/// The resolved value of every flag in [`REQUIRED_FLAGS`] — all ten are required in
++/// this slice (no scenario runs with an unset endpoint, region, etc.). Values are kept
++/// as the raw strings the operator typed: parsing them into typed durations/counts is
++/// out of scope here (issue #740 scope) and belongs to the slice that actually consumes
++/// them.
++///
++/// The line between what [`ParsedArgs`] refuses and what this leaves alone is
++/// deliberate: the parser rejects tokens that are not *values at all* (a mistyped flag
++/// swallowed into a value slot, an empty string, a flag repeated), because those are
++/// indistinguishable from configuration once echoed. What a value *means* —
++/// `--workers` as a count, `--duration` as a duration, `--driver-placement` as
++/// `internal`/`external` (proposal 0017 §10) — is validated by the slice that consumes
++/// it, where the accepted set is defined; validating it here would fix a vocabulary this
++/// slice has no consumer for.
++#[derive(Debug, PartialEq, Eq)]
++pub struct Config {
++    pub endpoint: String,
++    pub region: String,
++    pub bucket: String,
++    pub scenario: String,
++    pub duration: String,
++    pub workers: String,
++    pub seed: String,
++    pub out: String,
++    pub run_id: String,
++    pub driver_placement: String,
++}
++
++impl Config {
++    /// Every flag with its resolved value, in [`REQUIRED_FLAGS`] order. This is the ONE
++    /// place a flag is paired with the field that holds it, so the echoed block
++    /// ([`render_config_block`]) cannot drift into reporting nine of the ten: a flag added
++    /// to [`REQUIRED_FLAGS`] and not to this list is caught by
++    /// `crates/validate/tests/cli_surface.rs`'s equality assertion between the two.
++    pub fn entries(&self) -> Vec<(&'static str, &str)> {
++        vec![
++            ("endpoint", self.endpoint.as_str()),
++            ("region", self.region.as_str()),
++            ("bucket", self.bucket.as_str()),
++            ("scenario", self.scenario.as_str()),
++            ("duration", self.duration.as_str()),
++            ("workers", self.workers.as_str()),
++            ("seed", self.seed.as_str()),
++            ("out", self.out.as_str()),
++            ("run-id", self.run_id.as_str()),
++            ("driver-placement", self.driver_placement.as_str()),
++        ]
++    }
++}
++
++/// Every [`REQUIRED_FLAGS`] entry must be present; the first missing one (in
++/// declaration order) is named in the returned error, matching criterion 3's "a
++/// missing required argument exits non-zero with the offending flag named on stderr".
++pub fn resolve_config(parsed: &ParsedArgs) -> Result<Config, String> {
++    fn require(parsed: &ParsedArgs, name: &str) -> Result<String, String> {
++        parsed
++            .flag(name)
++            .map(str::to_string)
++            .ok_or_else(|| format!("missing required flag `--{name}`"))
++    }
++    Ok(Config {
++        endpoint: require(parsed, "endpoint")?,
++        region: require(parsed, "region")?,
++        bucket: require(parsed, "bucket")?,
++        scenario: require(parsed, "scenario")?,
++        duration: require(parsed, "duration")?,
++        workers: require(parsed, "workers")?,
++        seed: require(parsed, "seed")?,
++        out: require(parsed, "out")?,
++        run_id: require(parsed, "run-id")?,
++        driver_placement: require(parsed, "driver-placement")?,
++    })
++}
++
++/// What one environment lookup found — three answers, not two.
++///
++/// [`NotUnicode`](EnvValue::NotUnicode) exists because collapsing it into
++/// [`Absent`](EnvValue::Absent) (what `std::env::var(name).ok()` does) is a silent
++/// identity substitution: an operator whose `AWS_ACCESS_KEY_ID` holds bytes this tool
++/// cannot read would have the run signed with the `WYRD_S3_*` identity instead, and the
++/// echoed configuration would name that second identity as though it had been chosen.
++/// "Set to something unreadable" is an error naming the variable; "not set" is a
++/// fall-through to the next source.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum EnvValue {
++    /// The name is not set in this environment.
++    Absent,
++    /// The name is set, and its value is valid UTF-8 (possibly empty — emptiness is
++    /// judged by [`resolve_credentials`], which refuses it).
++    Present(String),
++    /// The name is set to bytes that are not valid UTF-8. An S3 access key is an ASCII
++    /// string, so this is never a usable credential — and never a reason to fall back.
++    NotUnicode,
++}
++
++/// Where the resolved access-key id came from — printed in the echoed configuration
++/// block so an operator can tell which pair actually took effect.
++#[derive(Debug, PartialEq, Eq)]
++pub enum CredentialSource {
++    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — what every S3 client and CI
++    /// runner already sets. Tried first, and wins when both pairs are present.
++    Aws,
++    /// `WYRD_S3_ACCESS_KEY` / `WYRD_S3_SECRET_KEY` — the gateway's own names
++    /// (`crates/server/src/cli.rs:2128,2135`), so a developer already running a
++    /// loopback gateway needs no second export.
++    Wyrd,
++}
++
++impl CredentialSource {
++    /// The pair's environment names, as printed in the echoed configuration block.
++    pub fn label(&self) -> &'static str {
++        match self {
++            CredentialSource::Aws => "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY",
++            CredentialSource::Wyrd => "WYRD_S3_ACCESS_KEY / WYRD_S3_SECRET_KEY",
++        }
++    }
++
++    /// The `(id, secret)` environment names this source reads, in the order
++    /// [`resolve_credentials`] tries the sources.
++    fn names(&self) -> (&'static str, &'static str) {
++        match self {
++            CredentialSource::Aws => ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
++            CredentialSource::Wyrd => ("WYRD_S3_ACCESS_KEY", "WYRD_S3_SECRET_KEY"),
++        }
++    }
++}
++
++/// A resolved id/secret pair plus the [`CredentialSource`] it came from. The secret is
++/// carried here (a later slice needs it to sign requests) but [`render_config_block`]
++/// never prints it — only the id and the source are echoed.
++pub struct Credentials {
++    pub access_key_id: String,
++    pub secret_access_key: String,
++    pub source: CredentialSource,
++}
++
++/// Redacting `Debug`, written out rather than derived: a derived one prints the secret,
++/// so a single future `{:?}` — in a log line, an error, a `dbg!` left in — would leak it
++/// past the "never printed" rule [`render_config_block`] keeps. The id and source stay
++/// visible because they are exactly what the echoed block already publishes.
++impl fmt::Debug for Credentials {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Credentials")
++            .field("access_key_id", &self.access_key_id)
++            .field("secret_access_key", &"<redacted>")
++            .field("source", &self.source)
++            .finish()
++    }
++}
++
++/// One environment read, keeping "set to something unreadable" distinct from "not set"
++/// (see [`EnvValue`]). `Ok(None)` means absent — the only answer that may fall through
++/// to the next credential source.
++fn read_credential(
++    lookup: &mut dyn FnMut(&str) -> EnvValue,
++    name: &str,
++) -> Result<Option<String>, String> {
++    match lookup(name) {
++        EnvValue::Present(value) => Ok(Some(value)),
++        EnvValue::Absent => Ok(None),
++        EnvValue::NotUnicode => Err(format!(
++            "`{name}` is set but is not valid UTF-8 — an S3 access key is an ASCII \
++             string, so wyrd-validate refuses rather than treating the variable as unset \
++             and signing the run with another pair's identity"
++        )),
++    }
++}
++
++/// AWS-shaped names first (what every S3 client and CI runner already sets), falling
++/// back to the gateway's own `WYRD_S3_*` names; when both pairs are fully present AWS
++/// wins. `lookup` is an INJECTED closure, not `std::env::var` read directly here — so
++/// the fallback ordering is exercised without mutating process-global state (proposal
++/// 0017 §2's "pure decisions, injected I/O", mirroring `run_ci_steps(&mut |name|
++/// std::env::var_os(name).is_some(), ...)`, `xtask/src/main.rs:1519`). Only
++/// `src/main.rs`'s `main` passes a closure that touches the real environment.
++///
++/// **Anything other than "absent" stops the search** — the same refusal the parser
++/// applies to a mistyped flag, at the other input surface. An operator who exported
++/// `AWS_ACCESS_KEY_ID` and misspelled the secret's name has stated an intent; quietly
++/// signing the run with the *other* pair's identity instead would attribute the results
++/// to a credential they never chose. An exported-but-EMPTY name is the same case (it is
++/// set, it cannot be used, and the error says which one to fix), and so is a name set to
++/// non-UTF-8 bytes ([`EnvValue::NotUnicode`]).
++pub fn resolve_credentials(
++    lookup: &mut dyn FnMut(&str) -> EnvValue,
++) -> Result<Credentials, String> {
++    for source in [CredentialSource::Aws, CredentialSource::Wyrd] {
++        let (id_name, secret_name) = source.names();
++        let id = read_credential(lookup, id_name)?;
++        let secret = read_credential(lookup, secret_name)?;
++        match (id, secret) {
++            (Some(id), Some(secret)) => {
++                for (name, value) in [(id_name, &id), (secret_name, &secret)] {
++                    if value.is_empty() {
++                        return Err(format!("`{name}` is set but empty — set it, or unset it"));
++                    }
++                }
++                return Ok(Credentials {
++                    access_key_id: id,
++                    secret_access_key: secret,
++                    source,
++                });
++            }
++            (Some(_), None) => {
++                return Err(format!(
++                    "`{id_name}` is set but `{secret_name}` is not — set both, or unset \
++                     `{id_name}` to use another credential pair"
++                ));
++            }
++            (None, Some(_)) => {
++                return Err(format!(
++                    "`{secret_name}` is set but `{id_name}` is not — set both, or unset \
++                     `{secret_name}` to use another credential pair"
++                ));
++            }
++            (None, None) => continue,
++        }
++    }
++    Err(
++        "no credentials found — set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or \
++         WYRD_S3_ACCESS_KEY and WYRD_S3_SECRET_KEY"
++            .to_string(),
++    )
++}
++
++/// One operator-supplied string as a single unambiguous record field: double-quoted,
++/// with quotes, backslashes and every non-printable character escaped
++/// (`str::escape_debug`, so a newline prints as `\n` and a terminal escape as `\u{1b}`).
++///
++/// Escaping is not cosmetic. The echoed block is a record of what this run was
++/// configured with, one field per line; interpolating a raw value lets `--bucket
++/// $'real\n--endpoint http://elsewhere'` print a line that reads exactly like a
++/// resolved `--endpoint`, so the record would misstate the run — and a value carrying a
++/// terminal control sequence could rewrite what an operator sees on their terminal.
++/// Escaping keeps every value fully recoverable (nothing is dropped or replaced) while
++/// making the field boundaries unforgeable; the same helper wraps the values named in
++/// parse errors, since those are printed to the same terminal.
++fn quoted(value: &str) -> String {
++    format!("\"{}\"", value.escape_debug())
++}
++
++/// The resolved-configuration block `wyrd-validate` echoes on success: every
++/// [`REQUIRED_FLAGS`] entry with the value it was given (quoted and escaped by
++/// `quoted`), plus the resolved access-key **id** and its [`CredentialSource`]. The
++/// secret NEVER appears here — criterion 4 asserts its absence by searching the whole
++/// process output for the secret's value.
++pub fn render_config_block(config: &Config, credentials: &Credentials) -> String {
++    let mut block = String::from("resolved configuration:\n");
++    for (flag, value) in config.entries() {
++        block.push_str(&format!("--{flag} {}\n", quoted(value)));
++    }
++    block.push_str(&format!(
++        "credentials: access-key-id={} source={}\n",
++        quoted(&credentials.access_key_id),
++        quoted(credentials.source.label())
++    ));
++    block
++}
++
++/// The raw OS argument vector as UTF-8 strings, refusing an argument this tool cannot
++/// read rather than panicking or transcoding it lossily.
++///
++/// `std::env::args()` **panics** on a non-UTF-8 argument, and a lossy conversion would be
++/// worse than the panic: `--bucket $'\xff'` would resolve to the replacement character
++/// and the echoed block would report a bucket name that was never asked for. The refusal
++/// names the argument's position and shows its lossy form (escaped, like every other
++/// operator-supplied value) so the operator can find the offending token.
++pub fn utf8_args<A: IntoIterator<Item = OsString>>(args: A) -> Result<Vec<String>, String> {
++    args.into_iter()
++        .enumerate()
++        .map(|(index, arg)| {
++            arg.into_string().map_err(|raw| {
++                format!(
++                    "argument {} is not valid UTF-8 (as far as it can be read: {}) — \
++                     wyrd-validate refuses an argument it cannot read rather than \
++                     guessing at it",
++                    index + 1,
++                    quoted(&raw.to_string_lossy())
++                )
++            })
++        })
++        .collect()
++}
++
++/// The whole of `wyrd-validate`'s work in this slice: read the arguments, parse them,
++/// validate presence, resolve credentials, echo. `main` in `src/main.rs` is the thin
++/// wrapper that supplies the real `std::env::args_os()` / `std::env::var_os` and prints
++/// the `Ok`/`Err` result — every decision above is reachable from a test without a
++/// process.
++pub fn run<A: IntoIterator<Item = OsString>>(
++    args: A,
++    lookup: &mut dyn FnMut(&str) -> EnvValue,
++) -> Result<String, String> {
++    let args = utf8_args(args)?;
++    let parsed = ParsedArgs::parse(&args)?;
++    let config = resolve_config(&parsed)?;
++    let credentials = resolve_credentials(lookup)?;
++    Ok(render_config_block(&config, &credentials))
++}
+diff --git a/crates/validate/src/main.rs b/crates/validate/src/main.rs
+new file mode 100644
+index 0000000..c253d6c
+--- /dev/null
++++ b/crates/validate/src/main.rs
+@@ -0,0 +1,34 @@
++//! Thin `wyrd-validate` binary over the `wyrd_validate` lib target — the only place that
++//! touches real process state, so every decision in `src/lib.rs` (`run`, `resolve_config`,
++//! `resolve_credentials`, `utf8_args`) stays reachable from a test without a process.
++//!
++//! Both reads are `*_os`: `std::env::args()` panics on a non-UTF-8 argument and
++//! `std::env::var(name).ok()` reports a non-UTF-8 *value* as absent, which would silently
++//! fall back to the other credential pair's identity. The `OsString` forms let
++//! `wyrd_validate` refuse each case by name instead (`EnvValue::NotUnicode`).
++
++#![forbid(unsafe_code)]
++
++use std::process::ExitCode;
++
++use wyrd_validate::EnvValue;
++
++fn main() -> ExitCode {
++    let mut lookup = |name: &str| match std::env::var_os(name) {
++        None => EnvValue::Absent,
++        Some(raw) => match raw.into_string() {
++            Ok(value) => EnvValue::Present(value),
++            Err(_) => EnvValue::NotUnicode,
++        },
++    };
++    match wyrd_validate::run(std::env::args_os().skip(1), &mut lookup) {
++        Ok(block) => {
++            print!("{block}");
++            ExitCode::SUCCESS
++        }
++        Err(message) => {
++            eprintln!("wyrd-validate: {message}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/crates/validate/tests/cli_surface.rs b/crates/validate/tests/cli_surface.rs
+new file mode 100644
+index 0000000..03f0368
+--- /dev/null
++++ b/crates/validate/tests/cli_surface.rs
+@@ -0,0 +1,863 @@
++//! `wyrd-validate`'s CLI surface (#740, criteria 3 and 4) — bound flag by flag and
++//! credential case by credential case, over the REAL compiled binary
++//! (`env!("CARGO_BIN_EXE_wyrd-validate")`), not a copy of its parsing logic. Every
++//! process here is spawned with an explicit, per-command environment
++//! (`Command::env`/`env_remove`) rather than mutating the test process's own
++//! environment — the same "injected I/O, no shared mutable state" reason
++//! `xtask/src/main.rs:1519` passes `run_ci_steps` a lookup closure instead of reading
++//! `std::env` directly (a `std::env::set_var` in one test flakes every other test
++//! running in parallel in the same process).
++//!
++//! A handful of pure-function cases additionally call `wyrd_validate::resolve_credentials`
++//! / `utf8_args` directly over in-memory inputs (no subprocess) — the SAME functions
++//! `main` calls, driven the same "injected lookup" way, for a fast, non-flaky proof of
++//! decisions that a subprocess can only observe indirectly.
++//!
++//! Three input surfaces are covered, because a tool that is strict on one and liberal on
++//! another still misreports the run it claims to have measured:
++//!
++//! * **arguments** — an unknown `--flag`, a flag-shaped token in a VALUE slot (per flag),
++//!   a repeated flag, an empty value, and an argument that is not valid UTF-8;
++//! * **environment** — both credential pairs, their precedence, half a pair, an
++//!   exported-but-empty name, and a name set to non-UTF-8 bytes (which must refuse, not
++//!   silently fall back to the other pair's identity);
++//! * **output** — the echoed record itself: a value carrying a newline or a terminal
++//!   control sequence must not be able to forge a configuration line, and no secret may
++//!   appear anywhere in the process output.
++
++#![forbid(unsafe_code)]
++
++use std::collections::BTreeMap;
++use std::ffi::OsString;
++use std::process::Command;
++
++use wyrd_validate::{
++    render_config_block, resolve_config, resolve_credentials, utf8_args, CredentialSource,
++    Credentials, EnvValue, ParsedArgs, REQUIRED_FLAGS,
++};
++
++fn bin() -> &'static str {
++    env!("CARGO_BIN_EXE_wyrd-validate")
++}
++
++/// The ten required flags, each with a distinct, greppable value so a per-flag
++/// assertion cannot pass by coincidence (no two values share a substring).
++fn base_flags() -> Vec<(&'static str, &'static str)> {
++    vec![
++        ("endpoint", "https://s3.example.invalid"),
++        ("region", "us-validate-1"),
++        ("bucket", "bucket-alpha-9f2"),
++        ("scenario", "smoke-scenario-7c1"),
++        ("duration", "30s-marker-b4e"),
++        ("workers", "workers-marker-1a3"),
++        ("seed", "seed-marker-de9"),
++        ("out", "/tmp/out-marker-5b6"),
++        ("run-id", "run-id-marker-88c"),
++        ("driver-placement", "placement-marker-f01"),
++    ]
++}
++
++fn args_for(flags: &[(&str, &str)]) -> Vec<String> {
++    let mut args = Vec::new();
++    for (name, value) in flags {
++        args.push(format!("--{name}"));
++        args.push((*value).to_string());
++    }
++    args
++}
++
++/// One flag's value replaced, the other nine left at their base values.
++fn flags_with(target: &str, replacement: &'static str) -> Vec<(&'static str, &'static str)> {
++    base_flags()
++        .into_iter()
++        .map(|(name, value)| {
++            if name == target {
++                (name, replacement)
++            } else {
++                (name, value)
++            }
++        })
++        .collect()
++}
++
++/// Credentials never appear on the required-flags list, so every base invocation still
++/// needs AWS creds set for the CLI-surface tests below to reach a clean exit 0.
++fn aws_creds() -> Vec<(&'static str, &'static str)> {
++    vec![
++        ("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEBASE"),
++        ("AWS_SECRET_ACCESS_KEY", "base-secret-should-never-print"),
++    ]
++}
++
++/// How the echoed block renders one flag: `--name "value"`, quoted and escaped
++/// (`wyrd_validate::render_config_block`). The quoting is what makes the record
++/// unforgeable, so the per-flag assertions below check the quoted form — a bare
++/// substring match would also pass against an unescaped, forgeable line.
++fn echoed(name: &str, value: &str) -> String {
++    format!("--{name} \"{value}\"")
++}
++
++// ─── criterion 3: the CLI surface, bound flag by flag ──────────────────────────────
++
++#[test]
++fn all_ten_flags_exit_zero_and_each_is_echoed_with_its_given_value() {
++    let flags = base_flags();
++    let output = Command::new(bin())
++        .args(args_for(&flags))
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        output.status.success(),
++        "expected exit 0, got {:?}\nstdout: {}\nstderr: {}",
++        output.status,
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    // Assert PER FLAG, so an implementation that parses three and ignores seven fails:
++    // each flag's exact `--name "value"` pair must appear, not merely the bare value.
++    for (name, value) in &flags {
++        let needle = echoed(name, value);
++        assert!(
++            stdout.contains(&needle),
++            "missing `{needle}` in resolved-configuration output:\n{stdout}"
++        );
++    }
++}
++
++/// The structural half of the assertion above: `Config::entries` — the single place a
++/// flag is paired with the field holding it, and therefore what the echoed block prints
++/// — must name exactly `REQUIRED_FLAGS`, in order. Without this, adding an eleventh flag
++/// to the parser and forgetting the echo would be caught only by remembering to extend
++/// the fixture above.
++#[test]
++fn the_echoed_block_covers_every_required_flag_in_order() {
++    let parsed = ParsedArgs::parse(&args_for(&base_flags())).expect("base flags parse");
++    let config = resolve_config(&parsed).expect("base flags are complete");
++    let echoed_flags: Vec<&str> = config.entries().into_iter().map(|(name, _)| name).collect();
++    assert_eq!(echoed_flags, REQUIRED_FLAGS.to_vec());
++}
++
++#[test]
++fn a_missing_required_flag_exits_nonzero_naming_it_on_stderr() {
++    let flags = base_flags();
++    for (omit_name, _) in &flags {
++        let subset: Vec<(&str, &str)> = flags
++            .iter()
++            .copied()
++            .filter(|(name, _)| name != omit_name)
++            .collect();
++        let output = Command::new(bin())
++            .args(args_for(&subset))
++            .envs(aws_creds())
++            .output()
++            .expect("failed to spawn wyrd-validate");
++        assert!(
++            !output.status.success(),
++            "omitting --{omit_name} must exit non-zero"
++        );
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        assert!(
++            stderr.contains(&format!("--{omit_name}")),
++            "stderr must name the missing flag `--{omit_name}`: {stderr}"
++        );
++    }
++}
++
++#[test]
++fn an_unrecognised_flag_exits_nonzero_naming_it() {
++    let mut flags = base_flags();
++    let mut args = args_for(&flags);
++    args.push("--totally-bogus-flag".to_string());
++    args.push("value".to_string());
++    // Also cover the case where a mistyped flag REPLACES a known one, which is the
++    // concrete footgun the Design section names: a misspelled `--duration` silently
++    // ignored would misreport how long the run actually measured.
++    flags.retain(|(name, _)| *name != "duration");
++    let mut mistyped_args = args_for(&flags);
++    mistyped_args.push("--duration-zz".to_string());
++    mistyped_args.push("30s".to_string());
++
++    for candidate in [args, mistyped_args] {
++        let output = Command::new(bin())
++            .args(&candidate)
++            .envs(aws_creds())
++            .output()
++            .expect("failed to spawn wyrd-validate");
++        assert!(
++            !output.status.success(),
++            "an unrecognised flag must exit non-zero: {candidate:?}"
++        );
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        assert!(
++            stderr.contains("bogus") || stderr.contains("duration-zz"),
++            "stderr must name the unrecognised flag: {stderr}"
++        );
++    }
++}
++
++/// `--flag=value` is not this product's spelling (`wyrd`'s own parser does not accept it
++/// either, `crates/server/src/cli.rs:2506`), and the failure mode matters more than the
++/// policy: the whole token must be refused BY NAME, not silently read as a flag called
++/// `endpoint=…` whose value is the next token — which would leave `--endpoint` unset
++/// while consuming the argument after it.
++#[test]
++fn the_equals_spelling_is_refused_by_name_rather_than_half_parsed() {
++    let mut args = vec!["--endpoint=https://s3.example.invalid".to_string()];
++    args.extend(args_for(
++        &base_flags()
++            .into_iter()
++            .filter(|(name, _)| *name != "endpoint")
++            .collect::<Vec<_>>(),
++    ));
++    let output = Command::new(bin())
++        .args(&args)
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        !output.status.success(),
++        "`--flag=value` must be refused, not half-parsed: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("--endpoint=https://s3.example.invalid"),
++        "stderr must name the whole unrecognised token: {stderr}"
++    );
++}
++
++/// The other half of "an unrecognised flag is refused": a flag-shaped token sitting in a
++/// VALUE slot. Checking unknown tokens only where a flag is expected leaves the typo one
++/// slot to the left — `--endpoint --totally-bogus …` parsing as "the endpoint is the
++/// string `--totally-bogus`", exiting 0, and echoing the typo back as configuration. That
++/// is the same misreported run the strict policy exists to prevent, reached by a
++/// different route, so it is asserted for EVERY flag, not just the first: a check written
++/// into one arm of the parser would otherwise pass.
++#[test]
++fn a_flag_shaped_token_in_a_value_slot_is_refused_for_every_flag() {
++    const BOGUS: &str = "--totally-bogus";
++    for (target, _) in base_flags() {
++        let output = Command::new(bin())
++            .args(args_for(&flags_with(target, BOGUS)))
++            .envs(aws_creds())
++            .output()
++            .expect("failed to spawn wyrd-validate");
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        assert!(
++            !output.status.success(),
++            "`--{target} {BOGUS}` must exit non-zero, not be swallowed as a value; \
++             stdout: {stdout}"
++        );
++        assert!(
++            !stdout.contains(BOGUS),
++            "`{BOGUS}` must never be echoed back as `--{target}`'s resolved value: {stdout}"
++        );
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        assert!(
++            stderr.contains(BOGUS) && stderr.contains(&format!("--{target}")),
++            "stderr must name both the flag left without a value and the offending token: \
++             {stderr}"
++        );
++    }
++}
++
++/// The everyday shape of the same slip: a flag typed with its value forgotten, so the
++/// NEXT (perfectly valid) flag lands in the value slot. `--endpoint --region us-east-1`
++/// must not resolve to "endpoint = `--region`, region missing" — it names both the flag
++/// left without a value and the token that was not one.
++#[test]
++fn a_flag_left_without_its_value_does_not_consume_the_next_flag() {
++    let mut args = vec!["--endpoint".to_string()];
++    args.extend(args_for(
++        &base_flags()
++            .into_iter()
++            .filter(|(name, _)| *name != "endpoint")
++            .collect::<Vec<_>>(),
++    ));
++    let output = Command::new(bin())
++        .args(&args)
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        !output.status.success(),
++        "a flag left without its value must exit non-zero: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("--endpoint") && stderr.contains("--region"),
++        "stderr must name the flag awaiting a value and the flag that is not one: {stderr}"
++    );
++}
++
++/// A single `-` may legitimately lead a value (a negative `--seed`), so the refusal above
++/// is on the `--` flag prefix specifically — not on "anything dash-shaped". Without this,
++/// tightening the check to `starts_with('-')` would look equally correct and would reject
++/// a legal invocation.
++#[test]
++fn a_single_dash_value_is_still_accepted() {
++    let output = Command::new(bin())
++        .args(args_for(&flags_with("seed", "-12345")))
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        output.status.success(),
++        "a negative seed is a legal value: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    assert!(
++        String::from_utf8_lossy(&output.stdout).contains(&echoed("seed", "-12345")),
++        "the negative seed must be echoed as given"
++    );
++}
++
++/// `--duration 30s --duration 30m` silently keeping one of the two would report a run
++/// that is not the one asked for — the same class as the swallowed typo above.
++#[test]
++fn a_repeated_flag_is_refused_naming_it() {
++    let mut args = args_for(&base_flags());
++    args.push("--duration".to_string());
++    args.push("30m-second-value".to_string());
++    let output = Command::new(bin())
++        .args(&args)
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        !output.status.success(),
++        "a repeated flag must exit non-zero: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("--duration"),
++        "stderr must name the repeated flag: {stderr}"
++    );
++}
++
++/// `--bucket ""` is not a configured bucket; echoing one back as resolved configuration
++/// is the same silent misreport as swallowing a typo.
++#[test]
++fn an_empty_value_is_refused_naming_the_flag() {
++    let output = Command::new(bin())
++        .args(args_for(&flags_with("bucket", "")))
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        !output.status.success(),
++        "an empty value must exit non-zero: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("--bucket"),
++        "stderr must name the flag given an empty value: {stderr}"
++    );
++}
++
++// ─── the echoed record itself: unforgeable, one field per line ──────────────────────
++
++/// The block is what an operator (and every later slice's artifact) reads as "what this
++/// run was configured with". A raw interpolation lets a value carrying a newline print a
++/// line that reads exactly like another resolved flag, so the record would state an
++/// endpoint the run never used. The value is not rejected — it is escaped, so it stays
++/// fully recoverable — but it can no longer forge a line.
++#[test]
++fn a_newline_in_a_value_cannot_forge_a_configuration_line() {
++    const FORGED: &str = "bucket-real\n--endpoint https://forged.invalid";
++    let output = Command::new(bin())
++        .args(args_for(&flags_with("bucket", FORGED)))
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        output.status.success(),
++        "an odd but representable value is escaped, not refused: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    // One header line + ten flags + one credentials line, and not one line more: the
++    // forged `--endpoint` never became a line of its own.
++    assert_eq!(
++        stdout.lines().count(),
++        REQUIRED_FLAGS.len() + 2,
++        "the block must have exactly one line per field:\n{stdout}"
++    );
++    let endpoint_lines: Vec<&str> = stdout
++        .lines()
++        .filter(|line| line.starts_with("--endpoint "))
++        .collect();
++    assert_eq!(
++        endpoint_lines,
++        vec![echoed("endpoint", "https://s3.example.invalid")],
++        "exactly one `--endpoint` line, and it is the one that was given:\n{stdout}"
++    );
++    assert!(
++        stdout.contains(r#"--bucket "bucket-real\n--endpoint https://forged.invalid""#),
++        "the value survives, escaped, inside its own field:\n{stdout}"
++    );
++}
++
++/// The same forging, one layer down: a terminal control sequence in a value can erase or
++/// rewrite what the operator sees printed, which is a misreported run that never even
++/// reaches a file. No raw control byte may leave this tool.
++#[test]
++fn a_terminal_control_sequence_in_a_value_is_escaped() {
++    const ESCAPE_SEQUENCE: &str = "run\u{1b}[2K-id";
++    let output = Command::new(bin())
++        .args(args_for(&flags_with("run-id", ESCAPE_SEQUENCE)))
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(output.status.success(), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(
++        !stdout.contains('\u{1b}'),
++        "no raw escape byte may reach the terminal:\n{stdout:?}"
++    );
++    assert!(
++        stdout.contains(r#"--run-id "run\u{1b}[2K-id""#),
++        "the sequence is escaped into its own field:\n{stdout}"
++    );
++}
++
++/// The access-key id is operator-supplied too (it comes from the environment), so it
++/// gets the same treatment as a flag value — asserted over the pure renderer, where the
++/// forged text can be pinned exactly.
++#[test]
++fn a_newline_in_the_access_key_id_cannot_forge_a_credentials_line() {
++    let parsed = ParsedArgs::parse(&args_for(&base_flags())).expect("base flags parse");
++    let config = resolve_config(&parsed).expect("base flags are complete");
++    let credentials = Credentials {
++        access_key_id: "AKIA-real\ncredentials: access-key-id=AKIA-forged".to_string(),
++        secret_access_key: "never-printed".to_string(),
++        source: CredentialSource::Aws,
++    };
++    let block = render_config_block(&config, &credentials);
++    assert_eq!(
++        block.lines().count(),
++        REQUIRED_FLAGS.len() + 2,
++        "the forged line never became a line:\n{block}"
++    );
++    assert_eq!(
++        block
++            .lines()
++            .filter(|line| line.starts_with("credentials:"))
++            .count(),
++        1,
++        "exactly one credentials line:\n{block}"
++    );
++    assert!(
++        !block.contains("never-printed"),
++        "the secret is never rendered:\n{block}"
++    );
++}
++
++// ─── criterion 4: credential resolution, both directions ───────────────────────────
++
++const AWS_ID: &str = "AKIA_REAL_AWS_ID";
++const AWS_SECRET: &str = "aws-secret-never-printed-6f3a";
++const WYRD_ID: &str = "wyrd-gateway-id-2b7";
++const WYRD_SECRET: &str = "wyrd-secret-never-printed-9d1";
++
++const CREDENTIAL_NAMES: [&str; 4] = [
++    "AWS_ACCESS_KEY_ID",
++    "AWS_SECRET_ACCESS_KEY",
++    "WYRD_S3_ACCESS_KEY",
++    "WYRD_S3_SECRET_KEY",
++];
++
++/// Spawn `wyrd-validate` with the base flags plus an EXPLICIT credential environment —
++/// every one of the four names is either set to a fixture value or removed, so no
++/// ambient variable from the test runner's own environment can leak into the case
++/// under test.
++fn run_with_credential_env(env: &[(&str, Option<OsString>)]) -> std::process::Output {
++    let mut cmd = Command::new(bin());
++    cmd.args(args_for(&base_flags()));
++    for name in CREDENTIAL_NAMES {
++        cmd.env_remove(name);
++    }
++    for (name, value) in env {
++        match value {
++            Some(v) => {
++                cmd.env(name, v);
++            }
++            None => {
++                cmd.env_remove(name);
++            }
++        }
++    }
++    cmd.output().expect("failed to spawn wyrd-validate")
++}
++
++/// `(name, value)` pairs for [`run_with_credential_env`], from ordinary strings.
++fn set(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, Option<OsString>)> {
++    pairs
++        .iter()
++        .map(|(name, value)| (*name, Some(OsString::from(*value))))
++        .collect()
++}
++
++#[test]
++fn aws_credentials_present_resolve_to_the_aws_id_and_source() {
++    let output = run_with_credential_env(&set(&[
++        ("AWS_ACCESS_KEY_ID", AWS_ID),
++        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
++    ]));
++    assert!(output.status.success(), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(stdout.contains(AWS_ID), "{stdout}");
++    assert!(stdout.contains("AWS_ACCESS_KEY_ID"), "{stdout}");
++    assert!(
++        !stdout.contains(AWS_SECRET)
++            && !String::from_utf8_lossy(&output.stderr).contains(AWS_SECRET),
++        "the secret must never appear in process output:\nstdout: {stdout}"
++    );
++}
++
++#[test]
++fn wyrd_fallback_credentials_resolve_when_aws_is_absent() {
++    let output = run_with_credential_env(&set(&[
++        ("WYRD_S3_ACCESS_KEY", WYRD_ID),
++        ("WYRD_S3_SECRET_KEY", WYRD_SECRET),
++    ]));
++    assert!(output.status.success(), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(stdout.contains(WYRD_ID), "{stdout}");
++    assert!(stdout.contains("WYRD_S3_ACCESS_KEY"), "{stdout}");
++    assert!(
++        !stdout.contains(WYRD_SECRET)
++            && !String::from_utf8_lossy(&output.stderr).contains(WYRD_SECRET),
++        "the secret must never appear in process output:\nstdout: {stdout}"
++    );
++}
++
++#[test]
++fn both_present_aws_wins() {
++    let output = run_with_credential_env(&set(&[
++        ("AWS_ACCESS_KEY_ID", AWS_ID),
++        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
++        ("WYRD_S3_ACCESS_KEY", WYRD_ID),
++        ("WYRD_S3_SECRET_KEY", WYRD_SECRET),
++    ]));
++    assert!(output.status.success(), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(stdout.contains(AWS_ID), "AWS must win: {stdout}");
++    assert!(!stdout.contains(WYRD_ID), "AWS must win: {stdout}");
++    assert!(
++        !stdout.contains(AWS_SECRET) && !stdout.contains(WYRD_SECRET),
++        "neither secret may ever appear in process output:\n{stdout}"
++    );
++}
++
++#[test]
++fn neither_present_exits_nonzero_naming_what_to_set() {
++    let output = run_with_credential_env(&[]);
++    assert!(
++        !output.status.success(),
++        "no credentials present must refuse, not silently proceed"
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("AWS_ACCESS_KEY_ID") || stderr.contains("WYRD_S3_ACCESS_KEY"),
++        "stderr must name what to set: {stderr}"
++    );
++}
++
++#[test]
++fn half_an_aws_pair_refuses_over_the_real_binary_instead_of_using_the_wyrd_identity() {
++    let output = run_with_credential_env(&set(&[
++        ("AWS_ACCESS_KEY_ID", AWS_ID),
++        ("WYRD_S3_ACCESS_KEY", WYRD_ID),
++        ("WYRD_S3_SECRET_KEY", WYRD_SECRET),
++    ]));
++    assert!(
++        !output.status.success(),
++        "half an AWS pair must refuse: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(
++        !stdout.contains(WYRD_ID),
++        "the Wyrd identity must not be silently substituted: {stdout}"
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("AWS_SECRET_ACCESS_KEY"),
++        "stderr must name the missing half: {stderr}"
++    );
++    assert!(
++        !stderr.contains(WYRD_SECRET) && !stdout.contains(WYRD_SECRET),
++        "no secret may appear in process output"
++    );
++}
++
++// ─── the pure decisions, over the injected lookup, no subprocess ───────────────────
++
++fn present(value: &str) -> EnvValue {
++    EnvValue::Present(value.to_string())
++}
++
++fn lookup_over(map: BTreeMap<&'static str, EnvValue>) -> impl FnMut(&str) -> EnvValue {
++    move |name| map.get(name).cloned().unwrap_or(EnvValue::Absent)
++}
++
++#[test]
++fn resolve_credentials_prefers_aws_over_wyrd_over_the_injected_lookup() {
++    let mut lookup = lookup_over(BTreeMap::from([
++        ("AWS_ACCESS_KEY_ID", present(AWS_ID)),
++        ("AWS_SECRET_ACCESS_KEY", present(AWS_SECRET)),
++        ("WYRD_S3_ACCESS_KEY", present(WYRD_ID)),
++        ("WYRD_S3_SECRET_KEY", present(WYRD_SECRET)),
++    ]));
++    let creds = resolve_credentials(&mut lookup).expect("both pairs present must resolve");
++    assert_eq!(creds.access_key_id, AWS_ID);
++    assert_eq!(creds.source, CredentialSource::Aws);
++}
++
++#[test]
++fn resolve_credentials_falls_back_to_wyrd_over_the_injected_lookup() {
++    let mut lookup = lookup_over(BTreeMap::from([
++        ("WYRD_S3_ACCESS_KEY", present(WYRD_ID)),
++        ("WYRD_S3_SECRET_KEY", present(WYRD_SECRET)),
++    ]));
++    let creds = resolve_credentials(&mut lookup).expect("wyrd pair alone must resolve");
++    assert_eq!(creds.access_key_id, WYRD_ID);
++    assert_eq!(creds.source, CredentialSource::Wyrd);
++}
++
++#[test]
++fn resolve_credentials_refuses_over_the_injected_lookup_when_neither_pair_is_present() {
++    let mut lookup = lookup_over(BTreeMap::new());
++    let err = resolve_credentials(&mut lookup).expect_err("neither pair present must refuse");
++    assert!(err.contains("AWS_ACCESS_KEY_ID") || err.contains("WYRD_S3_ACCESS_KEY"));
++}
++
++/// Half a pair is the credential-shaped form of the swallowed typo: an operator who
++/// exported `AWS_ACCESS_KEY_ID` and mistyped the secret's name has stated an intent, and
++/// signing the run with the OTHER pair's identity instead would attribute the results to
++/// a credential they never chose.
++#[test]
++fn resolve_credentials_refuses_half_a_pair_rather_than_falling_back() {
++    for (present_name, missing_name) in [
++        ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
++        ("AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID"),
++    ] {
++        // The complete fallback pair IS available — the point is that it is not silently
++        // taken while the first pair is half-stated.
++        let mut lookup = lookup_over(BTreeMap::from([
++            (present_name, present("half-a-pair-value")),
++            ("WYRD_S3_ACCESS_KEY", present(WYRD_ID)),
++            ("WYRD_S3_SECRET_KEY", present(WYRD_SECRET)),
++        ]));
++        let err = resolve_credentials(&mut lookup)
++            .map(|c| c.access_key_id)
++            .expect_err("half a pair must refuse, not fall through");
++        assert!(
++            err.contains(missing_name) && !err.contains(WYRD_ID),
++            "the error must name the missing half ({missing_name}): {err}"
++        );
++    }
++}
++
++#[test]
++fn resolve_credentials_refuses_a_present_but_empty_name() {
++    let mut lookup = lookup_over(BTreeMap::from([
++        ("AWS_ACCESS_KEY_ID", present("")),
++        ("AWS_SECRET_ACCESS_KEY", present(AWS_SECRET)),
++    ]));
++    let err = resolve_credentials(&mut lookup).expect_err("an empty credential must refuse");
++    assert!(err.contains("AWS_ACCESS_KEY_ID"), "{err}");
++}
++
++/// A name set to bytes that are not UTF-8 is SET — it is simply unusable. Reporting it
++/// as absent (what `std::env::var(name).ok()` does) would sign the run with the other
++/// pair's identity and echo that identity as though it had been chosen. Asserted for
++/// both names of both pairs: for the AWS pair with the Wyrd fallback fully available (so
++/// a fall-through would be silent and successful), and for the Wyrd pair with AWS
++/// absent (so the failure mode would be the misleading "no credentials found").
++#[test]
++fn resolve_credentials_refuses_a_non_utf8_name_rather_than_falling_back() {
++    let cases: [(&str, Vec<(&'static str, EnvValue)>); 4] = [
++        (
++            "AWS_ACCESS_KEY_ID",
++            vec![
++                ("AWS_SECRET_ACCESS_KEY", present(AWS_SECRET)),
++                ("WYRD_S3_ACCESS_KEY", present(WYRD_ID)),
++                ("WYRD_S3_SECRET_KEY", present(WYRD_SECRET)),
++            ],
++        ),
++        (
++            "AWS_SECRET_ACCESS_KEY",
++            vec![
++                ("AWS_ACCESS_KEY_ID", present(AWS_ID)),
++                ("WYRD_S3_ACCESS_KEY", present(WYRD_ID)),
++                ("WYRD_S3_SECRET_KEY", present(WYRD_SECRET)),
++            ],
++        ),
++        (
++            "WYRD_S3_ACCESS_KEY",
++            vec![("WYRD_S3_SECRET_KEY", present(WYRD_SECRET))],
++        ),
++        (
++            "WYRD_S3_SECRET_KEY",
++            vec![("WYRD_S3_ACCESS_KEY", present(WYRD_ID))],
++        ),
++    ];
++    for (unusable, rest) in cases {
++        let mut entries: BTreeMap<&'static str, EnvValue> = rest.into_iter().collect();
++        entries.insert(unusable, EnvValue::NotUnicode);
++        let mut lookup = lookup_over(entries);
++        let err = resolve_credentials(&mut lookup)
++            .map(|c| c.access_key_id)
++            .expect_err("an unreadable credential must refuse, not fall through");
++        assert!(
++            err.contains(unusable) && err.contains("UTF-8"),
++            "the error must name the unreadable variable ({unusable}): {err}"
++        );
++        assert!(
++            !err.contains(WYRD_ID) && !err.contains(AWS_ID),
++            "no other identity is offered in place of the unreadable one: {err}"
++        );
++    }
++}
++
++/// The boundary of the rule above, stated so it is not mistaken for an oversight: only
++/// the source actually CONSULTED matters. A complete, readable AWS pair resolves before
++/// the `WYRD_S3_*` names are read at all, so an unusable value parked in an unconsulted
++/// variable is irrelevant to this run — the run is signed with the identity precedence
++/// says it is signed with, and the echoed block names it.
++#[test]
++fn an_unusable_value_in_an_unconsulted_variable_does_not_block_the_winning_pair() {
++    let mut lookup = lookup_over(BTreeMap::from([
++        ("AWS_ACCESS_KEY_ID", present(AWS_ID)),
++        ("AWS_SECRET_ACCESS_KEY", present(AWS_SECRET)),
++        ("WYRD_S3_ACCESS_KEY", EnvValue::NotUnicode),
++        ("WYRD_S3_SECRET_KEY", EnvValue::NotUnicode),
++    ]));
++    let creds = resolve_credentials(&mut lookup).expect("the AWS pair still wins");
++    assert_eq!(creds.access_key_id, AWS_ID);
++    assert_eq!(creds.source, CredentialSource::Aws);
++}
++
++/// `Credentials` carries the secret (a later slice signs with it) and must never print
++/// it — including through the `Debug` a derive would have given it, which is how a
++/// secret reaches a log line without anyone deciding to put it there.
++#[test]
++fn the_debug_rendering_of_credentials_redacts_the_secret() {
++    let credentials = Credentials {
++        access_key_id: AWS_ID.to_string(),
++        secret_access_key: AWS_SECRET.to_string(),
++        source: CredentialSource::Aws,
++    };
++    let rendered = format!("{credentials:?}");
++    assert!(
++        !rendered.contains(AWS_SECRET),
++        "the secret must not survive a Debug format: {rendered}"
++    );
++    assert!(
++        rendered.contains(AWS_ID),
++        "the id (which the echoed block already publishes) stays visible: {rendered}"
++    );
++}
++
++// ─── input that is not valid UTF-8, at the OS boundary ─────────────────────────────
++//
++// `#[cfg(unix)]`: building a byte string that is not valid UTF-8 is a platform API
++// (`OsStringExt`), and the workspace's deployment targets are Linux (`deploy/`,
++// `Dockerfile`, the systemd/compose units). A `#[cfg(windows)]` twin would be a second
++// spelling that no gate ever compiles, so these three read the unix form only — the
++// DECISION they cover (`EnvValue::NotUnicode` vs `Absent`) is platform-independent and
++// is asserted over the injected lookup above, on every platform.
++
++/// `std::env::args()` PANICS on a non-UTF-8 argument and a lossy conversion would report
++/// a bucket the operator never asked for, so the argument vector is read as `OsString`
++/// and refused by name. Pure half: `utf8_args` is the function `run` calls first.
++#[cfg(unix)]
++#[test]
++fn utf8_args_refuses_an_unreadable_argument_naming_its_position() {
++    let args = vec![
++        OsString::from("--endpoint"),
++        non_utf8_os_string(),
++        OsString::from("--region"),
++    ];
++    let err = utf8_args(args).expect_err("a non-UTF-8 argument must be refused");
++    assert!(
++        err.contains("argument 2"),
++        "the error names which argument it could not read: {err}"
++    );
++}
++
++#[cfg(unix)]
++#[test]
++fn a_non_utf8_argument_exits_nonzero_without_panicking() {
++    let mut args: Vec<OsString> = args_for(&base_flags())
++        .into_iter()
++        .map(OsString::from)
++        .collect();
++    args.push(non_utf8_os_string());
++    let output = Command::new(bin())
++        .args(&args)
++        .envs(aws_creds())
++        .output()
++        .expect("failed to spawn wyrd-validate");
++    assert!(
++        !output.status.success(),
++        "an unreadable argument must exit non-zero"
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.starts_with("wyrd-validate: ") && stderr.contains("UTF-8"),
++        "the refusal is a message, not a panic: {stderr}"
++    );
++    assert!(
++        !stderr.contains("panicked"),
++        "a panic is not an argument refusal: {stderr}"
++    );
++}
++
++/// The same unreadable-environment case as the pure test above, driven end to end
++/// through the binary's own `std::env::var_os` closure (`crates/validate/src/main.rs`):
++/// that closure is the production code that decides `NotUnicode` vs `Absent`, and a
++/// `std::env::var(name).ok()` there would make this fall back to the Wyrd identity and
++/// exit 0.
++#[cfg(unix)]
++#[test]
++fn a_non_utf8_credential_refuses_over_the_real_binary_instead_of_falling_back() {
++    let mut env: Vec<(&'static str, Option<OsString>)> =
++        vec![("AWS_ACCESS_KEY_ID", Some(non_utf8_os_string()))];
++    env.extend(set(&[
++        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
++        ("WYRD_S3_ACCESS_KEY", WYRD_ID),
++        ("WYRD_S3_SECRET_KEY", WYRD_SECRET),
++    ]));
++    let output = run_with_credential_env(&env);
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(
++        !output.status.success(),
++        "an unreadable AWS id must refuse, not fall back: {stdout}"
++    );
++    assert!(
++        !stdout.contains(WYRD_ID),
++        "the Wyrd identity must not be silently substituted: {stdout}"
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(
++        stderr.contains("AWS_ACCESS_KEY_ID") && stderr.contains("UTF-8"),
++        "stderr must name the unreadable variable: {stderr}"
++    );
++}
++
++/// A byte string an OS accepts but UTF-8 does not (a lone `0xFF` continuation byte),
++/// built without `unsafe` — `OsString::from_vec` is safe; it is `String::from_utf8` that
++/// would refuse these bytes, which is exactly the case under test.
++#[cfg(unix)]
++fn non_utf8_os_string() -> OsString {
++    use std::os::unix::ffi::OsStringExt;
++    OsString::from_vec(vec![b'A', 0xff, b'Z'])
++}
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 65e52e5..cbfd4c0 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -244,5 +244,35 @@ The Colossus-style bootstrap recursion bottoms out here: etcd depends on nothing
+ | Telemetry | OpenTelemetry (OTLP) | `telemetry` (ADR-0012) |
+ | Simulation testing | madsim / turmoil | `testkit` (ADR-0009) |
+ | Composition / the binary | wires all concretes | `server` |
++| Blackbox validation (§5.4) | its own binary, `wyrd-validate`; links **no** `wyrd-*` crate (gate-enforced) | `validate` |
+ 
+ The dependency rule (ADR-0010): implementations and consumers depend on `traits`, never on each other's concretes. Only `server` knows the concrete backends, which is what makes "swap redb for FoundationDB" or "in-memory for etcd" a composition change rather than a refactor. The seam earned its keep in M4: swapping the production backend from TiKV to FoundationDB (ADR-0042) touched the `server` wiring and added a crate, and changed no consumer.
++
++---
++
++## 5.4 Blackbox validation — `wyrd-validate`
++
++The last row above is the one component that is deliberately **not** part of the running system. `wyrd-validate` (`crates/validate`, proposal 0017) answers "is this deployment correct?" from *outside*, the way any S3 client does: over the wire, against a running endpoint, with no privileged view of Wyrd's internals. It is pointed at a deployment — an operator's own cluster, or a loopback stack in CI.
++
++**Why a separate binary rather than a `wyrd` subcommand.** A subcommand would share the roles' dependency closure, and a validator that links Wyrd's own crates is testing Wyrd's types against Wyrd's types — its verdict would be self-referential. The property is therefore mechanical rather than a promise in a doc comment: `cargo xtask ci` runs a dependency-closure guard (`xtask::repo_guard`, registered in `HYGIENE_GUARDS` beside the stray-gitlink and `forbid(unsafe_code)` scans) that fails the build if the **normal** dependency closure of `wyrd-validate` — transitively, resolved under every feature, optional edges included — contains any `wyrd-*` crate. *Normal*, not total: dev-dependencies are unconstrained, because what a test harness links never ships in the binary.
++
++**What exists today.** The crate, its argument surface, and credential resolution: it parses, resolves, echoes its configuration and exits. It makes no S3 call yet — the client, scenarios, oracle and verdict arrive in later slices, and the flags below are the contract they fill in.
++
++| Flag | Value | Meaning |
++|------|-------|---------|
++| `--endpoint` | URL | the S3 endpoint under validation |
++| `--region` | region name | the region sent with every request |
++| `--bucket` | bucket name | the bucket the run operates in |
++| `--scenario` | scenario name | which declared scenario shape to run |
++| `--duration` | duration | how long the run lasts |
++| `--workers` | count | how many concurrent workers drive it |
++| `--seed` | seed | seeds the deterministic payloads and keys, so a run is reproducible |
++| `--out` | path | where the run's artifacts are written |
++| `--run-id` | identifier | names this run in its artifacts |
++| `--driver-placement` | `internal` / `external` | where the driver ran — recorded with the numbers, because a latency figure quoted without its placement is eventually quoted wrongly (proposal 0017 §10) |
++
++All ten are required and each takes a value. The parser is deliberately **stricter than `wyrd`'s own**: an unrecognised flag, a repeated flag, an empty value, a `--`-prefixed token in a value slot, or an argument that is not valid UTF-8 is refused with a message naming it, rather than absorbed. `wyrd`'s parser accepts an unknown `--flag` silently, and changing that would break existing invocations; this binary is new, so it grandfathers nothing — and a mistyped `--duration` that is quietly ignored (in either token position) misreports the run the tool claims to have measured.
++
++**Credentials come from the environment, never from a flag** — so they stay out of the process table: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` first (what every S3 client and CI runner already sets), falling back to the gateway's own `WYRD_S3_ACCESS_KEY` + `WYRD_S3_SECRET_KEY`, so a developer already running a loopback gateway needs no second export. When both pairs are present, AWS wins. Only "not set at all" falls through to the next pair: half a pair, an exported-but-empty name, and a name holding bytes that are not valid UTF-8 are each an error naming the variable — falling back would sign the run with an identity the operator never chose, and then report that identity as though they had. The echoed configuration prints the resolved access-key **id** and which pair it came from, and never the secret.
++
++**The echoed block is a record, so it is unforgeable**: one field per line, every operator-supplied value quoted and escaped. A value carrying a newline or a terminal control sequence therefore cannot print a line that reads like another resolved flag (nor rewrite what an operator sees on their terminal) — the value survives intact inside its own field instead.
+diff --git a/xtask/src/lib.rs b/xtask/src/lib.rs
+index bb68005..8dfb2b9 100644
+--- a/xtask/src/lib.rs
++++ b/xtask/src/lib.rs
+@@ -22,6 +22,20 @@ pub mod metadata_faults;
+ pub mod nemesis;
+ pub mod repo_guard;
+ 
++/// The workspace root, derived from this crate's manifest directory (`<root>/xtask`).
++///
++/// In the **lib** target (#740) because a guard that `run_ci` invokes through
++/// [`repo_guard::HYGIENE_GUARDS`] runs from here and needs the root too, and a
++/// binary-target `fn` cannot be called from the lib. `main.rs`'s `workspace_root` and the
++/// integration tests delegate to this one, so there is a single derivation of the root
++/// rather than a copy per target that could drift.
++pub fn workspace_root() -> std::path::PathBuf {
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .expect("xtask crate is nested under the workspace root")
++        .to_path_buf()
++}
++
+ /// Opt the `tikv` feature's type-check into `cargo xtask ci`. Set only by the privileged
+ /// Tier CI job that has the pre-1.0 `tikv-client` build toolchain (grpcio/protoc).
+ pub const TIKV_TOOLCHAIN_ENV: &str = "WYRD_TIKV_TOOLCHAIN";
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 9535df9..b049b23 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -1556,6 +1556,13 @@ fn run_ci() -> Result<(), String> {
+     // attribute) should surface before a multi-minute build, not after.
+     run_gitlink_guard()?;
+     run_unsafe_forbid_guard()?;
++    // #740: the blackbox dependency-closure guard, registered as DATA in the lib target
++    // (`xtask::repo_guard::HYGIENE_GUARDS`) rather than a third binary-target `fn`, and
++    // run through the lib's own `run_hygiene_guards` — whose injected runner lets
++    // `xtask/tests/blackbox_dependency_guard.rs` assert that the registered guards really
++    // are reached and that a failing one stops the gate (the same `run_ci_steps` reason,
++    // `main.rs:1486-1498`, and the same `feature_gated_checks` reason, `:1504-1505`).
++    xtask::repo_guard::run_hygiene_guards(&mut |guard| (guard.run)())?;
+     run_ci_steps(&mut |name| std::env::var_os(name).is_some(), &mut |args| {
+         cargo(args)
+     })?;
+@@ -1917,11 +1924,13 @@ fn is_ci() -> bool {
+ 
+ /// The workspace root, derived from this crate's manifest directory
+ /// (`<root>/xtask`).
++///
++/// One derivation, in the lib target (#740), because the hygiene guards `run_ci` runs
++/// through `xtask::repo_guard::HYGIENE_GUARDS` need the root too and cannot call a
++/// binary-target `fn`. Kept as a `pub(crate)` alias so every existing call site here
++/// reads unchanged.
+ pub(crate) fn workspace_root() -> PathBuf {
+-    Path::new(env!("CARGO_MANIFEST_DIR"))
+-        .parent()
+-        .expect("xtask crate is nested under the workspace root")
+-        .to_path_buf()
++    xtask::workspace_root()
+ }
+ 
+ #[cfg(test)]
+diff --git a/xtask/src/repo_guard.rs b/xtask/src/repo_guard.rs
+index 4011aa4..c07c387 100644
+--- a/xtask/src/repo_guard.rs
++++ b/xtask/src/repo_guard.rs
+@@ -28,7 +28,19 @@
+ //! drift this gate exists to stop. Target discovery comes from `cargo
+ //! metadata` ([`target_src_paths`]) so no manifest override or unconventional
+ //! layout can hide a root from the scan; [`scan_roots`] then checks each one.
++//!
++//! **(3) The blackbox dependency-closure guard** (#740, proposal 0017 §9).
++//! `wyrd-validate` exists to answer "is Wyrd correct" from outside, the way a
++//! client does; the moment its binary links a `wyrd-*` crate it is testing
++//! Wyrd's types against Wyrd's types and its verdict is self-referential.
++//! [`scan_blackbox_dependency_closure`] walks `cargo metadata`'s resolve
++//! graph transitively from a target package, following only **normal**
++//! (`kind: null`) edges — never `dev` or `build` — and additionally scans the
++//! package's own declared dependency list (feature-independent, so an
++//! `optional`, off-by-default `wyrd-*` edge the resolve graph might not
++//! surface is still caught; see [`BLACKBOX_GUARD_TARGETS`]).
+ 
++use std::collections::{BTreeMap, BTreeSet, VecDeque};
+ use std::path::Path;
+ 
+ /// Normalize source for the preamble walk: strip `//` line comments and
+@@ -553,3 +565,413 @@ pub fn scan_roots(
+     }
+     Ok(violations)
+ }
++
++/// `(package, forbidden name prefix)` pairs [`run_blackbox_dependency_guard`] enforces.
++/// Kept as DATA (the [`UNSAFE_FORBID_ALLOWLIST`] style) so a second blackbox tool is a
++/// one-line reviewed diff, not a second copy of the guard (#740, open question 2).
++/// One entry today: `wyrd-validate`'s normal dependency closure must contain no
++/// `wyrd-*` crate (proposal 0017 §9, "Normal, not total").
++pub const BLACKBOX_GUARD_TARGETS: &[(&str, &str)] = &[("wyrd-validate", "wyrd-")];
++
++/// The exact `cargo metadata` invocation [`scan_blackbox_dependency_closure`]'s input
++/// must come from, as data rather than an argument list buried in the runner — so
++/// `xtask/tests/blackbox_dependency_guard.rs` can assert the invocation itself and drive
++/// its real-workspace case over the SAME document production reads.
++///
++/// Each flag is load-bearing, and dropping any one of them would leave every planted test
++/// green while the guard stopped seeing part of the closure:
++///
++/// * `--all-features` — the resolve graph is feature-dependent, so an optional normal
++///   `wyrd-*` edge behind an off-by-default feature is invisible to a default resolve
++///   (`crates/metadata-tikv/Cargo.toml:11-30` is the live pattern of that shape);
++/// * `--locked` — a `cargo metadata` call can otherwise rewrite `Cargo.lock`, and a guard
++///   that mutates the tree it audits is its own defect;
++/// * no `--no-deps` (unlike the unsafe-forbid guard, `main.rs:1453`) — that flag omits
++///   the `resolve` section entirely, which is the graph that actually links.
++pub const BLACKBOX_METADATA_ARGS: &[&str] = &[
++    "metadata",
++    "--format-version",
++    "1",
++    "--locked",
++    "--all-features",
++];
++
++/// How `cargo metadata` classifies one dependency edge. `Normal` is the only kind that
++/// ships inside the binary, and therefore the only kind the blackbox closure follows.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum DepKind {
++    /// `"kind": null` — an ordinary `[dependencies]` entry (optional or not).
++    Normal,
++    /// `"kind": "dev"` — `[dev-dependencies]`; unconstrained by proposal 0017 §9,
++    /// because what a test harness links never ships.
++    Dev,
++    /// `"kind": "build"` — `[build-dependencies]`; runs at build time, never linked
++    /// into the binary.
++    Build,
++}
++
++/// Classify ONE `kind` field, failing closed on anything it cannot read.
++///
++/// Verified against the real workspace document (`cargo metadata --format-version 1
++/// --locked --all-features`): every `packages[].dependencies[]` entry carries a `kind`
++/// key and every `resolve.nodes[].deps[].dep_kinds[]` entry carries one, holding exactly
++/// `null`, `"dev"` or `"build"`.
++///
++/// So a missing key, a different string, or a non-string value is not a shape cargo
++/// emits — it is a document this guard cannot read, and "cannot read" must never
++/// silently become "not a normal dependency". That inference is what turns a malformed
++/// (or hand-edited, or future-cargo) document into a vacuous pass: the `wyrd-*` edge
++/// stays in the manifest, the guard classifies it as non-normal, and the gate goes green
++/// on a closure it never checked.
++fn dep_kind(kind: Option<&serde_json::Value>, context: &str) -> Result<DepKind, String> {
++    match kind {
++        Some(value) if value.is_null() => Ok(DepKind::Normal),
++        Some(value) => match value.as_str() {
++            Some("dev") => Ok(DepKind::Dev),
++            Some("build") => Ok(DepKind::Build),
++            _ => Err(format!(
++                "blackbox-guard: {context} has an unreadable dependency `kind` ({value}) \
++                 — refusing to classify an edge it cannot read (cargo emits null, \"dev\" \
++                 or \"build\")"
++            )),
++        },
++        None => Err(format!(
++            "blackbox-guard: {context} has no dependency `kind` field — refusing to \
++             classify an edge it cannot read"
++        )),
++    }
++}
++
++/// Does `cargo metadata` report this resolve-graph edge as a NORMAL dependency? True iff
++/// at least one of its `dep_kinds` entries is normal — an edge can carry several (one per
++/// kind/target combination), and a crate that is both a normal and a dev dependency does
++/// ship inside the binary.
++///
++/// EVERY entry is classified, not just entries until the first normal one: an edge whose
++/// `dep_kinds` array is missing, empty, or carries one entry `dep_kind` cannot read is
++/// an `Err`. "We cannot tell what kind this edge is" and "this edge is dev-only" are
++/// different answers, and silently choosing the second would drop the edge — and
++/// everything behind it — out of the closure the guard claims to have checked.
++fn edge_is_normal(edge: &serde_json::Value, context: &str) -> Result<bool, String> {
++    let kinds = edge
++        .get("dep_kinds")
++        .and_then(|k| k.as_array())
++        .ok_or_else(|| {
++            format!(
++                "blackbox-guard: {context} has no `dep_kinds` array — refusing to \
++                 classify an edge it cannot read"
++            )
++        })?;
++    if kinds.is_empty() {
++        return Err(format!(
++            "blackbox-guard: {context} has an empty `dep_kinds` array — refusing to \
++             classify an edge it cannot read"
++        ));
++    }
++    let mut normal = false;
++    for entry in kinds {
++        if dep_kind(entry.get("kind"), context)? == DepKind::Normal {
++            normal = true;
++        }
++    }
++    Ok(normal)
++}
++
++/// The **normal** dependency closure of `package`, transitively and under every
++/// feature — proposal 0017 §9's blackbox property, made mechanical. `metadata_json`
++/// MUST come from `cargo metadata --format-version 1 --locked --all-features` (no
++/// `--no-deps`): the resolve graph is what actually links, and it is
++/// FEATURE-DEPENDENT — an optional normal dependency behind an off-by-default feature
++/// (`crates/metadata-tikv/Cargo.toml:11-30` is the live pattern) is invisible to a
++/// default-feature resolve, which is exactly why `--all-features` is mandatory here
++/// (#740 Design).
++///
++/// Two independent sources are scanned, because the resolve graph alone can still miss
++/// an edge some future feature-resolution subtlety keeps out of it:
++///
++/// 1. **the resolve graph** (`resolve.nodes`), walked breadth-first from `package`'s
++///    node, following only normal (`edge_is_normal`) edges; every reached package whose name
++///    starts with `forbidden_prefix` is a violation, reported with the dependency PATH
++///    that reached it (a one-hop violation an operator can fix by deleting a line reads
++///    very differently from one three crates deep);
++/// 2. **`package`'s own declared dependency list** (`packages[].dependencies`), which
++///    is feature-INDEPENDENT and carries `optional` per entry — the belt to the
++///    graph's braces (#740 Design, Plan-review response). A crate the graph walk already
++///    named is not reported again from here.
++///
++/// Fails CLOSED (`Err`, never a vacuously clean `Ok(vec![])`), mirroring [`scan_roots`]'
++/// "refusing to pass a workspace it cannot see" (`repo_guard.rs:496-510`): an
++/// unparsable document, a `packages` array without `package`, a document with no
++/// `resolve` section, or a `resolve` section whose nodes never mention `package`.
++///
++/// The same refusal applies to every part of the closure the walk cannot read, not only
++/// to its entry point — a package REACHED by a normal edge but carrying no resolve node,
++/// a node with no `deps` array, an edge naming no `pkg`, an edge or declared dependency
++/// whose `kind` is unreadable (`dep_kind`), or a `package` whose declared dependency
++/// list is missing or has a nameless entry. Each of those would otherwise be a silent
++/// skip, and a skip one hop out hides every forbidden crate behind it, which is
++/// indistinguishable (to the gate) from a closure that is clean.
++pub fn scan_blackbox_dependency_closure(
++    metadata_json: &str,
++    package: &str,
++    forbidden_prefix: &str,
++) -> Result<Vec<String>, String> {
++    let meta: serde_json::Value = serde_json::from_str(metadata_json)
++        .map_err(|e| format!("blackbox-guard: cannot parse cargo metadata: {e}"))?;
++    let packages = meta
++        .get("packages")
++        .and_then(|p| p.as_array())
++        .ok_or_else(|| "blackbox-guard: cargo metadata has no `packages` array".to_string())?;
++
++    // Package id -> plain crate name, so a resolve-graph edge (keyed by a
++    // registry/version-qualified id) can be checked against `forbidden_prefix`.
++    let mut name_of: BTreeMap<&str, &str> = BTreeMap::new();
++    for p in packages {
++        if let (Some(id), Some(name)) = (
++            p.get("id").and_then(|v| v.as_str()),
++            p.get("name").and_then(|v| v.as_str()),
++        ) {
++            name_of.insert(id, name);
++        }
++    }
++
++    let mut matching = packages
++        .iter()
++        .filter(|p| p.get("name").and_then(|v| v.as_str()) == Some(package));
++    let pkg_entry = matching.next().ok_or_else(|| {
++        format!(
++            "blackbox-guard: package `{package}` not found in cargo metadata packages \
++             — refusing to pass a closure it cannot see"
++        )
++    })?;
++    // A name can legitimately appear twice in one resolve (two versions, or a registry
++    // crate that happens to share a workspace member's name). Scanning whichever came
++    // first would then audit one closure and clear the other, so the ambiguity is an
++    // error: the guard says which package it must be told about rather than guessing.
++    if matching.next().is_some() {
++        return Err(format!(
++            "blackbox-guard: cargo metadata reports more than one package named \
++             `{package}` — refusing to guess which closure to scan"
++        ));
++    }
++    let package_id = pkg_entry
++        .get("id")
++        .and_then(|v| v.as_str())
++        .ok_or_else(|| format!("blackbox-guard: package `{package}` has no `id`"))?;
++
++    let resolve = meta.get("resolve").ok_or_else(|| {
++        "blackbox-guard: cargo metadata has no `resolve` section — refusing to pass a \
++         closure it cannot see (run `cargo metadata` WITHOUT `--no-deps`)"
++            .to_string()
++    })?;
++    let nodes = resolve
++        .get("nodes")
++        .and_then(|n| n.as_array())
++        .ok_or_else(|| "blackbox-guard: `resolve` has no `nodes` array".to_string())?;
++    let mut node_of: BTreeMap<&str, &serde_json::Value> = BTreeMap::new();
++    for n in nodes {
++        if let Some(id) = n.get("id").and_then(|v| v.as_str()) {
++            node_of.insert(id, n);
++        }
++    }
++    if !node_of.contains_key(package_id) {
++        return Err(format!(
++            "blackbox-guard: package `{package}` does not appear in the resolve graph — \
++             refusing to pass a closure it cannot see"
++        ));
++    }
++
++    // (1) the resolve graph, breadth-first, following only normal edges. `visited` makes
++    // the walk terminate on the cycles a real dependency graph can contain (dev-cycles
++    // between workspace crates are legal) and keeps the reported path the shortest one.
++    let mut violations = Vec::new();
++    let mut named: BTreeSet<&str> = BTreeSet::new();
++    let mut visited: BTreeSet<&str> = BTreeSet::new();
++    visited.insert(package_id);
++    let mut queue: VecDeque<(&str, Vec<&str>)> = VecDeque::new();
++    queue.push_back((package_id, vec![package]));
++    while let Some((id, path)) = queue.pop_front() {
++        let name = name_of.get(id).copied().unwrap_or(id);
++        // Fail CLOSED one hop out, too: a package REACHED by a normal edge whose node the
++        // resolve section never defines is a part of the closure this scan cannot walk, so
++        // skipping it would hide every `forbidden_prefix` crate behind it. Same rule as the
++        // target package's own absence above — "refusing to pass a closure it cannot see".
++        let node = node_of.get(id).ok_or_else(|| {
++            format!(
++                "blackbox-guard: `{name}` is reached from `{package}` but has no node in \
++                 the resolve graph — refusing to pass a closure it cannot see (via {})",
++                path.join(" -> ")
++            )
++        })?;
++        let deps = node.get("deps").and_then(|d| d.as_array()).ok_or_else(|| {
++            format!(
++                "blackbox-guard: the resolve node for `{name}` has no `deps` array — \
++                 refusing to pass a closure it cannot see"
++            )
++        })?;
++        for dep in deps {
++            let Some(target_id) = dep.get("pkg").and_then(|v| v.as_str()) else {
++                return Err(format!(
++                    "blackbox-guard: a dependency edge of `{name}` names no `pkg` — \
++                     refusing to pass a closure it cannot see"
++                ));
++            };
++            let target_name = name_of.get(target_id).copied().unwrap_or(target_id);
++            // Classify BEFORE the `visited` short-circuit: an unreadable edge is an error
++            // whether or not this walk has already reached its target by another path.
++            let normal = edge_is_normal(dep, &format!("the edge `{name}` -> `{target_name}`"))?;
++            if !normal || visited.contains(target_id) {
++                continue;
++            }
++            visited.insert(target_id);
++            let mut next_path = path.clone();
++            next_path.push(target_name);
++            if target_name.starts_with(forbidden_prefix) && named.insert(target_name) {
++                violations.push(format!(
++                    "{package}: normal dependency closure reaches `{target_name}` via {}",
++                    next_path.join(" -> ")
++                ));
++            }
++            queue.push_back((target_id, next_path));
++        }
++    }
++
++    // (2) the package's own declared dependency list — feature-independent belt to the
++    // graph's braces. Absent or unreadable, it is an Err rather than a skipped scan: a
++    // belt nobody can see is not a belt (the same fail-closed rule as the walk above).
++    let declared = pkg_entry
++        .get("dependencies")
++        .and_then(|d| d.as_array())
++        .ok_or_else(|| {
++            format!(
++                "blackbox-guard: package `{package}` has no `dependencies` array — refusing \
++                 to pass a declaration list it cannot see"
++            )
++        })?;
++    for dep in declared {
++        let name = dep.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
++            format!(
++                "blackbox-guard: package `{package}` declares a dependency with no `name` — \
++                 refusing to pass a declaration it cannot read"
++            )
++        })?;
++        if dep_kind(
++            dep.get("kind"),
++            &format!("`{package}`'s declared dependency on `{name}`"),
++        )? != DepKind::Normal
++        {
++            continue;
++        }
++        if name.starts_with(forbidden_prefix) && !named.contains(name) {
++            let optional = dep
++                .get("optional")
++                .and_then(|v| v.as_bool())
++                .unwrap_or(false);
++            violations.push(format!(
++                "{package}: declares a normal dependency on `{name}`{} — not caught by \
++                 the resolve graph walk",
++                if optional { " (optional)" } else { "" }
++            ));
++        }
++    }
++
++    Ok(violations)
++}
++
++/// Shells [`BLACKBOX_METADATA_ARGS`] to `cargo` from the workspace root (see that
++/// constant for why each flag is load-bearing) and hands the JSON to
++/// [`scan_blackbox_dependency_closure`] for every [`BLACKBOX_GUARD_TARGETS`] entry.
++///
++/// Registered in [`HYGIENE_GUARDS`] as DATA (name + callable) rather than a `fn`
++/// private to the binary target — the same reason `xtask::feature_gated_checks` lives
++/// in the lib target (`main.rs:1504-1505`): a guard defined, tested and never CALLED
++/// passes every other assertion in #740 silently, exactly the wiring hazard
++/// `run_ci_steps`' injected `exec` already guards against (`main.rs:1486-1498`).
++pub fn run_blackbox_dependency_guard() -> Result<(), String> {
++    println!(
++        "\n$ xtask blackbox-dependency-guard (proposal 0017 §9: no wyrd-* in a validated \
++         package's normal closure)"
++    );
++    let root = crate::workspace_root();
++    let meta = std::process::Command::new("cargo")
++        .args(BLACKBOX_METADATA_ARGS)
++        .current_dir(&root)
++        .output()
++        .map_err(|e| format!("blackbox-guard: failed to spawn cargo metadata: {e}"))?;
++    if !meta.status.success() {
++        return Err(format!(
++            "blackbox-guard: `cargo metadata` failed with {}:\n{}",
++            meta.status,
++            String::from_utf8_lossy(&meta.stderr)
++        ));
++    }
++    // `cargo metadata`'s stdout is JSON, which is UTF-8 by definition; a lossy read here
++    // could only mangle a document `serde_json` would then refuse — the fail-closed
++    // branch, not a silent pass.
++    let metadata = String::from_utf8_lossy(&meta.stdout);
++    let mut violations = Vec::new();
++    for (package, prefix) in BLACKBOX_GUARD_TARGETS {
++        violations.extend(scan_blackbox_dependency_closure(
++            &metadata, package, prefix,
++        )?);
++    }
++    if violations.is_empty() {
++        println!(
++            "xtask blackbox-dependency-guard: every validated package's normal dependency \
++             closure stays blackbox (proposal 0017 §9)"
++        );
++        Ok(())
++    } else {
++        Err(format!(
++            "proposal 0017 §9 violation — a validator's normal dependency closure must \
++             contain no wyrd-* crate (transitively, under every feature), so its verdict \
++             never tests Wyrd's types against Wyrd's types:\n  {}",
++            violations.join("\n  ")
++        ))
++    }
++}
++
++/// One repo-hygiene check `run_ci` runs, registered as DATA (name + callable) — the
++/// `xtask::feature_gated_checks` pattern (`main.rs:1504-1505`, `xtask/src/lib.rs:81`),
++/// applied to a guard that is not a plain `cargo` invocation.
++///
++/// `run_gitlink_guard` / `run_unsafe_forbid_guard` predate this table and stay
++/// binary-target `fn`s called directly from `run_ci` (`main.rs:1557-1558`) — that
++/// pattern is NOT extended here (#740): a third guard added the same untestable
++/// way would be exactly the wiring hazard this table exists to close (a guard defined,
++/// tested and never called passes every other assertion silently).
++pub struct HygieneGuard {
++    pub name: &'static str,
++    pub run: fn() -> Result<(), String>,
++}
++
++/// The registered hygiene guards, in the order [`run_hygiene_guards`] runs them.
++/// `xtask/tests/blackbox_dependency_guard.rs` asserts the blackbox guard's presence
++/// here — that assertion IS #740's criterion 1: a guard missing from this exact list
++/// never runs, however many of its own planted-metadata cases it passes.
++pub const HYGIENE_GUARDS: &[HygieneGuard] = &[HygieneGuard {
++    name: "blackbox-dependency-guard",
++    run: run_blackbox_dependency_guard,
++}];
++
++/// Run every [`HYGIENE_GUARDS`] entry through the injected `run`, stopping at the first
++/// failure — `run_ci`'s hygiene phase, lifted into the lib target so the WIRING is
++/// exercised by a test and not only the guards themselves.
++///
++/// This is `run_ci_steps`' injected-`exec` idiom (`main.rs:1486-1498`, "so the real
++/// wiring is exercised without spawning cargo") applied to the guards: `run_ci` passes
++/// `|guard| (guard.run)()`, and `xtask/tests/blackbox_dependency_guard.rs` passes a
++/// recording closure. Two failure modes of #740's criterion 1 live in the three lines
++/// below and are therefore covered by that test rather than by hope — a guard that is
++/// registered but never reached, and a guard whose `Err` is discarded instead of
++/// stopping the gate (a violation reported to nobody is a green gate over a broken
++/// invariant). What remains outside a test's reach is one call line in `run_ci` itself,
++/// which no integration test can see into a binary target.
++pub fn run_hygiene_guards(
++    run: &mut dyn FnMut(&HygieneGuard) -> Result<(), String>,
++) -> Result<(), String> {
++    for guard in HYGIENE_GUARDS {
++        run(guard)?;
++    }
++    Ok(())
++}
+diff --git a/xtask/tests/blackbox_dependency_guard.rs b/xtask/tests/blackbox_dependency_guard.rs
+new file mode 100644
+index 0000000..500753f
+--- /dev/null
++++ b/xtask/tests/blackbox_dependency_guard.rs
+@@ -0,0 +1,554 @@
++//! #740 blackbox dependency-closure guard: the flippable regression for
++//! `xtask::repo_guard::scan_blackbox_dependency_closure` — the SAME pure function
++//! `run_blackbox_dependency_guard` runs inside `cargo xtask ci` — driven here over
++//! planted `cargo metadata` documents to demonstrate RED (a real violation caught, not
++//! resting red on non-existence), over the real workspace to demonstrate GREEN, and
++//! over malformed documents to demonstrate fail-closed. Mirrors the #616 idiom
++//! (`xtask/tests/repo_hygiene_guards.rs:34-49`, `:384-403`).
++//!
++//! Three properties are proved separately, because each can hold while another fails:
++//!
++//! 1. **the closure is transitive** — a `wyrd-*` crate two and three hops out is found,
++//!    with the path that reached it, while a clean chain of the same depth stays green
++//!    and a `dev` edge prunes everything behind it (proposal 0017 §9's "normal, not
++//!    total" is a property of the whole walk, not of the first hop);
++//! 2. **the guard fails closed** — every part of the document it cannot read is an
++//!    `Err`, never a vacuously clean pass: an unparsable document, a missing resolve
++//!    section, an unreachable node one hop out, and — the case that makes malformed
++//!    metadata dangerous rather than merely odd — a dependency `kind` it cannot
++//!    classify. "I cannot tell what kind this edge is" must not silently become "this
++//!    edge is dev-only", because that hides the edge and everything behind it;
++//! 3. **the guard actually runs** — [`the_blackbox_guard_is_registered_in_hygiene_guards`]
++//!    asserts its presence in `xtask::repo_guard::HYGIENE_GUARDS` and invokes the
++//!    registered callable over the real workspace, and
++//!    [`run_hygiene_guards_reaches_the_blackbox_guard`] /
++//!    [`run_hygiene_guards_stops_at_the_first_failing_guard`] drive the phase `run_ci`
++//!    executes (`xtask/src/main.rs`, beside `run_unsafe_forbid_guard`) with a recording
++//!    runner, so "registered but never reached" and "reached but its `Err` dropped" are
++//!    both covered. Without those, a guard that passes every planted case below and
++//!    never runs under `cargo xtask ci` would still pass this whole file.
++
++#![forbid(unsafe_code)]
++
++use xtask::repo_guard::{
++    run_hygiene_guards, scan_blackbox_dependency_closure, HygieneGuard, BLACKBOX_GUARD_TARGETS,
++    BLACKBOX_METADATA_ARGS, HYGIENE_GUARDS,
++};
++use xtask::workspace_root;
++
++// ─── planted `cargo metadata` documents ────────────────────────────────────────────
++//
++// Shaped exactly like the real thing (verified against `cargo metadata --format-version
++// 1 --locked --all-features` on this workspace): package ids are opaque strings, a
++// declared dependency carries `name`/`kind`/`optional`, and a resolve edge carries
++// `pkg` plus a non-empty `dep_kinds` array whose entries hold `null`, `"dev"` or
++// `"build"`.
++
++/// A declared dependency entry: `(dependency name, verbatim JSON for `kind`, optional)`.
++type Declared<'a> = (&'a str, &'a str, bool);
++/// A resolve-graph edge: `(dependency name, verbatim JSON for the `dep_kinds` array)`.
++type Edge<'a> = (&'a str, &'a str);
++
++/// A normal (`[dependencies]`) resolve edge — the only kind that ships in the binary.
++const NORMAL: &str = r#"[{"kind": null, "target": null}]"#;
++/// A `[dev-dependencies]` resolve edge: deliberately unconstrained (proposal 0017 §9).
++const DEV: &str = r#"[{"kind": "dev", "target": null}]"#;
++/// A `[build-dependencies]` resolve edge: runs at build time, never linked.
++const BUILD: &str = r#"[{"kind": "build", "target": null}]"#;
++
++fn pkg_id(name: &str) -> String {
++    format!("path+file:///fake/{name}#{name}@0.0.0")
++}
++
++fn metadata_doc(packages: &[(&str, &[Declared])], nodes: &[(&str, &[Edge])]) -> String {
++    let packages_json = packages
++        .iter()
++        .map(|(name, declared)| {
++            let deps = declared
++                .iter()
++                .map(|(dep, kind, optional)| {
++                    format!(r#"{{"name": "{dep}", "kind": {kind}, "optional": {optional}}}"#)
++                })
++                .collect::<Vec<_>>()
++                .join(",");
++            format!(
++                r#"{{"id": "{}", "name": "{name}", "dependencies": [{deps}]}}"#,
++                pkg_id(name)
++            )
++        })
++        .collect::<Vec<_>>()
++        .join(",");
++    let nodes_json = nodes
++        .iter()
++        .map(|(name, edges)| {
++            let deps = edges
++                .iter()
++                .map(|(dep, dep_kinds)| {
++                    format!(
++                        r#"{{"name": "{}", "pkg": "{}", "dep_kinds": {dep_kinds}}}"#,
++                        dep.replace('-', "_"),
++                        pkg_id(dep)
++                    )
++                })
++                .collect::<Vec<_>>()
++                .join(",");
++            format!(r#"{{"id": "{}", "deps": [{deps}]}}"#, pkg_id(name))
++        })
++        .collect::<Vec<_>>()
++        .join(",");
++    format!(r#"{{"packages": [{packages_json}], "resolve": {{"nodes": [{nodes_json}]}}}}"#)
++}
++
++/// `wyrd-validate --<edge_kind>--> <dep>`, declared and resolved, for the one-hop cases.
++fn one_hop(dep: &str, declared_kind: &str, optional: bool, edge_kind: Option<&str>) -> String {
++    let declared: Vec<Declared> = vec![(dep, declared_kind, optional)];
++    let edges: Vec<Edge> = edge_kind.map(|k| vec![(dep, k)]).unwrap_or_default();
++    metadata_doc(
++        &[("wyrd-validate", &declared), (dep, &[])],
++        &[("wyrd-validate", &edges), (dep, &[])],
++    )
++}
++
++fn scan(doc: &str) -> Result<Vec<String>, String> {
++    scan_blackbox_dependency_closure(doc, "wyrd-validate", "wyrd-")
++}
++
++// ─── criterion 2: the three planted cases ──────────────────────────────────────────
++
++#[test]
++fn a_normal_wyrd_dependency_is_exactly_one_violation_naming_it() {
++    let violations = scan(&one_hop("wyrd-core", "null", false, Some(NORMAL)))
++        .expect("planted document is well-formed");
++    assert_eq!(violations.len(), 1, "{violations:?}");
++    assert!(
++        violations[0].contains("wyrd-core"),
++        "the violation names the offending crate: {violations:?}"
++    );
++}
++
++#[test]
++fn the_same_edge_marked_dev_is_no_violation() {
++    let violations = scan(&one_hop("wyrd-core", "\"dev\"", false, Some(DEV)))
++        .expect("planted document is well-formed");
++    assert!(violations.is_empty(), "{violations:?}");
++}
++
++#[test]
++fn an_optional_off_by_default_normal_edge_is_still_the_violation() {
++    // The edge is declared (kind: null, optional: true) but absent from the resolve
++    // graph — exactly the case a narrower (non `--all-features`, declared-list-blind)
++    // scan would miss, and exactly what the Design's "belt to the graph's braces"
++    // second scan exists to catch.
++    let violations =
++        scan(&one_hop("wyrd-core", "null", true, None)).expect("planted document is well-formed");
++    assert_eq!(violations.len(), 1, "{violations:?}");
++    assert!(
++        violations[0].contains("wyrd-core") && violations[0].contains("optional"),
++        "the violation names the crate and that it is optional: {violations:?}"
++    );
++}
++
++// ─── the closure is TRANSITIVE, and pruned by edge kind at every depth ─────────────
++
++/// The whole reason the guard walks a graph rather than reading one manifest: a
++/// validator that pulls in a helper crate which itself links `wyrd-core` has exactly the
++/// self-referential verdict proposal 0017 §9 forbids, and no direct-dependency check
++/// would see it. The reported PATH is asserted, not just the crate name — "reaches
++/// wyrd-core" is not actionable; "via wyrd-validate -> helper -> wyrd-core" is.
++#[test]
++fn a_multi_hop_normal_path_reaches_the_violation_and_reports_the_path() {
++    let doc = metadata_doc(
++        &[
++            ("wyrd-validate", &[("helper", "null", false)]),
++            ("helper", &[("deep", "null", false)]),
++            ("deep", &[("wyrd-core", "null", false)]),
++            ("wyrd-core", &[]),
++        ],
++        &[
++            ("wyrd-validate", &[("helper", NORMAL)]),
++            ("helper", &[("deep", NORMAL)]),
++            ("deep", &[("wyrd-core", NORMAL)]),
++            ("wyrd-core", &[]),
++        ],
++    );
++    let violations = scan(&doc).expect("planted document is well-formed");
++    assert_eq!(violations.len(), 1, "{violations:?}");
++    assert!(
++        violations[0].contains("wyrd-validate -> helper -> deep -> wyrd-core"),
++        "the violation reports the path that reached it: {violations:?}"
++    );
++}
++
++/// The complementary half — without it, a guard that reported a violation for every
++/// reachable package would pass the case above. A three-hop closure of ordinary
++/// third-party crates is walked to the end and stays green.
++#[test]
++fn a_clean_multi_hop_closure_is_green() {
++    let doc = metadata_doc(
++        &[
++            ("wyrd-validate", &[("aws-sdk-s3", "null", false)]),
++            ("aws-sdk-s3", &[("hyper", "null", false)]),
++            ("hyper", &[("bytes", "null", false)]),
++            ("bytes", &[]),
++        ],
++        &[
++            ("wyrd-validate", &[("aws-sdk-s3", NORMAL)]),
++            ("aws-sdk-s3", &[("hyper", NORMAL)]),
++            ("hyper", &[("bytes", NORMAL)]),
++            ("bytes", &[]),
++        ],
++    );
++    assert!(
++        scan(&doc)
++            .expect("planted document is well-formed")
++            .is_empty(),
++        "a closure of ordinary crates must stay green however deep it is"
++    );
++}
++
++/// "Normal, not total" applies to the WHOLE walk, not just the first hop: the §14
++/// fixtures are dev-dependencies, and what they link is unconstrained. A guard that
++/// pruned dev edges only at the root would report every crate those fixtures reach.
++#[test]
++fn a_dev_edge_prunes_everything_behind_it() {
++    for pruned in [DEV, BUILD] {
++        let doc = metadata_doc(
++            &[
++                ("wyrd-validate", &[("fixture", "\"dev\"", false)]),
++                ("fixture", &[("wyrd-core", "null", false)]),
++                ("wyrd-core", &[]),
++            ],
++            &[
++                ("wyrd-validate", &[("fixture", pruned)]),
++                ("fixture", &[("wyrd-core", NORMAL)]),
++                ("wyrd-core", &[]),
++            ],
++        );
++        assert!(
++            scan(&doc)
++                .expect("planted document is well-formed")
++                .is_empty(),
++            "a {pruned} edge must prune the subtree behind it"
++        );
++    }
++}
++
++/// The two halves together, in one graph: the same `wyrd-core` is reachable through a
++/// dev edge (legal) and through a normal one (forbidden). Reporting it once, via the
++/// normal path, is the property — a walk that stopped at the first *reachable* mention
++/// would report the dev route, and one that pruned by target rather than by edge would
++/// report nothing at all.
++#[test]
++fn a_dev_route_does_not_mask_a_normal_route_to_the_same_crate() {
++    let doc = metadata_doc(
++        &[
++            (
++                "wyrd-validate",
++                &[("fixture", "\"dev\"", false), ("shim", "null", false)],
++            ),
++            ("fixture", &[("wyrd-core", "null", false)]),
++            ("shim", &[("wyrd-core", "null", false)]),
++            ("wyrd-core", &[]),
++        ],
++        &[
++            ("wyrd-validate", &[("fixture", DEV), ("shim", NORMAL)]),
++            ("fixture", &[("wyrd-core", NORMAL)]),
++            ("shim", &[("wyrd-core", NORMAL)]),
++            ("wyrd-core", &[]),
++        ],
++    );
++    let violations = scan(&doc).expect("planted document is well-formed");
++    assert_eq!(violations.len(), 1, "{violations:?}");
++    assert!(
++        violations[0].contains("wyrd-validate -> shim -> wyrd-core"),
++        "the normal route is the one reported: {violations:?}"
++    );
++}
++
++/// A real resolve graph contains cycles (two crates that are each other's
++/// dev-dependency, a crate that depends on an older copy of itself). The walk must
++/// terminate and still report what it found, rather than looping until the test harness
++/// times out.
++#[test]
++fn a_cyclic_graph_terminates_and_still_reports() {
++    let doc = metadata_doc(
++        &[
++            ("wyrd-validate", &[("a", "null", false)]),
++            ("a", &[("b", "null", false)]),
++            ("b", &[("a", "null", false), ("wyrd-core", "null", false)]),
++            ("wyrd-core", &[]),
++        ],
++        &[
++            ("wyrd-validate", &[("a", NORMAL)]),
++            ("a", &[("b", NORMAL)]),
++            ("b", &[("a", NORMAL), ("wyrd-core", NORMAL)]),
++            ("wyrd-core", &[]),
++        ],
++    );
++    let violations = scan(&doc).expect("planted document is well-formed");
++    assert_eq!(violations.len(), 1, "{violations:?}");
++    assert!(violations[0].contains("wyrd-core"), "{violations:?}");
++}
++
++// ─── fail-closed (Design: mirrors scan_roots' "refusing to pass a workspace it cannot
++// see", repo_guard.rs:496-510) ───────────────────────────────────────────────────────
++
++#[test]
++fn an_unparsable_document_is_err() {
++    scan("not json").expect_err("unparsable JSON must fail closed");
++}
++
++#[test]
++fn a_document_with_no_resolve_section_is_err() {
++    let doc = r#"{"packages": [{"id": "p", "name": "wyrd-validate", "dependencies": []}]}"#;
++    scan(doc).expect_err("a missing resolve section must fail closed");
++}
++
++#[test]
++fn a_package_absent_from_packages_is_err() {
++    scan(r#"{"packages": [], "resolve": {"nodes": []}}"#)
++        .expect_err("a package cargo metadata never saw must fail closed");
++}
++
++#[test]
++fn a_package_present_but_absent_from_the_resolve_graph_is_err() {
++    let doc = r#"{
++        "packages": [{"id": "p", "name": "wyrd-validate", "dependencies": []}],
++        "resolve": {"nodes": []}
++    }"#;
++    scan(doc).expect_err("a package missing from the resolve graph must fail closed");
++}
++
++/// Fail-closed one hop OUT, which is where a silent skip does real damage: an
++/// intermediate package reached by a normal edge but carrying no resolve node hides
++/// everything behind it, so `wyrd-validate -> middle -> wyrd-core` would report clean.
++/// Skipping the unwalkable node is indistinguishable, to the gate, from a clean closure.
++#[test]
++fn an_edge_reaching_a_package_with_no_resolve_node_is_err() {
++    let doc = r#"{
++        "packages": [
++            {"id": "v", "name": "wyrd-validate", "dependencies": []},
++            {"id": "m", "name": "middle", "dependencies": []}
++        ],
++        "resolve": {"nodes": [
++            {"id": "v", "deps": [{"name": "middle", "pkg": "m",
++                                  "dep_kinds": [{"kind": null, "target": null}]}]}
++        ]}
++    }"#;
++    let err = scan(doc).expect_err("a reached package with no node must fail closed");
++    assert!(
++        err.contains("middle"),
++        "the error names what it cannot see: {err}"
++    );
++}
++
++/// "I cannot tell what kind this edge is" is not "this edge is dev-only". Each of these
++/// documents carries a real `wyrd-core` edge whose kind cannot be classified — a
++/// missing `dep_kinds` array, an empty one, an entry without a `kind` key, and one whose
++/// `kind` is neither `null` nor a kind cargo emits. Classifying any of them as
++/// non-normal would drop the edge (and everything behind it) out of the closure the
++/// guard claims to have checked, which is exactly a green gate over an unchecked tree.
++#[test]
++fn an_edge_whose_kind_cannot_be_classified_is_err_not_silently_non_normal() {
++    for (case, dep_kinds) in [
++        ("no dep_kinds array", None),
++        ("an empty dep_kinds array", Some("[]")),
++        ("an entry with no kind key", Some(r#"[{"target": null}]"#)),
++        ("a non-string, non-null kind", Some(r#"[{"kind": 42}]"#)),
++        (
++            "a kind string cargo never emits",
++            Some(r#"[{"kind": "runtime"}]"#),
++        ),
++    ] {
++        let edge = match dep_kinds {
++            Some(kinds) => {
++                format!(r#"{{"name": "wyrd_core", "pkg": "c", "dep_kinds": {kinds}}}"#)
++            }
++            None => r#"{"name": "wyrd_core", "pkg": "c"}"#.to_string(),
++        };
++        let doc = format!(
++            r#"{{
++                "packages": [
++                    {{"id": "v", "name": "wyrd-validate", "dependencies": []}},
++                    {{"id": "c", "name": "wyrd-core", "dependencies": []}}
++                ],
++                "resolve": {{"nodes": [
++                    {{"id": "v", "deps": [{edge}]}},
++                    {{"id": "c", "deps": []}}
++                ]}}
++            }}"#
++        );
++        let err = scan(&doc).expect_err(&format!("{case} must fail closed"));
++        assert!(
++            err.contains("wyrd-core") || err.contains("wyrd_core"),
++            "the error names the edge it cannot read ({case}): {err}"
++        );
++    }
++}
++
++/// The same rule on the declared list, which is the half that catches an optional
++/// off-by-default edge: a `kind` this guard cannot classify must not be quietly treated
++/// as "not a normal dependency", because that is precisely how a hand-edited or
++/// future-cargo document turns the belt-and-braces scan into a vacuous pass.
++#[test]
++fn a_declared_dependency_whose_kind_cannot_be_classified_is_err() {
++    for (case, entry) in [
++        ("no kind key", r#"{"name": "wyrd-core", "optional": true}"#),
++        (
++            "a non-string, non-null kind",
++            r#"{"name": "wyrd-core", "kind": 42, "optional": true}"#,
++        ),
++        (
++            "a kind string cargo never emits",
++            r#"{"name": "wyrd-core", "kind": "runtime", "optional": true}"#,
++        ),
++    ] {
++        let doc = format!(
++            r#"{{
++                "packages": [{{"id": "v", "name": "wyrd-validate", "dependencies": [{entry}]}}],
++                "resolve": {{"nodes": [{{"id": "v", "deps": []}}]}}
++            }}"#
++        );
++        let err = scan(&doc).expect_err(&format!(
++            "a declared dependency with {case} must fail closed"
++        ));
++        assert!(
++            err.contains("wyrd-core") && err.contains("kind"),
++            "the error names the declaration it cannot read ({case}): {err}"
++        );
++    }
++}
++
++/// Two packages under one name (two versions in the resolve, or a registry crate that
++/// shares a workspace member's name) is an ambiguity, not a coin flip: auditing whichever
++/// entry came first would clear the other one silently.
++#[test]
++fn more_than_one_package_under_the_scanned_name_is_err() {
++    let doc = r#"{
++        "packages": [
++            {"id": "v1", "name": "wyrd-validate", "dependencies": []},
++            {"id": "v2", "name": "wyrd-validate",
++             "dependencies": [{"name": "wyrd-core", "kind": null, "optional": false}]}
++        ],
++        "resolve": {"nodes": [{"id": "v1", "deps": []}, {"id": "v2", "deps": []}]}
++    }"#;
++    let err = scan(doc).expect_err("an ambiguous package name must fail closed");
++    assert!(
++        err.contains("more than one package named"),
++        "the error says what is ambiguous: {err}"
++    );
++}
++
++/// The declared-list scan is the belt to the graph's braces; a belt nobody can read is
++/// not a belt, so a package entry without a `dependencies` array — or with a nameless
++/// entry in it — is an error rather than a skipped half of the scan.
++#[test]
++fn an_unreadable_declared_dependency_list_is_err() {
++    let no_list = r#"{
++        "packages": [{"id": "v", "name": "wyrd-validate"}],
++        "resolve": {"nodes": [{"id": "v", "deps": []}]}
++    }"#;
++    scan(no_list).expect_err("a missing declared-dependency list must fail closed");
++
++    let nameless = r#"{
++        "packages": [{"id": "v", "name": "wyrd-validate",
++                      "dependencies": [{"kind": null, "optional": false}]}],
++        "resolve": {"nodes": [{"id": "v", "deps": []}]}
++    }"#;
++    scan(nameless).expect_err("a nameless declared dependency must fail closed");
++}
++
++// ─── the real workspace, read exactly as production reads it ───────────────────────
++
++/// The invariant itself, over the document the guard actually consumes: the same argv
++/// (`BLACKBOX_METADATA_ARGS`) production shells, so this case cannot pass over a
++/// friendlier document than the gate reads. The flags are asserted individually because
++/// each one silently narrows what the scan can see if it is dropped — `--all-features`
++/// most of all, since without it an optional off-by-default `wyrd-*` edge never reaches
++/// the resolve graph and every planted case above still passes.
++#[test]
++fn the_guard_reads_an_all_features_locked_resolve_of_the_real_workspace() {
++    assert!(
++        BLACKBOX_METADATA_ARGS.contains(&"--all-features")
++            && BLACKBOX_METADATA_ARGS.contains(&"--locked")
++            && !BLACKBOX_METADATA_ARGS.contains(&"--no-deps"),
++        "the closure must be resolved under every feature, from the committed lockfile, \
++         WITH the resolve graph: {BLACKBOX_METADATA_ARGS:?}"
++    );
++    let meta = std::process::Command::new("cargo")
++        .args(BLACKBOX_METADATA_ARGS)
++        .current_dir(workspace_root())
++        .output()
++        .expect("failed to spawn cargo metadata");
++    assert!(
++        meta.status.success(),
++        "cargo metadata must succeed: {}",
++        String::from_utf8_lossy(&meta.stderr)
++    );
++    let metadata = String::from_utf8_lossy(&meta.stdout);
++    for (package, prefix) in BLACKBOX_GUARD_TARGETS {
++        let violations = scan_blackbox_dependency_closure(&metadata, package, prefix)
++            .expect("the real workspace metadata is scannable");
++        assert!(
++            violations.is_empty(),
++            "{package} must not reach any {prefix}* crate: {violations:?}"
++        );
++    }
++}
++
++// ─── criterion 1: the guard really runs inside `run_ci` ────────────────────────────
++
++#[test]
++fn the_blackbox_guard_is_registered_in_hygiene_guards() {
++    // `xtask::repo_guard::HYGIENE_GUARDS` is the exact list `run_ci`'s hygiene phase
++    // runs (`xtask/src/main.rs:1563`, beside `run_unsafe_forbid_guard` at `:1558`). A
++    // guard that is defined and passes every case above but is missing from this list
++    // never runs under `cargo xtask ci` — the wiring hazard `run_ci_steps`' injected
++    // `exec` already guards against (`main.rs:1486-1498`).
++    let guard: &HygieneGuard = HYGIENE_GUARDS
++        .iter()
++        .find(|g| g.name == "blackbox-dependency-guard")
++        .expect("the blackbox guard must be registered in HYGIENE_GUARDS, which run_ci executes");
++    // And the registered callable is not a stub: invoking it must actually run the
++    // real check over the real workspace and come back green.
++    (guard.run)().expect("the registered guard must pass over the real workspace");
++}
++
++/// Registration is only half of "the guard runs": the phase that walks the list must
++/// actually reach it. `run_hygiene_guards` is the code `run_ci` executes
++/// (`xtask/src/main.rs:1563`), driven here with a RECORDING runner instead of the real
++/// one — the `run_ci_steps` idiom (`main.rs:1486-1498`), which exercises the wiring
++/// without spawning anything.
++#[test]
++fn run_hygiene_guards_reaches_the_blackbox_guard() {
++    let mut visited = Vec::new();
++    run_hygiene_guards(&mut |guard| {
++        visited.push(guard.name);
++        Ok(())
++    })
++    .expect("a recording runner never fails");
++    assert!(
++        visited.contains(&"blackbox-dependency-guard"),
++        "the phase run_ci executes must reach the blackbox guard: {visited:?}"
++    );
++    assert_eq!(
++        visited.len(),
++        HYGIENE_GUARDS.len(),
++        "every registered guard is reached, not just the first: {visited:?}"
++    );
++}
++
++/// The other way a wired-up guard reports to nobody: its `Err` is dropped instead of
++/// stopping the gate. A violation that does not fail the build is a green gate over a
++/// broken invariant, so the phase must propagate the first failure and stop there.
++#[test]
++fn run_hygiene_guards_stops_at_the_first_failing_guard() {
++    let mut attempted = 0usize;
++    let err = run_hygiene_guards(&mut |_| {
++        attempted += 1;
++        Err("planted guard failure".to_string())
++    })
++    .expect_err("a failing guard must fail the phase, not be discarded");
++    assert!(err.contains("planted guard failure"), "{err}");
++    assert_eq!(attempted, 1, "the phase stops at the first failure");
++}

@@ -1,0 +1,3 @@
+- No findings on either lens: no introduced correctness/test-fidelity bugs or actionable reuse, simplification, or efficiency issues found. Reviewed the recording tap (`crates/dst/tests/custodian.rs:5094`), concurrent-writer oracle (`crates/dst/tests/custodian.rs:5509`), ambiguous-commit recovery (`crates/dst/tests/custodian.rs:5740`), and contested-window assertions (`crates/dst/tests/custodian.rs:5854`) against the read-only target.
+
+Validation evidence: frozen C4-ci logs show all three new properties passing; C4-verify records a passing madsim run with 50 seeds. Tests were not rerun during this advisory review.
