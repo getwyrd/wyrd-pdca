@@ -25,6 +25,7 @@ are staged and moved into place only once all of them succeed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -925,10 +926,26 @@ def restore_parent_brief(parent: Path, cfg) -> Path:
     plan = _parent_plan(parent, cfg)
     if plan is None:   # unreachable: _parent_plan returns None only when brief.md exists
         raise SplitError(f"{parent.name} already has a brief.md")
-    kids = [cfg.bundle(str(i)).name for i in ((read_lineage(parent) or {}).get("children") or [])]
-    bp.write_text(_split_parent_brief(parent, plan, kids or [f"named in `{PROPOSAL}`"],
-                                      written_by="`flow`, restoring a pre-#481 split"),
-                  encoding="utf-8")
+    # The lineage record is a provenance hint, not a contract: a valid-version file whose
+    # `children` is not a list of ids (hand-edited, corrupted) must not raise out of here,
+    # where flow_ids only catches SplitError. Same tolerance as flow._lineage_children;
+    # nothing usable left falls back to the proposal, as for a split older than lineage.
+    value = (read_lineage(parent) or {}).get("children")
+    ids = ([c.strip() for c in value if isinstance(c, str) and c.strip()]
+           if isinstance(value, list) else [])
+    kids = [cfg.bundle(i).name for i in ids] or [f"named in `{PROPOSAL}`"]
+    text = _split_parent_brief(parent, plan, kids,
+                               written_by="`flow`, restoring a pre-#481 split")
+    # Atomic: a torn brief.md would read as present on the next run, which then skips the
+    # restore and drives a truncated Plan artifact. Write beside it, then rename into place.
+    tmp = parent / ".brief.md.restoring"
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, bp)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise SplitError(f"{parent.name}: could not write the restored brief.md ({exc}) — "
+                         "nothing was left behind; fix the cause, then re-run") from exc
     return bp
 
 

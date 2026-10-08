@@ -79,5 +79,42 @@ class BrieflessSplitParent(unittest.TestCase):
         self.assertEqual(got, {"654": state.BUILT})
 
 
+    def test_a_malformed_lineage_children_value_falls_back_to_the_proposal(self) -> None:
+        # #269 review: a valid-version record whose `children` is not a list of ids must not
+        # raise TypeError out of the restore (flow_ids only catches SplitError).
+        for value in (7, [1, None], "691"):
+            with self.subTest(children=value):
+                (self.parent / "brief.md").unlink(missing_ok=True)
+                (self.parent / split.LINEAGE).write_text(
+                    json.dumps({"version": 1, "id": "654", "children": value}), encoding="utf-8")
+                text = split.restore_parent_brief(self.parent, self.cfg).read_text(encoding="utf-8")
+                self.assertIn(f"named in `{split.PROPOSAL}`", text)
+
+    def test_a_failed_write_leaves_no_brief_behind(self) -> None:
+        # #269 review: a torn brief.md would read as present next run and skip the restore.
+        with mock.patch.object(split.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(split.SplitError) as caught:
+                split.restore_parent_brief(self.parent, self.cfg)
+        self.assertIn("disk full", str(caught.exception))
+        self.assertFalse((self.parent / "brief.md").exists())
+        self.assertEqual([p.name for p in self.parent.iterdir() if p.name.startswith(".brief")], [])
+
+    def test_the_csv_sweep_restores_the_brief_too(self) -> None:
+        # #269 review: `flow --from-csv` (flow_batch) sweeps every in-flight bundle into
+        # _drive_and_act without going through flow_ids.
+        with mock.patch.object(flow.leaves, "do_plan_batch"), \
+                mock.patch.object(flow, "_drive_and_act", return_value={}) as drive:
+            flow.flow_batch(self.cfg, csv="x.csv")
+        self.assertTrue((self.parent / "brief.md").exists())
+        self.assertEqual(drive.call_args.args[1], [self.parent])
+
+    def test_the_csv_sweep_leaves_out_an_unrestorable_bundle(self) -> None:
+        shutil.rmtree(self.parent / "iteration-v2")
+        with mock.patch.object(flow.leaves, "do_plan_batch"), \
+                mock.patch.object(flow, "_drive_and_act", return_value={}) as drive:
+            self.assertEqual(flow.flow_batch(self.cfg, csv="x.csv"), {})
+        drive.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
