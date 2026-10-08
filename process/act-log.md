@@ -2343,3 +2343,212 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - **Memory holds.** No leaf killed at its cap and no oomd kill in the next five multi-lane runs
   (each leaf's `*.memory.jsonl` shows the peak).
 
+
+# Act review — 2026-09-30 — cycles considered: 115, 116, 117, 139, 140, 141, 142, 143, 144, 145, 146, 150, 151, 152, 154, 155, 195, 196, 197, 198, 203, 204, 205, 207, 251, 252, 253, 254, 255, 256, 257, 258, 268, 285, 286, 287, 288, 290, 330, 346, 347, 348, 349, 350, 356, 364, 365, 366, 398, 399, 405, 406, 407, 408, 409, 419, 430, 431, 438, 439, 440, 441, 454, 455, 458, 468, 469, 470, 477, 490, 503, 504, 505, 506, 507, 509, 510, 554, 575, 576, 577, 634, 635, 637, 638, 648, 649, 650, 655, 661, 662, 663, 664, 681, 685, 691, 692, 693, 695, 696, 697, 710, 715, 716, 717, 741, 742, 771, 772, 774, 775, 776, 800, 803, 804, 808, 809, 813, 814
+
+## What the cycles' records exposed
+- [act_candidates] 6× plan advisory: 5 finding(s); brief revised: yes (plan-advisory-*.md)
+- [act_candidates] 4× plan advisory: 4 finding(s); brief revised: yes (plan-advisory-*.md)
+- [needs_human_classes] 17× size backstop — this slice is behaving oversized:
+- [needs_human_classes] 9× t4 batched multi-pass rubric review (3x codex, union,
+- [needs_human_classes] 8× confirm the close disposition 'split' (no patch was
+- [needs_human_classes] 8× c4 per-fix red->green: this patch's test red pre-fix,
+- [needs_human_classes] 8× advisory code-review lens is a stub here; a
+- [needs_human_classes] 6× c4 wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) failed
+- [needs_human_classes] 6× validation — fitness-to-purpose — human must decide whether
+- [needs_human_classes] 5× c4 verification (red→green) — decide whether to accept
+- [needs_human_classes] 4× validation — fitness-to-purpose — human sign-off must decide
+- [needs_human_classes] 4× validation — fitness-to-purpose — is this the right
+- [needs_human_classes] 3× t5 — t5 judgment — oracle is reviewer
+- [needs_human_classes] 3× validation — fitness-to-purpose — decide whether the in-process
+- [needs_human_classes] 2× v — validation — fitness-to-purpose — always-human (gate
+- [needs_human_classes] 2× c5 — c5 causal adequacy — oracle is
+- [needs_human_classes] 2× v — validation — fitness-to-purpose — always-human. does
+- [needs_human_classes] 2× t5 — t5 judgment — oracle is "reviewer
+- [needs_human_classes] 2× t3 runtime
+- [needs_human_classes] 2× validation — fitness-to-purpose — decision owed: confirm the
+- [needs_human_classes] 2× confirm the close disposition 'likely-close' (no patch was
+- [needs_human_classes] 2× c4 wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) unverifiable
+- [needs_human_classes] 2× c4 wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) flaked
+- [needs_human_classes] 2× t5 judgment — confirm affected-path prior art across
+- [needs_human_classes] 2× c1 spec — resolve the one-file scope against
+
+## Process deltas  (TODO — the human decides these; each must be located)
+- Spec template: <field added/clarified/removed>            (path)
+- Ruleset: <rule added/retired/relaxed/tightened>           (path:line)
+- Gates: <check added/promoted/moved>                       (path:line)
+- Agent role prompts: <agents/*.md / skill adjustment>      (path:line)
+
+## How effectiveness will be judged
+- The next Do phases should not recreate <specific issue>. Watch the next K cycles.
+
+# Act review — 2026-09-30 (decided) — cycles considered: 682, 711, 721, 736, 738, 741, 742, 774, 775, 776, 777, 809, 810, 839, 840, 841, 842, 843, 852, 854 (decided by Eduard Ralph in session)
+
+> This entry completes the 2026-09-30 stub above, whose "Process deltas" and "How
+> effectiveness will be judged" sections were left as TODO placeholders. The log is
+> append-only, so the stub stays as written. The index held 133 frozen cycles; 113 were
+> reviewed through 2026-09-20 (cont.), and the 20 above are the new ones. No contribution's
+> disposition is re-decided here.
+
+## What the records exposed
+
+- **A brief's scope fence clashes with the rubric's same-PR obligations.** Docs currency
+  (`AGENTS.md:154`), Tier-0 DST (`:190`) and "Deferrals are settled" (`:200`) require work
+  the fence excluded, and the brief neither allowed it nor recorded a deferral.
+  - #776: one-file scope vs. an architecture-doc update. Three §6 items for one question,
+    and T4 re-fired across rounds.
+  - #841: DST out of scope with no `// deferred: #N` marker, so T4 blocked three times.
+  - #843: delivered the coverage that `restore.rs:785` marks `deferred: #843`, but couldn't
+    remove the marker (two §6 items).
+- **"Settled" decisions in briefs that the plan advisory can't verify.** They were made at
+  earlier PDCA sign-offs (bundle §9), not in the tracker, and the advisory saw empty or
+  missing `notes.json` / `sources/`. Seen in #721, #738, #741, #839 and #852.
+- **C5 mutants scored real mutants "unviable".** Wyrd's `warnings = "deny"` makes a body-stub
+  mutant fail to compile. In #842, 28 of 36 were unviable; with `--cap-lints=true` the result
+  was 25 caught, 2 missed, 9 unviable, and the 2 missed were real test gaps. In #775, 16 were
+  unviable for the same reason.
+- **Sign-off items carried round to round unchanged.** Not re-checked, not de-duplicated, and
+  sometimes parsed from prose.
+  - #776 kept a passed C4 timeout and an item made from "No NEEDS-HUMAN …".
+  - #776 listed the same scope question 3 times; #842 listed one prior-art question 5 times.
+- **"Carry to #N" work has no path to #N's Plan.** #776 carried five items to #777 after
+  #777's brief was written.
+- **The plan advisory calls an unmerged `Depends on` prerequisite a false base.** Seen in #741,
+  #738 and #852.
+- **Already-filed upstream issues recurred:**
+  - #575, prior-art questions to the human: #776, #810, #842, #854.
+  - #556, the size backstop just over 100 KB: #810 at 111 KB, #852 at 101 KB, #854 at 104 KB.
+- **Split closes and always-human items** (fitness-to-purpose, close-disposition 'split' on
+  682/711/721/736/741/809) behaved as designed. No delta.
+
+## Process deltas
+
+- **Agent role prompts + spec template (D1), filed upstream as eduralph/pdca-harness#640.**
+  The planner reconciles the scope fence with the target repo's same-PR review obligations:
+  each is in scope, deferred (tracking issue plus a marker Do must add), or n/a. A slice that
+  delivers an existing `deferred: #N` puts the marker's removal in scope. The brief gets a
+  `Rubric obligations:` line under Scope. Locations: `agents/planner.md:271` ("Verify before
+  you hand off"), the `.claude/agents/planner.md` copy, and `templates/brief.md.tpl:58`.
+  Lands with the upstream change.
+- **Spec template + agent role prompts (D2), filed upstream as eduralph/pdca-harness#641.**
+  The brief gets a `Settled decisions:` field: each decision is quoted and cites its record
+  (tracker comment URL or `results/issue_N/iteration-vK/SUMMARY.md` §9). The planner verifies
+  prior decisions as claims, and the plan advisory accepts a quoted, cited entry. Locations:
+  `templates/brief.md.tpl:58`, `agents/planner.md:276` (step 1), and `agents/plan-reviewer.md`.
+  Lands with the upstream change.
+- **Gates (D3), applied here:** C5-mutants runs with `--cap-lints=true`, so denied warnings no
+  longer make mutants unviable. (`scripts/mutants-in-diff:41`, with a rationale comment above
+  it; the `pdca.toml:1543` row is unchanged.)
+
+## Follow-ups routed (not process deltas)
+
+- **Upstream harness (eduralph/pdca-harness), new:**
+  - #642: deferred NEEDS-HUMAN items are not re-checked against the current round, not
+    de-duplicated, and are parsed from prose (#776, #842).
+  - #643: "carry to #N" items never reach #N's Plan (#776 → #777).
+  - #644: the plan advisory reports an unmerged `Depends on` prerequisite as a false base
+    (#738, #741, #852).
+- **Upstream harness, evidence added to existing issues:**
+  - #575 (prior-art on a synthetic one-commit target): comment 5998683824.
+  - #556 (size-backstop tolerance band): comment 5998684240.
+  - #364 (sign-off interview; the §6 triage-table request from issue_776): comment 5998684601.
+- **Wyrd tracker (getwyrd/wyrd), code follow-ups from §10:**
+  - #866: roles accept unknown flags and `--flag=value` without complaint (#738).
+  - #867: `AWS_SESSION_TOKEN` is ignored (#774).
+  - #868: the blackbox guard allows build-deps and matches by name prefix (#775).
+  - #869: CLI and runbook disagree on the not-complete rule; align to rule 1a (#810).
+  - #870: a `restore_staged_report` leg passes for the wrong reason (#841).
+  - #871: no test covers `part_chunks` skipping an unreadable `part:` record (#842).
+  - #872: stale `deferred: #843` marker and pin list (#843).
+  - #873: a bad `--endpoint` is reported as `NoResponse`, and GET has no whole-transfer
+    deadline (#852).
+  - Already filed: #855, the missing `retire:bytes` re-check (#842).
+- **Open Act item.** `cargo xtask ci` hit its 7200 s limit in #776 and #842, inside
+  `crates/server/tests/custodian_day_one.rs`, which passes in 0.19 s on its own. Two cases
+  aren't enough to diagnose it. Owner: Eduard Ralph. Next step: at the next review, file a
+  Wyrd bug if a third C4 timeout lands in the same test.
+
+## How effectiveness will be judged
+
+- **D3 (applied now).** Over the next five bundles with a C5-mutants row, unviable mutants are
+  under a third of those tested. Each "unviable" left in `gate-logs/C5-mutants.log` fails for
+  a reason other than a denied lint (unused variable, dead code).
+- **D1 (once #640 lands).** Over the next ten briefs with a tight scope fence, no §6 item is a
+  clash between the fence and docs currency, DST, or a deferral marker. Each such brief has a
+  filled `Rubric obligations:` line.
+- **D2 (once #641 lands).** Over the next ten briefs that cite an earlier decision, no
+  plan-advisory finding is an "unsupported settled decision" complaint about a decision that
+  was in fact made.
+- **Routed items.** At the next review, re-check #642–#644 and the eight Wyrd issues for an
+  owner and state. If #642 has landed, no §6 row repeats a question or keeps an item whose
+  gate passed.
+
+# Act review — 2026-09-30 (cont.) — the same 20 cycles, re-read beyond the index (decided by Eduard Ralph in session)
+
+> Second pass over 682 … 854 (the set above). The Act index reads only each bundle's live
+> `SUMMARY.md` §6/§7/§10, so this pass also read the archived `iteration-v*/SUMMARY.md` §10,
+> `session-carry-forward`, and `pr-description.md` ("Known limits" / "Follow-ups" / "Out of
+> scope"). It also re-checked live §10 lines the first pass had not routed. It found 17 items
+> the first pass missed. No disposition is re-decided.
+
+## What the records exposed
+
+- **The index loses follow-ups, which confirms upstream #608 and #636 on this instance.** Of
+  the 17, five were §10 lines that exist only in an archived iteration (#742 v7, #742 v8,
+  #809 v1, #854 v6; #777 v4 was a note on open #698 and needs nothing). Seven were written only
+  in PR descriptions. The `session-carry-forward` files held only auto-iterate rebuild orders
+  that the next round acted on; nothing deferred was found there.
+- **A new tool dependency reached a release workflow with no doctor check.** #742 made
+  `release.yml:41-42` lint `install.sh` with `shellcheck`, and `pdca.toml` had no row for it.
+  This is the same reactive-registration pattern as docker/openssl (#252-254) and protoc
+  (#365); eduralph/pdca-harness#263 stays the forcing function.
+- **A mutation-gate timeout went unused as a size signal.** #809's C5 timed out at 7200 s on
+  64 mutants, and the human read that as "slice too big"; the size signal doesn't consider it.
+
+## Process deltas
+
+- **Gates / doctor, applied here:** `[[doctor.checks]]` row `shellcheck` (WARN, group
+  `engine`). (`pdca.toml:1312-1317`, with its rationale comment at `:1308-1311`)
+- **Size signal, filed upstream as eduralph/pdca-harness#645:** a C5-mutants timeout or a high
+  mutant count counts as an oversize indicator. Lands with the upstream change.
+
+## Follow-ups routed
+
+- **getwyrd/wyrd:**
+  - #874: the CI path filter treats every `*.md` as docs-only, so a README-only change that a
+    test pins merges green (#742 v7).
+  - #875: `xtask dist --host` ignores `CARGO_TARGET_DIR` (#742 PR).
+  - #876 (`release-gating`): run `fdb-image.yml` on a PR and a manual `release.yml` before the
+    first tag after #742.
+  - #877: connection reuse, and ending the per-upload DNS lookup, before high-rate validator
+    scenarios (#854 PR + v6).
+  - #878: `https://` (TLS) support in the validator's S3 client (#852 PR).
+  - #879: `wyrd put` still accepts `--chunk-size 0` (#738 PR).
+  - #880: raising the 16 MiB chunk ceiling needs a transport change (gRPC size, D-server
+    memory, timeouts) (#738 PR + §6).
+  - #881: restore counter docs and CLI text are inexact for an INCOMPLETE run (#839).
+  - #882: metric vs. report-field unit mismatch for untrusted staged records (#839).
+  - #656, comment 5998992104: proposal 0016's reaper and operator-abort rows use the
+    `{session, parts}` shape that crosses `MAX_VALUE_BYTES` (#842 PR). #659 already carries a
+    matching note.
+- **Open Act items** (owner Eduard Ralph; revisit at the next review):
+  - #711 stays open as an umbrella until #721 and #722 land (both open). Close it by hand then.
+  - #711 §10: the "Duplicate-ChunkId: one plan, not two" cleanup in `rebalance.rs` (flat +
+    segmented) was dropped at Plan with no tracker item. You decide whether to file it; #700
+    is related but not the same.
+  - #721 §10: Plan re-ran on an already-split parent. Likely covered by eduralph/pdca-harness
+    #481 and #597 (both closed). Watch only; file if it recurs on a split accepted after #481.
+  - #841 §10: C4-diff-cov applied the patch to bare `origin/main`, so a stacked bundle got no
+    figure. Seen in the merge-mode era. Under `wave_mode = "stack"` (since 2026-10-01) the gate
+    takes its base from `run-verify.sh --print-base`. Check the next wave>0 bundle's
+    `gate-logs/C4-diff-cov.log`; if its `base_ref` is still `origin/main`, file upstream.
+
+## How effectiveness will be judged
+
+- **shellcheck:** no bundle that touches `deploy/dist/install.sh` goes red on the release
+  lint for want of the tool. `pdca doctor` warns on a host without it.
+- **#645 (once it lands):** the next bundle whose C5 row times out shows a size-backstop item
+  at sign-off.
+- **Index coverage:** until #608 and #636 land, each Act review also sweeps archived
+  `iteration-v*/SUMMARY.md` §10 and `pr-description.md` "Known limits" / "Follow-ups". At the
+  next review, record how many items only that sweep found; zero means it can stop.

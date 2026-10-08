@@ -1,0 +1,7 @@
+- NEEDS-HUMAN [impl] — `crates/server/build.rs:120`: The rerun inputs omit Git’s `shallow` file. Deepening a shallow checkout can make an existing tag reachable without changing HEAD or refs, leaving the baked identity stale. Reproduced with this build script: `git describe` changed from a bare SHA to `v1.2.3-1-g<SHA>`, but a second Cargo build retained `0.0.0+git.<SHA>`. Track shallow-history changes and cover incremental rebuilds.
+
+- NEEDS-HUMAN [impl] — `crates/server/tests/build_identity_startup_log.rs:181`: The unconditional SHA-containment assertion rejects a supported build override. On an untagged commit, `WYRD_VERSION=1.2.3 cargo test -p wyrd-server --test build_identity_startup_log` fails even though the binary correctly reports `1.2.3`. Assert the compile-time override when supplied, while retaining the independent Git assertion for ordinary builds.
+
+- NEEDS-HUMAN [impl] — `crates/server/tests/build_identity_startup_log.rs:46`: The independent Git probe inherits repository overrides and searches enclosing repositories, unlike the build script. An unpacked source tree inside another repository correctly builds as `0.0.0+git.unknown`, but this probe finds the outer HEAD and fails the assertion at line 173; reproduced in a nested scratch fixture. Independently restrict discovery to the workspace’s own repository and clear repository-selection overrides.
+
+No additional reuse, simplification, or efficiency findings.

@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/validate/src/s3/body.rs:101`: An always-ready source yielding empty `Bytes` loops forever inside one `poll_frame` call. It never returns `Pending`, so cancellation cannot stop that task; on a single-worker runtime it also prevents the operation deadline from firing. Bound empty-piece processing per poll, wake the task and yield, and add a regression for an always-ready empty source. The frozen `T4-batch-review` log independently reports this defect.
+
+- NEEDS-HUMAN [impl] — `crates/validate/tests/s3_client_roundtrip.rs:215`: The PUT lag oracle subtracts encoded wire bytes from produced payload bytes. `pump_up` counts aws-chunked framing as forwarded data (`crates/validate/tests/s3_client_roundtrip.rs:572`). With cumulative framing overhead H, the assertion permits actual payload lag up to W + H; H grows with the transfer, so excess buffering can pass the claimed fixed W bound. Count forwarded payload bytes separately from framing and use that count in the lag assertion.
+
+No additional reuse, simplification or efficiency findings. Reviewed the target source and frozen gate evidence; no builds were rerun.

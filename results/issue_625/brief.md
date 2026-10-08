@@ -162,9 +162,14 @@
   cannot be satisfied by guarding a single module, because it quantifies over **every** session
   state and every staged byte in the store.
 - **Repo + branch target:** getwyrd/wyrd @ main
-- **Depends on:** 637, 693, 656, 657, 658, 659
+- **Depends on:** 813, 814, 808, 810, 693, 656, 657, 658, 659
 - **Conflicts with:**
-- **Ordering note:** **RE-POINTED 2026-07-26 — #508 was re-planned as five slices, and this
+- **Ordering note:** **RE-POINTED 2026-09-18 — `664` → `808, 810`.** #664 was split at its
+  re-plan into #808 (drain status + rebalance read the staged class), #809 (the restore session
+  fence + the nonce) and #810 (the durable fence-generation record + residue across generations)
+  — `results/issue_664/split-proposal.md`. #810 carries #809 through its own `Depends on`; #808
+  is independent of that chain, so it is named separately. The previous re-point stands below.
+  **RE-POINTED 2026-09-12 — `637` → `663, 664`.** #637 was split into #661 → #662 → {#663, #664} (`results/issue_637/split-proposal.md`). A split parent reaches COMPLETE at its own sign-off, before any child lands (`src/pdca_harness/cli.py:1060-1073`), so the edge now names the last wave's two children, which carry #661 and #662 transitively. **RE-POINTED 2026-07-26 — #508 was re-planned as five slices, and this
   bundle's prerequisite moved from #508 to #636.** #508's seventh attempt was rejected at sign-off
   on reviewability and it is now split into 634 → 635 → 636 → 637 → 508; #508 is reduced to the S3
   wire surface, which this loop does not touch. Every record class this loop reads (`mpu:`,
@@ -185,7 +190,7 @@
   #508**, bottom-up as one stack. Under the old plan that was in tension with "depends on #508";
   under the split it is not. Per the issue thread, **this issue must not close without #633
   landing alongside it** — #633 depends on this bundle.
-  **RE-POINTED 2026-09-11 — `636` removed from `Depends on`.** #636 was DISCONTINUED at sign-off (2026-07-31) and re-sliced into #654–#660 (`docs/2026-07-31-alpha-reslicing-proposal.md`); #654 was then split into #691 (merged), #692 → #715/#716 (merged) + #717 → #771/#772, and #693. A `Depends on` id must reach COMPLETE before the driver schedules the dependent (`src/pdca_harness/waves.py:57-83`, `cli.py:_blocked_by`), and a DISCONTINUED bundle never does — so `636` was a permanent block, not a wait. Replaced by the slices whose behaviour the reaper drives: the state machine (#693), admission (#656), UploadPart staging (#657), Complete/tombstones (#658), and retirement routing + terminal delete (#659). #656–#659 have no bundle yet, so `pdca status` reads blocked-by them — that is the true state. ⚑ Flag for the Plan of #659: it names "terminal delete + exactly-once `mpuctl` decrement", which this brief also claims for the reaper; settle the owner there before either builds.
+  **RE-POINTED 2026-09-11 — `636` removed from `Depends on`.** #636 was DISCONTINUED at sign-off (2026-07-31) and re-sliced into #654–#660 (`docs/2026-07-31-alpha-reslicing-proposal.md`); #654 was then split into #691 (merged), #692 → #715/#716 (merged) + #717 → #771/#772, and #693. A `Depends on` id must reach COMPLETE before the driver schedules the dependent (`src/pdca_harness/waves.py:57-83`, `cli.py:_blocked_by`), and a DISCONTINUED bundle never does — so `636` was a permanent block, not a wait. Replaced by the slices whose behaviour the reaper drives: the state machine (#693), admission (#656), UploadPart staging (#657), Complete/tombstones (#658), and retirement routing + terminal delete (#659). #656–#659 have no bundle yet, so `pdca status` reads blocked-by them — that is the true state. ⚑ Flag for the Plan of #659: it names "terminal delete + exactly-once `mpuctl` decrement", which this brief also claims for the reaper; settle the owner there before either builds. **Re-pointed 2026-09-19:** #663 was split at its re-plan into #813 (scrub checks committed staged fragments; reconstruction keeps their repair queued) and #814 (reconstruction rebuilds a staged chunk); the field above names both in place of `663`.
 - **Surfaces:** data
 - **Difficulty:** high
 - **External dependencies:** `docker`, `libfdb_c loadable`, `fdb headers (bindgen)`, `fdb cluster healthy`

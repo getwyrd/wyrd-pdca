@@ -1,0 +1,11 @@
+Review based on the diff, target source, and frozen gate evidence; no gates were rerun.
+
+- NEEDS-HUMAN [impl] — `crates/validate/src/client.rs:241`: An SDK `ServiceError` does not guarantee successfully parsed S3 XML. As recorded in the frozen T4 evidence, the SDK also wraps XML/header parsing failures in operation-level unhandled service errors. This unconditional conversion turns malformed error responses into `Service(NoCodeInBody)` and discards the parsing diagnostic. Preserve these as `Unreadable` with status, request ID, and cause; add a raw-response regression distinguishing malformed XML from valid XML without `<Code>`.
+
+- NEEDS-HUMAN [impl] — `crates/validate/src/client.rs:249`: Checking `meta.code()` before body presence invents a received S3 code for an empty HTTP 404: the SDK synthesizes `NotFound` in that case (also identified by the frozen T4 evidence). The result becomes `Code("NotFound")` rather than `NoBody`, breaking the distinction the public error type promises. Check body absence before accepting SDK metadata and cover an empty 404 with field-by-field assertions.
+
+- NEEDS-HUMAN [impl] — `crates/validate/src/client.rs:321` and `crates/validate/src/client.rs:407`: The four new integration tests never exercise deadline expiry, truncated GET responses, or short, oversized, and failing PUT sources. The frozen mutation run confirms that deleting the short-body checks survives. The GET test's outer timeout tests streaming progress, not the client's timeout classification. Add focused failure-path tests asserting `Timeout` phase and `Body` variants, including a PUT whose excess arrives in a separate chunk, so these new guarantees cannot silently regress.
+
+- NEEDS-HUMAN [impl] — `crates/validate/tests/s3_client_roundtrip.rs:175`: The relay discards its listener and both pump task handles; the gateway does the same at `crates/validate/tests/s3_client_roundtrip.rs:102`. Dropping the fixture leaves helpers and sockets alive until runtime teardown, and the gateway can outlive its temporary storage. This violates the standing abort-on-drop convention. Own the tasks in fixture guards, including child pumps, and abort them when the fixture drops.
+
+No additional material reuse, simplification, or efficiency findings.

@@ -1,0 +1,3 @@
+No findings on either advisory lens: no patch-introduced correctness bugs or actionable reuse, simplification, or efficiency issues identified.
+
+Reviewed the diff against the source at `$PDCA_TARGET`, including extraction cleanup, binary-to-destination mapping, staging failures, installer symmetry, release smoke checks, and regression tests. Frozen evidence confirms CI and red→green pass. The 0% diff-coverage result measures only the standalone text test; CI also ran the staging tests successfully. Mutation testing stopped on an unmutated Git-index test failure and produced no mutation results. Real image building and privileged installation remain deferred as specified in the brief.
