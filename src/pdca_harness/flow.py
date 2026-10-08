@@ -2056,6 +2056,9 @@ def flow_batch(
              not in (state.COMPLETE, state.UNPLANNED, state.DISCONTINUED, state.RESOLVED)),
             key=lambda p: p.name,
         )
+        # INSTANCE DELTA (eduralph/pdca-harness#597): the sweep reaches briefless split
+        # parents too; restore each one's brief or leave it out (_briefed_or_restored).
+        bundles = [d for d in bundles if _briefed_or_restored(cfg, d, state.state(d))]
         if not bundles:
             print("flow: nothing to do — no in-flight briefs (all COMPLETE or none authored; "
                   "brief new issues to add work).", file=sys.stderr)
@@ -2092,6 +2095,28 @@ def flow_batch(
         # marker's life is exactly "this batch has not yet finished deciding what it drives".
         if claims is not None:
             claims.release(marker)
+
+
+def _briefed_or_restored(cfg: Config, d: Path, s: str) -> bool:
+    """Whether in-flight bundle ``d`` has a brief.md to drive, restoring a missing one first.
+
+    INSTANCE DELTA (eduralph/pdca-harness#597). A split accepted before #481 left its parent
+    past Do on a close marker yet with no brief, and every step from Check on reads
+    brief.md. The brief is restored the way `split --accept` now writes it; a bundle it
+    cannot be restored for is named and NOT driven (False), never driven into a crash. Both
+    intake paths call this: :func:`flow_ids` (named ids) and :func:`flow_batch` (the
+    `--from-csv` sweep of every in-flight bundle).
+    """
+    if (d / "brief.md").exists():
+        return True
+    try:
+        restored = split.restore_parent_brief(d, cfg)
+    except split.SplitError as exc:
+        print(f"flow: {d.name} — {s} but no brief.md, skipped: {exc}", file=sys.stderr)
+        return False
+    print(f"flow: {d.name} — restored its missing split-parent brief "
+          f"({restored.relative_to(d)}) from its iterate-to-Plan archive", file=sys.stderr)
+    return True
 
 
 def _claim_swept(claims: drive_claim.Run, bundles: list[Path]) -> list[Path]:
@@ -2223,6 +2248,11 @@ def flow_ids(
                       "command is only needed for whatever cannot be adopted, which is "
                       "named below.", file=sys.stderr)
                 seeds.append(d)
+            continue
+        if not _briefed_or_restored(cfg, d, s):
+            skipped[iid] = s
+            if claims is not None:
+                claims.release(d)
             continue
         bundles.append(d)
     if not bundles and not seeds:
