@@ -157,6 +157,9 @@
       deferred-findings matching (#335), and the instance's own #332 auto-iterate code with
       its `soft_auto_iters` growth rule — upstream's #408/#409 replaced it, and
       `max_auto_iters = 5` is now the only round bound.
+      One piece of the old #589 change stays local: an unreadable out-of-batch
+      prerequisite is refused rather than crashing `flow`, a marked delta until
+      eduralph/pdca-harness#660 lands (PR #272 review).
   - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
     vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
     whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker

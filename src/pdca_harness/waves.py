@@ -100,7 +100,18 @@ def check_dep_graph(cfg: Config, bundles: list[Path], *,
             # branch, read from the active bundle by publish._stack_base_branch — so resolve
             # Stacks on against bundle() (an archived-only stack parent stays rejected).
             resolved = cfg.bundle(dep) if dep in stacks else cfg.find_bundle(dep)
-            if state.state(resolved) != state.COMPLETE:
+            try:
+                dep_state = state.state(resolved)
+            except Exception as exc:  # noqa: BLE001 — a corrupt prerequisite is refused, not a crash
+                # INSTANCE DELTA (eduralph/pdca-harness#660, PR #259 review): e.g. a brief
+                # that is not UTF-8. Unreadable is not COMPLETE; say which and why, as a
+                # refusal `flow` reports (rc 2) rather than a traceback.
+                raise DependencyGraphError(
+                    f"{b.name}: declared dependency '{dep}' cannot be read "
+                    f"({type(exc).__name__}: {exc})",
+                    remedy=f"repair {dep}'s brief.md (it must be readable UTF-8), or drop "
+                           f"the edge from {b.name}'s brief") from exc
+            if dep_state != state.COMPLETE:
                 raise DependencyGraphError(
                     f"{b.name}: declared dependency '{dep}' is neither in this batch "
                     f"nor an existing COMPLETE bundle",
