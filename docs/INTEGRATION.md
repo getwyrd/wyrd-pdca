@@ -68,12 +68,14 @@
   date). In merge mode, a finding on a non-final wave's PR checks refused the merge and
   stopped the run at that wave boundary, so one red item stranded every later wave; stack mode
   keeps building and the finding is handled on its PR at review. The stale-stacked-PR cost
-  described below no longer applies: two instance deltas (see "Integration branch per batch"
-  and "Stacked PRs land on the target" under the delta list below; eduralph/pdca-harness#591,
-  #593) give each batch its own append-only integration branch folded from the real PR
-  branches, and every wave PR targets `main`. Merge a run's PRs bottom-up with merge commits.
-  The merge-mode keys stay configured (inert under `"stack"`) so switching back restores them
-  exactly. The history:
+  described below no longer applies: each batch gets its own append-only integration branch,
+  `pdca-integration/<base>-r<key>`, folded from the real PR branches, and every wave PR
+  targets `main`. The instance shipped this as two local changes on 2026-10-01; upstream
+  shipped the same in v0.59.0 (eduralph/pdca-harness#591, #593) and the local code was
+  retired at that upgrade (see the delta list below). Merge a run's PRs bottom-up with merge
+  commits, and delete a batch's integration branch once its PRs are merged. The merge-mode
+  keys stay configured (inert under `"stack"`) so switching back restores them exactly. The
+  history:
 - **Wave sequencing was `wave_mode = "merge"`** (2026-08-02 .. 2026-10-01): for a
   dependent multi-issue batch, the driver `gh pr merge`s each **non-final** wave's PRs into
   the real base (`main`) before the next wave builds; the final wave's PRs stay the human's
@@ -86,17 +88,20 @@
   serves as a PR base. This is distinct from the M4 pattern above: a *milestone's* durable
   `feat/*` integration branch remains the right shape for a planned PR sequence; `"merge"`
   governs the driver's own wave stacking within one batch run.
-- **And `auto_merge = true` again** (2026-08-16), so a dependent batch runs to completion in
-  ONE invocation: the driver readies and `gh pr merge`s each **non-final** wave's PRs, and the
-  next wave builds on the genuinely merged base. The final wave's PRs still stay the human's —
-  that half of the STOP discipline never moved.
+- **Merge mode merges each non-final wave again** (2026-08-16), so a dependent batch runs to
+  completion in ONE invocation: the driver readies and `gh pr merge`s each **non-final** wave's
+  PRs, and the next wave builds on the genuinely merged base. The final wave's PRs still stay
+  the human's — that half of the STOP discipline never moved. (From 2026-08-08 to 2026-08-16
+  an instance switch, `[driver].auto_merge = false`, kept merge mode's bases but stopped at
+  each wave boundary for a hand-merge. It was `true` from 2026-08-16 on, which is upstream's
+  only behaviour, and the switch and its code were retired at the v0.59.0 upgrade.)
   - **Why it was off, and why flipping the flag alone would not have fixed it.** On 2026-08-08
     the driver merged wyrd #703 six seconds after opening it, before the required `gate`
     context had reported; `gh pr merge` refused and the wave stopped with #703 readied and
     #704–706 untouched (eduralph/pdca-harness#462, closed — upstream shipped its wait in
-    v0.58.0). Turning
-    `auto_merge` back on by itself reproduces that one layer up: #413's rollup gate reads the
-    checks once, immediately before the merge, when the PR is *seconds old* — publish opened
+    v0.58.0). Merging again with nothing else changed reproduces that one layer up: #413's
+    rollup gate reads the checks once, immediately before the merge, when the PR is *seconds
+    old* — publish opened
     it just before this boundary — finds them still registering, and refuses. Same boundary
     stop, minus the draft. (Upstream attributes the early rollup to `ready_for_review` CI
     triggered by the ready-mark. That does **not** hold here: no `getwyrd/wyrd` workflow
@@ -108,78 +113,53 @@
     red, an unreadable rollup, or an exhausted budget still refuses and still STOPs; waiting
     can only turn a refusal into a merge a later read would have permitted anyway. **Upstream
     since v0.58.0** (#462): the instance's own `_await_rollup` delta (2026-08-16) was retired
-    at that upgrade. One thing it did that upstream's does not is kept as a marked delta: a
-    green is re-read once before it is believed (PR #224 review, re-raised on PR #253: a fast
-    check can register and pass before the slow `gate` has created its check run) —
-    eduralph/pdca-harness#582. The heartbeat it printed while waiting was not kept. The value
-    also keeps its four-hour ceiling (eduralph/pdca-harness#581, with the `inf` guard). Also
-    upstream
-    since v0.58.0: every refusal after the ready-mark returns the PR to draft
-    (`gh pr ready --undo`), so a stopped wave never leaves a PR advertising a readiness no
-    human granted. The instance value stays 1800 (upstream default 300) for a cold
-    `cargo xtask ci`.
-  - **What makes the *combination* safe: `merge_sync_base = true`** (2026-08-16, #228;
-    upstream eduralph/pdca-harness#531). The rollup gate above is honest about whichever tree
-    a PR's checks last ran on — which, for every wave member after the first, is the tree
-    **before its siblings merged**. A and B are each green against `main@X`; A merges to
-    `main@Y`; B then merges on a rollup describing `X`. If they conflict semantically `main`
-    is red and the next wave builds on it. `flow.py`'s `_audit_wave_overlap` sees *file*-level
-    overlap only and is explicitly advisory ("Loud, but never a stop"), and semantic conflicts
-    need no shared files. Note `regate_between_waves` does **not** cover this: `flow.py`
-    consults it in exactly one place, inside the `else: # stack` branch, so in merge mode it
-    is dead config.
-    With the knob on, a PR found behind its base is brought up to date **before** the rollup
-    gate — which empties its rollup and lets the existing `merge_wait_secs` wait do the rest,
-    so the gate decides on checks for the tree the PR actually merges into. Fail-closed: an
-    unreadable behind-state or a failed sync STOPs rather than merging on the older evidence.
-    An **instance delta** in `src/pdca_harness/merge.py`, on the same footing as the #371
-    confirm-once delta in `gates.py`; it goes away when #531 lands. Since v0.58.0 its four
-    STOP paths also return the PR to draft, like upstream's own refusal paths.
-    **Not** the same as host strictness — `strict = true` alone would make `gh pr merge`
-    refuse every wave member after the first and stop the batch, since upstream has no
-    `update-branch` path at all.
-  - **Integration branch per batch** (2026-10-01; upstream eduralph/pdca-harness#591). In
-    stack mode the fold branch is `pdca-integration/r-<key>/<base>`, where `<key>` is 128 bits
-    of a hash of the batch's named ids (`integrate.run_key_for`), not the shared
-    `pdca-integration/<base>`. Two concurrent stack-mode runs on one base (parallel tracks)
-    therefore fold onto their own branches; before this, each fold force-pushed its own run's
-    patches over the other's, so the next wave, its C4-verify base and its stacked PRs could
-    read the other run's work. The key is deterministic, so a re-run of the same batch
-    rebuilds the same branch. The branch reaches Do, C4-verify and publish through the
-    bundle's `stack-base` file, as before. **Instance delta** in `src/pdca_harness/integrate.py`
-    and the `fold` call in `flow.py`; it goes away when #591 lands. Cost: one integration
-    branch per batch accumulates on `origin` — delete a batch's branch once its stacked PRs
-    are merged.
-  - **Stacked PRs land on the target, and a fold never rewrites them** (2026-10-01; upstream
-    eduralph/pdca-harness#593). Upstream stack mode rebuilt the integration branch from the
-    base on every fold (re-applied patches, force-push), so a middle wave's PR went empty or
-    conflicting inside the same run, and it opened wave 1+ PRs against the integration branch,
-    so merging them bottom-up never reached `main`. Here the fold is **append-only over the
-    real PR branches** — it continues the branch from its tip and `git merge --no-ff
-    --signoff`s each accepted bundle's published branch not already in it, and pushes without
-    force — and **every wave PR targets `main`** (`publish._pr_base`). A wave≥1 bundle is still
-    built and verified on the integration branch; its PR shows its predecessors' changes too
-    until they merge, then (same SHAs) only its own. Merge a run's PRs bottom-up with merge
-    commits (not squash). A hand-declared `Stacks on:` parent keeps its PR-branch base (#123).
-    The fold merges the **exact commit publish pushed** (`publish.json` `head_sha`, fetched
-    from the `remote` it was pushed to) and stops if the branch has moved since, if the fetch
-    fails, or if the bundle has no PR (`pr_url` empty). A bundle re-published after it was
-    folded (`signoff --iterate-do`) has its earlier fold reverted, then the new commit merged —
-    still append-only. **A wave with two or more independent predecessors:** once they have
-    all merged, `main` and the dependent share no single common ancestor, so its PR diff can
-    still show a predecessor's change. Merge `main` into the dependent's branch
-    (`git merge --signoff origin/main`, then push; not GitHub's "Update branch" button, which
-    doesn't sign off for `dco`) and the diff drops to its own change (automating it: #267).
-    **Instance delta** in `src/pdca_harness/integrate.py` (`fold`) and `publish.py`
-    (`_pr_base`); it goes away when #593 lands.
-  - **`flow` restores a pre-#481 split parent's missing brief** (2026-10-01; upstream
-    eduralph/pdca-harness#597). A split accepted before #481 left its parent with a `split`
-    close marker and no `brief.md` (an iterate-to-Plan had archived it). The marker reads as
-    past Do, so `flow` drove the parent and crashed on the first brief read, killing the whole
-    run (issue_654). At intake, `flow` now writes the brief `split --accept` writes since
-    #481, from the same archive (`split.restore_parent_brief`), or skips the bundle with the
-    reason. **Instance delta** in `src/pdca_harness/flow.py` (`flow_ids`) and `split.py`; it
-    goes away when #597 lands.
+    at that upgrade. Every refusal after the ready-mark returns the PR to draft (`gh pr ready
+    --undo`), so a stopped wave never leaves a PR advertising a readiness no human granted.
+    **Also upstream since v0.59.0**: a green is re-read once before it is believed
+    (eduralph/pdca-harness#582; PR #224 review, re-raised on PR #253 — a fast check can
+    register and pass before the slow `gate` has created its check run). The instance kept
+    that as a local change at v0.58.0 and retired it at v0.59.0. Still local: the four-hour
+    ceiling on the value and the `inf` guard (eduralph/pdca-harness#581). The instance value
+    stays 1800 (upstream default 300) for a cold `cargo xtask ci`.
+  - **What makes the *combination* safe: a PR behind its base is updated first** (2026-08-16,
+    #228; **upstream since v0.59.0**, eduralph/pdca-harness#531). The rollup gate above is
+    honest about whichever tree a PR's checks last ran on — which, for every wave member after
+    the first, is the tree **before its siblings merged**. A and B are each green against
+    `main@X`; A merges to `main@Y`; B then merges on a rollup describing `X`. If they conflict
+    semantically `main` is red and the next wave builds on it. Under `merge_requires = "all"`
+    upstream now reads whether the PR is behind its base, updates its branch with a merge
+    commit of the base, waits for the new head's checks, and merges pinned to that head. The
+    instance's own `merge_sync_base = true` switch did the same from 2026-08-16 and was retired
+    at the v0.59.0 upgrade. `regate_between_waves` does **not** cover this: it applies to the
+    stack fold only.
+  - **Retired at v0.59.0, now upstream** (2026-10-01 local changes; the `stack-base` file
+    still carries the integration branch to Do, C4-verify and publish):
+    - *Integration branch per batch* (eduralph/pdca-harness#591). Two concurrent stack-mode
+      runs on one base (parallel tracks) fold onto their own branches. The branch is now
+      upstream's `pdca-integration/<base>-r<key>`; the instance's `pdca-integration/r-<key>/<base>`
+      names are gone. One integration branch per batch accumulates on `origin` — delete a
+      batch's branch once its PRs are merged.
+    - *Stacked PRs land on the target, and a fold never rewrites them*
+      (eduralph/pdca-harness#593). The fold merges each accepted bundle's published branch
+      onto the line without rebuilding it, and every wave PR targets `main`. A wave≥1 bundle is
+      still built and verified on the integration branch; its PR shows its predecessors'
+      changes too until they merge. A hand-declared `Stacks on:` parent keeps its PR-branch
+      base (#123). If a dependent of two or more independent predecessors still shows a
+      predecessor's change after they merged, merge `main` into its branch
+      (`git merge --signoff origin/main`, then push; not GitHub's "Update branch" button, which
+      doesn't sign off for `dco`) (automating it: #267).
+    - *A split parent with no `brief.md`* (eduralph/pdca-harness#597). Upstream's `flow`
+      never drives a bundle past Do that has no brief: it names it and skips it. The
+      instance restored the brief from the iterate-to-Plan archive instead; that restore is
+      gone, so such a parent (pre-#481, e.g. issue_654) needs its brief written by hand.
+    - Also retired at the same upgrade: the dependency-graph refusal (#589), the
+      stranded-child dependency check (#590), confirm-once on a failed gating row (#371), the
+      deferred-findings matching (#335), and the instance's own #332 auto-iterate code with
+      its `soft_auto_iters` growth rule — upstream's #408/#409 replaced it, and
+      `max_auto_iters = 5` is now the only round bound.
+      One piece of the old #589 change stays local: an unreadable out-of-batch
+      prerequisite is refused rather than crashing `flow`, a marked delta until
+      eduralph/pdca-harness#660 lands (PR #272 review).
   - **Delta retirement is checked mechanically** (issue #231). Every divergence from the
     vendored engine is marked `INSTANCE DELTA` where it lives and names the upstream issue
     whose landing retires it — in the full `eduralph/pdca-harness#N` form, on the marker
@@ -202,17 +182,13 @@
     Two gaps in that backstop, both verified 2026-08-16 and neither closed. **`rust` is still
     not required** — the 2026-08-02 note above asked for it before the first merge-mode batch,
     and `gate`/`dco` were added while `rust` was not, so a red `rust` check does not block a
-    merge. And **`strict` is `false`**, which is what makes the `merge_sync_base` delta above
-    necessary rather than belt-and-braces. Both are host-side, free, and worth closing now
-    that `auto_merge` is on.
+    merge. And **`strict` is `false`**, which is what makes the behind-base update above
+    necessary rather than belt-and-braces. Both are host-side and free to close.
   - **A wave with nothing to merge does not stop.** A close / no-fix bundle carries no patch
     and gets no PR, so no base has to move; the run continues to the next wave.
-  - **Act is deferred past any stop.** Act reviews a *finished* batch, so a run that STOPs at
-    a boundary (now the exceptional case — a red, or a wait that timed out) defers it to the
-    invocation that reaches the final wave.
   - **A dependency gate genuinely relaxes here — know what you are trading.** While
-    `auto_merge` was off, `_runnable` gated *every* declared `Depends on` on
-    `merged.is_merged`; with it on, only the explicit `Depends on (merged)` form does.
+    `auto_merge` was off (2026-08-08 .. 08-16), `_runnable` gated *every* declared `Depends on`
+    on `merged.is_merged`; since then only the explicit `Depends on (merged)` form does.
     The driver merges only **in-batch, non-final** waves, so this is not "the driver now
     guarantees it" — a prerequisite that is COMPLETE with an OPEN PR (the end state of every
     single-issue run, and of every batch's final wave) no longer holds its dependent back, and

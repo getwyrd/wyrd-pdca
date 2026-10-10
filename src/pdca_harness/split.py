@@ -25,7 +25,6 @@ are staged and moved into place only once all of them succeed.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -292,7 +291,32 @@ def advisory(text: str, *, file=None) -> None:
         pass
 
 
-def preflight(parent: Path, children: list[Child], cfg) -> None:
+#: The recorded lineage ``depth`` at which `pdca split <id> --accept` refuses by default
+#: (issue #545). A child of an unsplit parent is depth 1, so 2 allows original → children →
+#: grandchildren and refuses to split a grandchild. Kept in one place so a change of
+#: threshold is a one-line edit.
+MAX_SPLIT_DEPTH = 2
+
+
+def check_depth(parent: Path, *, force: bool = False) -> None:
+    """Refuse to split a bundle already ``MAX_SPLIT_DEPTH`` or more splits deep (#545).
+
+    Splitting takes minutes and building a wave takes hours, so an unbounded chain opens
+    issues faster than the cycle closes them. ``force`` is the human's override and lifts
+    only this refusal. The depth is read through the tolerant pair
+    :func:`read_lineage` / :func:`_recorded_depth`: a damaged record counts as depth 0 and
+    is never refused — a damaged hint never blocks the run.
+    """
+    depth = _recorded_depth(read_lineage(parent))
+    if depth >= MAX_SPLIT_DEPTH and not force:
+        raise SplitError(
+            f"{parent.name} is already {depth} splits deep (recorded depth {depth} in its "
+            f"{LINEAGE}) — a slice this deep is meant to be built or dropped, not split "
+            "again. Nothing was filed or written. Pass --force only if the human has "
+            "decided to split it anyway")
+
+
+def preflight(parent: Path, children: list[Child], cfg, *, force: bool = False) -> None:
     """Every reason acceptance would fail that does NOT depend on the ids.
 
     Split out of :func:`validate` because filing happens BEFORE the ids exist, and a
@@ -320,6 +344,9 @@ def preflight(parent: Path, children: list[Child], cfg) -> None:
             "second acceptance would create a duplicate set of children and leave the "
             "first orphaned from the parent's breadcrumb. Reopen it first if that is what "
             "you want")
+    # The depth bound (issue #545): ids-independent, so it refuses here, before any
+    # tracker issue is filed and before anything is written. `force` lifts only this one.
+    check_depth(parent, force=force)
     # Whether accept can leave the parent a Plan artifact (issue #481). It needs no ids, so
     # it is asked HERE too: `accept` refusing it alone would come after the CLI had filed
     # the children as real tracker issues.
@@ -860,7 +887,7 @@ def _field(label: str, value: str) -> str:
 
 
 def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
-                        children: list[str], *, written_by: str = "`split --accept`") -> str:
+                        children: list[str]) -> str:
     """The Plan artifact :func:`accept` writes for a parent that has none (issue #481).
 
     It describes the split — why the slice was decomposed, which child bundles carry
@@ -876,7 +903,7 @@ def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
     kids = ", ".join(children)
     return (
         f"# Brief — issue {_bundle_id(parent)} / {title} (split parent)\n\n"
-        f"> The Plan artifact (docs 02 §PLAN), written by {written_by} (issue #481):\n"
+        "> The Plan artifact (docs 02 §PLAN), written by `split --accept` (issue #481):\n"
         "> this bundle had no brief.md when its split was accepted — an iterate-to-Plan\n"
         f"> had archived it to `{rel}`.\n\n"
         + _field("Slug", slug)
@@ -897,56 +924,6 @@ def _split_parent_brief(parent: Path, plan: tuple[str, str, str],
         + _field("External dependencies", "none")
         + _field("Disposition hint", "split")
     )
-
-
-def restore_parent_brief(parent: Path, cfg) -> Path:
-    """Write the Plan artifact a split parent is missing; return its path.
-
-    INSTANCE DELTA (eduralph/pdca-harness#597). Since #481, :func:`accept` writes a brief
-    for a parent whose own brief an iterate-to-Plan had archived. A split accepted BEFORE
-    that has no brief at all, yet its close marker makes it past Do (BUILT), so ``flow``
-    drives it to Check and sign-off — and every step there reads ``brief.md``. This writes
-    the same brief :func:`accept` would have, from the same archive (:func:`_parent_plan`),
-    naming the children its lineage record lists (or the proposal, for a split older than
-    lineage records).
-
-    Raises :class:`SplitError` when the bundle is not a split parent missing its brief, or
-    has no archive complete enough to rebuild one from; nothing is written then.
-    """
-    bp = parent / "brief.md"
-    if bp.exists():
-        raise SplitError(f"{parent.name} already has a brief.md")
-    try:
-        marker = (parent / state.CLOSE_MARKER).read_text(encoding="utf-8").split()
-    except (OSError, ValueError):
-        marker = []
-    if marker[:1] != ["split"]:
-        raise SplitError(f"{parent.name} has no brief.md and is not a split parent — "
-                         "brief it at Plan")
-    plan = _parent_plan(parent, cfg)
-    if plan is None:   # unreachable: _parent_plan returns None only when brief.md exists
-        raise SplitError(f"{parent.name} already has a brief.md")
-    # The lineage record is a provenance hint, not a contract: a valid-version file whose
-    # `children` is not a list of ids (hand-edited, corrupted) must not raise out of here,
-    # where flow_ids only catches SplitError. Same tolerance as flow._lineage_children;
-    # nothing usable left falls back to the proposal, as for a split older than lineage.
-    value = (read_lineage(parent) or {}).get("children")
-    ids = ([c.strip() for c in value if isinstance(c, str) and c.strip()]
-           if isinstance(value, list) else [])
-    kids = [cfg.bundle(i).name for i in ids] or [f"named in `{PROPOSAL}`"]
-    text = _split_parent_brief(parent, plan, kids,
-                               written_by="`flow`, restoring a pre-#481 split")
-    # Atomic: a torn brief.md would read as present on the next run, which then skips the
-    # restore and drives a truncated Plan artifact. Write beside it, then rename into place.
-    tmp = parent / ".brief.md.restoring"
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, bp)
-    except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        raise SplitError(f"{parent.name}: could not write the restored brief.md ({exc}) — "
-                         "nothing was left behind; fix the cause, then re-run") from exc
-    return bp
 
 
 def accept(parent: Path, ids: list[str], cfg) -> list[Path]:

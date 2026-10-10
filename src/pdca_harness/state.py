@@ -158,26 +158,20 @@ DOWNSTREAM_GLOBS = ("check-advisory-*.md", "*.error.log", "*.memory.jsonl")
 # and "what proves a cycle ran" deliberately differ, so it is deliberately NOT read by
 # `_archive_iteration`.
 #
-# All three accumulate ACROSS rebuilds by design, and archiving any of them breaks the
+# Each file accumulates ACROSS rebuilds by design, and archiving any of them breaks the
 # feature that depends on the accumulation:
-#   auto-iterate.json       — the round budget; archive it and the count resets every
-#                             iterate, so auto-iterate never terminates
-#                             (`autoiterate.BUDGET_FILE`).
-#   deferred-findings.json  — a deferred human finding vanishes into iteration-v<N>/,
-#                             exactly the loss it exists to prevent (issue #170;
-#                             `autoiterate.DEFERRED_FILE`).
-#   loop-telemetry.json     — `leaves._record_loop_attempt`: "The file persists across
-#                             iterations (it is not archived), so it accumulates."
+#   auto-iterate.json      — the round budget; archive it and the count resets every
+#                            iterate, so auto-iterate never terminates.
+#   loop-telemetry.json    — `leaves._record_loop_attempt`: "The file persists across
+#                            iterations (it is not archived), so it accumulates."
+#   deferred-findings.json — `autoiterate.DEFERRED_FILE` (#409): the HUMAN findings an
+#                            auto-iterate round iterated past. Archive it and every one of
+#                            them leaves the live bundle with the SUMMARY that carried it,
+#                            so the handover §6 would never show it to the human.
 # Yet a bundle cannot hold any of them without having run a cycle, so each is unambiguous
-# evidence. Folding them into DOWNSTREAM_OF_BRIEF instead would fix the misclassification
-# and break the accumulation, which is the worse bug. The names are literals rather than
-# imports because `autoiterate` imports `assemble`, which would cycle back here;
-# `test_state_resolved` pins them against those constants.
-CYCLE_EVIDENCE_ONLY = (
-    "auto-iterate.json",
-    "deferred-findings.json",
-    "loop-telemetry.json",
-)
+# evidence. Adding them to DOWNSTREAM_OF_BRIEF instead would fix the misclassification
+# below and break termination, which is the worse bug.
+CYCLE_EVIDENCE_ONLY = ("auto-iterate.json", "loop-telemetry.json", "deferred-findings.json")
 
 # §9 outcome token → bundle state. state owns the state names, so the mapping
 # lives here; signoff knows only the tokens (no import cycle).

@@ -221,6 +221,18 @@ and the proposal itself is the reslicing the cap forbids when there is no room. 
 (children inherit the parent's track). No room means no
 proposal and no accept — not a proposal "for later". The only way past that is the
 explicit per-id override above, recorded at the top of the proposal.
+The parent's tracker issue **stays open** while its children are worked on: `--accept`
+neither closes nor labels it. Once the parent's bundle is COMPLETE and every child issue
+is closed, `pdca cleanup --apply` closes it with a comment naming every child —
+as completed if at least one child was completed, else as not planned. Only a COMPLETE
+parent waits for its children: one whose bundle ends DISCONTINUED is closed as not planned
+like any other discontinued bundle.
+
+`--accept` refuses a bundle that is already two splits deep (its lineage record says
+depth 2 or more): a slice that deep is meant to be built or dropped, not split again.
+`--force` overrides that refusal, and it is the human's decision, not yours. Do not pass
+`--force` unless the human has asked for it in so many words; when the refusal appears,
+show it to the human and stop there.
 
 What happens next no longer depends on how this run was started:
 

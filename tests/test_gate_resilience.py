@@ -8,10 +8,10 @@ class — a straggler from a finished child still holding the substrate — is n
 (a leaked test process from a prior cycle was found burning a core for 21 hours).
 
 Proves: every bundle-scoped gate run persists its full output to gate-logs/<rule_id>.log
-and the row records where and how long; a failed GATING row is confirmed exactly once,
-recording BOTH verdicts (fail→pass passes flagged flaky and raises a §6 HUMAN item;
-fail→fail stays red; advisory rows and opted-out configs are single-sample); and a
-captured child's process group is swept after a NORMAL exit, not only on timeout.
+and the row records where and how long; and a captured child's process group is swept
+after a NORMAL exit, not only on timeout. Confirm-once on a failed gating row (#371) is
+upstream since v0.59.0 and tested there (test_gate_confirm.py); the instance's own tests
+for it were retired with its local version.
 Real commands, no Claude / Docker. Run from the project root:
     PYTHONPATH=src python -m unittest discover -s tests
 """
@@ -128,84 +128,6 @@ class OutputPersistence(GateRun):
         driver._archive_iteration(d, 1, include_brief=False)
         self.assertTrue((d / "iteration-v1" / row["log"]).is_file(),
                         "the archived log is not where the archived row points")
-
-
-class ConfirmOnce(GateRun):
-    """#371 — a failed gating row is confirmed exactly once; both verdicts recorded."""
-
-    def _flip_cmd(self) -> str:
-        # Fails on the first run, passes on the second — a transient in two lines.
-        flag = self.tmp / "already-failed"
-        return f"test -f {flag} || {{ touch {flag}; echo transient; exit 1; }}; echo fine"
-
-    def test_a_transient_fail_becomes_a_flagged_pass_not_a_parked_bundle(self) -> None:
-        row, result, _ = self._run({**_GATE, "cmd": self._flip_cmd()})
-        self.assertEqual(row["result"], "pass")
-        self.assertEqual(row["attempts"], ["fail", "pass"])
-        self.assertTrue(row["flaky"])
-        self.assertIn("transiently", row["path_line"])  # the flip is visible, not silent
-        self.assertEqual(result["overall"], "pass")
-
-    def test_both_attempts_land_in_the_gate_log(self) -> None:
-        # A flip is only diagnosable from BOTH runs' output, so the confirm's capture is
-        # appended under its own banner rather than replacing the first run's. The banner
-        # is the instance's (#371 over upstream's single-run #370 writer); the header this
-        # sits under is upstream's, and reports the FINAL verdict.
-        row, _, d = self._run({**_GATE, "cmd": self._flip_cmd()})
-        text = (d / row["log"]).read_text(encoding="utf-8")
-        self.assertIn("# outcome: pass", text)
-        self.assertIn("confirm re-run (attempt 2/2): pass", text)
-        self.assertIn("transient", text)                    # first run's output, kept
-        self.assertIn("fine", text)                         # the confirm's, appended
-
-    def test_a_reproducible_fail_stays_red(self) -> None:
-        row, result, _ = self._run({**_GATE, "cmd": "echo still-red; false"})
-        self.assertEqual(row["result"], "fail")
-        self.assertEqual(row["attempts"], ["fail", "fail"])
-        self.assertFalse(row["flaky"])
-        self.assertEqual(result["overall"], "fail")
-
-    def test_an_advisory_row_is_a_single_sample(self) -> None:
-        # The confirm exists so one transient cannot PARK the bundle; an advisory row
-        # cannot park anything, so it keeps the cheaper single run.
-        row, _, _ = self._run({**_GATE, "cmd": self._flip_cmd(), "gating": False})
-        self.assertEqual(row["result"], "fail")
-        self.assertNotIn("attempts", row)
-
-    def test_the_config_switch_restores_single_sample_verdicts(self) -> None:
-        row, result, _ = self._run({**_GATE, "cmd": self._flip_cmd()},
-                                   gates_confirm_fail=False)
-        self.assertEqual(row["result"], "fail")
-        self.assertNotIn("attempts", row)
-        self.assertEqual(result["overall"], "fail")
-
-    def test_a_check_can_opt_out_so_a_model_backed_gate_is_never_resampled(self) -> None:
-        # A gating row whose command IS a model (the batched-review row) must stay a
-        # single sample: re-running it re-samples a nondeterministic judge, and a
-        # second, luckier sample could overwrite real first-run blockers as "flaky".
-        row, result, _ = self._run(
-            {**_GATE, "cmd": self._flip_cmd(), "confirm_fail": False})
-        self.assertEqual(row["result"], "fail")
-        self.assertNotIn("attempts", row)
-        self.assertEqual(result["overall"], "fail")
-
-    def test_a_pass_is_never_re_run(self) -> None:
-        counter = self.tmp / "runs"
-        row, _, _ = self._run({**_GATE, "cmd": f"echo x >> {counter}; true"})
-        self.assertEqual(row["result"], "pass")
-        self.assertEqual(len(counter.read_text().splitlines()), 1)
-
-    def test_a_flaky_pass_raises_a_section6_item_the_human_must_clear(self) -> None:
-        row, result, _ = self._run({**_GATE, "cmd": self._flip_cmd()})
-        items = assemble._flaky_gate_items(result)
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].kind, assemble.HUMAN)  # substrate, not builder-fixable
-        self.assertIn("flaked at Check", items[0].text)
-        self.assertIn(row["log"], items[0].text)
-
-    def test_a_clean_matrix_raises_no_flake_items(self) -> None:
-        _, result, _ = self._run({**_GATE, "cmd": "true"})
-        self.assertEqual(assemble._flaky_gate_items(result), [])
 
 
 class StragglerSweep(unittest.TestCase):

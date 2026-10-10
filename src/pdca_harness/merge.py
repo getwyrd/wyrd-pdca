@@ -16,11 +16,6 @@ merges nothing. The harness's own ``gh pr merge`` runs in the orchestrator, outs
 ``builder_guard`` hook that blocks the model leaves from merging — exactly as publish's
 ``gh pr create`` does.
 
-``[driver].auto_merge = false`` turns the merging back off without leaving merge mode: the
-flow never calls :func:`merge_wave` and STOPs at the wave boundary instead, so the PRs keep
-the draft ``publish`` opened and the merge stays the human's (pdca-harness#462). This module
-is the mechanics only — it merges whenever it is called.
-
 "Never on an unmerged base" is only half the rule: the next wave must never build on a
 base whose verification was not GREEN either, and ``gh pr merge``'s own refusal cannot
 carry that (issue #413). It fails closed only on the checks the HOST repo marks *required*
@@ -41,43 +36,39 @@ seconds between create and ready_for_review), so the FIRST rollup read above is 
 ``_wait_for_green`` re-reads the rollup until it resolves or ``[driver].merge_wait_secs``
 (default 300; ``0`` disables the wait — the original immediate-refusal behaviour) of
 wall-clock time elapses, through the patchable ``_sleep`` below so a test costs no real
-time. Whichever way ``_merge_one`` declines to merge a PR it already readied — the rollup
+time. A ``green`` read is confirmed once before it is believed (issue #582): the rollup
+lists only the checks registered so far, so a fast check that passed can read green while
+a slow job has not reported yet. The wait re-reads one full poll interval later and merges
+only if that read is green too; a green seen with less than a poll interval of budget left
+to confirm it refuses as pending.
+Whichever way ``_merge_one`` declines to merge a PR it already readied — the rollup
 never resolving green, a failing ``gh pr merge`` — ``_undo_ready`` marks it back to draft
 (``gh pr ready --undo``) before returning, so a stopped wave never leaves a PR advertising
 a readiness no human granted (``docs/INTEGRATION.md`` §10).
 
-**INSTANCE DELTA — ``[driver].merge_sync_base`` (eduralph/pdca-harness#531, OPEN).** The
-rollup gate above is honest about whichever tree the PR's checks last ran on — which, for
-every wave member after the first, is the tree BEFORE its siblings merged. Upstream merges a
-wave's PRs back to back and verifies no combination: A and B are each green against
-``main@X``, A merges to ``main@Y``, and B then merges on a rollup describing ``X``. If A and
-B conflict semantically, ``main`` is red and the next wave builds on it. ``flow.py``'s
-``_audit_wave_overlap`` sees *file*-level overlap only and is explicitly advisory, and
-semantic conflicts need no shared files.
-
-Whether that happens is decided entirely by the host's ``required_status_checks.strict``,
-which upstream neither reads nor documents as load-bearing; ``getwyrd/wyrd`` is
-``strict: false``, so GitHub does not re-run a PR's checks after its base moves.
-:func:`_behind_by` + :func:`_sync_base` close it inside the driver instead of depending on
-host configuration: a PR found behind is brought up to date first, which empties its rollup
-and lets the *existing* wait-and-gate decide on checks for the tree it really merges into.
-
-Three things the PR #230 review corrected, each of which would have left the delta broken in
-a way its own tests did not see. The check **loops**: ``_wait_for_green`` may wait up to
-``merge_wait_secs``, and a sibling landing during that wait leaves the head behind again with
-a green rollup for the pre-move tree — the original failure in a smaller window — so the base
-is re-read after every gate, bounded by :data:`_MAX_SYNC_ROUNDS`. The post-sync wait runs
-**even under** ``merge_requires = "required"``: that mode skips the rollup *gate*, but a sync
-invalidates the checks and ``gh pr merge`` refuses while required ones are pending, so
-skipping the wait would fail every wave at its second PR. And the compare **qualifies a fork
-head** as ``OWNER:BRANCH`` (as ``publish.py:301`` already does), since a bare name resolves
-against the base repo — where a fork's branch does not exist, so every merge would stop.
-
-Note this is not the same fix as turning on host strictness. ``strict: true`` alone would
-make ``gh pr merge`` refuse every wave member after the first, stopping the batch —
-upstream #462's shape, and the stop that ``auto_merge = true`` was turned back on to remove
-— because upstream has no ``update-branch`` path at all. ``merge_sync_base = false``
-reproduces upstream exactly.
+A green rollup also says nothing about the BASE it was earned against (issue #531). The
+wave's PRs merge one after another, so once an earlier member lands, a later member's head
+— and its rollup — still describe the old base: merging it lands a combination nothing
+verified (on a host whose branch protection does not require up-to-date branches,
+``strict`` off), or the host refuses it and the wave stops after its first merge (``strict``
+on). Whether that happens must not hinge on ``strict`` any more than on required checks, so
+under the default ``merge_requires = "all"`` ``_merge_one`` decides, after the ready-mark,
+whether the PR is behind its base, in plain git as ``publish._line_tip_refusal`` does
+(#593): read the PR's head from the host, fetch, record the base branch's tip, and ask
+``git merge-base --is-ancestor <tip> <head>`` (``_base_read``). A PR that is behind is
+brought up to date with a merge-commit update of its own branch (``gh pr update-branch``,
+never ``--rebase`` — a rebase rewrites the commits sign-off reviewed — whatever
+``merge_method`` is). GitHub may finish that update after the command returns, so
+``_wait_for_update`` re-reads the head until it contains the recorded tip, charged to the
+same ``merge_wait_secs`` budget the rollup wait then gets for the NEW head. After the green
+the head and base are read again: the head must be the one read before the wait (so the
+green was that head's) and must not be behind, and ``gh pr merge`` is pinned to it
+(``--match-head-commit``), so a head that changes after the green read is refused by the
+host instead of merged. Every refusal on that path undoes the ready-mark. The base moving
+between the last read and the host executing the merge is a gap no client can close: a
+``strict`` host refuses that merge, a non-strict one would merge it.
+``merge_requires = "required"`` (trust the host's protection) is unchanged: no base read,
+no update, no pin.
 """
 
 from __future__ import annotations
@@ -103,29 +94,6 @@ _sleep = time.sleep
 # is to refuse, never to guess green on a bucket we cannot interpret.
 _ROLLUP_OK = frozenset({"pass", "skipping"})
 _ROLLUP_PENDING = frozenset({"pending"})
-
-
-def has_contribution(d: Path) -> bool:
-    """True if this bundle has a patch that must reach its base.
-
-    A close / no-fix disposition writes no ``patch.diff`` (or an empty one) and publish opens
-    no PR for it, so nothing of it needs merging and no base has to move on its account.
-
-    Shared rather than inlined (#462 review): ``_merge_one`` skips these bundles, and the
-    ``[driver].auto_merge = false`` boundary stop in ``flow`` must skip exactly the same set
-    when deciding whether a completed wave has anything for the human to merge. Two copies of
-    the test would eventually disagree, and the disagreement is invisible — a wave that stops
-    for nothing, or one that does not stop when it should.
-    """
-    patch = d / "patch.diff"
-    try:
-        return patch.is_file() and bool(patch.read_text(encoding="utf-8").strip())
-    except OSError:
-        # Unreadable is not "nothing to merge". For the merge path this means attempting the
-        # merge (which reports its own failure); for the boundary stop it means stopping.
-        # Both cost an invocation; the opposite reading risks building on a base that never
-        # moved, so fail toward the loud outcome.
-        return True
 
 
 def merge_wave(cfg: Config, bundles: list[Path], *, dry_run: bool = False,
@@ -201,40 +169,172 @@ def _names(checks: list) -> str:
         for c in checks)
 
 
-def _wait_for_green(pr_url: str, wait_secs: int, *, poll_interval: int = 15) -> tuple[str, str]:
+def _wait_for_green(pr_url: str, wait_secs: int, *, poll_interval: int = 15,
+                    spent: int = 0) -> tuple[str, str]:
     """Re-read ``pr_url``'s check rollup (``_check_rollup``) until it clears ``pending``/
     ``empty`` or ``wait_secs`` of (patchable) wall-clock time is exhausted (issue #462).
-    Returns the final ``(verdict, detail)`` unchanged — this never itself decides to merge.
+    Returns the final ``(verdict, detail)`` — this never itself decides to merge.
 
-    ``wait_secs <= 0`` performs exactly one read and returns immediately: the original
-    behaviour, for a host whose checks are known to already be in by the time the wave
-    boundary fires. Sleeps go through the module-level ``_sleep`` so a test can make the
-    whole loop cost no real time.
+    ``spent`` (issue #531, ``0 <= spent <= wait_secs``) is the part of ``wait_secs`` the
+    caller already used waiting for ``gh pr update-branch`` to land (``_wait_for_update``).
+    The loop starts with that much already waited, so the two waits share one bound: time
+    the update took is time this wait no longer has, and a green it cannot confirm in what
+    is left refuses as pending, like any other.
 
-    **A green is confirmed once before it is believed** (INSTANCE DELTA,
-    eduralph/pdca-harness#582 — PR #224 review, re-raised on PR #253). While a new PR's
-    checks are registering the rollup does not say "incomplete": it reports whatever has
-    registered SO FAR, so one fast check that already passed reads as a clean green while
-    the slow job that matters has not created its check run yet. A green — first read or
-    reached through the loop — is re-read one interval later and believed only if it held;
-    a re-read that went pending/empty falls back into the wait, and a red or unreadable one
-    returns at once. The confirm is charged to the budget, so a small ``wait_secs`` never
-    sleeps longer than the operator allowed, and an exhausted budget returns the last read
-    as it stands. ``wait_secs <= 0`` does not confirm either: one read, upstream exactly.
+    A ``green`` read is not believed on its own (issue #582): seconds after a PR opens, the
+    rollup lists only the checks registered SO FAR, so one fast check that already passed
+    reads as ``green`` while a slow job has not created its check run yet. A green is
+    therefore re-read once more, one full poll interval later (charged to ``wait_secs``),
+    and returned only if that read is ``green`` too. A confirm that reads ``pending``/
+    ``empty`` goes back into the wait; ``failing``/``unreadable`` is returned at once. The
+    confirm is never shortened to fit the budget: a green first seen with less than one
+    poll interval of budget left is returned as ``pending`` (fail-closed), with a detail
+    that says so — so a ``wait_secs`` below ``poll_interval`` never returns ``green``. This
+    compares verdicts only, not check names: a slow job that has not registered within one
+    poll interval still gets through.
+
+    ``wait_secs <= 0`` performs exactly one read and returns its verdict as-is: the
+    original behaviour, for a host whose checks are known to already be in by the time the
+    wave boundary fires. Sleeps go through the module-level ``_sleep`` so a test can make
+    the whole loop cost no real time; their sum never exceeds ``wait_secs``.
     """
     verdict, detail = _check_rollup(pr_url)
+    if wait_secs <= 0:
+        return verdict, detail
+    waited = spent
+    while True:
+        while verdict in ("pending", "empty") and waited < wait_secs:
+            step = min(poll_interval, wait_secs - waited)
+            _sleep(step)
+            waited += step
+            verdict, detail = _check_rollup(pr_url)
+        if verdict != "green":
+            return verdict, detail
+        # Confirm a full poll interval later or not at all: a re-read squeezed into what is
+        # left of the budget is too soon to show a slow job registering, and overrunning
+        # the budget would break its bound — so refuse the green as unconfirmed instead.
+        left = wait_secs - waited
+        if left < poll_interval:
+            return "pending", (f"green first seen with {left}s of wait budget left, too "
+                               f"little to confirm it {poll_interval}s later ({detail})")
+        _sleep(poll_interval)
+        waited += poll_interval
+        verdict, detail = _check_rollup(pr_url)
+        if verdict == "green":
+            return verdict, detail
+
+
+def _pr_head(pr_url: str) -> tuple[str, str, str]:
+    """PR ``pr_url``'s head commit and base branch as the host reports them (issue #531),
+    from one ``gh pr view``: ``(head_sha, base_branch, "")``, or ``("", "", why)`` when the
+    answer cannot be interpreted. The head is the host's, not a local ref: it is the SHA
+    ``gh pr merge --match-head-commit`` is checked against."""
+    r = subprocess.run(["gh", "pr", "view", str(pr_url), "--json", "headRefOid,baseRefName"],
+                       capture_output=True, text=True)
+    try:
+        pr = json.loads(r.stdout or "") if r.returncode == 0 else None
+    except ValueError:
+        pr = None
+    head = pr.get("headRefOid") if isinstance(pr, dict) else None
+    base = pr.get("baseRefName") if isinstance(pr, dict) else None
+    if isinstance(head, str) and head and isinstance(base, str) and base:
+        return head, base, ""
+    err = (r.stderr or r.stdout or "").strip()[:200]
+    return "", "", f"its head and base could not be read (`gh pr view`: {err or 'no output'})"
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def _git_failed(repo: Path, what: str, r: subprocess.CompletedProcess) -> str:
+    tail = (r.stderr or "").strip().splitlines()
+    return (f"git failed: `git {what}` in {repo} exited {r.returncode} "
+            f"({tail[-1] if tail else 'no output'})")
+
+
+def _fetch(cfg: Config, repo: Path) -> str:
+    """Fetch the PR's base (``base_remote``) and its branch (``origin``, where publish
+    pushed it — the same remote on an own-repo checkout) into ``repo``. "" or why not."""
+    for remote in dict.fromkeys((cfg.base_remote, "origin")):
+        r = _git(repo, "fetch", remote)
+        if r.returncode != 0:
+            return _git_failed(repo, f"fetch {remote}", r)
+    return ""
+
+
+def _contains(repo: Path, tip: str, head: str) -> tuple[bool | None, str]:
+    """Whether commit ``head`` contains commit ``tip``: ``git merge-base --is-ancestor <tip>
+    <head>`` in ``repo`` — exit 0 yes, exit 1 no. Any other exit is git failing (a commit
+    this checkout does not have lands here too) and returns ``(None, why)``."""
+    r = _git(repo, "merge-base", "--is-ancestor", tip, head)
+    if r.returncode in (0, 1):
+        return r.returncode == 0, ""
+    return None, _git_failed(repo, f"merge-base --is-ancestor {tip[:12]} {head[:12]}", r)
+
+
+def _base_read(cfg: Config, repo: Path, pr_url: str) -> tuple[str, str, bool | None, str]:
+    """Whether PR ``pr_url``'s head lacks its base branch's current tip (issue #531), in
+    plain git as ``publish._line_tip_refusal`` decides its question (#593), not by a
+    host-side comparison: the head and base branch from the host (``_pr_head``), a fetch
+    into the checkout ``repo`` (``_fetch``), the base tip recorded from
+    ``<base_remote>/<base>``, then ``_contains``. Returns ``(head, tip, behind, "")``. On any
+    failure — ``gh`` unreadable, a failed fetch, a base that does not resolve, ``git
+    merge-base`` exiting other than 0/1 — ``behind`` is None and the last item says why:
+    the caller refuses, fail-closed, and never guesses "up to date"."""
+    head, base, why = _pr_head(pr_url)
+    if not head:
+        return "", "", None, why
+    why = _fetch(cfg, repo)
+    if why:
+        return head, "", None, why
+    ref = f"{cfg.base_remote}/{base}"
+    r = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    tip = (r.stdout or "").strip()
+    if r.returncode != 0 or not tip:
+        return head, "", None, (f"its base {ref} does not resolve in {repo} after the "
+                                f"fetch (`git rev-parse` exited {r.returncode})")
+    contains, why = _contains(repo, tip, head)
+    if contains is None:
+        return head, tip, None, why
+    return head, tip, not contains, ""
+
+
+def _wait_for_update(cfg: Config, repo: Path, pr_url: str, stale: str, tip: str,
+                     wait_secs: int, *, poll_interval: int = 5) -> tuple[str, int, str]:
+    """Wait for ``gh pr update-branch`` to land on PR ``pr_url`` (issue #531). GitHub may
+    apply the update after the command returns, so a read straight after it can still see
+    the old head ``stale``: re-read the head (``_pr_head``) until it contains the recorded
+    base tip ``tip`` (``_fetch`` + ``_contains``) or ``wait_secs`` of (patchable)
+    wall-clock time is spent. Returns ``(head, waited, "")`` for the first head that
+    contains ``tip`` — ``waited`` is then charged to the rollup wait
+    (``_wait_for_green(spent=waited)``) — or ``("", waited, why)`` to refuse: the bound ran
+    out, or a read failed (``gh`` unreadable, a failed fetch, ``git merge-base`` exiting
+    other than 0/1). Only a head not seen before is fetched and checked. ``wait_secs <=
+    0`` reads once; the sleeps go through ``_sleep`` and never sum past ``wait_secs``."""
     waited = 0
-    held = False  # the last read was a green that a green one interval earlier preceded
-    while waited < wait_secs and verdict not in ("failing", "unreadable"):
-        if verdict == "green" and held:
-            break
+    seen = stale
+    while True:
+        head, _, why = _pr_head(pr_url)
+        if not head:
+            return "", waited, why
+        if head != seen:
+            why = _fetch(cfg, repo)
+            if why:
+                return "", waited, why
+            contains, why = _contains(repo, tip, head)
+            if contains is None:
+                return "", waited, why
+            if contains:
+                return head, waited, ""
+            seen = head
+        if waited >= wait_secs:
+            return "", waited, (f"its update had not landed after {wait_secs}s — its head "
+                                f"{head[:12]} still lacks base commit {tip[:12]}; raise "
+                                "[driver] merge_wait_secs if the host is slow to apply it")
         step = min(poll_interval, wait_secs - waited)
         _sleep(step)
         waited += step
-        again, again_detail = _check_rollup(pr_url)
-        held = verdict == "green" and again == "green"
-        verdict, detail = again, again_detail
-    return verdict, detail
 
 
 def _undo_ready(pr_url: str) -> None:
@@ -252,69 +352,14 @@ def _undo_ready(pr_url: str) -> None:
               "— it is left marked ready; a human must re-draft it.", file=sys.stderr)
 
 
-#: How many times :func:`_merge_one` will sync a PR onto a base that keeps moving before it
-#: gives up (PR #230 review). Not a retry budget — each round is a real sync plus a real gate,
-#: and a base that overtakes three of those is busy enough that a human should place the
-#: merge. Bounded because the loop is otherwise unbounded on a contended base.
-_MAX_SYNC_ROUNDS = 3
-
-
-def _behind_by(repo_spec: str, pr_url: str) -> int | None:
-    """How many commits this PR's head is behind its base — ``None`` when that cannot be
-    read, which the caller treats as fail-closed.
-
-    INSTANCE DELTA (eduralph/pdca-harness#531, OPEN). Deliberately asks the compare API
-    rather than reading ``mergeStateStatus``: GitHub only reports ``BEHIND`` where the base
-    requires strictness, so on a ``strict: false`` base — which is exactly the case this
-    delta exists for — a behind PR reads ``CLEAN`` and the staleness is invisible. The
-    commit count is the same on either configuration.
-    """
-    view = subprocess.run(
-        ["gh", "pr", "view", str(pr_url), "--json",
-         "baseRefName,headRefName,headRepositoryOwner"],
-        capture_output=True, text=True)
-    if view.returncode != 0:
-        return None
-    try:
-        refs = json.loads(view.stdout or "{}")
-        base, head = refs["baseRefName"], refs["headRefName"]
-    except (ValueError, KeyError, TypeError):
-        return None
-    # A fork-based PR's head must be qualified OWNER:BRANCH, exactly as publish.py:301 does
-    # for `gh pr create --head`: a bare name resolves against the BASE repo, where the fork's
-    # branch does not exist. Unqualified, this compare would 404 (=> None => every merge
-    # stops) or, worse, silently compare a same-named base-repo branch — staleness measured
-    # against the wrong commit.
-    owner = (refs.get("headRepositoryOwner") or {})
-    owner_login = owner.get("login") if isinstance(owner, dict) else None
-    if owner_login and owner_login != str(repo_spec).split("/")[0]:
-        head = f"{owner_login}:{head}"
-    cmp_ = subprocess.run(
-        ["gh", "api", f"repos/{repo_spec}/compare/{base}...{head}", "--jq", ".behind_by"],
-        capture_output=True, text=True)
-    if cmp_.returncode != 0:
-        return None
-    try:
-        return int((cmp_.stdout or "").strip())
-    except ValueError:
-        return None
-
-
-def _sync_base(pr_url: str) -> bool:
-    """Bring a behind PR up to date with its base. INSTANCE DELTA
-    (eduralph/pdca-harness#531, OPEN).
-
-    The push re-triggers CI, so the rollup for the new head is EMPTY — which is precisely
-    what :func:`_wait_for_green` already polls on. The sync therefore needs no waiting of its
-    own; it hands the existing gate a rollup that describes the tree the PR merges into.
-    """
-    print(f"→ gh pr update-branch {pr_url}")
-    r = subprocess.run(["gh", "pr", "update-branch", str(pr_url)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print((r.stderr or r.stdout).strip(), file=sys.stderr)
-        return False
-    return True
+def _refuse(d: Path, pr_url: str, why: str) -> int:
+    """Decline to merge ``d``'s already-readied PR (issue #531): say why, STOP, and undo
+    the ready-mark (``_undo_ready``), as every other refusal in ``_merge_one`` does."""
+    print(f"\n!!! merge: {d.name} ({pr_url}) was NOT merged — {why}. STOP: later waves are "
+          "NOT run; resolve at the PR, then re-run (the run resumes idempotently).\n",
+          file=sys.stderr)
+    _undo_ready(pr_url)
+    return 1
 
 
 def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
@@ -323,7 +368,8 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     post-merge base fetch across bundles that share a checkout."""
     if state.state(d) != state.COMPLETE:
         return 0  # not accepted — nothing of this bundle's to merge
-    if not has_contribution(d):
+    patch = d / "patch.diff"
+    if not patch.is_file() or not patch.read_text(encoding="utf-8").strip():
         return 0  # close / no-fix disposition — no contribution to merge
     rec = publish._publish_record(d)
     pr_url = rec.get("pr_url") if rec else None
@@ -356,70 +402,6 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
               file=sys.stderr)
         return 1
 
-    # INSTANCE DELTA — sync a behind PR onto its base BEFORE the rollup gate below
-    # (eduralph/pdca-harness#531, OPEN). Without this the gate is honest about the wrong
-    # tree: a wave's second merge reads a rollup computed before its sibling landed, so the
-    # combination is never verified. Ordering is the whole trick — the sync's push empties
-    # the rollup for the new head, and `_wait_for_green` already polls on empty, so the gate
-    # below decides on checks that describe the tree this PR actually merges into.
-    # Fail-closed on an unreadable behind-state, on the same principle the rollup gate uses:
-    # absence of evidence is not green.
-    # LOOPS, deliberately. Checking once is not enough: `_wait_for_green` below may wait for
-    # up to `merge_wait_secs` (1800 here; the wait itself is upstream since v0.58.0, #462),
-    # and a sibling landing on the base during that wait
-    # leaves the head behind again — with a green rollup for the pre-move tree, which
-    # non-strict protection will happily merge. That is the very failure this exists to
-    # prevent, in a smaller window (PR #230 review). So: re-read after every gate, and stop
-    # only when the base has not moved.
-    synced_and_gated = False
-    if cfg.merge_sync_base and repo_spec:
-        for _round in range(_MAX_SYNC_ROUNDS):
-            behind = _behind_by(str(repo_spec), str(pr_url))
-            if behind is None:
-                print(f"\n!!! merge: {d.name} ({pr_url}) — could NOT determine whether the "
-                      "PR is behind its base, so whether its checks describe the tree it "
-                      "would merge into is unknown. STOP: later waves are NOT run; resolve "
-                      "at the PR, then re-run (or set [driver] merge_sync_base = false to "
-                      "merge without the check).\n", file=sys.stderr)
-                _undo_ready(pr_url)
-                return 1
-            if not behind:
-                break
-            print(f"   {behind} commit(s) behind base — syncing before the rollup gate")
-            if not _sync_base(str(pr_url)):
-                print(f"\n!!! merge: {d.name} ({pr_url}) is {behind} commit(s) behind its "
-                      "base and could NOT be updated — a conflict with a sibling that "
-                      "already merged, or no write access. Merging now would verify a tree "
-                      "this PR is not merging into. STOP: later waves are NOT run; resolve "
-                      "at the PR, then re-run.\n", file=sys.stderr)
-                _undo_ready(pr_url)
-                return 1
-            # The sync invalidated whatever checks existed, so wait for the new head's —
-            # ALWAYS, including under `merge_requires = "required"`. That mode skips the
-            # rollup GATE below, but it cannot skip the wait: `gh pr merge` refuses while
-            # required checks are pending, so merging straight after a sync would fail every
-            # wave at its second PR (PR #230 review).
-            print(f"→ gh pr checks {pr_url}  (after sync)")
-            verdict, detail = _wait_for_green(str(pr_url), cfg.merge_wait_secs)
-            if cfg.merge_requires != "required" and verdict != "green":
-                print(f"\n!!! merge: {d.name} ({pr_url}) was NOT merged — after syncing onto "
-                      f"its base the checks are {verdict} ({detail}). This is the combination "
-                      "check: each fix was green alone, and this is the first time they were "
-                      "verified together. STOP: later waves are NOT run.\n", file=sys.stderr)
-                _undo_ready(pr_url)
-                return 1
-            if verdict == "green":
-                print(f"   post-sync rollup green ({detail})")
-            synced_and_gated = True
-        else:
-            print(f"\n!!! merge: {d.name} ({pr_url}) — the base moved under this PR "
-                  f"{_MAX_SYNC_ROUNDS} times running; each sync was overtaken before it could "
-                  "merge. Merging now would verify a tree it is not merging into. STOP: "
-                  "later waves are NOT run; merge by hand when the base is quiet, then "
-                  "re-run.\n", file=sys.stderr)
-            _undo_ready(pr_url)
-            return 1
-
     # Full check-rollup gate (issue #413), read AFTER the ready-mark and immediately before
     # the merge: `gh pr ready` can itself trigger `ready_for_review` CI, so only a rollup
     # read here says anything about green AT MERGE TIME. `gh pr merge` below fails closed
@@ -428,12 +410,45 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
     # `!= "required"` rather than `== "all"` so an unexpected value gates rather than
     # merging (Config.load already coerces one, but this module is the one that must not
     # merge past a red rollup).
-    if cfg.merge_requires != "required" and not synced_and_gated:
+    if cfg.merge_requires != "required":
+        # Issue #531: the rollup below describes the PR's head as it stands — tested on the
+        # base that head was built on, not the base it merges into once an earlier member of
+        # this wave (or anything else) moved it. So read whether the head is behind its base
+        # and, if it is, bring it up to date first (a merge-commit update of its own branch,
+        # never a rebase of the reviewed commits): the rollup waited on below is then the
+        # rollup of the combination that merges.
+        if not repo_spec:
+            return _refuse(d, pr_url, "its publish record names no repo, so there is no "
+                                      "checkout to read its base in")
+        repo = publish._checkout_path(cfg, repo_spec)
+        head, tip, behind, why = _base_read(cfg, repo, str(pr_url))
+        if behind is None:
+            return _refuse(d, pr_url, why)
+        waited = 0
+        if behind:
+            print(f"   head {head[:12]} lacks base commit {tip[:12]} — bringing it up to date")
+            print(f"→ gh pr update-branch {pr_url}")
+            up = subprocess.run(["gh", "pr", "update-branch", str(pr_url)],
+                                capture_output=True, text=True)
+            if up.returncode != 0:
+                print((up.stderr or up.stdout).strip(), file=sys.stderr)
+                return _refuse(d, pr_url, "it is behind its base and could not be brought up "
+                               "to date (`gh pr update-branch` failed: a conflict with the "
+                               "base, the update refused, or a `gh` too old for it)")
+            # GitHub may apply the update after the command returns: poll for it, charged
+            # to the same merge_wait_secs budget the rollup wait below then gets.
+            head, waited, why = _wait_for_update(cfg, repo, str(pr_url), head, tip,
+                                                 cfg.merge_wait_secs)
+            if not head:
+                return _refuse(d, pr_url, why)
+            print(f"   updated: head {head[:12]} contains base commit {tip[:12]}")
+        else:
+            print(f"   head {head[:12]} contains base commit {tip[:12]} — up to date")
         print(f"→ gh pr checks {pr_url}")
         # A wave boundary fires seconds after the PR opened (issue #462), so the first read
         # is routinely pending/empty — not a verdict yet. Wait for it to resolve, bounded by
         # [driver].merge_wait_secs, before treating an unresolved rollup as a refusal.
-        verdict, detail = _wait_for_green(str(pr_url), cfg.merge_wait_secs)
+        verdict, detail = _wait_for_green(str(pr_url), cfg.merge_wait_secs, spent=waited)
         if verdict != "green":
             why = {
                 "failing": f"a check is FAILING — {detail}",
@@ -454,15 +469,33 @@ def _merge_one(cfg: Config, d: Path, *, dry_run: bool, method: str,
             return 1
         # Positive evidence in the run log that this merge was gated, not merged blind.
         print(f"   check rollup green ({detail})")
+        # Issue #531: `gh pr checks` does not say which head it read, so read the head and
+        # base again: the head must be the one read before the wait (the green rollup is
+        # then that head's) and must still contain its base's tip. The merge is pinned to
+        # it, so a head that changes after this read is refused by the host, not merged.
+        after, _, behind, why = _base_read(cfg, repo, str(pr_url))
+        if behind is None:
+            return _refuse(d, pr_url, why)
+        if after != head:
+            return _refuse(d, pr_url, f"its head changed from {head[:12]} to {after[:12]} "
+                           "while its checks were being read, so the green rollup may not "
+                           "be that head's")
+        if behind:
+            return _refuse(d, pr_url, "its base moved while its checks were being read, so "
+                           "the green rollup is not of the combination it would merge; "
+                           "re-run to bring it up to date and verify it again")
+        cmd += ["--match-head-commit", head]
 
-    print(f"→ gh pr merge {pr_url} --{method}")
+    print(f"→ {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print((r.stderr or r.stdout).strip(), file=sys.stderr)
         print(f"\n!!! merge: {d.name} ({pr_url}) did not merge — a conflict, no merge "
-              "rights on the base, or a host-required check that failed or started after "
-              "the rollup gate above. STOP: later waves are NOT run; resolve at the PR, "
-              "then re-run.\n", file=sys.stderr)
+              "rights on the base, a host-required check that failed or started after the "
+              "rollup gate above, a head that changed after that gate read it green (the "
+              "merge is pinned to it), or a base that moved after the last read on a host "
+              "that requires up-to-date branches. STOP: later waves are NOT run; resolve at "
+              "the PR, then re-run.\n", file=sys.stderr)
         _undo_ready(pr_url)
         return 1
     # Refresh the base so the NEXT wave's worktree resets to the merged result.

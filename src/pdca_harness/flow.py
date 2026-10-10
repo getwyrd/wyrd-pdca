@@ -24,6 +24,7 @@ import datetime
 import re
 import sys
 import threading
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from . import (act, assemble, autoiterate, brief, drive_claim, driver, gates, integrate, lane,
@@ -173,23 +174,7 @@ def _apply_decision(
     problem = signoff.unrecordable(d / "SUMMARY.md")
     if problem:
         return _repair_unsignable(d, action=action, today=today, why=problem)
-    # Ledger integrity is checked HERE, not in `_maybe_auto_iterate` (PR #168 review round 8).
-    # That was the wrong home for it: the function returns at its `not cfg.auto_iterate` guard,
-    # and the batch sweep never calls it at all — so a bundle whose ledger broke after assembly
-    # could be resumed with auto-iterate off, or signed off through the batch queue, and
-    # ACCEPTED against a stale SUMMARY that never mentioned the lost objections.
-    #
-    # `_apply_decision` is the choke point every path shares and where the accept guard already
-    # lives, so the condition is enforced beside C6 rather than beside the rebuild decision.
-    try:
-        autoiterate.deferred(d)
-    except autoiterate.DeferredLedgerUnreadable as exc:
-        assemble.ensure_section6_item(d / "SUMMARY.md", _LEDGER_LOST.format(exc=exc))
-        if action == "accept":
-            print(f"flow: {d.name} — cannot accept, {exc}; recorded in §6", file=sys.stderr)
-            return "blocked"
-        print(f"flow: {d.name} — {exc}; recorded in §6", file=sys.stderr)
-    if action == "accept" and signoff.open_needs_human(d / "SUMMARY.md"):
+    if action == "accept" and accept_blockers(d):
         print(f"flow: {d.name} — cannot accept, §6 NEEDS-HUMAN still open (C6)", file=sys.stderr)
         return "blocked"
     # The iterate rationale ("why rejected / what to change") rides §9 → the driver
@@ -225,6 +210,32 @@ def _apply_decision(
     if apply_now or action == "iterate-plan":
         driver.run_issue(d, cfg)  # COMPLETE | ITERATE_* → re-loop (iterate-plan: archive → UNPLANNED)
     return action
+
+
+def accept_blockers(d: Path) -> list[str]:
+    """The open §6 rows that refuse an accept (C6) — read the same way on every accept path.
+
+    There are two, and both take their C6 check from here: :func:`_apply_decision` (every
+    ``flow`` sign-off — single, batch, a decision already recorded in the bundle) and
+    ``cli._signoff`` (``pdca signoff <id> --accept``). While the CLI ran a check of its own,
+    the ledger rule below held on one path and not the other.
+
+    Before reading §6 it puts an unreadable deferred-findings ledger (#409) into §6 as an open
+    row. Assembly already renders that row when the ledger is unreadable at assembly time;
+    this covers a ledger that became unreadable AFTER the SUMMARY was assembled, whose
+    findings the SUMMARY on disk may not carry — whether or not auto-iterate is on, since a
+    ledger written by an earlier run outlives the setting that wrote it. A row the human has
+    already ticked is their clearance and is left alone, as C6 honours every other tick.
+
+    The row is written to, and C6 read from, the same §6: the one ``assemble`` wrote, never a
+    ``## 6. NEEDS-HUMAN`` block a leaf quoted into §5 (``signoff._needs_human_section``).
+    Read from the quote, a block of ticked rows passed an accept over open rows below it.
+    """
+    problem = autoiterate.ledger_problem(d)
+    if problem and signoff.ensure_needs_human_item(d / "SUMMARY.md",
+                                                  autoiterate.UNREADABLE_LEDGER_ITEM):
+        print(f"{d.name} — {problem}; added it to §6 NEEDS-HUMAN", file=sys.stderr)
+    return signoff.open_needs_human(d / "SUMMARY.md")
 
 
 #: :func:`_apply_recorded_decision` outcome meaning "the bundle carries no decision, so it
@@ -289,20 +300,19 @@ def _signoff_and_apply(
     return _apply_decision(cfg, d, by=by, today=today, apply_now=apply_now)
 
 
-_LEDGER_LOST = ("the deferred-findings ledger is unreadable — findings held over from earlier "
-                "auto-iterate rounds may be LOST; recover or reconstruct it before accepting "
-                "({exc})")
-
-
 def _maybe_auto_iterate(
     cfg: Config, d: Path, *, by: str, today: str, apply_now: bool
 ) -> bool:
-    """Rebuild without asking, when Check found only implementation defects (issue #264).
+    """Rebuild without asking while Check still finds implementation work (#264, #409).
 
-    Returns True iff the bundle was routed to ITERATE_DO. Every other outcome — auto-iterate
-    off, the bundle not halted at AWAITING_SIGNOFF, a decision already recorded in the bundle
-    and not yet consumed, an empty §6, any HUMAN-kind finding, or the per-bundle budget
-    spent — returns False and leaves the bundle exactly where it was, for the human.
+    Returns True iff the bundle was routed to ITERATE_DO. HUMAN findings beside the IMPL ones
+    do not stop it: ``autoiterate.write_decision`` defers them to the ledger, and assembly
+    returns them to §6 at handover — all but a review or gate that gave no verdict, which the
+    next Check runs again (``autoiterate.defer``). Every other outcome — auto-iterate off,
+    the bundle not halted at AWAITING_SIGNOFF, a decision already recorded in the bundle and
+    not yet consumed, a §6 with no IMPL item (empty, or HUMAN only), the size backstop's
+    item, the per-bundle budget spent, or a deferred ledger it cannot read — returns False
+    and leaves the bundle exactly where it was, for the human.
 
     Deliberately routed through the existing ``_apply_decision`` rather than calling
     ``signoff.record`` directly: §9 then stays authored solely by ``signoff.record``, and the
@@ -336,59 +346,43 @@ def _maybe_auto_iterate(
         print(f"flow: {d.name} — cannot classify Check findings ({type(exc).__name__}: {exc}); "
               f"not auto-iterating", file=sys.stderr)
         return False
-    # Record this Check's implementation-finding count BEFORE any early return, so the
-    # convergence baseline is the Check immediately preceding the next rebuild whoever
-    # triggers it. Recording only on the rounds that auto-iterated left a human `iterate-do`
-    # after a growth halt comparing against a stale automatic round (PR #168 review round 3).
-    # It runs after `should_iterate` below, which needs the PREVIOUS observation to compare.
-    def _observe() -> None:
-        autoiterate.observe(d, items)
-
-    # Readability is checked BEFORE eligibility (PR #168 review round 7). It used to sit
-    # after, so a ledger that became unreadable once the SUMMARY was already assembled went
-    # unreported whenever the current Check had no IMPL finding: the eligibility test returned
-    # first, `collect_needs_human`'s synthetic warning existed only in memory, and the C6 guard
-    # then read a STALE SUMMARY — so the bundle could be ACCEPTED without the human ever
-    # learning that earlier deferred findings were no longer readable.
-    try:
-        autoiterate.deferred(d)
-    except autoiterate.DeferredLedgerUnreadable as exc:
-        # Put the condition into the artifact the accept-guard actually reads. Appending in
-        # place rather than re-assembling: a re-assemble would discard any §6 box the human
-        # has already ticked in this sign-off.
-        added = assemble.ensure_section6_item(d / "SUMMARY.md", _LEDGER_LOST.format(exc=exc))
-        print(f"flow: {d.name} — {exc}; not auto-iterating (findings would be lost)"
-              + ("; recorded in §6" if added else ""), file=sys.stderr)
-        _observe()
-        return False
     if not autoiterate.eligible(items):
-        # Say WHY when it was the size backstop (#324). This rule fires at 2 rounds while
-        # `max_auto_iters` defaults to 3, so it deliberately stops the loop with a round
-        # still nominally available — and an operator who set that number and sees the
-        # loop halt early has to be able to read the reason, or their setting simply
-        # appears not to work. Every other decline is an ordinary HUMAN finding the human
-        # is about to read in §6 anyway.
+        # The loop has exactly two stops while implementation work remains (#409): the size
+        # backstop here and the hard cap below. Say WHY when it was the size backstop
+        # (#324). It fires at 2 rounds while `max_auto_iters` defaults to 3, so it
+        # deliberately stops the loop with a round still nominally available — and an
+        # operator who set that number and sees the loop halt early has to be able to read
+        # the reason, or their setting simply appears not to work. Every other decline is a
+        # §6 with no implementation work at all, which the human is about to read anyway.
         for item in items:
             if size_signal.is_size_item(item.text):
                 print(f"flow: {d.name} — not auto-iterating: {item.text}",
                       file=sys.stderr)
                 break
-        _observe()
         return False
     spent = autoiterate.count(d)
-    fire, why_not = autoiterate.should_iterate(d, items, cfg)
-    _observe()  # after the comparison — `should_iterate` reads the PREVIOUS observation
-    if not fire:
-        print(f"flow: {d.name} — {why_not}; handing the findings to the human",
-              file=sys.stderr)
+    if spent >= cfg.max_auto_iters:
+        print(f"flow: {d.name} — auto-iterate budget spent ({spent}/{cfg.max_auto_iters}); "
+              f"handing the implementation findings to the human", file=sys.stderr)
         return False
-    n_impl = autoiterate.impl_count(items)
-    n_held = sum(1 for it in items if it.kind == assemble.HUMAN)
-    held = f", deferring {n_held} for the human" if n_held else ""
-    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters} "
-          f"(soft {cfg.soft_auto_iters}): rebuilding for {n_impl} implementation-level "
-          f"finding(s){held}", file=sys.stderr)
-    autoiterate.write_decision(d, items)
+    try:
+        autoiterate.write_decision(d, items)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Raised before any budget is spent or decision written. Rebuilding now would
+        # archive this SUMMARY while the ledger could not record its HUMAN findings, so hand
+        # over instead. The unreadable-ledger row blocks accept: assembly renders it, and
+        # `accept_blockers` adds it if the ledger broke after assembly.
+        print(f"flow: {d.name} — not auto-iterating: {exc}", file=sys.stderr)
+        return False
+    impl = sum(1 for item in items if item.kind == assemble.IMPL)
+    held = len(autoiterate.deferrable(items))
+    rerun = sum(1 for item in items if item.no_verdict)
+    deferred = (f"; {held} finding(s) needing human judgment deferred to handover "
+                f"({autoiterate.DEFERRED_FILE})" if held else "")
+    rechecked = (f"; {rerun} review/gate row(s) with no verdict left for the next Check to "
+                 "re-run" if rerun else "")
+    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters}: rebuilding for "
+          f"{impl} implementation-level finding(s){deferred}{rechecked}", file=sys.stderr)
     return _apply_decision(cfg, d, by="auto-iterate", today=today,
                            apply_now=apply_now) == "iterate-do"
 
@@ -646,11 +640,20 @@ def _sweep_quietly(cfg: Config, bundles: list[Path]) -> None:
 
 
 def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str,
-                    texts_prevalidated: bool = False) -> None:
+                    texts_prevalidated: bool = False) -> bool:
     """Publish one COMPLETE bundle (Check's closing step), isolated so a single failure
     can't abort the batch (testbed #3); a non-zero return is loud, never silent (#97).
     ``texts_prevalidated`` (#295 review): the wave pre-pass already drafted + T4-gated
-    the texts, so publish runs mechanics-only (no second T4 run mid-wave)."""
+    the texts, so publish runs mechanics-only (no second T4 run mid-wave).
+
+    Returns whether this call pushed the bundle's branch, so the wave fold has it to merge
+    (#593). Read off ``publish.json``: both publish paths write it only once every step,
+    the push included, has succeeded — also when ``gh pr create`` then fails (rc 1, e.g. an
+    iterated bundle whose old draft PR is still open), and that pushed branch is folded. So
+    True iff, after the call, the record exists and either did not exist before it or its
+    ``st_mtime_ns`` changed. An earlier run's record, which an iterate keeps, never counts,
+    nor does a call that raised (``_isolate`` logged it): that errs toward holding."""
+    before = _record_mtime(d)
     rc = _isolate(d, "publish", lambda: publish.publish(
         cfg, d.name.removeprefix("issue_"),
         dry_run=cfg.publisher.mode == "stub", by=by, today=today, skip_if_no_target=True,
@@ -658,82 +661,299 @@ def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str,
     if rc not in (0, None):  # None ⇒ _isolate already logged an exception
         print(f"flow: {d.name} is COMPLETE but publish did not complete (rc {rc}) — NOT "
               f"published; run `pdca publish {d.name.removeprefix('issue_')}`.", file=sys.stderr)
+    after = _record_mtime(d)
+    return rc is not None and after is not None and after != before
+
+
+def _record_mtime(d: Path) -> int | None:
+    """``publish.json``'s ``st_mtime_ns``, or None when there is none — to tell a record the
+    publish call just wrote from one an earlier run left (#593)."""
+    try:
+        return (d / "publish.json").stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 # ----------------------------------------------------------------------------
 # Shared multi-bundle driver: compute waves → per wave (drive → cheap-first sign-off →
 # publish → fold onto the integration branch the next wave builds on) → Act once (docs 09).
 # ----------------------------------------------------------------------------
-def _runnable(cfg: Config, wave: list[Path], batch_names: set[str]) -> list[Path]:
+def _runnable(cfg: Config, wave: list[Path], batch_names: set[str], *,
+              held: set[str] | frozenset[str] = frozenset(),
+              requested: Collection[str] | None = None,
+              hold_unmerged: bool = False) -> list[Path]:
     """Drop a wave bundle whose declared prerequisite isn't ready to build on top of.
 
-    A prerequisite **in this run's batch** is carried into the dependent's base by the wave
-    fold once it reaches COMPLETE (it sits in an earlier wave), so COMPLETE is the bar — e.g.
-    a prereq DISCONTINUED earlier never gets there, and its dependent is skipped loudly. A
-    prerequisite **outside this batch** (a prior run's) is gated on its on-disk COMPLETE state
-    (archived `completed/` too, #171) — **except** an out-of-batch ``Depends on (merged)``
-    prereq, which keeps its stricter #107 merge-gate (#186): nothing in *this* run carries an
-    out-of-batch prereq's diff into the base, and COMPLETE means only "a draft PR was opened",
-    so a dependent built on a COMPLETE-but-unmerged base would miss the prerequisite. It must
-    wait until the PR is genuinely merged (``merged.is_merged``) — a later ``pdca flow`` run
-    then picks it up. A skipped bundle never completes, so its own dependents fall out of later
-    waves the same way (the skip cascades).
-
-    **Merge mode with ``auto_merge`` off gates EVERY dep on the merge (#462 review).** That
-    combination stops the run at each non-final wave boundary and asks the human to merge, so
-    a resumed run's correctness rests entirely on their having actually done it. Nothing else
-    can carry the diff: the driver merges nothing, and the wave fold that would otherwise
-    carry an in-batch prereq is the ``stack`` path, not this one. So the reason given above
-    for an out-of-batch prereq — nothing in *this* run carries its diff into the base — holds
-    for **in-batch** and **plain ``Depends on``** prereqs too. Gating only ``Depends on
-    (merged)`` would let COMPLETE alone satisfy a dependent on the resumed run and build it
-    against a base the prerequisite never reached: precisely the condition the boundary stop
-    exists to prevent, reintroduced one invocation later."""
+    A prerequisite that is not COMPLETE on disk (archived ``completed/`` too, #171) is never
+    ready, whichever field names it — e.g. a prereq DISCONTINUED earlier never gets there,
+    and its dependent is skipped loudly. A prerequisite **in this run's batch** is carried
+    into the dependent's base by the wave fold once it reaches COMPLETE (it sits in an
+    earlier wave), so COMPLETE is the bar. An in-batch prerequisite named in ``held``
+    (bundle dir names, #593) is not ready either: it is COMPLETE, but this run pushed no
+    branch of it (its texts or its publish failed before the push), so the fold has nothing
+    of it to carry — its dependents are held while the rest of the run goes on. A
+    prerequisite **outside this batch** (a prior run's) is gated on its COMPLETE state —
+    **except** an out-of-batch ``Depends on (merged)`` prereq, which keeps its stricter #107
+    merge-gate (#186): nothing in *this* run carries an out-of-batch prereq's diff into the
+    base (a finished named id aside, below), and COMPLETE means only "a draft PR was
+    opened", so a dependent built on a COMPLETE-but-unmerged base would miss the
+    prerequisite. It must wait until the PR is genuinely merged into the DEPENDENT's target
+    base — its repo and branch (``publish._resolve_target``), not just some branch
+    (``merged.merged_into``, #647) — a later ``pdca flow`` run then picks it up. With
+    ``hold_unmerged`` (stack mode, publishing on, not a dry-run, #647) a plain ``Depends
+    on`` prerequisite the run was NOT asked for — not in ``requested`` (bundle dir names;
+    ``None``: ``batch_names``) — waits the same way when a line would carry it (a non-empty
+    patch and a usable target, ``integrate._fold_candidates``): no line of this run does.
+    Either way the dependent is named on ONE stderr line, with what to do. A dependent with
+    no usable target of its own (publish skips it) has no base to wait for: no #647 hold,
+    and its ``Depends on (merged)`` keeps #186's answer — any merge counts. A finished named
+    id (an id the run was asked for that an earlier run finished, #646) is carried onto the
+    line before wave 0 when it is clean (:func:`_carry_finished`); when it is not, it is
+    named in ``held``, and a bundle whose plain ``Depends on`` names it is not ready (a
+    ``Stacks on`` edge to it is not held). A skipped bundle never completes, so its own
+    dependents fall out of later waves the same way (the skip cascades)."""
+    asked = set(requested) if requested is not None else set(batch_names)
     runnable: list[Path] = []
-    # Merge mode that merges nothing: the human's merge is the ONLY thing that can advance a
-    # base, so verify it rather than trust it (#462 review).
-    verify_every_dep = cfg.wave_mode == "merge" and not cfg.auto_merge
     for d in wave:
         bp = d / "brief.md"
-        merged_deps = set(brief.depends_on_merged(bp)) if bp.exists() else set()
+        deps = waves.declared_deps(bp) if bp.exists() else []
+        merged_deps = set(brief.depends_on_merged(bp)) if deps else set()
+        plain_deps = set(brief.depends_on(bp)) if deps else set()
+        # "Merged" means merged into d's OWN target (#647) — none usable: ("", "").
+        repo, base = publish._resolve_target(d)[:2] if deps else ("", "")
+        targeted = bool(repo and base)
         unmet: list[str] = []
-        for dep in (waves.declared_deps(bp) if bp.exists() else []):
-            out_of_batch = cfg.bundle(dep).name not in batch_names
-            dd = cfg.find_bundle(dep)
-            # A prereq with no contribution has no merge to wait for, and the boundary stop
-            # lets its wave through for the same reason — the two must agree or a close/no-fix
-            # prerequisite would gate its dependent forever on a PR nobody will ever open.
-            # Scoped to the new check: #186's `Depends on (merged)` gate keeps its own rule.
-            if verify_every_dep and merge.has_contribution(dd):
-                if not merged.is_merged(cfg, dep):
+        unmerged: list[str] = []   # COMPLETE, but not merged into d's base: wait (#647)
+        carryable: list[str] = []  # … of those, ones a line of d's target would carry
+        for dep in deps:
+            p = cfg.find_bundle(dep)
+            out_of_batch = p.name not in batch_names
+            if state.state(p) != state.COMPLETE:  # archived prereq too (#171)
+                unmet.append(dep)  # not ready, whichever field names it
+                continue
+            # A plain `Depends on` prereq the run was not asked for, which a line would
+            # carry: no line of this run does (#647).
+            cand = (integrate._fold_candidates([p])
+                    if hold_unmerged and targeted and out_of_batch and dep in plain_deps
+                    and p.name not in asked else [])
+            if out_of_batch and (dep in merged_deps or cand):
+                # Only a merge INTO d's base puts it there (#186 for `Depends on (merged)`,
+                # #647 for the plain edge above). With no target of d's own, #186's answer
+                # and its "not ready" line stand.
+                if merged.merged_into(cfg, dep, repo, base):
+                    continue
+                if not targeted:
                     unmet.append(dep)
-            elif out_of_batch and dep in merged_deps:
-                if not merged.is_merged(cfg, dep):  # PR not yet merged — wait, don't build (#186)
-                    unmet.append(dep)
-            elif state.state(dd) != state.COMPLETE:  # archived prereq too (#171)
+                    continue
+                unmerged.append(p.name)
+                if cand and dep not in merged_deps and cand[0][1:3] == (repo, base):
+                    carryable.append(p.name)  # named in the run, the carry puts it on (#646)
+            elif p.name in held and (not out_of_batch or dep in plain_deps):
+                # In batch: accepted, but no branch pushed this run: nothing to fold (#593).
+                # Out of batch: a finished named id the carry could not put on the line (#646).
                 unmet.append(dep)
+        if unmerged:
+            todo = (f"name {', '.join(carryable)} in the same `pdca flow <ids>` command so "
+                    f"the run's line carries them, or wait" if carryable else "wait")
+            print(f"flow: {d.name} held — prerequisite(s) {', '.join(unmerged)} not merged "
+                  f"into {base} ({repo}), and no line of this run carries them; not built "
+                  f"on a base missing them. To build it, {todo} until their PR merges into "
+                  f"{base}, then re-run.", file=sys.stderr)
         if unmet:
             print(f"flow: {d.name} skipped — prerequisite(s) not ready "
                   f"({', '.join(unmet)}); not built on a base missing them.", file=sys.stderr)
-        else:
+        if not unmet and not unmerged:
             runnable.append(d)
     return runnable
 
 
-def _point_at_integration(integ: dict[tuple[str, str], str], runnable: list[Path]) -> None:
+def _point_at_integration(integ: dict[tuple[str, str], str], runnable: list[Path],
+                          tips: Mapping[tuple[str, str], str | None] | None = None) -> None:
     """Reconcile each runnable bundle's stack base with THIS run's integration state (#187).
 
     ``integ`` maps each integrated target to its run-scoped integration branch. A bundle is
     pointed at the branch for **its own** ``(repo, base)`` target only — never a sibling
     target's, which is absent on that repo or carries unrelated patches. A bundle whose target
     wasn't integrated this run has any **stale** stack base (left by a prior/resumed run)
-    cleared, so it builds off its own target base rather than an old integration branch."""
+    cleared, so it builds off its own target base rather than an old integration branch.
+
+    ``tips`` maps a target to the line commit the run's last fold pushed (#593; ``None`` in
+    a dry-run): the commit the bundle is built on. It is recorded beside the branch
+    (``stack-base-tip``), so publish cuts the PR branch from it even after later waves have
+    grown the line (a held bundle published late)."""
     for d in runnable:
-        branch = integ.get(publish._resolve_target(d)[:2])
+        target = publish._resolve_target(d)[:2]
+        branch = integ.get(target)
         if branch:
-            publish.write_stack_base(d, branch)
+            publish.write_stack_base(d, branch, (tips or {}).get(target))
         else:
             publish.clear_stack_base(d)
+
+
+def _fold_lines(cfg: Config, bundles: list[Path], *, dry: bool,
+                folded_this_run: Mapping[tuple[str, str], str | None], batch: list[str],
+                skipped: dict[str, str] | None = None,
+                ) -> tuple[dict[tuple[str, str], tuple[str, Path | None]],
+                           dict[tuple[str, str], str | None], tuple[str, str] | None]:
+    """ONE :func:`integrate.fold` of ``bundles`` and, with ``[driver].regate_between_waves``,
+    the re-gate of each line it pushed, under ONE lock scope (#297 review round 10): the
+    locks stack keeps every target's integ lock held from the fold through the tip read and
+    the re-gate, so no gap exists in which another flow's publish-boundary sweep could
+    remove the tree — or another fold rewrite it — before the re-gate attests it. The in-run
+    fold and the pre-wave carry (#646) share it; only what they do with the result differs.
+
+    Returns ``(folded, tips, red)``: the fold's result, each folded target's pushed tip
+    (None in a dry-run, which pushes nothing), and the first target whose re-gate is red
+    (None: none is, or none ran). An :class:`integrate.IntegrationError` from the fold or
+    the tip read propagates."""
+    with contextlib.ExitStack() as locks:
+        folded = integrate.fold(cfg, bundles, dry_run=dry, locks=locks,
+                                folded_this_run=folded_this_run, batch=batch, skipped=skipped)
+        tips = {tgt: integrate.pushed_tip(wt) if wt is not None else None
+                for tgt, (_branch, wt) in folded.items()}
+        # hold_lock=False: the locks stack already holds each tree's lock (re-acquiring
+        # would deadlock on our own flock).
+        red = next((tgt for tgt, (_branch, wt) in folded.items()
+                    if cfg.regate_between_waves and not dry and wt is not None
+                    and gates.run_integration(cfg, wt, hold_lock=False)
+                    .get("overall") == "fail"), None)
+    return folded, tips, red
+
+
+def _finished_named(cfg: Config, batch: Collection[str] | None,
+                    drive_names: set[str]) -> list[Path]:
+    """The run's finished named ids (#646): each id it was asked for (``batch``) that is
+    COMPLETE and not in the drive set — the caller skipped it as terminal — once, in the
+    order asked for. None without a ``batch``."""
+    found: dict[str, Path] = {}
+    for iid in batch or ():
+        d = cfg.bundle(str(iid).removeprefix("issue_"))
+        if d.name not in drive_names and state.state(d) == state.COMPLETE:
+            found.setdefault(d.name, d)
+    return list(found.values())
+
+
+def _finished_head(d: Path, ref: tuple[str, str, bool] | None, repo: Path, base_ref: str,
+                   tip: str | None) -> str | tuple[str, str]:
+    """Finished bundle ``d``'s PR head when it is state-clean (#646): its PR reads OPEN, or
+    MERGED with the head already on ``base_ref`` or on the line at ``tip``, and the head
+    resolves in ``repo``. Else ``(reason, hint)`` — fail-closed: no recorded PR or branch,
+    or a state that cannot be read, is not clean."""
+    rec = publish._publish_record(d) if ref else None
+    pr_url = rec.get("pr_url") if isinstance(rec, dict) else None
+    if not pr_url:
+        return "no PR with a pushed branch on record (publish.json)", "open"
+    st = merged.pr_state(str(pr_url))
+    if st is None:
+        return f"its PR state could not be read (`gh pr view {pr_url}` failed)", "open"
+    pr, head = st
+    if pr not in ("OPEN", "MERGED"):
+        return f"its PR is {pr}", "open"
+    if not head or integrate._rev(repo, head) is None:
+        return f"its PR head {head or '(none reported)'} is not in {repo}", "open"
+    if pr == "MERGED" and not any(integrate._carries(repo, head, f"{d.name}'s head", r, of=r)
+                                  for r in (base_ref, tip) if r):
+        return f"its PR merged at {head[:12]}, which neither {base_ref} nor the line has", "edge"
+    return head
+
+
+_CARRY_HINTS = {
+    "open": "get {name}'s PR open with its branch on origin (re-open it, `pdca publish {iid}`, "
+            "or re-drive {name}), then re-issue",
+    "edge": "remove the `Depends on: {iid}` edge from the dependent's brief, then re-issue",
+    "line": "delete {line} on origin unless this run's own fold already replaced it, then "
+            "re-issue",
+}
+
+
+def _carry_finished(cfg: Config, bundles: list[Path], finished: list[Path], *,
+                    batch: list[str], integ: dict[tuple[str, str], str],
+                    folded_tips: dict[tuple[str, str], str | None], held: set[str]) -> None:
+    """Before wave 0, put a re-issued run's finished named ids on its line (#646).
+
+    ``finished`` (:func:`_finished_named`) are ids the run was asked for that an earlier run
+    of the batch finished. Nothing happens unless a drive-set bundle's plain ``Depends on``
+    names one the fold can carry (:func:`integrate._fold_candidates`); then every carryable
+    finished id of THAT target is judged, in the order asked for. Clean — its PR state
+    clean (:func:`_finished_head`), origin's line holding nothing else it cannot account for
+    (:func:`integrate.foreign_commit`), merged without error, re-gate not red — it is folded
+    by ONE fold per target (:func:`_fold_lines`), which continues origin's line from the
+    tip checked here (no force; refused if it moved) or starts it when absent. The target
+    is then seeded into ``integ`` / ``folded_tips``: wave 0 is pointed at the line and every
+    later fold continues it. Any other finished id goes into ``held``, so only its plain
+    ``Depends on`` dependents wait (:func:`_runnable`), named with its reason on ONE stderr
+    line; the run goes on. A target the carry did not put to use is not seeded, so the
+    run's first fold of it starts fresh, as today. A dry-run (stub publisher) asks no host
+    and holds nothing: it prints the plan. A prerequisite that is no requested id, such as
+    a split child an earlier run adopted, is not carried: :func:`_runnable` holds its plain
+    ``Depends on`` dependents until its PR merges into their base (#647)."""
+    cands = {d.name: (d, (repo, base), ref)
+             for d, repo, base, _slug, ref in integrate._fold_candidates(finished)}
+    dependents: dict[str, list[str]] = {}
+    for b in bundles:
+        bp = b / "brief.md"
+        for dep in (brief.depends_on(bp) if bp.exists() else []):
+            if cfg.bundle(dep).name in cands:
+                dependents.setdefault(cfg.bundle(dep).name, []).append(b.name)
+    for tgt in sorted({cands[name][1] for name in dependents}):
+        ids = [d for d, t, _ref in cands.values() if t == tgt]          # in the order asked for
+        line = integrate.integration_branch(cfg, tgt[1], batch)
+        if cfg.publisher.mode == "stub":    # dry-run: ask no host, hold nothing
+            print(f"flow: dry-run — before wave 0, carry {', '.join(d.name for d in ids)} "
+                  f"(finished in an earlier run) onto {line} if clean:", file=sys.stderr)
+            integrate.fold(cfg, ids, dry_run=True, batch=batch)
+            continue
+        why: dict[str, tuple[str, str]] = {}    # not clean: name → (reason, hint)
+        heads: dict[str, str] = {}              # state-clean: name → its PR head
+        base_ref, tip, bad = f"{cfg.base_remote}/{tgt[1]}", None, None
+        try:
+            repo, tip = integrate.carry_view(cfg, tgt[0], line, [
+                cands[d.name][2][0] for d in ids if cands[d.name][2]])
+            for d in ids:
+                try:
+                    v = _finished_head(d, cands[d.name][2], repo, base_ref, tip)
+                except integrate.IntegrationError as exc:
+                    v = (str(exc), "open")
+                if isinstance(v, str):
+                    heads[d.name] = v
+                else:
+                    why[d.name] = v
+            bad = integrate.foreign_commit(repo, tip, base_ref, heads.values()) if tip else None
+        except integrate.IntegrationError as exc:
+            why = {d.name: (str(exc), "open") for d in ids}
+        if bad:   # an untrusted line: carry nothing onto it, point nothing at it
+            why = {d.name: (f"origin's {line} holds {bad[:12]}, which neither {base_ref} nor "
+                            f"a finished prerequisite's PR accounts for", "line") for d in ids}
+        clean = [d for d in ids if d.name not in why]
+        if clean:
+            skipped: dict[str, str] = {}
+            try:
+                folded, tips, red = _fold_lines(cfg, clean, dry=False, batch=batch,
+                                                folded_this_run={tgt: tip} if tip else {},
+                                                skipped=skipped)
+            except integrate.IntegrationError as exc:
+                folded, tips, red = {}, {}, None
+                skipped.update({d.name: str(exc) for d in clean})
+            carried = [d.name for d in clean if d.name not in skipped]
+            why.update({name: (msg, "open") for name, msg in skipped.items()})
+            if red:
+                why.update({name: (f"the re-gate of {line} carrying it is red", "open")
+                            for name in carried})
+            elif tgt in folded:
+                integ[tgt], folded_tips[tgt] = folded[tgt][0], tips[tgt]
+                print(f"flow: carried {', '.join(carried)} (finished in an earlier run) onto "
+                      f"{line} at {tips[tgt]} before wave 0 — this run's {tgt[0]} @ {tgt[1]} "
+                      f"bundles build on it.", file=sys.stderr)
+        for d in ids:
+            if d.name in why:
+                held.add(d.name)
+                reason, hint = why[d.name]
+                advice = _CARRY_HINTS[hint].format(name=d.name, line=line,
+                                                   iid=d.name.removeprefix("issue_"))
+                print(f"flow: {d.name} (finished in an earlier run) is not carried onto "
+                      f"{line}: {reason} — holding "
+                      f"{', '.join(dependents.get(d.name, [])) or 'no bundle'} this run; "
+                      f"{advice}.", file=sys.stderr)
 
 
 def _audit_wave_overlap(wave: list[Path]) -> None:
@@ -978,47 +1198,6 @@ def _inside_bundle_root(cfg: Config, d: Path) -> bool:
     return real is not None and root is not None and real.parent == root
 
 
-def _seed_offer(cfg: Config, seeds: list[Path]) -> frozenset[str]:
-    """The bundle names recovery ``seeds`` may hand this run: their lineage children,
-    transitively through a child that is itself terminal on a split — the same walk
-    :func:`_adopt_split_children` takes. INSTANCE DELTA (eduralph/pdca-harness#590): only
-    feeds the strict dependency check, which may then accept an edge to one of these; what
-    is actually adopted is still decided by the splice.
-
-    Offered: only a child that is an ACTIVE bundle still in flight — the only kind the splice
-    can adopt. A child archived to ``completed/`` or already terminal is not offered (the
-    normal check judges an edge to it), and neither is one whose state cannot be read. And
-    it is TOTAL (PR #259 review): the per-child probe is contained the way adoption's own
-    ``_isolate`` contains it, so a corrupt child is left for adoption to name, never a
-    traceback out of the pre-scan."""
-    offer: set[str] = set()
-    queue = list(seeds)
-    seen: set[str] = set()
-    while queue:
-        d = queue.pop()
-        if d.name in seen:
-            continue
-        seen.add(d.name)
-        try:
-            record = split.read_lineage(d)
-        except Exception:  # noqa: BLE001 — an unreadable lineage offers nothing
-            record = None
-        for cid in _lineage_children(record) if record else []:
-            child = cfg.bundle(cid)
-            if not child.is_dir():
-                continue  # archived or never created: nothing the splice can adopt
-            try:
-                s = state.state(child)
-                again = s in _TERMINAL and _is_split_parent(child)
-            except Exception:  # noqa: BLE001 — contained, as `_isolate` does for adoption
-                continue
-            if again:
-                queue.append(child)
-            elif s not in _TERMINAL:
-                offer.add(child.name)
-    return frozenset(offer)
-
-
 def _is_split_parent(d: Path) -> bool:
     """True iff ``d`` is terminal AND its close marker records a ``split``.
 
@@ -1043,6 +1222,96 @@ def _is_split_parent(d: Path) -> bool:
             encoding="utf-8").strip() == SPLIT_DISPOSITION
     except Exception:  # noqa: BLE001 — a hint that cannot be read must never end a run
         return False
+
+
+def _has_plan_artifact(cfg: Config, d: Path) -> bool:
+    """True iff ``d`` may enter this run's drive set: it has a ``brief.md`` — or is given one
+    here, when it is a split parent a pre-#481 ``split --accept`` left without one (#597).
+
+    The flow never drives a bundle with no Plan artifact: Do, Check, sign-off and publish
+    all read the brief, and the first read (``_point_at_integration`` →
+    ``publish._resolve_target``) raised ``FileNotFoundError`` out of the whole run. The
+    intake filters only ever asked "UNPLANNED?", and a briefless bundle carrying a close
+    marker or a ``patch.diff`` is past Do by :func:`state.state`'s own contract (#481), so
+    it slipped through as BUILT. Called by every intake path — :func:`flow_ids`,
+    :func:`flow_batch`'s sweep and :func:`_adopt_split_children` — and only AFTER the run
+    holds the bundle's claim (#565), so a bundle another live run drives is never written.
+
+    * A bundle with its own ``brief.md`` is never opened, let alone rewritten.
+    * A split parent with none gets exactly what ``split --accept`` writes since #481
+      (``split.py:937-939``): :func:`split._parent_plan` over its iterate-to-Plan archive,
+      rendered by :func:`split._split_parent_brief` with the lineage record's children as
+      bundle names, in record order. Reused, never re-implemented, so the two cannot drift.
+    * Everything else — no usable archive, no usable children record, a briefless bundle
+      that is not a split parent, a write that fails — is named on stderr with what to do,
+      and kept out of the run. Never raises.
+    """
+    if (d / "brief.md").exists():
+        return True
+    iid = d.name.removeprefix("issue_")
+    try:
+        marker = (d / state.CLOSE_MARKER).read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001 — absent or unreadable: not a split parent
+        marker = ""
+    if marker != SPLIT_DISPOSITION:
+        print(f"flow: {d.name} — no brief.md, NOT driven: it is past Do (a close marker or "
+              f"patch.diff) with no Plan artifact, and a bundle is never driven without one. "
+              f"Restore {d.name}/brief.md (an iterate-to-Plan archives it as "
+              f"iteration-v<N>/brief.md), then `pdca flow {iid}`", file=sys.stderr)
+        return False
+    try:
+        plan = split._parent_plan(d, cfg)
+    except Exception as exc:  # noqa: BLE001 — skips this bundle, never the run
+        # A SplitError is worded for `split --accept`: its reason, then "— refusing to
+        # split" and that command's own retry. Only the reason belongs in a flow run; the
+        # one remedy is the flow's.
+        why = (str(exc).partition(" — refusing to split")[0]
+               if isinstance(exc, split.SplitError) else f"{type(exc).__name__}: {exc}")
+        print(f"flow: {d.name} — split parent NOT driven: {why}. Write {d.name}/brief.md "
+              f"(slug, success criterion, repo + branch target), then `pdca flow {iid}`",
+              file=sys.stderr)
+        return False
+    if plan is None:
+        # `_parent_plan`'s "it has its own brief.md" (split.py:805-806): written since the
+        # check at the top, by a writer the claim does not fence (drive_claim.py:42-46).
+        return True
+    children = _lineage_children(split.read_lineage(d) or {})
+    if not children:
+        print(f"flow: {d.name} — split parent with no brief.md, NOT driven: its "
+              f"{split.LINEAGE} is missing, unreadable or names no children, so the brief "
+              f"`split --accept` writes (which lists them) cannot be rebuilt. Write "
+              f"{d.name}/brief.md (slug, success criterion, repo + branch target), then "
+              f"`pdca flow {iid}`", file=sys.stderr)
+        return False
+    text = split._split_parent_brief(d, plan, [cfg.bundle(c).name for c in children])
+    tmp = d / ".brief.md.rebuild"
+    try:
+        # Whole or not at all: a half-written brief.md would read as the bundle's OWN brief
+        # on the next run, and is never rewritten again.
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(d / "brief.md")
+    except Exception as exc:  # noqa: BLE001 — a failed write skips this bundle, never the run
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        print(f"flow: {d.name} — split parent with no brief.md, NOT driven: rebuilding it "
+              f"from {plan[0]} failed ({exc}). Write {d.name}/brief.md, then "
+              f"`pdca flow {iid}`", file=sys.stderr)
+        return False
+    print(f"flow: {d.name} — split parent had no brief.md (its split was accepted before "
+          f"#481); rebuilt it from {plan[0]}, as `pdca split --accept` writes it",
+          file=sys.stderr)
+    return True
+
+
+def _admit(cfg: Config, d: Path, claims: drive_claim.Run | None) -> bool:
+    """:func:`_has_plan_artifact` for one intake path, letting go of the claim on a bundle
+    it keeps out — this run will not drive it, so the ``pdca flow <id>`` it was told to run
+    must not be refused by this very run (#565)."""
+    if _has_plan_artifact(cfg, d):
+        return True
+    if claims is not None:
+        claims.release(d)
+    return False
 
 
 def _adoptable(cfg: Config, parent: Path, *, known: set[str],
@@ -1383,6 +1652,8 @@ def _adopt_split_children(cfg: Config, candidates: list[Path], *, k: int,
             # Claimed only now, once `_adoptable` has vouched for each child (#565): a
             # child this run may not drive is named here and left out of `taken`.
             kids = [c for c in kids if not _refused_child(claims, parent, c)]
+        # Only now, with the claim held: a child adopted into the run has a brief (#597).
+        kids = [c for c in kids if _admit(cfg, c, claims)]
         to_examine += onward      # a generation that already closed is walked THROUGH
         if kids:
             taken |= {c.name for c in kids}
@@ -1683,6 +1954,59 @@ def _warn_stranded_split_children(cfg: Config, bundles: list[Path],
                   f"{' '.join(stranded)}`", file=sys.stderr)
 
 
+def _offered_by_seeds(cfg: Config, seeds: list[Path]) -> frozenset[str]:
+    """The bundle names the adoption seeds will OFFER this run (#590) — read silently.
+
+    The strict levelling of the named batch runs before the ``k=-1`` seed splice, so a
+    named id with ``Depends on`` a seed's child was refused as "neither in this batch nor
+    COMPLETE" one statement before that child would have been scheduled ahead of it. The
+    child IS part of the request — the operator named its parent as a recovery seed — so
+    :func:`waves.check_dep_graph` takes these names as resolvable.
+
+    "Offered" is: a lineage child, reached transitively through children that are
+    themselves terminal on a split (:func:`_is_split_parent`, the walk-through
+    :func:`_adoptable` hands back), whose bundle has a brief and is not terminal. A child
+    already COMPLETE resolves on its own; one DISCONTINUED / RESOLVED, or with no brief, is
+    not offered, so an edge to it still refuses up front. Same reader as adoption
+    (:func:`split.read_lineage` + :func:`_lineage_children`) and the same id / containment
+    guards, but NOTHING is printed or recorded: :func:`_adoptable` reports every skip, and
+    the adoption pass that follows still reports them, once. A child offered here that
+    adoption then does not take (another run holds it, …) is held at the re-level or
+    skipped by :func:`_runnable` at its dependent's wave — never a raise.
+
+    Never raises: a seed whose read fails contributes nothing, which leaves today's strict
+    answer for any edge into it.
+    """
+    offered: set[str] = set()
+    to_examine = list(seeds)
+    examined: set[str] = set()
+    while to_examine:
+        parent = to_examine.pop(0)
+        if parent.name in examined:
+            continue
+        examined.add(parent.name)
+        try:
+            if not _is_split_parent(parent):
+                continue
+            for cid in _lineage_children(split.read_lineage(parent) or {}):
+                if not _PLAIN_ID.fullmatch(cid):
+                    continue
+                d = cfg.bundle(cid)
+                if not _inside_bundle_root(cfg, d):
+                    continue
+                s = state.state(d)
+                if s in _TERMINAL:
+                    if _is_split_parent(d):
+                        to_examine.append(d)   # walked through, not offered (#473)
+                    continue
+                if s == state.UNPLANNED or not (d / "brief.md").exists():
+                    continue
+                offered.add(d.name)
+        except Exception:  # noqa: BLE001 — quiet by contract; the strict check stands
+            continue
+    return frozenset(offered)
+
+
 def _drive_and_act(
     cfg: Config,
     bundles: list[Path],
@@ -1694,6 +2018,7 @@ def _drive_and_act(
     max_passes: int | None = None,
     adopt_seeds: list[Path] | None = None,
     claims: drive_claim.Run | None = None,
+    batch: Collection[str] | None = None,
 ) -> dict[str, str]:
     """Drive a set of in-flight bundles through the full cycle to Act, in waves.
 
@@ -1732,6 +2057,16 @@ def _drive_and_act(
     drive (:func:`_adopt_split_children`). An adoption SEED is let go once the pre-pass over
     it has run: it is terminal, so this run never drives it — only its children, which the
     pre-pass has claimed in their own right. ``None`` — a library call — claims nothing.
+
+    ``batch`` (#591) is the bundles the run was ASKED to drive — ``flow_ids``' id list as
+    given (ids it skips as terminal or briefless included), ``flow_batch``'s sweep as taken
+    at run start. It scopes the run's integration branches (:func:`integrate.fold`), so a
+    concurrent run on the same base that drives a different batch never folds onto — and
+    never replaces — this run's line, while the same batch re-issued (its finished bundles
+    now skipped) lands on the same line. Before wave 0 such a re-issued run puts those
+    finished bundles on that line when a bundle it drives depends on one, or holds that
+    bundle, loudly (:func:`_carry_finished`, #646). ``None`` — a library call — scopes by
+    the drive set as passed.
     """
     bundles = list(bundles)          # the drive set — split adoption extends it (#469)
     allowance = cfg.max_passes if max_passes is None else max_passes
@@ -1742,11 +2077,22 @@ def _drive_and_act(
     # answered for even when held, from "a child this run adopted", which is dropped again
     # if a later reschedule holds it (:func:`_adopt_split_children`).
     named = frozenset(batch_names)
+    # What scopes this run's integration line (#591): the request, frozen before adoption
+    # grows the drive set, so every fold of the run lands on one batch-scoped branch.
+    run_batch = sorted(batch) if batch is not None else sorted(named)
     published: set[str] = set()
+    # Bundles whose publish pushed their branch THIS run (`_publish_bundle` True, #593). An
+    # iterate keeps an earlier attempt's publish.json, so a record on disk cannot tell.
+    pushed: set[str] = set()
+    # Accepted bundles the fold has no branch of to carry (#593): left out of every fold,
+    # their in-batch dependents held by `_runnable`, instead of stopping the run.
+    held_unpushed: set[str] = set()
     accepted: list[Path] = []        # cumulative COMPLETE bundles, wave then name order
     integ: dict[tuple[str, str], str] = {}  # per-target (repo, base) → integration branch (#187)
+    # Per-target (repo, base) → the tip this run's last fold pushed (None in a dry-run), so
+    # each later fold continues THIS run's line, append-only (`integrate.fold`, #593).
+    folded_tips: dict[tuple[str, str], str | None] = {}
     preflighted = False              # per-lane preflight runs at most once, before the first pool
-    stopped_early = False            # a wave boundary STOPped the batch — suppresses Act (#462)
     # The batch the caller NAMED is levelled first and strictly, exactly as before —
     # `compute_waves` raises on a cycle or an unresolvable dependency. That contract belongs
     # to the request (`waves.partition_schedulable`'s own docstring, waves.py:243-246, calls
@@ -1762,13 +2108,13 @@ def _drive_and_act(
     # `test_a_named_id_in_the_re_scheduled_tail_is_held_not_lost`. An ADOPTED child held by
     # that same re-levelling goes the other way — out of the drive set again, so it is not
     # reported as this run's work (`_adopt_split_children`, `named` above).
-    # INSTANCE DELTA (eduralph/pdca-harness#590): a named id may depend on a seed's child —
-    # `flow 809 810` with 810 `Depends on: 842`, a child of 809's split. That child is part
-    # of this request (its parent was named as a recovery seed), so the strict check accepts
-    # the edge; the `k=-1` splice below schedules the child and re-levels the named ids
-    # behind it. A child adoption then refuses is held by that re-level, never a raise.
-    wave_list = waves.compute_waves(  # validates (raises) + levels the batch
-        cfg, bundles, pending=_seed_offer(cfg, adopt_seeds or []))
+    #
+    # The request is the named ids AND what their recovery seeds offer (#590): an edge to a
+    # seed's in-flight child is resolvable here, adds no edge, and is ordered by the `k=-1`
+    # splice below, which re-levels with the child in place. Anything else still refuses.
+    offered = _offered_by_seeds(cfg, list(adopt_seeds)) if adopt_seeds else frozenset()
+    # validates (raises) + levels the batch
+    wave_list = waves.compute_waves(cfg, bundles, offered=offered)
     # Recovery (#473): a seed is an id the operator named whose bundle was ALREADY terminal
     # on a split, so an earlier run's children may still be sitting where it left them.
     # `k=-1` makes `wave_list[k+1:]` the WHOLE schedule — the children are levelled in front
@@ -1793,13 +2139,30 @@ def _drive_and_act(
             # finished bundle has always been. The seeds' own dispositions are `flow_ids`'
             # `skipped` map, which is what the caller reports.
             return {}
+    # A re-issued run's finished named ids (#646): carried onto the line before wave 0 when
+    # clean, else named in `held_finished`, which holds only their plain `Depends on`
+    # dependents. Only where a fold would run: stack mode, publishing on.
+    held_finished: set[str] = set()
+    if do_publish and cfg.wave_mode != "merge":
+        _carry_finished(cfg, bundles, _finished_named(cfg, batch, batch_names),
+                        batch=run_batch, integ=integ, folded_tips=folded_tips,
+                        held=held_finished)
     # `wave_list` is iterated by a LIST iterator on purpose (#469): adoption splices the
     # recomputed remainder into `wave_list[k+1:]` after wave k drives, and the iterator —
     # which simply indexes forward — picks the new tail up. So "how many waves are left" is
     # read live below (never cached in a `last`), and an adopted child's wave is driven,
     # published and folded by exactly the code every other wave goes through.
+    # A plain `Depends on` prerequisite the run was not asked for is on no line of this run,
+    # so its dependent waits for its merge into the dependent's base (#647). Only where a
+    # fold would run (stack mode, publishing on), and not in a dry-run, which asks no host
+    # and holds nothing. The ids asked for are normalised as `_finished_named` does.
+    hold_unmerged = (do_publish and cfg.wave_mode != "merge"
+                     and cfg.publisher.mode != "stub")
+    requested = set(named) | {cfg.bundle(str(i).removeprefix("issue_")).name
+                              for i in (batch or ())}
     for k, wave in enumerate(wave_list):
-        runnable = _runnable(cfg, wave, batch_names)
+        runnable = _runnable(cfg, wave, batch_names, held=held_unpushed | held_finished,
+                             requested=requested, hold_unmerged=hold_unmerged)
         if not runnable:
             continue
         # The pool, read off the schedule as it stands NOW — so a splice below has already
@@ -1839,10 +2202,11 @@ def _drive_and_act(
                     f"lane preflight failed for a lanes={cfg.lanes} batch — not fanning out "
                     "(fix the per-lane resources above, then re-run)")
         # Reconcile each runnable bundle's stack base with this run's integration state:
-        # point it at its OWN (repo, base) target's branch, or clear a stale marker a
-        # prior/resumed run left so it builds off its own base (#187). Unconditional — the
-        # stale-clear must run even before any wave has folded (integ still empty).
-        _point_at_integration(integ, runnable)
+        # point it at its OWN (repo, base) target's branch, and the line commit it builds on
+        # (#593), or clear a stale marker a prior/resumed run left so it builds off its own
+        # base (#187). Unconditional — the stale-clear must run even before any wave has
+        # folded (integ still empty).
+        _point_at_integration(integ, runnable, folded_tips)
         # This wave's allowance is its own cap AND what is left of the run's pool, whichever
         # is smaller — the second term is the admission rule again, applied to the wave that
         # was let in (#469); with the pool covering the live schedule (#473) it can only bite
@@ -1890,7 +2254,8 @@ def _drive_and_act(
                     # Mechanics-only: the pre-pass drafted AND T4-gated the texts — a
                     # second T4 run here could transiently fail AFTER siblings pushed,
                     # recreating the half-published wave (#295 review).
-                    _publish_bundle(cfg, d, by=by, today=today, texts_prevalidated=True)
+                    if _publish_bundle(cfg, d, by=by, today=today, texts_prevalidated=True):
+                        pushed.add(d.name)   # its branch is this run's to fold (#593)
                 else:
                     print(f"flow: {d.name} — publish texts not ready (draft/T4 failed); "
                           f"NOT published this run; fix and run `pdca publish "
@@ -1905,93 +2270,52 @@ def _drive_and_act(
         if k < len(wave_list) - 1 and do_publish:
             dry = cfg.publisher.mode == "stub"
             if cfg.wave_mode == "merge":
-                # [driver].auto_merge = false — merge mode WITHOUT the driver merging
-                # (pdca-harness#462). The wave's PRs stay exactly as publish opened them:
-                # drafts, based on the real target base, readied by nobody. Stopping here is
-                # not a fallback but the only correct move: `compute_waves` levels by longest
-                # path (waves.py:179), so every wave k+1 bundle has a prerequisite in wave k
-                # — running on would build it against a base that prerequisite never reached.
-                # The human merges, then re-runs; `merged.is_merged` makes that idempotent.
-                #
-                # Only stop for a wave that actually has something to merge (#462 review).
-                # A close/no-fix bundle carries no patch and publish opens no PR for it, and
-                # `_merge_one` skips exactly those — so a wave that is entirely closes leaves
-                # every base already where the next wave needs it. Stopping there would tell
-                # the operator to go merge PRs that do not exist and cost a second
-                # invocation for nothing. Same test as `_merge_one`: COMPLETE with a
-                # non-empty patch.diff.
-                if not cfg.auto_merge:
-                    to_merge = [d for d in complete if merge.has_contribution(d)]
-                    if to_merge:
-                        print(f"flow: wave {k} is accepted and published as draft PR(s); "
-                              f"[driver].auto_merge is off, so the driver is NOT readying or "
-                              f"merging them. STOPPING — wave {k + 1} would build on a base "
-                              f"its prerequisite has not reached. Merge these yourself, then "
-                              f"re-run to continue: "
-                              f"{', '.join(d.name for d in to_merge)}.", file=sys.stderr)
-                        stopped_early = True
-                        break
-                    print(f"flow: wave {k} has nothing to merge (no accepted bundle carries "
-                          f"a patch), so no base needs to move — continuing to wave {k + 1} "
-                          f"despite [driver].auto_merge being off.", file=sys.stderr)
                 if merge.merge_wave(cfg, complete, dry_run=dry, method=cfg.merge_method):
                     print(f"flow: wave {k} did not merge; STOPPING — later waves not run.",
                           file=sys.stderr)
-                    stopped_early = True
                     break
             else:  # default: stack — fold onto a per-target integration branch
-                # ONE lock scope covers fold AND re-gate (#297 review round 10): the
-                # locks stack keeps every target's integ lock held between the two,
-                # so no gap exists in which another flow's publish-boundary sweep
-                # could remove the tree — or another fold rewrite it — before the
-                # re-gate attests it.
-                stop_wave = False
-                with contextlib.ExitStack() as locks:
-                    try:
-                        # INSTANCE DELTA (eduralph/pdca-harness#591): this batch's own
-                        # integration branch, so a concurrent run on the same base (another
-                        # track) cannot overwrite it. Keyed on the ids the run SET OUT to
-                        # drive, so a re-run of the same batch rebuilds the same branch.
-                        folded = integrate.fold(cfg, accepted, dry_run=dry, locks=locks,
-                                                run_key=integrate.run_key_for(named))
-                    except integrate.IntegrationError as exc:
-                        print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
-                              f"later waves not run.", file=sys.stderr)
-                        stopped_early = True
-                        break
-                    if folded and not dry:
-                        integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
-                        # Optional re-gate (#wave-model): validate EACH folded
-                        # combination over its integration tip before the next wave
-                        # builds on it; any red ⇒ STOP. hold_lock=False: the locks
-                        # stack already holds this tree's lock (re-acquiring would
-                        # deadlock on our own flock).
-                        if cfg.regate_between_waves and any(
-                                wt is not None
-                                and gates.run_integration(cfg, wt, hold_lock=False)
-                                        .get("overall") == "fail"
-                                for _tgt, (_branch, wt) in folded.items()):
-                            print(f"flow: wave {k} integration re-gate FAILED — a "
-                                  f"combination is red though each fix was green alone; "
-                                  f"STOPPING (later waves not run).", file=sys.stderr)
-                            stop_wave = True
-                if stop_wave:
-                    stopped_early = True
+                # An accepted, patched, targeted bundle whose branch was not pushed this run
+                # (texts failed draft/T4, or publish failed before or at its push — an
+                # earlier attempt's publish.json may still name the old, rejected branch)
+                # leaves the fold nothing to carry (#593). Hold it, and via `_runnable` its
+                # dependents, rather than stop the run. A branch pushed this run is folded
+                # even if `gh pr create` failed after it. Not in a dry-run: the stub pushes
+                # nothing and records no branch.
+                if not dry:
+                    for d in integrate.unpublished(accepted, pushed=pushed):
+                        if d.name not in held_unpushed:
+                            held_unpushed.add(d.name)
+                            print(f"flow: {d.name} pushed no branch this run — left out "
+                                  f"of the integration fold; bundles that depend on it are "
+                                  f"held this run.", file=sys.stderr)
+                # ONE lock scope covers fold, tip read AND re-gate (#297 review round 10),
+                # shared with the pre-wave carry (`_fold_lines`, #646).
+                try:
+                    folded, tips, red = _fold_lines(
+                        cfg, [d for d in accepted if d.name not in held_unpushed], dry=dry,
+                        folded_this_run=dict(folded_tips), batch=run_batch)
+                except integrate.IntegrationError as exc:
+                    print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
+                          f"later waves not run.", file=sys.stderr)
+                    break
+                # The next fold continues from exactly each pushed tip and refuses a line
+                # another run moved (#593). A dry-run pushes nothing (None).
+                folded_tips.update(tips)
+                if folded and not dry:
+                    # Update, not replace: a target only the carry folded keeps its line.
+                    integ.update({tgt: branch for tgt, (branch, _wt) in folded.items()})
+                # Optional re-gate (#wave-model): EACH folded combination is validated over
+                # its integration tip before the next wave builds on it; any red ⇒ STOP.
+                if red:
+                    print(f"flow: wave {k} integration re-gate FAILED — a "
+                          f"combination is red though each fix was green alone; "
+                          f"STOPPING (later waves not run).", file=sys.stderr)
                     break
 
     _sweep_quietly(cfg, bundles)  # publish/freeze boundary — reclaim footprint (#297)
     results = {d.name.replace("issue_", ""): state.state(d) for d in bundles}
-    # Act runs ONCE across a FINISHED batch (this function's contract, above). Every `break`
-    # above leaves later waves unrun, so the batch is partial and Act would be reviewing a
-    # slice of it (#462 review). That was survivable while each break was an error path taken
-    # once; `auto_merge = false` makes the boundary stop the ROUTINE outcome of any
-    # multi-wave run, so Act would fire after every wave — once per resume — instead of once
-    # per batch. Defer it to the invocation that actually reaches the final wave.
-    if do_act and stopped_early:
-        print("flow: batch STOPped before its final wave — deferring Act to the run that "
-              "finishes it (Act reviews a completed batch, not a slice of one).",
-              file=sys.stderr)
-    if do_act and not stopped_early:
+    if do_act:
         _maybe_run_act(cfg, today,
                        any_complete=any(s == state.COMPLETE for s in results.values()))
     # Never silent about a split children this run never reached (#566) — the end-of-run
@@ -2056,9 +2380,11 @@ def flow_batch(
              not in (state.COMPLETE, state.UNPLANNED, state.DISCONTINUED, state.RESOLVED)),
             key=lambda p: p.name,
         )
-        # INSTANCE DELTA (eduralph/pdca-harness#597): the sweep reaches briefless split
-        # parents too; restore each one's brief or leave it out (_briefed_or_restored).
-        bundles = [d for d in bundles if _briefed_or_restored(cfg, d, state.state(d))]
+        # The batch identity (#591): the sweep as taken at run start, before the claim /
+        # `_admit` / scheduling trims below — it scopes this run's integration line. No
+        # resume stability: finished bundles leave the sweep, so a re-run gets a fresh line
+        # of its own — never another run's.
+        swept = [d.name for d in bundles]
         if not bundles:
             print("flow: nothing to do — no in-flight briefs (all COMPLETE or none authored; "
                   "brief new issues to add work).", file=sys.stderr)
@@ -2069,6 +2395,14 @@ def flow_batch(
                 print("flow: nothing to drive — this run could not claim any in-flight "
                       "bundle (each is named above).", file=sys.stderr)
                 return {}
+        # After the claim, never in the state filter above (#565): a briefless bundle past Do
+        # is given its brief or named and left out — never written while another run holds
+        # it, and never driven without one (#597).
+        bundles = [d for d in bundles if _admit(cfg, d, claims)]
+        if not bundles:
+            print("flow: nothing to drive — no in-flight bundle has a brief.md (each is "
+                  "named above).", file=sys.stderr)
+            return {}
         # Resume tolerance (#191): the sweep pulls in EVERY in-flight bundle, so a stale /
         # misconfigured `Depends on` in an unrelated leftover must not abort the whole run.
         # Hold (skip this run, leave in-flight) any bundle with an unresolvable dependency or
@@ -2088,35 +2422,14 @@ def flow_batch(
                   "unresolved dependency or a cycle.", file=sys.stderr)
             return {}
         return _drive_and_act(cfg, bundles, do_publish=do_publish, do_act=do_act, by=by,
-                              today=today, max_passes=max_passes, claims=claims)
+                              today=today, max_passes=max_passes, claims=claims,
+                              batch=swept)
     finally:
         # The sweep is fully decided by every return above (and by a raise, which leaves
         # nothing further for `cli._split` to promise about either) — released here so the
         # marker's life is exactly "this batch has not yet finished deciding what it drives".
         if claims is not None:
             claims.release(marker)
-
-
-def _briefed_or_restored(cfg: Config, d: Path, s: str) -> bool:
-    """Whether in-flight bundle ``d`` has a brief.md to drive, restoring a missing one first.
-
-    INSTANCE DELTA (eduralph/pdca-harness#597). A split accepted before #481 left its parent
-    past Do on a close marker yet with no brief, and every step from Check on reads
-    brief.md. The brief is restored the way `split --accept` now writes it; a bundle it
-    cannot be restored for is named and NOT driven (False), never driven into a crash. Both
-    intake paths call this: :func:`flow_ids` (named ids) and :func:`flow_batch` (the
-    `--from-csv` sweep of every in-flight bundle).
-    """
-    if (d / "brief.md").exists():
-        return True
-    try:
-        restored = split.restore_parent_brief(d, cfg)
-    except split.SplitError as exc:
-        print(f"flow: {d.name} — {s} but no brief.md, skipped: {exc}", file=sys.stderr)
-        return False
-    print(f"flow: {d.name} — restored its missing split-parent brief "
-          f"({restored.relative_to(d)}) from its iterate-to-Plan archive", file=sys.stderr)
-    return True
 
 
 def _claim_swept(claims: drive_claim.Run, bundles: list[Path]) -> list[Path]:
@@ -2249,18 +2562,22 @@ def flow_ids(
                       "named below.", file=sys.stderr)
                 seeds.append(d)
             continue
-        if not _briefed_or_restored(cfg, d, s):
+        if not _admit(cfg, d, claims):
+            # Past Do with no brief.md and none to rebuild (#597): named by `_admit`, and
+            # still answered for in the map (#468), so the run cannot exit 0 over it.
             skipped[iid] = s
-            if claims is not None:
-                claims.release(d)
             continue
         bundles.append(d)
     if not bundles and not seeds:
         return skipped
     bundles.sort(key=lambda p: p.name)
+    # The batch is the ids AS ASKED FOR (#591), skipped ones included, so a re-issued run
+    # whose finished bundles are now skipped still folds onto the same integration line
+    # (`integrate.batch_key` normalises `500` / `issue_500`, order and repeats).
     return skipped | _drive_and_act(cfg, bundles, adopt_seeds=seeds, do_publish=do_publish,
                                     do_act=do_act, by=by, today=today,
-                                    max_passes=max_passes, claims=claims)
+                                    max_passes=max_passes, claims=claims,
+                                    batch=list(ids))
 
 
 def _bundle_dirs(cfg: Config) -> set[str]:
