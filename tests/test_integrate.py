@@ -1,6 +1,6 @@
 """Slice for integration-branch stacking (`integrate.fold`) — the default wave
-sequencing that folds each wave's accepted patches onto a run-scoped branch the next
-wave builds on, without merging (#wave-model).
+sequencing that folds each wave's accepted, published branches onto a run-scoped branch
+the next wave builds on, without merging anything into the target (#wave-model, #593).
 
 Two halves: pure/dry-run cases (no git — naming, nothing-to-fold, dry-run shells
 nothing, different-target exclusion) and real-git folds against a bare ``origin`` +
@@ -16,7 +16,6 @@ import json
 import shutil
 import subprocess
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -74,29 +73,26 @@ class FoldDryAndUnit(unittest.TestCase):
         self.assertNotEqual(integrate.integration_branch(self.cfg, "a-/b"),
                             integrate.integration_branch(self.cfg, "a/-b"))
 
-    def test_run_key_is_stable_order_free_and_injective_with_the_base(self) -> None:
-        # #591: a re-run of the same batch rebuilds the SAME branch.
-        self.assertEqual(integrate.run_key_for(["issue_2", "issue_1"]),
-                         integrate.run_key_for(["issue_1", "issue_2", "issue_1"]))
-        self.assertEqual(integrate.run_key_for([]), "")
-        self.assertEqual(integrate.integration_branch(self.cfg, "main", ""),
-                         "pdca-integration/main")          # empty key = upstream name
-        # The key is its own ref component, so the base component keeps its length, and
-        # `r-<key>` can never equal a flattened base (its `-` would be escaped).
-        keyed = integrate.integration_branch(self.cfg, "main", "abc")
-        self.assertEqual(keyed, "pdca-integration/r-abc/main")
-        self.assertNotEqual(integrate.integration_branch(self.cfg, "r-abc"),
-                            "pdca-integration/r-abc")
-        long_base = "b" * 245   # valid under the upstream name; must stay valid keyed
-        self.assertEqual(integrate.integration_branch(self.cfg, long_base, "abc").split("/")[-1],
-                         long_base)
+    def test_integration_branch_name_is_scoped_to_the_batch(self) -> None:
+        # #591: two batches on one base get two lines; the same batch — in any order, any
+        # repeat, `500` or `issue_500` — gets the same line back.
+        def name(base: str, *batch: str) -> str:
+            return integrate.integration_branch(self.cfg, base, list(batch))
 
-    def test_run_key_does_not_collide_on_the_reviewed_pair(self) -> None:
-        # PR #265 review: 32-bit keys collided on these two ordinary id sets.
-        a = integrate.run_key_for(["issue_1000181", "issue_181"])
-        b = integrate.run_key_for(["issue_1025538", "issue_25538"])
-        self.assertNotEqual(a, b)
-        self.assertEqual(len(a), 32)
+        a = name("main", "500", "501")
+        self.assertRegex(a, r"^pdca-integration/main-r[0-9a-f]+$")
+        self.assertEqual(name("main", "501", "issue_500", "500"), a)
+        self.assertNotEqual(name("main", "500"), a)
+        self.assertNotEqual(name("main", "500", "502"), a)
+        self.assertNotEqual(a, integrate.integration_branch(self.cfg, "main"))  # unscoped
+        # Still injective in the base, scoped or not: `-r` never comes out of the base
+        # flattening (its `-`s are `-h` / `-s`), so a base can never pose as base + batch.
+        self.assertNotEqual(name("release/2.0", "500"), name("release-2.0", "500"))
+        key = a.removeprefix("pdca-integration/main-r")
+        self.assertNotEqual(integrate.integration_branch(self.cfg, "main-r" + key), a)
+        self.assertNotEqual(name("main-r" + key, "500", "501"), a)
+        self.assertEqual(subprocess.run(["git", "check-ref-format", "refs/heads/" + a]
+                                        ).returncode, 0)
 
     def test_nothing_to_fold(self) -> None:
         self.assertEqual(integrate.fold(self.cfg, []), {})
@@ -175,47 +171,31 @@ class FoldGit(unittest.TestCase):
         (self.primary / name).unlink()
         return diff
 
-    def _bundle(self, iid: str, patch: str, *, publish: bool = True,
-                remote: str = "origin", pr_url: str | None = None,
-                pin: bool = True) -> Path:
-        """A bundle as `publish` leaves it: its patch, and — the fold merges REAL PR
-        branches since #593 — a signed commit on `fix/<iid>` pushed to ``remote``, recorded
-        in publish.json with the exact commit pushed (``head_sha``; ``pin=False`` writes a
-        record from before that field existed)."""
+    def _bundle(self, iid: str, patch: str) -> Path:
         d = self.cfg.bundle(iid)
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True)
         (d / "brief.md").write_text(
             f"- **Slug:** {iid.lower()}\n- **Repo + branch target:** org/repo @ main\n",
             encoding="utf-8")
         (d / "patch.diff").write_text(patch, encoding="utf-8")
-        if publish:
-            branch = f"fix/{iid.lower()}"
-            p = self.primary
-            self._git(p, "fetch", "-q", "origin")
-            self._git(p, "checkout", "-q", "-B", branch, "origin/main")
-            self._git(p, "apply", str((d / "patch.diff").resolve()))
-            self._git(p, "add", "-A")
-            self._git(p, "commit", "-q", "-s", "-m", f"fix {iid}")
-            self._git(p, "push", "-q", "-f", remote, branch)
-            sha = subprocess.run(["git", "-C", str(p), "rev-parse", "HEAD"],
-                                 capture_output=True, text=True).stdout.strip()
-            self._git(p, "checkout", "-q", "main")
-            rec = {"branch": branch, "remote": remote, "repo": "org/repo", "base": "main",
-                   "pr_url": f"https://example/pr/{iid}" if pr_url is None else pr_url}
-            if pin:
-                rec["head_sha"] = sha
-            (d / "publish.json").write_text(json.dumps(rec), encoding="utf-8")
+        self._publish(d)
         return d
 
-    def _show(self, ref: str, path: str) -> subprocess.CompletedProcess:
+    def _publish(self, d: Path, base: str = "main") -> None:
+        """What publish does for the bundle (#593: the fold merges the PUBLISHED branch):
+        cut its branch off origin/<base>, commit its patch.diff signed off, push it to
+        origin, and record it in publish.json."""
+        branch = f"fix/{d.name.removeprefix('issue_')}"
         self._git(self.primary, "fetch", "-q", "origin")
-        return subprocess.run(["git", "-C", str(self.primary), "show", f"origin/{ref}:{path}"],
-                              capture_output=True, text=True)
-
-    def _tip(self, branch: str) -> str:
-        return subprocess.run(["git", "-C", str(self.primary), "ls-remote", "origin",
-                               f"refs/heads/{branch}"], capture_output=True,
-                              text=True).stdout.split()[0]
+        self._git(self.primary, "checkout", "-q", "-B", branch, f"origin/{base}")
+        self._git(self.primary, "apply", str(d / "patch.diff"))
+        self._git(self.primary, "add", "--all")
+        self._git(self.primary, "commit", "-q", "-s", "-m", f"fix {d.name}")
+        self._git(self.primary, "push", "-q", "origin", branch)
+        self._git(self.primary, "checkout", "-q", "main")
+        (d / "publish.json").write_text(json.dumps(
+            {"mode": "new-pr", "branch": branch, "base": base, "repo": "org/repo"}),
+            encoding="utf-8")
 
     def _pushed(self, branch: str) -> bool:
         out = subprocess.run(
@@ -233,164 +213,14 @@ class FoldGit(unittest.TestCase):
         self.assertTrue(self._pushed("pdca-integration/main"))
 
     def test_fold_commits_carry_a_dco_signoff(self) -> None:
-        # #405: the integration branch is rebuilt each fold, so a stacked PR cut from an
-        # earlier fold carries these commits outside the base's ancestry — where a
-        # DCO-gated host inspects them. Sign them like publish does (#81).
+        # #405: every later wave's PR carries the fold's merge commits outside the base's
+        # ancestry — where a DCO-gated host inspects them. Sign them like publish does (#81).
         b = self._bundle("S1", self._modify_patch("one\n"))
         _, wt = integrate.fold(self.cfg, [b])[("org/repo", "main")]
         trailer = subprocess.run(
             ["git", "-C", str(wt), "log", "-1", "--format=%(trailers:key=Signed-off-by,valueonly)"],
             capture_output=True, text=True).stdout.strip()
         self.assertEqual(trailer, "Tester <t@example.com>")
-
-    def test_two_batches_fold_onto_their_own_branches(self) -> None:
-        """#591: two concurrent stack-mode runs on one base (two parallel tracks) must not
-        share an integration branch — each fold rebuilds its branch with only ITS batch's
-        patches and force-pushes it, so a shared branch hands one run the other's work."""
-        a = self._bundle("A1", self._modify_patch("track a\n"))
-        b = self._bundle("B1", self._add_patch("b.txt", "track b\n"))
-        key_a, key_b = integrate.run_key_for(["issue_A1"]), integrate.run_key_for(["issue_B1"])
-        self.assertNotEqual(key_a, key_b)
-        branch_a, _ = integrate.fold(self.cfg, [a], run_key=key_a)[("org/repo", "main")]
-        branch_b, wt = integrate.fold(self.cfg, [b], run_key=key_b)[("org/repo", "main")]
-        self.assertEqual(branch_a, f"pdca-integration/r-{key_a}/main")
-        self.assertNotEqual(branch_a, branch_b)
-        self.assertTrue(self._pushed(branch_a) and self._pushed(branch_b))
-        # B's fold left A's branch as A built it: A's change, not B's file.
-        show = lambda ref, path: subprocess.run(
-            ["git", "-C", str(self.primary), "show", f"origin/{ref}:{path}"],
-            capture_output=True, text=True)
-        self._git(self.primary, "fetch", "-q", "origin")
-        self.assertEqual(show(branch_a, "base.txt").stdout, "track a\n")
-        self.assertNotEqual(show(branch_a, "b.txt").returncode, 0)
-        self.assertEqual(show(branch_b, "b.txt").stdout, "track b\n")
-        self.assertEqual(show(branch_b, "base.txt").stdout, "base\n")
-
-    def test_a_later_fold_appends_and_never_rewrites_an_earlier_one(self) -> None:
-        """#593: the wave-1 fold must continue the wave-0 fold, not rebuild it — a PR
-        stacked on the wave-0 fold's commits must still find them as ancestors."""
-        b0 = self._bundle("W0", self._modify_patch("wave0\n"))
-        branch, _ = integrate.fold(self.cfg, [b0], run_key="k")[("org/repo", "main")]
-        tip0 = self._tip(branch)
-        # A second apart, so a REBUILD (the pre-#593 fold) would mint a new commit even
-        # for identical content — same-second rebuilds reproduce the same SHA and hide it.
-        time.sleep(1.1)
-        b1 = self._bundle("W1", self._add_patch("w1.txt", "wave1\n"))
-        integrate.fold(self.cfg, [b0, b1], run_key="k")          # cumulative, as the flow passes
-        tip1 = self._tip(branch)
-        self.assertNotEqual(tip0, tip1)
-        self._git(self.primary, "fetch", "-q", "origin")
-        ancestry = subprocess.run(["git", "-C", str(self.primary), "merge-base", "--is-ancestor",
-                              tip0, tip1])
-        self.assertEqual(ancestry.returncode, 0, "the wave-0 fold was rewritten")
-
-    def test_a_refold_of_the_same_batch_adds_nothing(self) -> None:
-        b = self._bundle("R1", self._modify_patch("one\n"))
-        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
-        tip = self._tip(branch)
-        time.sleep(1.1)   # a rebuild would now mint a new SHA (see the append test above)
-        integrate.fold(self.cfg, [b], run_key="k")
-        self.assertEqual(self._tip(branch), tip)
-
-    def test_the_fold_carries_the_published_commits_themselves(self) -> None:
-        """#593: the stacked branch inherits the predecessor's OWN commit (same SHA), so
-        a dependent PR's diff shrinks to its own change once the predecessor merges."""
-        b = self._bundle("S2", self._modify_patch("one\n"))
-        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
-        self._git(self.primary, "fetch", "-q", "origin")
-        ancestry = subprocess.run(["git", "-C", str(self.primary), "merge-base", "--is-ancestor",
-                              "origin/fix/s2", f"origin/{branch}"])
-        self.assertEqual(ancestry.returncode, 0)
-
-    def test_an_unpublished_bundle_cannot_be_stacked_on(self) -> None:
-        b = self._bundle("U1", self._modify_patch("one\n"), publish=False)
-        with self.assertRaises(integrate.IntegrationError) as caught:
-            integrate.fold(self.cfg, [b])
-        self.assertIn("no published branch", str(caught.exception))
-
-    def test_a_pushed_branch_without_a_pr_cannot_be_stacked_on(self) -> None:
-        # #266 review: publish writes publish.json with an empty pr_url when the push
-        # worked but `gh pr create` failed; a predecessor with no PR can't merge bottom-up.
-        b = self._bundle("N1", self._modify_patch("one\n"), pr_url="")
-        with self.assertRaises(integrate.IntegrationError) as caught:
-            integrate.fold(self.cfg, [b])
-        self.assertIn("no PR", str(caught.exception))
-
-    def test_the_fold_merges_the_pushed_commit_not_a_later_tip(self) -> None:
-        # #266 review: a commit added to the PR branch after publish (a bot, another
-        # actor) was never checked, so it must not ride into the next wave's base.
-        b = self._bundle("P1", self._modify_patch("one\n"))
-        p = self.primary
-        self._git(p, "checkout", "-q", "fix/p1")
-        (p / "extra.txt").write_text("unreviewed\n", encoding="utf-8")
-        self._git(p, "add", "-A")
-        self._git(p, "commit", "-q", "-s", "-m", "later")
-        self._git(p, "push", "-q", "origin", "fix/p1")
-        self._git(p, "checkout", "-q", "main")
-        with self.assertRaises(integrate.IntegrationError) as caught:
-            integrate.fold(self.cfg, [b], run_key="k")
-        self.assertIn("moved since Check", str(caught.exception))
-        self.assertFalse(self._pushed("pdca-integration/r-k/main"))
-
-    def test_a_failed_fetch_stops_instead_of_folding_a_cached_copy(self) -> None:
-        # #266 review: a cached remote-tracking ref must not stand in for a fetch that
-        # failed.
-        b = self._bundle("G1", self._modify_patch("one\n"))
-        self._git(self.primary, "fetch", "-q", "origin")   # origin/fix/g1 is now cached
-        self._git(self.primary, "config", "remote.origin.fetch",
-                  "+refs/heads/does-not-exist:refs/remotes/origin/nothing")
-        from unittest import mock
-        real = integrate._git
-        fail_fetch = lambda repo, *a: 1 if a[:1] == ("fetch",) and "fix/g1" in a else real(repo, *a)
-        with mock.patch.object(integrate, "_git", fail_fetch):
-            with self.assertRaises(integrate.IntegrationError) as caught:
-                integrate.fold(self.cfg, [b], run_key="k")
-        self.assertIn("could not fetch", str(caught.exception))
-
-    def test_a_republished_bundle_replaces_its_earlier_fold_append_only(self) -> None:
-        # #266 review: `signoff --iterate-do` rebuilds a bundle off the base and publish
-        # force-updates its PR branch, so the new commit is not a descendant of the one
-        # already folded. The fold reverts the earlier fold and merges the new commit —
-        # the branch still only grows.
-        b = self._bundle("I1", self._modify_patch("old\n"))
-        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
-        tip0 = self._tip(branch)
-        b = self._bundle("I1", self._modify_patch("revised\n"))
-        integrate.fold(self.cfg, [b], run_key="k")
-        self.assertEqual(self._show(branch, "base.txt").stdout, "revised\n")
-        ancestry = subprocess.run(["git", "-C", str(self.primary), "merge-base",
-                                   "--is-ancestor", tip0, f"origin/{branch}"])
-        self.assertEqual(ancestry.returncode, 0, "the earlier fold was rewritten")
-        # Every commit the fold added carries a DCO sign-off, the revert included.
-        log = subprocess.run(["git", "-C", str(self.primary), "log", "--first-parent",
-                              "--format=%s|%(trailers:key=Signed-off-by,valueonly)",
-                              f"{tip0}..origin/{branch}"],
-                             capture_output=True, text=True).stdout.splitlines()
-        log = [line for line in log if line]
-        self.assertEqual(len(log), 2, log)
-        self.assertTrue(log[1].startswith('Revert "pdca-integrate: issue_I1'), log)
-        self.assertTrue(all(line.split("|")[1] for line in log), log)
-
-    def test_a_branch_pushed_to_another_remote_is_fetched_from_it(self) -> None:
-        # #266 review: an `Onto branch: <remote>/<branch>` publishes to that remote; the
-        # fold must fetch it there, not a same-named branch on origin.
-        fork = self.tmp / "fork.git"
-        subprocess.run(["git", "init", "--bare", "-q", str(fork)], check=True)
-        self._git(self.primary, "remote", "add", "fork", str(fork))
-        decoy = self._bundle("R9", self._add_patch("decoy.txt", "origin\n"))  # fix/r9 on origin
-        decoy.joinpath("publish.json").unlink()
-        b = self._bundle("R9", self._add_patch("real.txt", "fork\n"), remote="fork")
-        branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
-        self.assertEqual(self._show(branch, "real.txt").stdout, "fork\n")
-        self.assertNotEqual(self._show(branch, "decoy.txt").returncode, 0)
-
-    def test_a_record_without_head_sha_folds_the_current_tip(self) -> None:
-        # Records written before head_sha existed still fold (the tip, with a warning).
-        b = self._bundle("L1", self._modify_patch("one\n"), pin=False)
-        with redirect_stderr(io.StringIO()) as err:
-            branch, _ = integrate.fold(self.cfg, [b], run_key="k")[("org/repo", "main")]
-        self.assertIn("predates head_sha", err.getvalue())
-        self.assertEqual(self._show(branch, "base.txt").stdout, "one\n")
 
     def test_multi_disjoint_fold_carries_all(self) -> None:
         # A modify + an add (disjoint) both land on the branch — the multi-parent fold
@@ -415,7 +245,7 @@ class FoldGit(unittest.TestCase):
             yield False
 
         with mock.patch.object(integrate, "integ_lock", unheld):
-            with self.assertRaises(integrate.IntegrationError):
+            with self.assertRaisesRegex(integrate.IntegrationError, "integration lock"):
                 integrate.fold(self.cfg, [b])
         self.assertFalse(self._pushed("pdca-integration/main"))  # nothing left origin
 
@@ -436,17 +266,7 @@ class FoldGit(unittest.TestCase):
             encoding="utf-8")
         (b_aa / "patch.diff").write_text(self._add_patch("f2.txt", "hi\n"),
                                          encoding="utf-8")
-        # Published off `aa`, as publish would (the fold merges real branches, #593).
-        self._git(self.primary, "fetch", "-q", "origin")
-        self._git(self.primary, "checkout", "-q", "-B", "fix/o2", "origin/aa")
-        self._git(self.primary, "apply", str((b_aa / "patch.diff").resolve()))
-        self._git(self.primary, "add", "-A")
-        self._git(self.primary, "commit", "-q", "-s", "-m", "fix O2")
-        self._git(self.primary, "push", "-q", "-f", "origin", "fix/o2")
-        self._git(self.primary, "checkout", "-q", "main")
-        (b_aa / "publish.json").write_text(json.dumps(
-            {"branch": "fix/o2", "repo": "org/repo", "base": "aa",
-             "pr_url": "https://example/pr/O2"}), encoding="utf-8")
+        self._publish(b_aa, base="aa")
         order: list[str] = []
         real_lock = integrate.integ_lock
 
@@ -491,13 +311,14 @@ class FoldGit(unittest.TestCase):
                 gates.run_integration(self.cfg, self.primary)
 
     def test_overlap_raises_integration_error(self) -> None:
-        # Two patches that each rewrite base.txt's only line — the second can't apply onto
-        # the first, an undeclared cross-wave overlap → a loud STOP.
+        # Two branches that each rewrite base.txt's only line — the second can't merge onto
+        # the first, an undeclared cross-wave overlap → a loud STOP, nothing pushed.
         b1 = self._bundle("C1", self._modify_patch("one\n"))
         b2 = self._bundle("C2", self._modify_patch("two\n"))
         with redirect_stderr(io.StringIO()):
-            with self.assertRaises(integrate.IntegrationError):
+            with self.assertRaisesRegex(integrate.IntegrationError, "does not merge cleanly"):
                 integrate.fold(self.cfg, [b1, b2])
+        self.assertFalse(self._pushed("pdca-integration/main"))   # the line left as it was
 
 
 class PointAtIntegration(unittest.TestCase):

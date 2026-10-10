@@ -34,6 +34,7 @@ subprocess in the working dir; ``interactive`` leaves inherit the terminal.
 
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import hashlib
 import io
@@ -46,7 +47,10 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from . import act as act_mod
 from . import rubric as rubric_mod
@@ -89,13 +93,18 @@ VALID_DECISIONS = frozenset({"accept", "iterate-do", "iterate-plan", "discontinu
 # Subprocess invocation — the one place a leaf command is run.
 # ----------------------------------------------------------------------------
 class LeafError(subprocess.CalledProcessError):
-    """A headless leaf exited non-zero. Carries the captured stderr tail
-    (``output``) so a failed reviewer/advisory leaf leaves recoverable error text
-    in the bundle (#138), and ``produced`` — whether the child emitted a substantive
-    stream event (real work) before exiting, vs only the CLI's ``system``/``init``
-    or ``api_retry`` events. ``produced is False`` is the transient-infra signal: the
-    child died at/near invocation (usage/rate limit, 5xx, auth, network) before doing
-    any work, so a retry is likely to succeed."""
+    """A headless leaf exited non-zero. Carries ``output`` — the captured stderr tail, plus
+    the leaf's own stream report of its death when there was one — so a failed leaf leaves
+    recoverable error text in the bundle (#138, #506), and ``produced`` — whether the
+    child did work that stands as its own (:func:`progress.run_with_heartbeat`).
+    ``produced is False`` covers the two shapes of a transient-infra death: the child died
+    at/near invocation, before emitting any work, where no report says why (a rate limit, a
+    5xx, a network blip); or its main session's last word was the CLI's own report of a
+    cause the vendor marks transient (a lost connection, an overload or 5xx, a passing
+    rate-limit rejection), however much work came first. Either way a retry is likely to
+    succeed — unless a signal ended it (:attr:`transient`). A spent usage limit is neither
+    shape: while the stream says the account's limit is refusing requests (a subscription
+    window that resets hours away), ``produced`` is ``True`` whatever the child did."""
 
     def __init__(self, returncode: int, cmd, output: str = "", produced: bool = False):
         super().__init__(returncode, cmd, output=output)
@@ -103,9 +112,16 @@ class LeafError(subprocess.CalledProcessError):
 
     @property
     def transient(self) -> bool:
-        """A no-output non-zero exit — almost certainly transient infra, not a
-        reviewer that looked at the diff and couldn't decide."""
-        return not self.produced
+        """Worth another attempt: the leaf died of transient infra — before emitting any
+        work, or on its own report of a transient API error — and **not** of a signal
+        (#539). A signal death (the memory cap, the OOM killer, an operator's kill;
+        ``-signum`` or a wrapper's ``128 + signum``) repeats on every attempt, so having
+        said nothing first does not make it transient (#510). The harness's own timeout
+        (:data:`progress.TIMEOUT_RC`) is not a signal spelling and keeps its meaning. Nor is
+        a leaf transient whose stream says its usage limit is refusing requests: a spent
+        subscription window refuses every attempt until it resets, hours away, so
+        ``produced`` is ``True`` for it however the leaf died."""
+        return not self.produced and not progress.is_signal_death(self.returncode)
 
 
 
@@ -759,30 +775,49 @@ def _invoke(
             # The death explained next to the death reported: the post-mortem rides
             # `output` into the same `*.error.log` the stderr tail lands in.
             output = (output or "") + telemetry.post_mortem(rc)
-        # Only the stream path gives a real "did a session start" signal. Without it
-        # (a stream-less family) we cannot tell invocation-death from a substantive
-        # failure, so report produced=True → not transient, not retried — preserving
-        # the prior immediate-placeholder behavior for non-stream leaves.
+        # Only the stream path says how the leaf died — whether a session started, whether
+        # it ended on the vendor's own transient report, and whether its usage limit was
+        # refusing requests (#539). Without it (a stream-less family) we can tell none of
+        # that from a substantive failure, so report produced=True → not transient, not
+        # retried — preserving the prior immediate-placeholder behavior for non-stream
+        # leaves.
         raise LeafError(rc, argv, output=output, produced=produced or not use_stream)
 
 
+# Two additions for the Do builder (#537), documented here rather than in the docstring
+# below (sibling #533 owns that prose). Both leave a call site that does not use them
+# exactly as it was:
+#   * ``prompt`` may be a callable of the attempt number (1, 2, …), asked for attempt N's
+#     prompt immediately before attempt N is spawned. A retried leaf is re-invoked over
+#     whatever its dead predecessor left, and only the caller knows what that is and how
+#     its leaf should read it. A plain string is sent unchanged on every attempt.
+#   * When the settled record cannot be written, the write's OSError is still raised, now
+#     FROM the leaf's own final failure (``__cause__``), so a caller whose contract is that
+#     the leaf's failure reaches the flow (Do, #286) can still re-raise it.
 def _invoke_leaf_resilient(
     leaf: LeafConfig,
     workdir: Path,
-    prompt: str,
+    prompt: str | collections.abc.Callable[[int], str],
     *,
     error_log: Path,
     attempts: int = 3,
     backoff: float = 4.0,
+    harvest: _LeafHarvest | None = None,
     **kw,
 ) -> Exception | None:
     """Run a headless reviewer/advisory leaf with bounded retry + error capture (#138).
 
-    A non-zero exit that produced **no output** is the transient-infra signal — the
-    child died at/near invocation (usage/rate limit, 5xx, auth, network), not a
-    reviewer that read the diff and couldn't decide — so retry it with exponential
-    backoff. A failure that *did* produce output, or a non-LeafError (e.g. command
-    not found), is substantive: do not retry. Each failed attempt's captured stderr
+    A transient-infra death (:attr:`LeafError.transient`) is retried with exponential
+    backoff: a non-zero exit before the leaf emitted any work, where no report says why (a
+    rate limit, a 5xx or a network blip at invocation), or one whose main session ended on
+    the CLI's own report of a cause the vendor marks transient (a lost connection, an
+    overload or 5xx, a passing rate-limit rejection) however much work came first — not a
+    reviewer that read the diff and couldn't decide. Every other failure is substantive and
+    not retried: a leaf that worked and then failed on its own account, one a **signal**
+    killed (#510), one whose stream says the account's usage limit is refusing requests (a
+    spent subscription window, which refuses every attempt until it resets), or a
+    non-LeafError (e.g. command not found). A retry is a fresh re-invoke of the whole leaf,
+    not a resume of its session. Each failed attempt's captured stderr
     tail is written to ``error_log`` AS IT HAPPENS (#540), so the bundle carries
     recoverable error text, not just an exit code, from the moment there is any — and a
     run killed inside the retry loop leaves a post-mortem instead of nothing at all. The
@@ -794,6 +829,15 @@ def _invoke_leaf_resilient(
     The unfinished state's whole lifetime is inside this function: the loop ends either by
     failing, which settles the records, or by succeeding, which discards them — so no
     caller ever has to know about it.
+
+    ``harvest`` (#541) is the :class:`_LeafHarvest` that owns the artifact path the leaf
+    writes to. Every attempt runs in the SAME workdir, so a file a dying attempt left there
+    is still sitting at that path when the next attempt starts — and the caller's
+    ``if produced.exists()`` could not tell whose work it was. The owner is therefore told
+    of each death as it happens (``withdraw``): it takes the dead attempt's file OFF the
+    path and returns it quoted, as part of that attempt's record, so nothing is destroyed
+    and nothing can be re-attributed. Passing no owner leaves this function byte-identical
+    to #540 — a caller with no artifact of its own (a direct test drive) has nothing to own.
 
     Every attempt also runs under memory telemetry when its spawn is memory-capped:
     the ``*.memory.jsonl`` twin of ``error_log`` (`_memory_log_for`), cleared here
@@ -808,19 +852,32 @@ def _invoke_leaf_resilient(
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            _invoke(leaf, workdir, prompt, **kw)
+            _invoke(leaf, workdir, prompt(attempt) if callable(prompt) else prompt, **kw)
             # Success — leave no error log behind, as before (#138). Now that a failed
             # attempt flushes its record as it happens (#540), "no error log" has to be
             # RESTORED on the retry that recovers: an unfinished record left beside a
             # produced artifact would describe a leaf that has since succeeded. Suppressed
             # like the flush itself — a leaf that worked must not be turned into a failure
             # by the cleanup of its own post-mortem.
+            #
+            # The dead attempts' account is handed to the artifact's owner FIRST (#541):
+            # the log is about to go, and the owner is the one that knows whether the
+            # operator is about to be told "no artifact was produced" — the one case in
+            # which that account (including what a dead attempt left at the artifact path)
+            # must go back into the bundle rather than vanish with the log.
+            if harvest is not None:
+                harvest.leaf_succeeded("".join(records))
             with contextlib.suppress(OSError):
                 error_log.unlink(missing_ok=True)
             return None
         except Exception as exc:  # noqa: BLE001 — a failed leaf must never crash the cycle
             last = exc
             records.append(_format_leaf_attempt(exc, attempt))
+            # …and whatever this attempt left at the artifact path, taken off it and quoted
+            # into the same record (#541) — BEFORE the stop rule below, so the last attempt's
+            # residue is preserved exactly like every earlier one's.
+            if harvest is not None:
+                records.append(harvest.withdraw(attempt))
             transient = getattr(exc, "transient", False)
             if not transient or attempt == attempts:
                 break
@@ -831,15 +888,354 @@ def _invoke_leaf_resilient(
             _flush_attempt_records(error_log, records)
             delay = backoff * (2 ** (attempt - 1))
             print(f"leaves: {workdir.name} — leaf exited {getattr(exc, 'returncode', '?')} "
-                  f"with no output (transient); retry {attempt}/{attempts - 1} in "
-                  f"{delay:.0f}s", file=sys.stderr)
+                  "on transient infra (before emitting any work, or on its own report of a "
+                  f"transient API error); retry {attempt}/{attempts - 1} in {delay:.0f}s",
+                  file=sys.stderr)
             time.sleep(delay)
     # The attempts are spent: the same records, now SETTLED — which is what makes the log
     # read as "the leaf ran and FAILED" (state.leaf_ran_and_failed). Raises exactly as the
     # single write it replaces did: a bundle that cannot hold its own error log is not a
     # failure this wrapper may swallow.
-    _replace_record(error_log, state.settled_record("".join(records)))
+    try:
+        _replace_record(error_log, state.settled_record("".join(records)))
+    except OSError as exc:
+        raise exc from last  # the same OSError; the leaf's failure rides along (#537)
     return last
+
+
+# What a preserved account ends with when the leaf itself went on to exit 0 (#541). Prose
+# for whoever opens the file, never a discriminator: it carries NO settlement marker, so
+# `state.leaf_ran_and_failed` reads False and every reader treats the log exactly as it
+# treats an absent one — the leaf may be re-run, which is precisely the remedy here.
+_WITHDRAWN_TRAILER = ("----- the leaf then exited 0, but nothing of ITS OWN could be filed; "
+                      "the records above are the attempts that died before it -----")
+
+# How much of a withdrawn residue is QUOTED into the bundle's error log: this many reads
+# from each end, each bounded to `_RESIDUE_READ` bytes, with an elision line between them.
+# A residue is a whole review artifact and `*.error.log` is a TRACKED bundle file, so
+# quoting it whole put a measured 9.6 MB into project history for one 3.2 MB artifact that
+# died transiently three times (#541 review). Bounded exactly like the channel it rides
+# beside — `progress.py`'s `err_tail = deque(maxlen=200)`, the same attempt's stderr tail.
+# Head AND tail, because a truncated verdict says the most at both ends: what it was
+# reviewing, and where it was cut off. The read is bounded too, not just the line count: an
+# artifact need not contain a single newline, and one 3 MB "line" is one 3 MB string.
+_RESIDUE_LINES = 100
+_RESIDUE_READ = 1000
+
+
+class _Residue(NamedTuple):
+    """A file a dead attempt left at the artifact path, as the harness last saw it (#541).
+
+    ``attempt`` is the one whose record already quoted it, so a LATER withdrawal that finds
+    the very same file can say "nothing new" instead of quoting it again under its own name.
+    ``digest`` covers every byte, or is ``None`` when the residue could not be read — which
+    no longer condemns the path, because the identity it is filed under settles ownership
+    on its own (:func:`_residue_identity`).
+    """
+
+    attempt: int
+    digest: str | None
+
+
+class _LeafHarvest:
+    """The ONE owner of the artifact path a retried leaf writes to (#541).
+
+    All three harvest sites — the Check reviewer, a Check advisory leaf, a plan advisory
+    leaf — used to end with the same hand-copied test: ``if produced.exists(): copy2(...)``,
+    else a placeholder. That test knows nothing about WHICH attempt wrote the file, and every
+    attempt runs in the same sandbox — so a truncated verdict left behind by an attempt that
+    then died transiently was copied out as the output of the attempt that exited 0
+    afterwards. The engine's rule is the opposite one: no evidence must never be
+    filed as a verdict (``engine/README.md`` §The two gate shapes that matter — "a gate
+    never turns 'no evidence' into a verdict"). Copying it in three places is what let
+    a fix land at two sites and leave the third wrong, so the mechanism lives here once and
+    the sites hold only what genuinely differs — the paths and their own §6 prose.
+
+    Two moments, both driven by :func:`_invoke_leaf_resilient`:
+
+    * :meth:`withdraw`, as each attempt dies — the file that attempt left is taken OFF the
+      path and returned quoted, so it lands in the bundle's ``*.error.log`` as that
+      attempt's account instead of being silently deleted (a real verdict must not be
+      destroyed while the operator is told none was produced) and can never be read as a
+      later attempt's work. If it cannot be withdrawn, the path is UN-OWNED from then on;
+      that state is carried forward rather than ending the run — the leaf keeps every
+      attempt the shipped stop rule gives it, and the refusal is paid at the harvest.
+    * :meth:`run`, around the whole loop — on a failure the site's placeholder, on success
+      the harvest itself: the live attempt's own file, or nothing at all. An un-owned path
+      is settled by IDENTITY there (:meth:`_live_attempt_took_the_path`), not refused on
+      sight: a residue that could not be unlinked can still have been overwritten by the
+      attempt that exited 0, and that file is its verdict.
+
+    Every residue it could not remove is remembered by :func:`_residue_identity`, which is
+    what makes both of those exact rather than heuristic: the same file is recognised on a
+    later attempt's death (quoted once, not once per attempt) and at the harvest (refused),
+    while a file that has been written since is recognised as the live attempt's work
+    whether or not its bytes differ.
+    """
+
+    def __init__(self, *, produced: Path, dest: Path,
+                 unavailable: Callable[[str, str], None],
+                 empty_reason: str, failed_reason: str = "leaf failed",
+                 explain: Callable[[Exception | None], tuple[str, str] | None]
+                 | None = None) -> None:
+        self.produced = produced          # where the leaf writes, inside its sandbox
+        self.dest = dest                  # where a HARVESTED artifact lands, in the bundle
+        self._unavailable = unavailable   # the site's §6 placeholder: (reason, failure)
+        self._empty_reason = empty_reason
+        self._failed_reason = failed_reason
+        # A site's own, more specific account of a run that files nothing — given the
+        # final exception, or None when the live attempt exited 0 and wrote nothing — as
+        # ``(reason, failure)``, or None to keep the generic one. Only the plan reviewer
+        # has one (#526: a vendor sandbox that could not start). It never decides WHETHER
+        # an artifact is filed, only how a placeholder explains why none was.
+        self._explain = explain
+        self._unowned: str | None = None  # why the path can no longer be attributed
+        # What was left ON the path and could not be withdrawn, by filesystem identity.
+        self._residues: dict[tuple[int, ...], _Residue] = {}
+        self._unidentified = False        # …and whether one could not even be `stat`-ed
+        self._account = ""                # the dead attempts' records, once the leaf exits 0
+        self._error_log: Path | None = None
+
+    def run(self, leaf: LeafConfig, workdir: Path, prompt: str, *,
+            error_log: Path, **kw) -> bool:
+        """Run the leaf under the retry loop, then file ONLY the live attempt's artifact.
+
+        Never raises for a leaf that merely failed: every path here ends in either a
+        harvested artifact or the site's §6 placeholder, exactly as the three sites did
+        by hand. Returns whether it filed the live attempt's artifact — False means the
+        placeholder is what the bundle holds."""
+        self._error_log = error_log
+        err = _invoke_leaf_resilient(leaf, workdir, prompt, error_log=error_log,
+                                     harvest=self, **kw)
+        if err is not None:
+            self._unavailable(*(self._explained(err)
+                                or (f"{self._failed_reason}: {err}", _failure_class(err))))
+            return False
+        # The live attempt exited 0. Anything at the path is ITS work — each dead attempt's
+        # file was withdrawn as that attempt died — UNLESS a withdrawal was refused and what
+        # is there is still that dead attempt's file, which nothing may be filed from.
+        if not self.produced.exists():
+            self._degrade(*(self._explained(None)
+                            or (self._empty_reason, _FAIL_SUBSTANTIVE)))
+        elif self._unowned is not None and not self._live_attempt_took_the_path():
+            self._degrade(self._unowned, _FAIL_UNOWNED)
+        else:
+            shutil.copy2(self.produced, self.dest)
+            return True
+        return False
+
+    def _explained(self, err: Exception | None) -> tuple[str, str] | None:
+        """The site's own account of a run that filed nothing, when it has one."""
+        return self._explain(err) if self._explain is not None else None
+
+    def withdraw(self, attempt: int) -> str:
+        """Take the just-dead ``attempt``'s artifact off the path, quoted into its record.
+
+        Returns that attempt's record block for the retry loop's account — ``""`` when the
+        attempt left nothing, which is the ordinary shape. The text is embedded through
+        :func:`state.neutralize_leaf_text` for the same reason the stderr tail is (#540):
+        it is the leaf's own text landing in the harness's account of the leaf's own run.
+
+        A residue an earlier withdrawal already quoted and could NOT remove is recognised
+        before it is read (#541 review). It is still sitting at the path when the next
+        attempt dies, and that attempt never wrote it: quoting it again would file the same
+        text under a second attempt's name — "no notion of which attempt wrote it", one
+        level down, inside the fix for it — and would re-read and re-digest a whole artifact
+        once per attempt.
+        """
+        try:
+            ident = _residue_identity(self.produced)
+        except FileNotFoundError:
+            return ""                       # the ordinary shape: it wrote nothing
+        except OSError as exc:              # something is there that cannot even be named
+            self._disown(f"could not be examined ({exc})")
+            return self._record(attempt, f"(the residue could not be examined) {exc}")
+        known = self._residues.get(ident)
+        if known is not None:
+            return self._unchanged(attempt, known.attempt)
+        try:
+            text, digest = _read_residue(self.produced)
+        except FileNotFoundError:
+            return ""                       # it went away between the stat and the read
+        except OSError as exc:              # there IS something there, and it is unreadable
+            # NOT unlinked: what could not be quoted must not be destroyed either — that is
+            # the same loss, with the account missing too. Its identity is recorded, so an
+            # attempt that writes over it is still recognisable as having done so.
+            self._disown(f"could not be read ({exc})", ident, _Residue(attempt, None))
+            return self._record(attempt, f"(the residue could not be read) {exc}")
+        try:
+            self.produced.unlink()
+        except OSError as exc:
+            # Carry the un-owned state forward instead of ending the run (the residue is
+            # already quoted by now): the retry contract is the shipped stop rule's alone,
+            # and the harvest below refuses this path rather than filing a file it cannot
+            # attribute. A bundle whose writes are failing loses no attempt over it.
+            self._disown(f"could not be removed ({exc})", ident, _Residue(attempt, digest))
+        return self._record(attempt, state.neutralize_leaf_text(text))
+
+    def leaf_succeeded(self, account: str) -> None:
+        """Keep the dead attempts' records: the successful attempt is about to clear the
+        error log (#540), and they are needed back only if the harvest files nothing."""
+        self._account = account
+
+    def _live_attempt_took_the_path(self) -> bool:
+        """Is the file at the path provably NOT one of the residues we failed to withdraw?
+
+        ``unlink()`` needs write permission on the DIRECTORY; ``open(path, "w")`` needs it
+        only on the FILE — so a residue this harness could not take off the path can still
+        be overwritten by the attempt that goes on to exit 0, and what is there is then that
+        attempt's own complete verdict. Refusing THAT would destroy a live verdict in order
+        to protect against a dead one, in a bundle that then says no artifact was produced:
+        the same destruction this class exists to prevent, aimed the other way.
+
+        Settled by IDENTITY (#541 review), because content cannot settle it in either
+        direction: a deterministic leaf that re-writes the same verdict on its next attempt
+        produces bytes IDENTICAL to the residue, and a residue that could never be READ has
+        no bytes to compare at all — both were refused, and both were live verdicts. Any
+        write moves ``st_mtime_ns``; an atomic ``os.replace`` moves ``st_ino`` too. The
+        digest is then a second chance in the other direction, for a filesystem whose
+        timestamps are too coarse to have moved: the same identity carrying DIFFERENT bytes
+        is still a rewrite. Only "the same file, unchanged" is refused.
+
+        Conservative in the two cases it cannot settle: a residue that could not even be
+        ``stat``-ed was never filed under an identity, and a path that cannot be examined
+        NOW cannot be attributed either — both stay un-owned whatever is on them.
+        """
+        if self._unidentified:
+            return False
+        try:
+            ident = _residue_identity(self.produced)
+        except OSError:
+            return False
+        known = self._residues.get(ident)
+        if known is None:
+            return True    # written since the last withdrawal, and only the leaf writes here
+        now = _artifact_digest(self.produced)
+        return known.digest is not None and now is not None and now != known.digest
+
+    def _degrade(self, reason: str, failure: str) -> None:
+        """No artifact filed: preserve the dead attempts' account, then the §6 placeholder."""
+        self._preserve()
+        self._unavailable(reason, failure)
+
+    def _preserve(self) -> None:
+        """Put the dead attempts' account — including whatever they left at the artifact
+        path — back in the bundle's ``*.error.log``.
+
+        Only ever on the degrade path, and only for a run that HAD dead attempts: the
+        operator is about to be told no artifact was produced, so the one text that could
+        have been one must not be the thing this cycle deleted. A leaf whose own artifact
+        IS filed still leaves no error log behind (#540) — nothing to explain there.
+
+        Best-effort, like the mid-retry flush it mirrors: a bundle that cannot take the
+        write still gets its placeholder, since failing here would turn a leaf that merely
+        produced nothing into a crashed Check beat."""
+        if not self._account or self._error_log is None:
+            return
+        try:
+            _replace_record(self._error_log, self._account + _WITHDRAWN_TRAILER + "\n")
+        except OSError as exc:
+            print(f"leaves: could not preserve the dead attempts' account in "
+                  f"{self._error_log.name} ({exc}); the placeholder below is all that is "
+                  "left of them", file=sys.stderr)
+
+    def _disown(self, why: str, ident: tuple[int, ...] | None = None,
+                residue: _Residue | None = None) -> None:
+        """Mark the path un-ownable, remembering WHICH file is on it.
+
+        Nothing may be filed from it unless a later attempt provably wrote there, which is
+        what ``ident`` is kept for — including for a residue that could not be READ, whose
+        identity is knowable even when its bytes are not. Only a residue that could not be
+        ``stat``-ed at all leaves nothing to settle by.
+        """
+        self._unowned = (
+            f"the leaf exited 0, but {self.produced.name} could not be attributed to it: "
+            f"a dead attempt's file was still there and {why}")
+        if ident is None or residue is None:
+            self._unidentified = True
+        else:
+            self._residues[ident] = residue
+
+    def _record(self, attempt: int, body: str) -> str:
+        return (f"----- attempt {attempt} — what it left at {self.produced.name} "
+                f"(withdrawn: it is NOT a later attempt's work) -----\n{body}\n\n")
+
+    def _unchanged(self, attempt: int, owner: int) -> str:
+        """``attempt`` left nothing new — the file on the path is still the one attempt
+        ``owner``'s record quoted, and could not be removed then either."""
+        return (f"----- attempt {attempt} — nothing new at {self.produced.name}: attempt "
+                f"{owner}'s residue is still there, un-withdrawn and quoted above "
+                f"-----\n\n")
+
+
+def _read_residue(path: Path) -> tuple[str, str]:
+    """What a dead attempt left at ``path``: BOUNDED text to quote, and a digest of ALL of it.
+
+    Two jobs, one read, because the two answers must describe the same bytes. The text goes
+    into a tracked bundle file, so it is capped head/tail with an elision line
+    (:data:`_RESIDUE_LINES`); the digest covers every byte, so a later attempt that
+    overwrites this residue IN PLACE is still recognisable as having done so
+    (:meth:`_LeafHarvest._live_attempt_took_the_path`) even on a filesystem whose
+    timestamps are too coarse to have moved, and even when the quote elided most of it.
+
+    Raises ``OSError`` — ``FileNotFoundError`` when the attempt left nothing at all; the
+    caller decides what an unreadable residue means.
+    """
+    digest = hashlib.sha256()
+    head: list[str] = []
+    tail: deque[str] = deque(maxlen=_RESIDUE_LINES)
+    elided = 0
+    with path.open("rb") as fh:
+        # readline(limit), not iteration: consecutive calls still cover every byte (so the
+        # digest is of the whole file), but no single read — hence no single line — can be
+        # larger than the bound.
+        while chunk := fh.readline(_RESIDUE_READ):
+            digest.update(chunk)
+            line = chunk.decode("utf-8", "replace").rstrip("\n")
+            if len(head) < _RESIDUE_LINES:
+                head.append(line)
+                continue
+            if len(tail) == _RESIDUE_LINES:
+                elided += 1
+            tail.append(line)
+    middle = ([f"----- … {elided} line(s) elided: the residue is quoted head and tail only, "
+               "bounded like the stderr tail beside it -----"] if elided else [])
+    return "\n".join(head + middle + list(tail)), digest.hexdigest()
+
+
+def _residue_identity(path: Path) -> tuple[int, ...]:
+    """WHICH file is at ``path`` right now, as the filesystem sees it (#541 review).
+
+    The one question :class:`_LeafHarvest` has to answer about a residue it could not
+    remove — "is this still it?" — and content cannot answer it. A leaf that re-writes the
+    same verdict deterministically leaves bytes identical to the residue's, and a residue
+    that could not be READ has no bytes to compare at all; both were read as "unchanged"
+    and cost a live verdict. ``st_mtime_ns`` moves on any write, ``st_ino`` on an atomic
+    ``os.replace``, and both are knowable for a file this process cannot open. ``st_dev``
+    (an inode number is only unique within a filesystem), ``st_size`` and ``st_ctime_ns``
+    cost nothing and narrow the one remaining coincidence — an in-place rewrite a
+    coarse-granularity clock did not separate — which the digest then covers.
+
+    Raises ``OSError`` — ``FileNotFoundError`` when nothing is there at all.
+    """
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _artifact_digest(path: Path) -> str | None:
+    """A digest of everything at ``path``, or ``None`` when nothing readable is there.
+
+    It answers exactly one question (#541 review): is this still the file a dead attempt
+    left, or has the attempt that exited 0 written over it?
+    """
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            while chunk := fh.read(65536):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def _flush_attempt_records(error_log: Path, records: list[str]) -> None:
@@ -2138,19 +2534,74 @@ def do_build(d: Path, cfg: Config) -> None:
             _do_build_command(d, cfg, builder, n)
     except Exception as exc:  # noqa: BLE001 — capture, then re-raise for the caller
         try:
-            error_log.write_text(_format_leaf_attempt(exc, 1), encoding="utf-8")
-            print(f"leaves: {d.name} — Do failed; captured the error tail in "
-                  f"{BUILD_ERROR_LOG}", file=sys.stderr)
+            # The log was cleared above, so one that exists now was written during THIS Do
+            # — by the retry wrapper, attempt by attempt (#540). Overwriting it with one
+            # record would destroy the post-mortem the retries built (#537). What is left
+            # for this capture is a Do that died AROUND the leaf (`worktree.ensure`, the
+            # lane lock), which otherwise has nothing bundle-local at all.
+            if error_log.exists():
+                print(f"leaves: {d.name} — Do failed; the builder's per-attempt record is "
+                      f"in {BUILD_ERROR_LOG}", file=sys.stderr)
+            else:
+                error_log.write_text(_format_leaf_attempt(exc, 1), encoding="utf-8")
+                print(f"leaves: {d.name} — Do failed; captured the error tail in "
+                      f"{BUILD_ERROR_LOG}", file=sys.stderr)
         except OSError:
             pass  # never let error-capture mask the real failure
+        with contextlib.suppress(Exception):  # …nor may the report of what it left
+            _report_failed_do(d)
         raise
 
 
-def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None:
-    """Run Do on a command backend: set up isolation, then invoke the leaf.
+def _do_residue(d: Path) -> list[str]:
+    """The Do artifacts actually in bundle ``d``: patch.diff, build-notes.md and the test
+    file(s) the brief names, those that exist. Read only — nothing here deletes them."""
+    names = ["patch.diff", "build-notes.md"]
+    names += [str(t) for t in brief.test_files(d / "brief.md")]
+    return [n for n in dict.fromkeys(names) if (d / n).is_file()]
 
-    Every failure here — setup or invocation — is captured to `build.error.log` by the
-    caller and re-raised, so `flow._isolate` still contains it and drops just this bundle.
+
+def _report_failed_do(d: Path) -> None:
+    """What a failed Do left in the bundle, and what a plain re-run would do next (#537).
+
+    Printed for EVERY failed Do — transient, substantive or setup — because the honest
+    next action depends on the residue, not on why the builder died. The state is ASKED
+    (:func:`state.state`), never inferred from which files are present: a bundle left
+    holding patch.diff reads BUILT (state.py:347-364), and ``driver.advance`` then runs
+    Check on it, not Do (driver.py:76). Reporting only — nothing here deletes anything.
+    """
+    issue = d.name.removeprefix("issue_")
+    left = _do_residue(d)
+    if left:
+        print(f"leaves: {d.name} — left in the bundle: {', '.join(left)}. That is an "
+              "unfinished attempt's work, not a finished build; nothing deletes it.",
+              file=sys.stderr)
+    else:
+        print(f"leaves: {d.name} — no patch.diff, build-notes.md or brief-named test file "
+              "was left in the bundle.", file=sys.stderr)
+    now = state.state(d)
+    if now == state.BUILT:
+        advice = (f"the bundle now reads {now}, so a plain re-run (`pdca run {issue}`) runs "
+                  "CHECK on that unfinished patch.diff, not Do. To rebuild instead, move "
+                  "patch.diff out of the bundle first.")
+    elif now == state.PLANNED:
+        advice = (f"the bundle still reads {now}, so a plain re-run (`pdca run {issue}`) "
+                  "starts Do again.")
+        if left:
+            advice += (" That builder is NOT told the files above are residue; move them "
+                       "aside first if they should not be built on.")
+    else:
+        advice = f"the bundle reads {now}; `pdca status` shows what a re-run does next."
+    print(f"leaves: {d.name} — next: {advice}", file=sys.stderr)
+
+
+def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None:
+    """Run Do on a command backend: set up isolation, then invoke the leaf resiliently.
+
+    Every failure here — setup or invocation — still reaches `build.error.log` and is still
+    re-raised, so `flow._isolate` contains it and drops just this bundle: an INVOCATION
+    failure is recorded attempt by attempt by `_invoke_leaf_resilient`, a SETUP failure by
+    the caller's capture.
     """
     _record_loop_attempt(d, n, builder, cfg)
     # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
@@ -2189,19 +2640,65 @@ def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None
         # A family without its own PreToolUse STOP hook gets the driver's `gh`
         # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
         env = guard.shim_env(cfg, env)
-    # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
-    _invoke(
-        builder, workdir, _build_prompt(d, cfg, worktree_root=wt),
-        label=f"Do {d.name}",
-        status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
-        stream_json=True,  # Tier 3: show the builder's live tool-use
-        env=env, extra_argv=extra, cfg=cfg,
-        memory_log=d / BUILD_MEMORY_LOG,  # scope telemetry, active only when capped
-    )
+    # The builder runs on the SAME resilient path as the reviewer and both advisories
+    # (#537). It was the one of them still on plain `_invoke`, so no builder failure was
+    # ever retried — on the leaf where an attempt costs the most. The shipped attempt
+    # budget, backoff and transient rule are reused as they are; a substantive failure is
+    # still not retried. `memory_log` is left to the wrapper's `_memory_log_for`
+    # derivation, as at the other three call sites: build.error.log → build.memory.jsonl,
+    # the same file this call used to name explicitly (#420 unchanged).
+    #
+    # Attempt 1 is sent exactly today's prompt, built here as before. A retry is told its
+    # predecessor died mid-flight and that anything it finds is that attempt's residue
+    # (`_build_prompt(dead_attempts=…)`) — `worktree.ensure` ran once, above, so the
+    # worktree and the bundle still hold whatever the dead attempt left. `spent` counts
+    # the attempts actually spawned (the wrapper asks for attempt N's prompt right before
+    # spawning it), which is what the failure report names — not the budget.
+    first = _build_prompt(d, cfg, worktree_root=wt)
+    spent = 0
+
+    def prompt_for(attempt: int) -> str:
+        nonlocal spent
+        spent = attempt
+        if attempt == 1:
+            return first
+        return _build_prompt(d, cfg, worktree_root=wt, dead_attempts=attempt - 1)
+
+    try:
+        # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
+        err = _invoke_leaf_resilient(
+            builder, workdir, prompt_for,
+            error_log=d / BUILD_ERROR_LOG,
+            label=f"Do {d.name}",
+            status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
+            stream_json=True,  # Tier 3: show the builder's live tool-use
+            env=env, extra_argv=extra, cfg=cfg,
+        )
+    except OSError as unwritable:
+        # The bundle could not hold the builder's settled record. The wrapper raises that
+        # write's OSError FROM the builder's own failure; Do's contract is that the
+        # builder's failure — not the bookkeeping about it — reaches the flow (#286).
+        err = unwritable.__cause__
+        if err is None:
+            raise
+        print(f"leaves: {d.name} — could not write {BUILD_ERROR_LOG} ({unwritable})",
+              file=sys.stderr)
+    if err is None:
+        return
+    if getattr(err, "transient", False):
+        print(f"leaves: {d.name} — transient: the builder leaf exited "
+              f"{getattr(err, 'returncode', '?')} on transient infra (before emitting any "
+              "work, or on its own report of a transient API error), the class of "
+              "failure the harness retries to absorb; not absorbed after "
+              f"{spent} attempt(s).", file=sys.stderr)
+    raise err
 
 
 def _build_prompt(d: Path, cfg: Config | None = None, *,
-                  worktree_root: Path | None = None) -> str:
+                  worktree_root: Path | None = None, dead_attempts: int = 0) -> str:
+    # `dead_attempts` (#537) — how many earlier attempts of THIS Do's builder died before
+    # this one was spawned. 0 (every caller but a retry) adds nothing, so the prompt is
+    # byte-identical; otherwise the retry notice sits between the task and the rubric.
     # The target repo's standing rubric (#314), so the builder self-reviews against
     # the same criteria the reviewer will apply — the asymmetry that costs a
     # guaranteed round. "" when unconfigured, so the prompt is byte-identical.
@@ -2252,7 +2749,38 @@ def _build_prompt(d: Path, cfg: Config | None = None, *,
         "runs the target's own hooks (formatter/linters), which no PDCA gate models, so a patch the target's "
         "commit hook would reject is not done even if every gate is green. Do NOT push, "
         "open, or mark any PR ready."
-    ) + rubric
+    ) + (_retry_notice(d, dead_attempts, worktree_root) if dead_attempts else "") + rubric
+
+
+def _retry_notice(d: Path, dead_attempts: int, worktree_root: Path | None) -> str:
+    """What a RETRIED builder is told about the attempt(s) that died before it (#537).
+
+    `worktree.ensure` runs once per Do, before the retry wrapper, so a retry opens the
+    same worktree and bundle its predecessor was working in. Unwarned, it can read a
+    partial patch.diff / build-notes.md / test file there as a finished build and exit 0,
+    and a half-written attempt is then reported as the leaf's success. Every sentence is
+    true of the disk as it is when the retry is spawned: Do only starts from PLANNED
+    (driver.py:69-75), i.e. with no patch.diff (state.py:347), so nothing of this kind in
+    the bundle came from a finished build — though a build-notes.md or test file may be an
+    earlier failed Do's, so the notice does not name WHICH attempt left it; and the pointer
+    at the error log is given only when the per-attempt record (#540) is there to read.
+    """
+    record = d / BUILD_ERROR_LOG
+    log = (f" The harness's record of how it died (exit status and captured stderr tail) "
+           f"is in {record}." if record.is_file() else "")
+    edits = ("any change already in the worktree ($PDCA_WORKTREE) — it is NOT reset "
+             "between attempts" if worktree_root is not None else
+             "any source edit already made in place")
+    before = "attempt" if dead_attempts == 1 else f"{dead_attempts} attempts"
+    return (
+        f"\n\nRETRY NOTICE — this is attempt {dead_attempts + 1} of this Do's builder leaf. "
+        f"The previous {before} died MID-FLIGHT (exited non-zero); the work was NOT "
+        f"finished.{log} Any patch.diff, build-notes.md or test file you find in {d}, and "
+        f"{edits}, is INCOMPLETE RESIDUE of an attempt that did not finish: verify it "
+        "against the brief's Success criterion and complete or replace it. Never treat any "
+        "of it as evidence the work is done, and re-run the test red→green yourself rather "
+        "than trust a result you did not observe."
+    )
 
 
 def _stub_build(d: Path, cfg: Config) -> None:
@@ -2276,6 +2804,31 @@ def _stub_build(d: Path, cfg: Config) -> None:
         "tried, and what was ruled out. The reviewer never sees this file.\n",
         encoding="utf-8",
     )
+
+
+# What every harness-authored reviewer / advisory prompt tells its leaf to end with (#541).
+# One instruction, one spelling, three prompts. The trailer is the leaf's own statement that
+# it finished the file: `assemble.leaf_status` looks for it as the artifact's last non-blank
+# line, and an artifact that ends with it is read as a real verdict whatever its body quotes.
+# Its absence changes nothing. An artifact without it (a leaf that ignores this, or a
+# third-party leaf that never saw this prompt) is classified exactly as it was before the
+# trailer existed, and whether an artifact is filed at all never depends on it: keeping a dead
+# attempt's leftover file out of the bundle is `_LeafHarvest`'s ownership check, which does
+# not read the trailer. So the instruction says only what the trailer does. It must not
+# threaten a cost for leaving it off — there is none, and a leaf told that a report without
+# the trailer is not read as its verdict could leave it off on purpose, to hold a report back.
+# Instructed rather than stamped by the harness after the fact, deliberately: only the writer
+# can say it finished, and a stamp applied to whatever is at the path would re-assert exactly
+# the assumption #541 removed.
+#
+# Appended LAST, as its own paragraph, at the point each prompt is composed — after the
+# project rubric where the leaf gets one — so it is the final thing the leaf reads. An
+# instruction that says "nothing may follow it" must not itself be followed by more prompt.
+_COMPLETION_INSTRUCTION = (
+    "\n\nWhen {artifact} is complete, end it with this exact line, on its own, as the very last "
+    f"line of the file: {assemble.LEAF_COMPLETE_TRAILER} — it tells the harness this file is "
+    "your finished report. Nothing may follow it."
+)
 
 
 # ----------------------------------------------------------------------------
@@ -2306,30 +2859,27 @@ _REVIEW_PROMPT = (
     "with a one-line outline of the task under review (the bug to fix / functionality to "
     "implement), then a complete verdict table — one row for EVERY element of the "
     "5/5/1 matrix, in order:\n"
+    # Bare labels, no `{elem} — ` prefix: the Item cell is matched exactly against the label
+    # (#408), and a listed prefix is what reviewers copied into it.
     + "\n".join(f"  {label}" for _elem, label, _kind, _oracle in gates.canonical_elements())
     + "\nFormat it as a Markdown table `| Item | Verdict | Basis |`, the Item column "
-    "carrying the element label above EXACTLY as written — no element-id prefix, no extra "
-    "words (issue #332: the driver identifies its own template rows by an exact match, and a "
-    "decorated label reads as a different, substantive finding). The Verdict is one of "
-    "PASS / FAIL / NEEDS-HUMAN / "
+    "carrying the element label EXACTLY as listed above (no element-id prefix, no added "
+    "words), the Verdict one of PASS / FAIL / NEEDS-HUMAN / "
     "N/A, the Basis a one-line reason you re-derived yourself (cite path:line where "
     "you can) — state the DECISION OWED (the context + impact the verdict turns on, "
     "what the human must decide and why), not a restatement of the implementation, "
     "especially for NEEDS-HUMAN rows. Emit NEEDS-HUMAN for the always-human items (validation "
     "fitness-to-purpose, contested root-cause, ambiguous scope) — each NEEDS-HUMAN "
-    "row becomes a §6 item the human must clear. Do not omit a row; use N/A with a "
-    "reason when an element does not apply. "
-    # issue #332 — the reviewer states builder-fixability; the taxonomy bounds where it may.
-    "On the two JUDGMENT rows (C5 causal adequacy, T5 judgment) ONLY, when the concern is "
-    "really an implementation defect a rebuild can fix — a missed case behind a weak causal "
-    "argument, a test that does not exercise what it claims — write the verdict cell as "
-    "`NEEDS-HUMAN [impl]`. The driver then routes it back to Do instead of spending the "
-    "human's attention on it. Keep the plain `NEEDS-HUMAN` for anything needing an "
-    "ARCHITECTURAL, scope or fitness-to-purpose decision; when in doubt omit `[impl]`, since "
-    "an untagged row always reaches the human. The tag is IGNORED elsewhere — on the input "
-    "cells C1/C3, whose defects belong to Plan and survive any rebuild against the same "
-    "brief, and on the validation row, which is emitted every cycle regardless — so do not "
-    "write it there. For a visual / manual-repro NEEDS-HUMAN row, "
+    "row becomes a §6 item the human must clear. On the "
+    + " and ".join(f"'{label}'" for elem, label, _kind, _oracle in gates.canonical_elements()
+                   if elem in assemble._PROMOTABLE_ELEMENTS)
+    + " rows ONLY, when your NEEDS-HUMAN concern is an IMPLEMENTATION defect the builder "
+    "can fix by iterating (a logic bug, a missed case, a weak or incorrect test), write the "
+    "Verdict `NEEDS-HUMAN [impl]` so the driver routes it straight back to Do; keep plain "
+    "`NEEDS-HUMAN` there for a concern that needs a human decision (scope, root cause, "
+    "fitness-to-purpose). Never tag any other row `[impl]` — it is ignored there. Do not "
+    "omit a row; use N/A with a "
+    "reason when an element does not apply. For a visual / manual-repro NEEDS-HUMAN row, "
     "verify what you can yourself — where feasible, exercise the change with the patch "
     "applied at $PDCA_TARGET (run the relevant test, or start/drive the app if the runner "
     "allows), observe, and report; only where it genuinely can't be driven, hand the human "
@@ -2921,46 +3471,67 @@ def _run_review_sandboxed(d: Path, cfg: Config) -> None:
         # the leaf its ambient sandbox, #290); the codex network grant does not (#291).
         extra_argv += _sandbox_argv(cfg, profile, seeded=seeded)
         error_log = d / state.REVIEW_ERROR_LOG
-        # A transient (no-output) reviewer failure is retried with backoff before it
-        # degrades to a §6 placeholder; the failed attempts' stderr lands in error_log.
-        err = _invoke_leaf_resilient(
-            cfg.reviewer, sandbox, _REVIEW_PROMPT + rubric_mod.for_reviewer(d, cfg),
+        # A transient reviewer death (before emitting any work, or on its own report of a
+        # transient API error) is retried with backoff before it degrades to a §6
+        # placeholder; the failed attempts' stderr and stream report land in error_log.
+        # `_LeafHarvest` owns check-review.md across those attempts (#541): a file a dead
+        # attempt left in the sandbox is withdrawn into error_log as that attempt dies, so
+        # what lands in the bundle is the LIVE attempt's own work or nothing at all.
+        _LeafHarvest(
+            produced=sandbox / "check-review.md", dest=d / "check-review.md",
+            unavailable=lambda reason, failure: _review_unavailable(
+                d, reason, failure=failure, error_log=error_log),
+            failed_reason="reviewer leaf failed",
+            empty_reason="reviewer produced no check-review.md",
+        ).run(
+            # The closing instruction goes AFTER the project rubric (#541), so it is the
+            # last thing the reviewer reads, rubric or not.
+            cfg.reviewer, sandbox,
+            _REVIEW_PROMPT + rubric_mod.for_reviewer(d, cfg)
+            + _COMPLETION_INSTRUCTION.format(artifact="check-review.md"),
             error_log=error_log,
             label=f"Check review {d.name}",
             status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
             stream_json=True,  # Tier 3 (no-op unless the reviewer family has a stream)
             env=env, extra_argv=extra_argv, cfg=cfg,
         )
-        if err is not None:
-            _review_unavailable(d, f"reviewer leaf failed: {err}",
-                                failure=_failure_class(err), error_log=error_log)
-            return
-        produced = sandbox / "check-review.md"
-        if produced.exists():
-            shutil.copy2(produced, d / "check-review.md")
-        else:
-            _review_unavailable(d, "reviewer produced no check-review.md")
 
 
 # How a reviewer / advisory leaf failed (#138, #278). The split that matters downstream is
-# INFRA (nothing reviewed the diff) vs SUBSTANTIVE (it reviewed, and yielded nothing usable) —
-# but the two infra shapes need different *actions* from the operator, so keep them distinct.
-_FAIL_TRANSIENT = "transient"      # ran, exited non-zero with no output; retries exhausted
+# INFRA (infrastructure stopped it before a review came back) vs SUBSTANTIVE (the leaf itself
+# yielded nothing usable) — but the infra shapes need different *actions* from the operator,
+# so keep them distinct.
+# transient: died of transient infra — before emitting any work, or on its own report of
+#   a transient API error — and retries did not recover it.
+# substantive: ran and failed any other way (a signal death and a spent usage limit
+#   included), no usable verdict.
+_FAIL_TRANSIENT = "transient"
 _FAIL_STARTUP = "startup"          # never ran at all — the command could not be launched
-_FAIL_SUBSTANTIVE = "substantive"  # ran and produced output, but no usable verdict
+_FAIL_SUBSTANTIVE = "substantive"
 # Launched, but the vendor sandbox the harness seeded it with could not start on this host
 # (#526), so nothing it tried ran. Never inferred from an exception alone, as the others
 # are: only the vendor's own evidence of the sandbox failing sets it
 # (:class:`_BashSandboxProbe`, :func:`_sandbox_refusal`), so an ordinary empty result
 # stays substantive.
 _FAIL_SANDBOX = "sandbox"
+# …and the one shape that is none of those (#541): the leaf RAN and exited 0, but a dead
+# attempt's file could not be taken off the artifact path, so nothing there can be
+# attributed to it. Only :class:`_LeafHarvest` can raise it. A distinct FAILURE CLASS, not a
+# distinct status token: it selects its own prose in :func:`_unavailable_classification` and
+# shares the default `human-empty` marker with the substantive shape, because what every
+# machine reader takes from a marker — is this a placeholder, and the §6 / §10 label for why
+# (#526) — is true of both: no usable verdict reached the bundle. The distinction that
+# matters here is one a human reads, so it lives in the prose.
+_FAIL_UNOWNED = "unowned"
 
 
 def _failure_class(exc: Exception | None) -> str:
     """Classify a failed leaf invocation.
 
-    A :class:`LeafError` means the child actually ran: ``transient`` (no output — a rate
-    limit / 5xx / network blip) or substantive. But a **startup** failure never produces a
+    A :class:`LeafError` means the child actually ran: ``transient`` (it died of a rate
+    limit / 5xx / network blip before emitting any work, or on its own report of one after
+    working — :attr:`LeafError.transient`) or substantive (any other way it can fail, a
+    signal death or a spent usage limit included). But a **startup** failure never produces a
     LeafError at all — the spawn raises ``FileNotFoundError`` before one exists, when the
     configured binary is absent or not executable (the canonical ``[Errno 2] … 'codex'``).
     Reading ``.transient`` off such an exception yields ``False``, so it was reported as "the
@@ -2989,8 +3560,8 @@ def _review_unavailable(d: Path, reason: str, *, failure: str = _FAIL_SUBSTANTIV
         "# Advisory review — NOT COMPLETED\n\n"
         f"The reviewer did not produce a verdict table ({reason}).\n\n"
         + _unavailable_classification(failure, error_log)
-        + "- NEEDS-HUMAN — re-run the Check reviewer; this bundle has no advisory review "
-        "and must not be accepted until one exists.\n",
+        # Defined in `assemble`, which recognises this exact row as no verdict (#409).
+        + f"- NEEDS-HUMAN — {assemble.REVIEW_UNAVAILABLE_FINDING}\n",
         encoding="utf-8",
     )
 
@@ -3005,11 +3576,25 @@ def _unavailable_classification(failure: str, error_log: Path | None) -> str:
     adversarial pass and the operator has to hand-annotate "infra, not substance". `assemble`
     reads the marker and labels the §6 row accordingly.
 
-    Every infra shape (transient, startup, sandbox) carries an infra marker — nothing
-    reviewed the diff either way — but their prose differs, because the operator's next action
+    Every infra shape (transient, startup, sandbox) carries an infra marker — no review came
+    back either way — but their prose differs, because the operator's next action
     does: a transient blip is safe to re-run as-is; a leaf that never started will fail the
     same way until its command is fixed; a leaf whose seeded sandbox could not start (#526)
-    will fail the same way until the HOST can start it."""
+    will fail the same way until the HOST can start it.
+
+    The un-owned shape (#541) is the one that gets prose WITHOUT a marker of its own. Its leaf
+    RAN and exited 0, so "leaf did not run" would be false of it; it takes the default
+    `human-empty` instead, which is true of it: no usable verdict reached the bundle. What a
+    token cannot carry (that a dead attempt's file could not be taken off the artifact path,
+    and that the remedy is to clear whatever blocked the withdrawal) is spelled out in the
+    prose below, where the human reads it.
+
+    The marker only ever says WHY an artifact is a placeholder. Whether it IS one is settled
+    by the completion trailer the leaf writes as its artifact's last line
+    (:func:`assemble.leaf_status`), which no placeholder here carries. So the status table
+    does not grow to tell real from placeholder, and it stays closed at the four in
+    ``assemble._LEAF_STATUS_LABEL``: the un-owned shape shares `human-empty` rather than
+    adding one."""
     status = {
         _FAIL_TRANSIENT: assemble.LEAF_STATUS_INFRA,
         _FAIL_STARTUP: assemble.LEAF_STATUS_STARTUP,
@@ -3017,11 +3602,12 @@ def _unavailable_classification(failure: str, error_log: Path | None) -> str:
     }.get(failure, assemble.LEAF_STATUS_HUMAN)
     marker = f"<!-- pdca:leaf-status {status} -->\n\n"
     if failure == _FAIL_TRANSIENT:
-        kind = ("**transient infra — safe to re-run.** The leaf exited non-zero with no "
-                "output and retries did not recover, so it almost certainly hit a usage/"
-                "rate limit or a transient API/network error rather than reviewing the "
-                "diff; a sibling advisory leaf of a different family may already have "
-                "covered it.")
+        kind = ("**transient infra — safe to re-run.** The leaf exited non-zero either "
+                "before emitting any work or on its own report of a transient API error "
+                "(a lost connection, an overload or 5xx, a passing rate-limit rejection), "
+                "and retries did not recover it — so it hit a rate limit or a transient "
+                "API/network error rather than finishing its review of the diff; a sibling "
+                "advisory leaf of a different family may already have covered it.")
     elif failure == _FAIL_STARTUP:
         kind = ("**startup infra — the leaf never ran.** Its configured command could not be "
                 "launched at all (the binary is absent, or not executable), so nothing "
@@ -3037,6 +3623,14 @@ def _unavailable_classification(failure: str, error_log: Path | None) -> str:
                 "way: the HOST has to be able to start the sandbox (bubblewrap + socat "
                 "installed, and unprivileged user namespaces allowed — on Ubuntu, "
                 "`kernel.apparmor_restrict_unprivileged_userns=1` denies them), then re-run.")
+    elif failure == _FAIL_UNOWNED:
+        kind = ("**un-owned artifact — the leaf RAN and exited 0, but nothing could be filed "
+                "as its work.** A file an earlier, DEAD attempt had left at the artifact path "
+                "could not be withdrawn, and what is there is still that file — so filing it "
+                "would report a dead attempt's text as this leaf's verdict. (Had the live "
+                "attempt written over it, that would be ITS work and would have been filed.) "
+                "The dead attempt's own text is quoted in the error log; read it, clear "
+                "whatever blocked the withdrawal, then re-run the leaf.")
     else:
         kind = ("**substantive — needs a human.** The leaf ran but did not yield a usable "
                 "verdict; do not assume an infra blip.")
@@ -3078,7 +3672,11 @@ def _stub_review(d: Path, cfg: Config) -> None:
         "## Per-item verdicts (5 correctness · 5 conformance · 1 validation)\n"
         + "\n".join(rows)
         + "\n\nValidation fitness-to-purpose stays NEEDS-HUMAN by design — the human "
-        "decides at sign-off.\n",
+        "decides at sign-off.\n"
+        # The stub closes its artifact exactly as a command-mode leaf is told to (#541):
+        # it really did finish, so the offline path must not be the one shape the harness
+        # cannot recognise as complete.
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",
         encoding="utf-8",
     )
 
@@ -3145,22 +3743,17 @@ def _advisory_prompt(spec: dict, leaf_id: str, rubric: str = "") -> str:
         "gate you cannot re-run (#403); ground every "
         "cited path:line on the target source at $PDCA_TARGET, never other checkouts. "
         f"Write check-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
-        "bullet with a path:line. For any finding a human must adjudicate, prefix the "
-        "bullet '- NEEDS-HUMAN — ' (it becomes a SUMMARY §6 item). If the finding is an "
-        "IMPLEMENTATION defect the builder can fix by iterating — a logic bug, a missed "
-        "case, a weak or incorrect test, a conformance nit — prefix it "
-        "'- NEEDS-HUMAN [impl] — ' instead, so the driver can route it straight back to Do "
-        "without spending the human's attention (issue #264). Keep the plain "
-        "'- NEEDS-HUMAN — ' form for anything needing a human ARCHITECTURAL / scope / "
-        "fitness-to-purpose decision. TAG EVERY NEEDS-HUMAN BULLET, one way or the other: "
-        "write '[impl]' for a build defect and '[human]' for a judgment call, and do not "
-        "leave the choice unmade (issue #332 — 'when in doubt, omit' used to be the "
-        "instruction here, and across a 230-attempt corpus 139 findings arrived untagged, "
-        "which is 91% of the bundles that then could not be rebuilt unattended). An untagged "
-        "bullet still counts as '[human]', so an omission costs correctness nothing — it just "
-        "spends a human on work a rebuild could have done. You are ADVISORY — you never gate; "
-        "the human decides at sign-off. If you find nothing, say so explicitly."
-    ) + rubric
+        "bullet with a path:line. Every NEEDS-HUMAN bullet (each becomes a SUMMARY §6 "
+        "item) MUST carry exactly one tag. If the finding is an IMPLEMENTATION defect the "
+        "builder can fix by iterating — a logic bug, a missed case, a weak or incorrect "
+        "test, a conformance nit — write it '- NEEDS-HUMAN [impl] — ', so the driver can "
+        "route it straight back to Do without spending the human's attention (issue #264). "
+        "If it needs a human ARCHITECTURAL / scope / fitness-to-purpose decision, write it "
+        "'- NEEDS-HUMAN [human] — '. Decide which for every bullet; an untagged bullet is "
+        "read as [human]. You are ADVISORY — you "
+        "never gate; the human decides at sign-off. If you find nothing, say so explicitly."
+    ) + rubric + _COMPLETION_INSTRUCTION.format(   # last, after the rubric (#541)
+        artifact=f"check-advisory-{leaf_id}.md")
 
 
 def _resolved_builder_family(d: Path) -> str:
@@ -3290,21 +3883,22 @@ def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, 
         extra += _sandbox_argv(cfg, profile, seeded=seeded)   # see _run_review_sandboxed
         out = sandbox / f"check-advisory-{leaf_id}.md"
         error_log = advisory_error_log(d, leaf_id)
-        err = _invoke_leaf_resilient(
+        # The same artifact owner as the main reviewer (#541) — one implementation, so a
+        # dead attempt's residue cannot be filed as a live attempt's findings HERE either;
+        # every failure still degrades to the §6 placeholder (advisory never crashes the
+        # cycle), which is what `unavailable` writes.
+        _LeafHarvest(
+            produced=out, dest=advisory_artifact(d, leaf_id),
+            unavailable=lambda reason, failure: _advisory_unavailable(
+                d, leaf_id, reason, failure=failure, error_log=error_log),
+            empty_reason="produced no artifact",
+        ).run(
             leaf, sandbox,
             _advisory_prompt(spec, leaf_id, rubric_mod.for_reviewer(d, cfg)),
             error_log=error_log,
             label=f"Advisory {leaf_id} {d.name}",
             status=lambda: progress.bundle_activity(sandbox, (out.name,)),
             stream_json=True, env=env, extra_argv=extra, cfg=cfg)
-        if err is not None:  # advisory must never crash the cycle
-            _advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
-                                  failure=_failure_class(err), error_log=error_log)
-            return
-        if out.exists():
-            shutil.copy2(out, advisory_artifact(d, leaf_id))
-        else:
-            _advisory_unavailable(d, leaf_id, "produced no artifact")
 
 
 def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
@@ -3313,7 +3907,8 @@ def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
         f"# Advisory review — {leaf_id} (stub)\n\nLens: {role}.\n\n"
         "- NEEDS-HUMAN — advisory code-review lens is a stub here; a real "
         f"`{leaf_id}` leaf (family/argv in [[leaves.advisory]]) reviews the patch and "
-        "lists findings. The human adjudicates at sign-off.\n",
+        "lists findings. The human adjudicates at sign-off.\n"
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",   # it finished (#541) — see `_stub_review`
         encoding="utf-8")
 
 
@@ -3324,8 +3919,9 @@ def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
     advisory_artifact(d, leaf_id).write_text(
         f"# Advisory review — {leaf_id} — NOT COMPLETED\n\n"
         + _unavailable_classification(failure, error_log)
-        + f"- NEEDS-HUMAN — advisory leaf '{leaf_id}' did not produce findings ({reason}); "
-        "re-run it or adjudicate by hand.\n",
+        # Defined in `assemble`, which recognises this exact row as no verdict (#409).
+        + "- NEEDS-HUMAN — "
+        + assemble.ADVISORY_UNAVAILABLE_FINDING.format(leaf=leaf_id, reason=reason) + "\n",
         encoding="utf-8")
 
 
@@ -3380,6 +3976,8 @@ def _plan_advisory_prompt(spec: dict, leaf_id: str) -> str:
         f"Glob, create plan-advisory-{leaf_id}.md with the Write tool, and make its first "
         "line say that Bash was unavailable in this run. Do not add that line when Bash "
         "works."
+        # #541: the closing instruction goes LAST, after everything else the prompt says.
+        + _COMPLETION_INSTRUCTION.format(artifact=f"plan-advisory-{leaf_id}.md")
     )
 
 
@@ -3726,50 +4324,68 @@ def _run_plan_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: d
         out = sandbox / f"plan-advisory-{leaf_id}.md"
         error_log = d / f"plan-advisory-{leaf_id}.error.log"
         bash = _BashSandboxProbe()
-        err = _invoke_leaf_resilient(
+
+        def sandbox_account(err: Exception | None) -> tuple[str, str] | None:
+            """#526's reading of a run that filed nothing: a vendor sandbox that could not
+            start is ``sandbox-empty`` infra, on the vendor's own evidence — the CLI's
+            refusal (a failed run) or every Bash call dying in the sandbox's startup (a run
+            that exited 0 and wrote nothing). ``None`` keeps the generic account."""
+            if err is not None:
+                refusal = (_sandbox_refusal(getattr(err, "output", ""))
+                           if _failure_class(err) != _FAIL_STARTUP else "")
+                if refusal:  # the CLI refused to start without its sandbox
+                    return ("the vendor sandbox could not start, so the CLI refused to "
+                            f"run: {refusal}", _FAIL_SANDBOX)
+                return None
+            dead = bash.sandbox_start_failure()
+            if dead:
+                return ("produced no artifact; every Bash call it made failed before "
+                        f"running, because the vendor sandbox could not start: {dead}",
+                        _FAIL_SANDBOX)
+            return None
+
+        # The third site on the SAME artifact owner (#541): the plan reviewer's sandbox is
+        # no different, so a dead attempt's residue must not be filed as the brief's review
+        # here either. A fix that landed at the two Check sites and not at this one is
+        # exactly the shape this shared owner exists to make impossible. What is this
+        # site's own — #526's sandbox evidence — rides in as `explain`, not as a copy.
+        filed = _LeafHarvest(
+            produced=out, dest=plan_advisory_artifact(d, leaf_id),
+            unavailable=lambda reason, failure: _plan_advisory_unavailable(
+                d, leaf_id, reason, failure=failure, error_log=error_log),
+            empty_reason="produced no artifact", explain=sandbox_account,
+        ).run(
             leaf, sandbox, _plan_advisory_prompt(spec, leaf_id),
             error_log=error_log,
             label=f"Plan advisory {leaf_id} {d.name}",
             status=lambda: progress.bundle_activity(sandbox, (out.name,)),
             stream_json=True, env=env, extra_argv=extra, cfg=cfg, on_event=bash)
-        if err is not None:  # advisory must never crash Plan
-            failure = _failure_class(err)
-            refusal = (_sandbox_refusal(getattr(err, "output", ""))
-                       if failure != _FAIL_STARTUP else "")
-            if refusal:  # the CLI refused to start without its sandbox (#526)
-                _plan_advisory_unavailable(
-                    d, leaf_id, "the vendor sandbox could not start, so the CLI refused to "
-                    f"run: {refusal}", failure=_FAIL_SANDBOX, error_log=error_log)
-            else:
-                _plan_advisory_unavailable(d, leaf_id, f"leaf failed: {err}",
-                                           failure=failure, error_log=error_log)
-            return
-        dead = bash.sandbox_start_failure()
-        if out.exists():
-            shutil.copy2(out, plan_advisory_artifact(d, leaf_id))
-            if dead:  # delivered without Bash (#526): say so, whatever the leaf said
-                _note_bash_unavailable(plan_advisory_artifact(d, leaf_id), dead)
-        elif dead:
-            _plan_advisory_unavailable(
-                d, leaf_id, "produced no artifact; every Bash call it made failed before "
-                f"running, because the vendor sandbox could not start: {dead}",
-                failure=_FAIL_SANDBOX)
-        else:
-            _plan_advisory_unavailable(d, leaf_id, "produced no artifact")
+        dead = bash.sandbox_start_failure() if filed else ""
+        if dead:  # delivered without Bash (#526): say so, whatever the leaf said
+            _note_bash_unavailable(plan_advisory_artifact(d, leaf_id), dead)
 
 
 def _note_bash_unavailable(artifact: Path, evidence: str) -> None:
-    """Append the harness's own account to a review the leaf delivered while Bash was
+    """Add the harness's own account to a review the leaf delivered while Bash was
     dead (#526). The prompt asks the leaf to disclose it; this does not depend on the
     leaf remembering to. A blockquote, not a bullet: it is not a finding, so it never
-    counts toward ``findings`` or triggers the revision pass."""
+    counts toward ``findings`` or triggers the revision pass.
+
+    A review the leaf CLOSED keeps its completion trailer as its last line (#541): the note
+    goes in just above it. Appended below, it would un-close the review, and a closed review
+    that quotes a leaf-status marker would then be read as a placeholder — the leaf's own
+    statement that it finished, undone by the harness's annotation."""
     text = artifact.read_text(encoding="utf-8")
-    artifact.write_text(
-        text + ("" if text.endswith("\n") else "\n")
-        + "\n> **pdca:** Bash was unavailable to this reviewer. The vendor sandbox could "
-        "not start on this host, so every Bash call it made failed before running "
-        f"(`{evidence}`) and it ran no commands; this review was delivered without Bash.\n",
-        encoding="utf-8")
+    note = ("> **pdca:** Bash was unavailable to this reviewer. The vendor sandbox could "
+            "not start on this host, so every Bash call it made failed before running "
+            f"(`{evidence}`) and it ran no commands; this review was delivered without "
+            "Bash.\n")
+    above, _nl, closing = text.rstrip().rpartition("\n")
+    if closing.strip() == assemble.LEAF_COMPLETE_TRAILER:
+        text = f"{above.rstrip()}\n\n{note}\n{closing.strip()}\n"
+    else:
+        text += ("" if text.endswith("\n") else "\n") + "\n" + note
+    artifact.write_text(text, encoding="utf-8")
 
 
 def _stub_plan_advisory(d: Path, spec: dict, leaf_id: str) -> None:
@@ -3778,7 +4394,8 @@ def _stub_plan_advisory(d: Path, spec: dict, leaf_id: str) -> None:
         f"# Plan advisory — {leaf_id} (stub)\n\nLens: {role}.\n\n"
         f"- NEEDS-HUMAN — plan-advisory lens is a stub here; a real `{leaf_id}` leaf "
         "(family/argv in [[leaves.plan_advisory]]) reviews the brief and lists findings. "
-        "The human adjudicates at sign-off.\n",
+        "The human adjudicates at sign-off.\n"
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",   # it finished (#541) — see `_stub_review`
         encoding="utf-8")
 
 

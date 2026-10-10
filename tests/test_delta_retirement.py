@@ -299,11 +299,11 @@ class LiveTreeDiscipline(unittest.TestCase):
                          "or the retirement check cannot track it")
 
     def test_the_documented_deltas_are_found(self):
-        # The deltas issue #231 tables (minus #462, retired at v0.58.0), plus the #335
-        # carry (marked with #231).
+        # The deltas issue #231 tables, minus those retired at an upgrade: #462 at v0.58.0;
+        # #335, #371, #531, #582, #589, #590, #591, #593, #597 at v0.59.0.
         sites, _ = dr.scan_tree(ROOT)
         found = {n for s in sites for repo, n in s.refs if repo == UPSTREAM}
-        self.assertLessEqual({335, 371, 531, 579, 580, 581, 582, 589, 590, 591, 593, 594, 597}, found)
+        self.assertLessEqual({535, 579, 580, 581, 594}, found)
 
 
 if __name__ == "__main__":

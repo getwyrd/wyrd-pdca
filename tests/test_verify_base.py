@@ -471,27 +471,5 @@ class C4BaseLadderPostures(unittest.TestCase):
         self.assertFalse(result.wasSuccessful())
 
 
-
-class StackedPrBase(unittest.TestCase):
-    """#593: a WAVE-stacked PR targets the real base (merging the integration branch lands
-    nothing); a hand-declared `Stacks on:` parent keeps its PR-branch base (#123)."""
-
-    def setUp(self) -> None:
-        self.d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.d, True)
-
-    def test_a_wave_stacked_pr_targets_the_base(self) -> None:
-        publish.write_stack_base(self.d, "pdca-integration/main-rabc")
-        self.assertEqual(publish._pr_base(self.d, "main", "pdca-integration/main-rabc", True),
-                         "main")
-
-    def test_a_stacks_on_parent_branch_stays_the_base(self) -> None:
-        self.assertEqual(publish._pr_base(self.d, "main", "fix/123-parent", True),
-                         "fix/123-parent")
-
-    def test_a_fork_always_targets_the_base(self) -> None:
-        self.assertEqual(publish._pr_base(self.d, "main", "fix/123-parent", False), "main")
-        self.assertEqual(publish._pr_base(self.d, "main", None, True), "main")
-
 if __name__ == "__main__":
     unittest.main()

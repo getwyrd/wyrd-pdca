@@ -304,15 +304,16 @@ class Config:
     # out is recorded ``unverifiable`` (→ SUMMARY §6 NEEDS-HUMAN), never pass/fail.
     # ``None`` (unset / 0) ⇒ unbounded — today's behaviour, unchanged.
     gates_default_timeout_secs: int | None = None
+    # Confirm-once for a failed gating row (issue #371): ``[gates] confirm_gating_fail``.
+    # On (the default), a gating row that FAILS at Check is re-run once; fail→pass is
+    # recorded ``pass`` + ``flaky`` and routed to SUMMARY §6 as a HUMAN item. A row opts out
+    # alone with ``confirm_fail = false``. Only a literal ``false`` (or any non-boolean)
+    # turns it off — off is today's one-run behaviour.
+    gates_confirm_gating_fail: bool = True
     # Delegated gates (issue #67): a host runner that single-sources its own gates
     # (e.g. "cargo xtask"). A check's bare ``subcmd`` is run as ``<runner> <subcmd>``, so
     # PDCA orchestrates the host runner instead of re-declaring the gates. "" ⇒ inline only.
     gates_runner: str = ""
-    # Confirm-once on a failed GATING row (eduralph/pdca-harness#371): re-run the command
-    # once and record both verdicts; a fail→pass flip passes flagged ``flaky`` and routes
-    # a §6 flake item to the human. On by default — one transient red must not park the
-    # bundle; ``confirm_gating_fail = false`` restores raw single-sample verdicts.
-    gates_confirm_fail: bool = True
     # Target-aware gate selection (docs 04). A check may carry ``target`` (a label or
     # list); it runs iff its labels are a SUBSET of the bundle's label set. The bundle is
     # classified from its brief on two axes: a PRIMARY one (``gate_target_match``: label →
@@ -338,21 +339,12 @@ class Config:
     # dropped. ``[driver].max_passes``; ``PDCA_MAX_PASSES`` overrides for one run;
     # ``--max-passes`` overrides both.
     max_passes: int = 20
-    # Auto-iterate (issues #264/#332): while SUMMARY §6 carries implementation-level work —
-    # a `gate` cell of the 5/5/1 (C2/C4/T1..T4), an advisory finding tagged `[impl]`, or a
-    # judgment cell the reviewer tagged `[impl]` — the driver records `iterate-do` and
-    # rebuilds instead of stopping for a human.
-    #
-    # A finding that NEEDS a human no longer halts the rebuild (#332). It is deferred into
-    # the bundle's `deferred-findings.json` and re-enters §6 at handover, so the human sees
-    # it when the rounds run out rather than when it was raised — later than before, never
-    # not at all, and the C6 accept-guard still holds until it is cleared. What bounds the
-    # iteration is the round budget below, not the finding.
-    #
-    # Two cases still halt immediately: an empty §6 (a clean bundle awaiting a human
-    # ACCEPT — this never auto-accepts) and a §6 of human findings with no implementation
-    # work beside them (nothing for a rebuild to do). OFF by default.
-    # ``[driver].auto_iterate``; ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
+    # Auto-iterate (issue #264): when every open SUMMARY §6 item is implementation-level
+    # (a `gate` cell of the 5/5/1 — C2/C4/T1..T4), let the driver record `iterate-do` and
+    # rebuild instead of stopping for a human. A judgment cell (C5/T5/validation), an
+    # unverifiable gate, an external dependency, or an unmarked advisory finding still
+    # halts. It never auto-accepts. OFF by default. ``[driver].auto_iterate``;
+    # ``PDCA_AUTO_ITERATE`` / ``--auto-iterate`` override.
     auto_iterate: bool = False
     # The per-bundle cap on those automatic rounds; on exhaustion the bundle halts at
     # AWAITING_SIGNOFF for the human. Clamped below ``max_passes``
@@ -373,12 +365,6 @@ class Config:
     # ``test_an_adopted_wave_only_gets_what_is_left_of_the_run_budget``). A run that adopts
     # nothing cannot reach the pool at all, so the clamp holds there exactly as before.
     max_auto_iters: int = 3
-    # The SOFT floor (issue #332): rounds up to it fire unconditionally, rounds ABOVE it
-    # fire only while the implementation-finding count is not increasing. 0 ⇒ unset ⇒
-    # equals ``max_auto_iters``, which reproduces the pre-#332 behaviour exactly (every
-    # round unconditional), so a rendered instance changes nothing until it opts in.
-    # Normalized in :meth:`__post_init__`; never above ``max_auto_iters``.
-    soft_auto_iters: int = 0
     # Worktree isolation (issue #94): run a cycle's Do/Check in a dedicated git worktree
     # off the target's base, so the host's primary checkout is never mutated in place.
     # On by default; ``[driver].worktree = false`` disables (then Do/Check edit the
@@ -410,14 +396,6 @@ class Config:
     # The `gh pr merge` strategy for wave_mode="merge" (issue #wave-model): merge | squash |
     # rebase. Default "merge" (a merge commit — auditable, bisectable). [driver].merge_method.
     merge_method: str = "merge"
-    # Whether wave_mode="merge" may actually merge (pdca-harness#462). On (default), a
-    # non-final wave's PRs are readied and merged at its boundary. Off, the driver merges
-    # NOTHING and readies NOTHING — every accepted bundle stays the draft PR publish opened,
-    # and the flow STOPs at the first non-final wave boundary rather than build the next wave
-    # on a base its prerequisite never reached. Keeps merge mode's real-base PRs (so
-    # C4-verify's `origin/<brief base>` still matches the PR base) while the merge stays the
-    # human's. No effect under wave_mode="stack". [driver].auto_merge.
-    auto_merge: bool = True
     # Which checks must be green before wave_mode="merge" merges a non-final wave's PR
     # (issue #413). "all" (the default) reads the PR's FULL check rollup — `gh pr checks`,
     # after the ready-mark, immediately before the merge — and refuses on any failing,
@@ -431,22 +409,13 @@ class Config:
     # queued or not yet registered, so a rollup read that moment is `pending` or `empty`:
     # absence of evidence, not a verdict. `_merge_one` re-reads the rollup until it resolves
     # or this many wall-clock seconds elapse; only an unresolved rollup at the bound (or a
-    # genuinely failing/unreadable one) refuses. `0` performs no wait at all — a single
-    # read, the original immediate-refusal behaviour. [driver].merge_wait_secs.
+    # genuinely failing/unreadable one) refuses. A green read is confirmed by one more read
+    # a full poll interval (15 s) later, charged to this budget (issue #582: an early
+    # rollup can be green on the fast checks alone); a green with less than 15 s of budget
+    # left to confirm it refuses as pending, so a value from 1 to 14 refuses every PR. `0`
+    # performs no wait at all — a single read, the original immediate-refusal behaviour.
+    # [driver].merge_wait_secs.
     merge_wait_secs: int = 300
-    # INSTANCE DELTA (eduralph/pdca-harness#531). In merge mode a wave's PRs are merged
-    # back to back, and nothing verifies the COMBINATION: each PR's rollup describes the
-    # base as it stood before its siblings landed. Whether that matters is decided entirely
-    # by the host's `required_status_checks.strict`, which the driver neither reads nor
-    # documents — and with strict:false GitHub does not re-run a PR's checks after a sibling
-    # merges, so the wave's second merge lands on a rollup for the pre-merge tree. Each fix
-    # was green alone; the combination was never verified. With this on, a PR found behind
-    # its base is brought up to date BEFORE the rollup gate, so the checks the gate reads
-    # describe the tree the PR actually merges into. It composes with `merge_wait_secs`
-    # rather than duplicating it: the sync makes the rollup empty for the new head, and
-    # `_wait_for_green` already polls on empty. False reproduces upstream exactly.
-    # [driver].merge_sync_base.
-    merge_sync_base: bool = True
     # Optional integration re-gate (#wave-model): after each wave folds onto the
     # integration branch, run the repo-scoped gates over that tip before the next wave
     # builds on it, so a combination that is red though each fix was green alone STOPs the
@@ -576,23 +545,6 @@ class Config:
     # commit-only and reports), or a literal issue number.
     records_issue: str = ""
 
-    def __post_init__(self) -> None:
-        self._normalize_auto_iters()
-
-    def _normalize_auto_iters(self) -> None:
-        """Resolve the soft floor against the hard ceiling (issue #332).
-
-        Unset (0 or negative) means "no soft tier" — the floor sits AT the ceiling, so every
-        allowed round fires unconditionally and the behaviour is exactly pre-#332. A floor
-        configured ABOVE the ceiling is a misconfiguration with only one safe reading: the
-        ceiling still bounds the work, so clamp to it rather than let the floor raise the
-        cap it is supposed to sit under. Idempotent — :meth:`override_max_passes` re-runs it
-        after lowering the ceiling, which must drag the floor down with it.
-        """
-        if self.soft_auto_iters <= 0:
-            self.soft_auto_iters = self.max_auto_iters
-        self.soft_auto_iters = min(self.soft_auto_iters, self.max_auto_iters)
-
     def profile(self, leaf: LeafConfig):
         """The resolved :class:`~pdca_harness.families.FamilyProfile` for ``leaf``."""
         from . import families as _families  # local import: keep config import-light
@@ -633,10 +585,6 @@ class Config:
         spent >= budget check then declines before the decision is recorded)."""
         self.max_passes = max(1, n)
         self.max_auto_iters = min(self.max_auto_iters, max(0, self.max_passes - 1))
-        # The soft floor sits under the ceiling by construction, so lowering the ceiling
-        # must drag it down too — otherwise a floor left above it would make every
-        # remaining round unconditional, which is the opposite of what the clamp is for.
-        self._normalize_auto_iters()
 
     def close_class(self, disposition: str) -> str:
         """The close class matching ``disposition``, or "" if it is not a close hint.
@@ -692,7 +640,13 @@ class Config:
             gates_default_timeout_secs = None
         if gates_default_timeout_secs is not None and gates_default_timeout_secs < 0:
             gates_default_timeout_secs = None
-        gates_confirm_fail = bool(gates.get("confirm_gating_fail", True))
+        # Confirm-once (issue #371): absent ⇒ on; a non-boolean fails toward OFF (today's
+        # one-run behaviour), loudly — the dependency_halt lesson (PR #292).
+        gates_confirm_gating_fail = gates.get("confirm_gating_fail", True)
+        if not isinstance(gates_confirm_gating_fail, bool):
+            print(f"config: [gates] confirm_gating_fail = {gates_confirm_gating_fail!r} is "
+                  "not a boolean — treating it as false (no confirm re-run)", file=sys.stderr)
+            gates_confirm_gating_fail = False
         registry_consistency = dict(gates.get("registry_consistency", {}))
         install_extra_bootstrap = data.get("install", {}).get("extra_bootstrap", "")
         # `pdca try <id>` launch command (project-specific); "" ⇒ the command errors with a hint.
@@ -832,29 +786,14 @@ class Config:
         if os.environ.get("PDCA_MAX_AUTO_ITERS"):
             max_auto_iters = max(1, int(os.environ["PDCA_MAX_AUTO_ITERS"]))
         max_auto_iters = min(max_auto_iters, max(0, max_passes - 1))
-        # The soft floor (issue #332). 0 ⇒ unset ⇒ __post_init__ sets it to the ceiling,
-        # so an instance that never declares it behaves exactly as it did before.
-        soft_auto_iters = max(0, int(driver_cfg.get("soft_auto_iters", 0)))
-        if os.environ.get("PDCA_SOFT_AUTO_ITERS"):
-            soft_auto_iters = max(0, int(os.environ["PDCA_SOFT_AUTO_ITERS"]))
         worktree = bool(driver_cfg.get("worktree", True))  # issue #94; on by default
         overflow = max(0, int(driver_cfg.get("overflow", 0)))  # issue #226; 0 ⇒ heal in place
         lane_preflight = driver_cfg.get("lane_preflight", "")  # issue #213
         wave_mode = driver_cfg.get("wave_mode", "stack")  # #wave-model: stack | merge
         merge_method = driver_cfg.get("merge_method", "merge")  # merge | squash | rebase
-        # Strict, not `bool()` (#462 review): `bool("false")` is True, so an instance that
-        # wrote `auto_merge = "false"` would get the merging it explicitly asked to stop —
-        # the one direction this switch exists to prevent. `_parse_opt_in` fails CLOSED,
-        # which for this knob means "driver merges nothing", the safe reading. An absent key
-        # still arrives as the real bool `True`, so the upstream default is unchanged.
-        auto_merge = _parse_opt_in(driver_cfg.get("auto_merge", True), "auto_merge")
         # Check-rollup policy for merge mode (issue #413). An unknown value falls back to
         # "all" with a note — the fail-safe direction is the STRICTER reading (verify the
         # rollup ourselves), never a typo silently buying host-config-only semantics.
-        # INSTANCE DELTA (eduralph/pdca-harness#531). Default ON: the failure it prevents is
-        # a silently-unverified combination landing on the real base, which is worse than the
-        # cost of a redundant no-op check per merge.
-        merge_sync_base = bool(driver_cfg.get("merge_sync_base", True))
         merge_requires = str(driver_cfg.get("merge_requires", "all")).strip().lower()
         if merge_requires not in ("all", "required"):
             print(f"config: unknown [driver].merge_requires '{merge_requires}' — expected "
@@ -983,21 +922,18 @@ class Config:
             builder_variants=builder_variants,
             gates_runner=gates_runner,
             gates_default_timeout_secs=gates_default_timeout_secs,
-            gates_confirm_fail=gates_confirm_fail,
+            gates_confirm_gating_fail=gates_confirm_gating_fail,
             lanes=lanes,
             max_passes=max_passes,
             auto_iterate=auto_iterate,
             max_auto_iters=max_auto_iters,
-            soft_auto_iters=soft_auto_iters,
             worktree=worktree,
             overflow=overflow,
             lane_preflight=lane_preflight,
             wave_mode=wave_mode,
             merge_method=merge_method,
-            auto_merge=auto_merge,
             merge_requires=merge_requires,
             merge_wait_secs=merge_wait_secs,
-            merge_sync_base=merge_sync_base,
             regate_between_waves=regate_between_waves,
             act_cadence=act_cadence,
             scratch_dir=scratch_dir,
@@ -1030,7 +966,8 @@ def _normalize_host_ci(entries: list) -> list[dict]:
     (the CI-parity slot the issue names — the contribution as the host's CI will see
     it), ``scope = "bundle"`` (they need the patched tree), and an ``id``/``label``
     derived from the command so a failure always names what ran. Explicit id / label /
-    tier keys on a table row win over those defaults — but ``gating`` is FORCED true,
+    tier keys on a table row win over those defaults (as does any other row key, e.g.
+    ``confirm_fail``, issue #371) — but ``gating`` is FORCED true,
     a contract rather than a default: the host's CI will fail the PR on every declared
     command regardless of what an advisory row believed, and the #311 criterion is
     literal — a command that exits non-zero blocks publish. A declared

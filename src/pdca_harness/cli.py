@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     p_flow.add_argument("--by", default="", help="who signed off (recorded in §9)")
     p_flow.add_argument("--lanes", type=int, help="unattended Do+Check worker-pool size (docs 09; overrides [driver].lanes / PDCA_LANES)")
     p_flow.add_argument("--max-passes", type=int, help="sign-off pass budget before the driver stops driving a bundle (#260; overrides [driver].max_passes / PDCA_MAX_PASSES)")
-    p_flow.add_argument("--auto-iterate", action="store_true", help="rebuild without stopping while Check finds implementation-level work; findings needing a human are DEFERRED into the bundle and re-enter \u00a76 at handover, not shown before it. Bounded by [driver].soft_auto_iters / max_auto_iters, never auto-accepts (#264/#332; overrides [driver].auto_iterate / PDCA_AUTO_ITERATE)")
+    p_flow.add_argument("--auto-iterate", action="store_true", help="rebuild without stopping while Check finds implementation-level work; findings needing human judgment are deferred to the handover §6, and the loop stops at [driver].max_auto_iters or the size backstop (#264, #409; overrides [driver].auto_iterate / PDCA_AUTO_ITERATE)")
     p_flow.add_argument("--no-inhibit", action="store_true", help="don't hold a suspend inhibitor for the run (also PDCA_NO_INHIBIT=1) — for CI/containers where it's unavailable or unwanted (#244)")
 
     p_size = sub.add_parser("size",
@@ -255,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="comma-separated tracker ids, one per child, IN PROPOSAL "
                               "ORDER. Omit to have the child issues filed for you, each as "
                               "a sub-issue of the parent")
+    p_split.add_argument("--force", action="store_true",
+                         help="with --accept: split even a bundle already two or more "
+                              "splits deep (refused by default, #545). The human's call; "
+                              "overrides only the depth refusal")
 
     p_status = sub.add_parser("status", help="list bundle states (cheap-first queue)")
     p_status.add_argument("issue_id", nargs="?")
@@ -720,22 +724,11 @@ def _flow_claimed(cfg: Config, args: argparse.Namespace, claims: drive_claim.Run
         print(f"flow: {exc}", file=sys.stderr)
         return 1
     except waves.DependencyGraphError as exc:
-        # INSTANCE DELTA (eduralph/pdca-harness#589): the batch's dependency graph cannot be
-        # scheduled. Refused before anything is built — a Plan session or `--from-briefs`
-        # may already have written a brief (PR #257 review), but no Do or Check has run —
-        # so this is operator error: say what and how out, never a traceback. Reached
-        # through a split parent too: its `flow` adopts the children, whose dependencies
-        # the operator never named.
-        if exc.cycle:
-            way_out = ("  The ordering edges form a loop, so no order exists. Remove or "
-                       "correct one `Depends on` / `Stacks on` edge in the loop above, in "
-                       "the brief of the bundle whose edge is wrong.")
-        else:
-            way_out = ("  Fix one of: add the prerequisite to this run's ids; finish it "
-                       "first; or, if it landed outside the PDCA cycle (its tracker issue is "
-                       "closed), drop the edge from the dependent's brief and record why in "
-                       "its Ordering note.")
-        print(f"flow: refused before any build — {exc}.\n{way_out}", file=sys.stderr)
+        # An unschedulable dependency graph is operator input (#589), refused like a bad
+        # pdca.toml (rc 2, #92) — not a traceback. Only this subtype: any other ValueError
+        # out of `flow_ids` is a real fault and still propagates.
+        print(f"flow: {exc}\n  refusing to start — no bundle was built.\n"
+              f"  Ways out: {exc.remedy}.", file=sys.stderr)
         return 2
 
     # Two PRESENTATIONS of that one map — never two drive paths, and never a second source
@@ -888,7 +881,9 @@ def _split(cfg: Config, args) -> int:
     try:
         proposal_text = (d / split.PROPOSAL).read_text(encoding="utf-8")
         children = split.parse(proposal_text)
-        split.preflight(d, children, cfg)
+        # `force` is read with a default: callers that build a bare namespace without it
+        # (tests, scripts) keep today's behaviour — the depth refusal applies (#545).
+        split.preflight(d, children, cfg, force=bool(getattr(args, "force", False)))
     except OSError:
         split.advisory(f"split: {d.name} has no {split.PROPOSAL} — run "
                        f"`{_prog()} split {args.issue_id}` first")
@@ -1109,15 +1104,8 @@ def _waves(cfg: Config, ids: list[str]) -> int:
     except ValueError as exc:
         print(f"unschedulable: {exc}", file=sys.stderr)
         return 1
-    # With merge mode's auto_merge off (pdca-harness#462) the run STOPs at the first
-    # non-final boundary, so the usual "each wave builds on the prior's" promise would
-    # misdescribe the plan the flow will actually execute — say what happens instead.
-    held = cfg.wave_mode == "merge" and not cfg.auto_merge
-    carry = ("the driver merges nothing: wave 0 runs, then the flow STOPs for you to merge"
-             if held and len(plan) > 1 else
-             "the driver merges nothing" if held else
-             "each wave builds on the prior's accepted work")
-    print(f"{len(bundles)} bundle(s) → {len(plan)} wave(s) ({cfg.wave_mode} mode; {carry}):")
+    print(f"{len(bundles)} bundle(s) → {len(plan)} wave(s) ({cfg.wave_mode} mode; "
+          f"each wave builds on the prior's accepted work):")
     for k, wave in enumerate(plan):
         print(f"  wave {k}: " + ", ".join(d.name.removeprefix("issue_") for d in wave))
     return 0
@@ -1139,8 +1127,9 @@ def _publish_flag(d: Path) -> str:
     url, base = rec.get("pr_url"), rec.get("base")
     if not url:
         return "  [published]"
-    # A stacked PR (#wave-model / #123) targets the wave integration branch, not the base —
-    # show ↑<base> so the human knows to merge the stack bottom-up.
+    # ↑<base> means "part of a stack, merge bottom-up" (#wave-model / #123). For a wave stack
+    # it no longer names an intermediate branch: every PR targets the real base (#593), so
+    # it reads ↑main, and the order to merge in comes from the briefs' `Depends on`.
     stacked = rec.get("mode") in ("stacked-pr", "stacked")
     return f"  [PR {url}{f' ↑{base}' if stacked else ''}]"
 
@@ -1546,7 +1535,9 @@ def _signoff(cfg: Config, args: argparse.Namespace) -> int:
 
     if args.accept:
         action = "accept"
-        open_items = signoff.open_needs_human(summary)
+        # The C6 read every accept path shares — it also puts an unreadable deferred-findings
+        # ledger into §6 first (#409), which a check of this path's own would skip.
+        open_items = flow.accept_blockers(d)
         if open_items:
             print("cannot accept — §6 NEEDS-HUMAN still open (C6):", file=sys.stderr)
             for it in open_items:

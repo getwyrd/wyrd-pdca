@@ -20,6 +20,14 @@ checks have not reported yet. `_merge_one` now waits (`_wait_for_green`, bounded
 `[driver].merge_wait_secs`, driven through the patchable `merge._sleep` so these tests cost
 no wall-clock) before treating an unresolved rollup as a refusal, and undoes the ready-mark
 (`gh pr ready --undo`) on every path where it declines to merge a PR it already readied.
+
+Issue #531 ties the green to the base and the head that merge: after the ready-mark
+`_merge_one` decides in plain git whether the PR's head lacks its base's tip (`gh pr view`
+for the head, `git fetch`, `git merge-base --is-ancestor`), brings a PR that is behind up to
+date (`gh pr update-branch`, polled until it lands), waits for that head's rollup, reads the
+head and base again, and merges pinned to the head (`--match-head-commit`). The `MergeWave`
+stubs answer that read as "up to date"; `MergeAgainstCurrentBase` drives it against a
+stateful fake host (`_Host`).
 """
 
 from __future__ import annotations
@@ -57,27 +65,36 @@ def _rollup(*checks: tuple[str, str], code: int = 0) -> SimpleNamespace:
         stdout=json.dumps([{"name": n, "bucket": b} for n, b in checks]))
 
 
+HEAD = "1" * 40       # the PR head the stubs' `gh pr view` reports (issue #531)
+BASE_TIP = "b" * 40   # the base tip the stubs' `git rev-parse` resolves
+
+
+def _up_to_date(cmd: list[str]) -> SimpleNamespace | None:
+    """Issue #531's base read, answered for a PR that is NOT behind its base: `gh pr view`
+    reports head `HEAD` on base `main`, `git rev-parse` resolves the base tip, and the
+    fetches and `git merge-base --is-ancestor` fall through to the callers' default exit 0
+    (up to date). ``None`` for every other command."""
+    if cmd[:3] == ["gh", "pr", "view"]:
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+            {"headRefOid": HEAD, "baseRefName": "main"}))
+    if cmd[:1] == ["git"] and "rev-parse" in cmd:
+        return SimpleNamespace(returncode=0, stderr="", stdout=BASE_TIP + "\n")
+    return None
+
+
 def _gh(**by_verb: SimpleNamespace):
     """Build a `subprocess.run` stub: every `gh`/`git` call succeeds, except the verbs
     named here (`checks=`, `ready=`, `merge=`) which return the given result. The default
-    rollup is green, so tests that are not about #413 reach `gh pr merge` exactly as they
-    did before it."""
+    rollup is green and the PR up to date with its base, so tests that are not about #413
+    or #531 reach `gh pr merge` exactly as they did before them."""
     default_checks = _rollup(("ci", "pass"))
-    # The #531 sync runs before the rollup gate, so the shared stub has to answer its two
-    # reads or every caller hits its fail-closed arm. Default: a PR that is UP TO DATE, so
-    # tests not about #531 reach `gh pr merge` exactly as they did before it.
-    default_view = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
-        {"baseRefName": "main", "headRefName": "fix/x"}))
 
     def run(cmd, **kw):
-        if cmd[:2] == ["gh", "api"]:
-            return by_verb.get("api", SimpleNamespace(returncode=0, stdout="0\n", stderr=""))
-        if cmd[:2] == ["gh", "pr"]:
-            if cmd[2] == "view" and "view" not in by_verb:
-                return default_view
-            return by_verb.get(cmd[2], default_checks if cmd[2] == "checks"
-                               else SimpleNamespace(returncode=0, stdout="", stderr=""))
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["gh", "pr"] and cmd[2] in by_verb:
+            return by_verb[cmd[2]]
+        if cmd[:3] == ["gh", "pr", "checks"]:
+            return default_checks
+        return _up_to_date(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return run
 
@@ -86,8 +103,10 @@ class MergeWave(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
         self.cfg = _cfg(self.tmp)
-        # A green rollup is confirmed one interval later (eduralph/pdca-harness#582), so
-        # every merge here would otherwise sleep for real: no test in this class may.
+        # issue #582: every green rollup is now re-read once more, one poll interval later,
+        # before it is believed — so any test that reaches a green rollup would sleep a
+        # real 15 s. Patch the wait's sleep for the whole class; a test that patches it
+        # again in its own `with` (to inspect the calls) just nests over this one.
         sleeper = mock.patch.object(merge, "_sleep")
         sleeper.start()
         self.addCleanup(sleeper.stop)
@@ -131,8 +150,11 @@ class MergeWave(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             rc = merge.merge_wave(self.cfg, [b], method="squash")
         self.assertEqual(rc, 0)
-        self.assertIn(["gh", "pr", "merge", "https://gh/pr/1", "--squash"], runs)
-        self.assertTrue(any("fetch" in c for c in runs))   # base refreshed after merge
+        merge_cmd = ["gh", "pr", "merge", "https://gh/pr/1", "--squash",
+                     "--match-head-commit", HEAD]
+        self.assertIn(merge_cmd, runs)
+        # base refreshed AFTER the merge (issue #531 fetches before it too, for its read)
+        self.assertTrue(any("fetch" in c for c in runs[runs.index(merge_cmd) + 1:]))
 
     def test_close_no_fix_skipped(self) -> None:
         b = self._bundle("M3", patch=None)             # no patch — nothing to merge
@@ -191,7 +213,8 @@ class MergeWave(unittest.TestCase):
         self.assertEqual(rc, 0)
         gh = [c for c in runs if c[:2] == ["gh", "pr"]]
         self.assertEqual(gh[0], ["gh", "pr", "ready", "https://gh/pr/1"])
-        self.assertEqual(gh[-1], ["gh", "pr", "merge", "https://gh/pr/1", "--merge"])
+        self.assertEqual(gh[-1], ["gh", "pr", "merge", "https://gh/pr/1", "--merge",
+                                  "--match-head-commit", HEAD])
 
     def test_ready_failure_stops_before_merge(self) -> None:
         # If a PR can't be readied it can't be merged — fail-closed, and never attempt merge.
@@ -210,7 +233,7 @@ class MergeWave(unittest.TestCase):
             rc = merge.merge_wave(self.cfg, [b])
         self.assertEqual(rc, 1)
         self.assertIn("could not be marked ready", err.getvalue())
-        self.assertNotIn(["gh", "pr", "merge", "https://gh/pr/1", "--merge"], runs)
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in runs))
 
     def test_dry_run_readies_nothing(self) -> None:
         # A dry-run must shell nothing — not even the new ready step.
@@ -313,14 +336,7 @@ class MergeWave(unittest.TestCase):
                 reads["n"] += 1
                 return (_rollup(("ci", "pending"), code=8) if reads["n"] < 3
                         else _rollup(("ci", "pass")))
-            # The #531 sync (instance delta) reads the PR's refs and its behind-count
-            # before the rollup gate; answer both as "up to date", as `_gh()` does.
-            if cmd[:3] == ["gh", "pr", "view"]:
-                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
-                    {"baseRefName": "main", "headRefName": "fix/x"}))
-            if cmd[:2] == ["gh", "api"]:
-                return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return _up_to_date(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch("pdca_harness.merge.subprocess.run", side_effect=fake_run), \
                 mock.patch.object(merge, "_sleep", create=True) as sleep, \
@@ -329,11 +345,12 @@ class MergeWave(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             rc = merge.merge_wave(self.cfg, [b], method="merge")
         self.assertEqual(rc, 0)
-        # pending, pending, green — and the instance's confirm read of that green
-        # (eduralph/pdca-harness#582); upstream alone reads three times.
+        # pending, pending, green, then green again — issue #582: the first green is
+        # re-read once more, one poll interval later, before it is believed.
         self.assertEqual(reads["n"], 4)
         self.assertTrue(sleep.called)                 # the wait actually slept in between
-        self.assertIn(["gh", "pr", "merge", "https://gh/pr/1", "--merge"], calls)
+        self.assertIn(["gh", "pr", "merge", "https://gh/pr/1", "--merge",
+                       "--match-head-commit", HEAD], calls)
         self.assertNotIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
 
     def test_wait_bound_zero_performs_no_wait(self) -> None:
@@ -353,13 +370,12 @@ class MergeWave(unittest.TestCase):
         rc, calls, _ = self._drive("ME")
         self.assertEqual(rc, 0)
         gh = [c[:3] for c in calls if c[:2] == ["gh", "pr"]]
-        # `view` is the #531 behind-check. Order is the contract: the rollup is read AFTER
-        # the ready-mark, and AFTER the sync read — so it describes the tree being merged
-        # into, not the one the branch was cut from. The second `checks` is the confirm read
-        # of the green (eduralph/pdca-harness#582).
+        # Rollup read AFTER ready; issue #582: read twice — the green is confirmed once.
+        # Issue #531: the head is read before and after the rollup wait; no update for a
+        # PR that is not behind its base.
         self.assertEqual(gh, [["gh", "pr", "ready"], ["gh", "pr", "view"],
                               ["gh", "pr", "checks"], ["gh", "pr", "checks"],
-                              ["gh", "pr", "merge"]])
+                              ["gh", "pr", "view"], ["gh", "pr", "merge"]])
 
     def test_empty_rollup_refuses_under_the_default(self) -> None:
         # Absence of evidence is not green: nothing reported ⇒ nothing verified.
@@ -408,12 +424,7 @@ class MergeWave(unittest.TestCase):
             elif cmd[:3] == ["gh", "pr", "checks"]:
                 return (_rollup(("e2e", "pending"), code=8) if readied
                         else _rollup(("e2e", "pass")))
-            elif cmd[:3] == ["gh", "pr", "view"]:      # #531 behind-check: up to date
-                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
-                    {"baseRefName": "main", "headRefName": "fix/x"}))
-            elif cmd[:2] == ["gh", "api"]:
-                return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return _up_to_date(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch("pdca_harness.merge.subprocess.run", side_effect=fake_run), \
                 mock.patch.object(merge, "_sleep", create=True), \
@@ -456,6 +467,200 @@ class MergeWave(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(any(c[:3] == ["gh", "pr", "checks"] for c in calls))
         self.assertTrue(self._merged(calls))
+
+    # ---- issue #582: a green rollup is believed only once it has held -----------------
+
+    def _drive_reads(self, iid: str, reads: list[SimpleNamespace], *,
+                     cfg: Config | None = None,
+                     timeline: list | None = None) -> tuple[int, list[list[str]], str, list]:
+        """Run one bundle through `merge_wave` where `gh pr checks` returns ``reads`` in
+        order (the last one repeating). Returns the exit code, every command shelled,
+        stderr, and the arguments `merge._sleep` was called with. ``timeline``, if given,
+        receives every rollup read and sleep in the order they happened —
+        ``("read", <the rollup returned>)`` / ``("sleep", secs)`` — and ``("merge",)``
+        when `gh pr merge` runs."""
+        b = self._bundle(iid)
+        calls: list[list[str]] = []
+        events = timeline if timeline is not None else []
+        n = {"read": 0}
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                n["read"] += 1
+                read = reads[min(n["read"], len(reads)) - 1]
+                events.append(("read", read))
+                return read
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                events.append(("merge",))
+            return _up_to_date(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch("pdca_harness.merge.subprocess.run", side_effect=fake_run), \
+                mock.patch.object(merge, "_sleep",
+                                  side_effect=lambda secs: events.append(("sleep", secs))), \
+                mock.patch.object(merge.state, "state", return_value=state.COMPLETE), \
+                mock.patch.object(merge.merged, "is_merged", return_value=False), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = merge.merge_wave(cfg or self.cfg, [b])
+        slept = [e[1] for e in events if e[0] == "sleep"]
+        return rc, calls, err.getvalue(), slept
+
+    @staticmethod
+    def _checks(calls: list[list[str]]) -> list[list[str]]:
+        return [c for c in calls if c[:3] == ["gh", "pr", "checks"]]
+
+    def test_partial_green_then_failing_does_not_merge(self) -> None:
+        # The defect: a fast check (dco) has passed while a slow one (e2e) has not yet
+        # registered, so the first read is a partial `green`. Before #582 that merged at
+        # once; the confirm read sees e2e fail and refuses, exactly as a red rollup does.
+        rc, calls, err, slept = self._drive_reads("MK1", [
+            _rollup(("dco", "pass")),
+            _rollup(("dco", "pass"), ("e2e", "fail"), code=1)])
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("FAILING", err)
+        self.assertIn("e2e (fail)", err)               # names the failing check
+        self.assertIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
+        self.assertEqual(len(self._checks(calls)), 2)  # failing returns at once
+        self.assertLessEqual(sum(slept), self.cfg.merge_wait_secs)
+
+    def test_partial_green_then_pending_merges_only_after_the_fourth_read(self) -> None:
+        # (i)+(ii): the confirm read is pending, so the wait resumes; the rollup then goes
+        # green and holds — merge only after that 4th read, never on the first green.
+        rc, calls, _, slept = self._drive_reads("MK2", [
+            _rollup(("dco", "pass")),
+            _rollup(("dco", "pass"), ("e2e", "pending"), code=8),
+            _rollup(("dco", "pass"), ("e2e", "pass")),
+            _rollup(("dco", "pass"), ("e2e", "pass"))])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._merged(calls))
+        gh = [c[:3] for c in calls if c[:2] == ["gh", "pr"]]
+        self.assertEqual(gh, [["gh", "pr", "ready"], ["gh", "pr", "view"]]
+                         + [["gh", "pr", "checks"]] * 4
+                         + [["gh", "pr", "view"], ["gh", "pr", "merge"]])  # after read 4
+        self.assertNotIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
+        self.assertLessEqual(sum(slept), self.cfg.merge_wait_secs)
+
+    def test_confirm_read_unreadable_returns_at_once(self) -> None:
+        # (ii): an unreadable confirm read refuses with no further reads.
+        rc, calls, err, _ = self._drive_reads("MK3", [
+            _rollup(("dco", "pass")),
+            SimpleNamespace(returncode=4, stdout="", stderr="HTTP 502")])
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("could not be read", err)
+        self.assertEqual(len(self._checks(calls)), 2)
+
+    def test_green_with_no_budget_left_to_confirm_is_not_believed(self) -> None:
+        # (iii): with a 15 s budget, pending → (15 s) → green leaves nothing to confirm the
+        # green with, so it is refused as pending — saying why — and the bound holds.
+        cfg = _cfg(self.tmp, merge_wait_secs=15)
+        rc, calls, err, slept = self._drive_reads("MK4", [
+            _rollup(("dco", "pass"), ("e2e", "pending"), code=8),
+            _rollup(("dco", "pass"), ("e2e", "pass"))], cfg=cfg)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("not finished within 15s", err)
+        self.assertIn("confirm", err)
+        self.assertIn("green first seen with 0s of wait budget left, too little to confirm "
+                      "it 15s later (2 checks)", err)
+        self.assertIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
+        self.assertEqual(len(self._checks(calls)), 2)
+        self.assertLessEqual(sum(slept), 15)
+
+    def test_wait_never_exceeds_the_bound_while_green_flickers(self) -> None:
+        # (iii): green and pending alternating — every confirm fails, the loop keeps
+        # waiting, and the total slept time stays within merge_wait_secs.
+        cfg = _cfg(self.tmp, merge_wait_secs=100)
+        flicker = [_rollup(("dco", "pass")),
+                   _rollup(("dco", "pass"), ("e2e", "pending"), code=8)] * 50
+        rc, calls, err, slept = self._drive_reads("MK5", flicker, cfg=cfg)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("not finished within 100s", err)
+        self.assertTrue(slept)
+        self.assertLessEqual(sum(slept), 100)
+
+    def test_wait_bound_zero_returns_a_single_green_read_as_is(self) -> None:
+        # (iv): merge_wait_secs = 0 is unchanged — one read, no sleep, verdict as-is.
+        cfg = _cfg(self.tmp, merge_wait_secs=0)
+        rc, calls, _, slept = self._drive_reads("MK6", [_rollup(("dco", "pass"))], cfg=cfg)
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._merged(calls))
+        self.assertEqual(len(self._checks(calls)), 1)
+        self.assertEqual(slept, [])
+
+    def test_budget_under_one_poll_interval_never_confirms_a_green(self) -> None:
+        # The confirm read comes one FULL poll interval (15 s) after the first green, or not
+        # at all. With merge_wait_secs = 1 that interval never fits, so green, green is
+        # refused as unconfirmed — not "confirmed" by a read squeezed in 1 s later.
+        cfg = _cfg(self.tmp, merge_wait_secs=1)
+        green = _rollup(("dco", "pass"), ("e2e", "pass"))
+        rc, calls, err, slept = self._drive_reads("MK7", [green, green], cfg=cfg)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("not finished within 1s", err)
+        self.assertIn("confirm", err)
+        self.assertIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
+        self.assertEqual(len(self._checks(calls)), 1)
+        self.assertEqual(slept, [])
+
+    def test_green_with_under_a_poll_interval_of_budget_left_is_not_believed(self) -> None:
+        # With merge_wait_secs = 20, pending → (15 s) → green leaves 5 s: less than the full
+        # poll interval a confirm read needs, so the green is refused as unconfirmed rather
+        # than "confirmed" by a read 5 s later.
+        cfg = _cfg(self.tmp, merge_wait_secs=20)
+        green = _rollup(("dco", "pass"), ("e2e", "pass"))
+        rc, calls, err, slept = self._drive_reads("MK8", [
+            _rollup(("dco", "pass"), ("e2e", "pending"), code=8), green, green], cfg=cfg)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self._merged(calls))
+        self.assertIn("not finished within 20s", err)
+        self.assertIn("green first seen with 5s of wait budget left, too little to confirm "
+                      "it 15s later (2 checks)", err)
+        self.assertIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"], calls)
+        self.assertEqual(len(self._checks(calls)), 2)
+        self.assertEqual(slept, [15])
+
+    def test_a_merge_always_follows_two_greens_one_poll_interval_apart(self) -> None:
+        # The invariant, swept over budgets on both sides of each 15 s boundary: whenever
+        # merge_wave merges, the last two rollup reads before it were both green with
+        # exactly one poll interval (15 s) slept between them, and the total slept never
+        # exceeds merge_wait_secs. Each rollup sequence merges exactly when the budget has
+        # room for that confirm, so the sweep also pins WHEN a merge happens.
+        green = _rollup(("dco", "pass"), ("e2e", "pass"))
+        pending = _rollup(("dco", "pass"), ("e2e", "pending"), code=8)
+        cases = {                     # rollup reads in order, smallest budget that merges
+            "green": ([green], 15),
+            "pending-green": ([pending, green], 30),
+            "empty-green": ([_rollup(), green], 30),
+            "pending3-green": ([pending] * 3 + [green], 60),
+            "green-empty-green": ([green, _rollup(), green], 45),   # confirm read is EMPTY
+            "flicker": ([green, pending] * 40, None),          # never holds — never merges
+        }
+        for budget in (1, 14, 15, 16, 20, 29, 30, 31, 44, 45, 46, 59, 60, 61, 300):
+            for name, (reads, merges_from) in cases.items():
+                with self.subTest(budget=budget, rollups=name):
+                    timeline: list = []
+                    rc, calls, _, slept = self._drive_reads(
+                        f"MS-{budget}-{name}", reads,
+                        cfg=_cfg(self.tmp, merge_wait_secs=budget), timeline=timeline)
+                    self.assertLessEqual(sum(slept), budget)
+                    expect = merges_from is not None and budget >= merges_from
+                    self.assertEqual(self._merged(calls), expect)
+                    if not expect:
+                        self.assertEqual(rc, 1)
+                        self.assertIn(["gh", "pr", "ready", "https://gh/pr/1", "--undo"],
+                                      calls)
+                        continue
+                    self.assertEqual(rc, 0)
+                    before = timeline[:timeline.index(("merge",))]
+                    at = [i for i, e in enumerate(before) if e[0] == "read"]
+                    self.assertGreaterEqual(len(at), 2, "merged on a single rollup read")
+                    self.assertIs(before[at[-2]][1], green)
+                    self.assertIs(before[at[-1]][1], green)
+                    self.assertEqual(
+                        sum(e[1] for e in before[at[-2]:at[-1]] if e[0] == "sleep"), 15)
 
     def test_merge_requires_comes_from_the_driver_table(self) -> None:
         # Through the REAL config loader, not a hand-built Config: `[driver]
@@ -505,237 +710,446 @@ class MergeWave(unittest.TestCase):
         self.assertIn("merge_wait_secs", err.getvalue())
 
 
-class WaitForGreenConfirms(unittest.TestCase):
-    """`_wait_for_green` confirms a green once before believing it — the instance delta
-    over upstream #462 (eduralph/pdca-harness#582, PR #224 review re-raised on PR #253)."""
+# ---- issue #531: merge only a verified head, one that contains the base it merges into --
 
-    def _wait(self, verdicts: list[str], wait_secs: int):
-        seen: list[str] = []
-        sleeps: list[int] = []
-        script = iter(verdicts)
-
-        def read(_url):
-            v = next(script, verdicts[-1])
-            seen.append(v)
-            return v, v
-        with mock.patch.object(merge, "_check_rollup", side_effect=read), \
-                mock.patch.object(merge, "_sleep", side_effect=sleeps.append):
-            out = merge._wait_for_green("https://gh/pr/1", wait_secs)
-        return out, seen, sleeps
-
-    def test_a_first_read_green_is_confirmed_not_trusted(self):
-        (v, _), seen, sleeps = self._wait(["green", "green"], 300)
-        self.assertEqual(v, "green")
-        self.assertEqual(seen, ["green", "green"])
-        self.assertEqual(len(sleeps), 1)
-
-    def test_a_check_registering_after_a_green_is_caught(self):
-        # green, then the slow check appears (pending), then it passes: confirmed at the end.
-        (v, _), seen, _ = self._wait(["green", "pending", "green", "green"], 300)
-        self.assertEqual(v, "green")
-        self.assertEqual(seen, ["green", "pending", "green", "green"])
-
-    def test_a_check_registering_red_after_a_green_refuses(self):
-        (v, _), seen, _ = self._wait(["green", "failing"], 300)
-        self.assertEqual(v, "failing")
-        self.assertEqual(seen, ["green", "failing"])
-
-    def test_a_green_reached_through_the_loop_is_confirmed_too(self):
-        (v, _), seen, _ = self._wait(["empty", "green", "green"], 300)
-        self.assertEqual(v, "green")
-        self.assertEqual(seen, ["empty", "green", "green"])
-
-    def test_zero_budget_is_a_single_read_green_included(self):
-        (v, _), seen, sleeps = self._wait(["green"], 0)
-        self.assertEqual((v, seen, sleeps), ("green", ["green"], []))
-
-    def test_the_confirm_is_charged_to_the_budget(self):
-        for budget in (1, 5, 14):
-            with self.subTest(budget=budget):
-                (v, _), _seen, sleeps = self._wait(["green", "green"], budget)
-                self.assertEqual(v, "green")
-                self.assertLessEqual(sum(sleeps), budget)
-
-    def test_an_exhausted_budget_returns_an_unconfirmed_green_as_it_stands(self):
-        # Budget spent before the confirm read could happen: the green stands (it is the
-        # last evidence), never a fabricated refusal.
-        (v, _), seen, _ = self._wait(["pending", "green"], 15)
-        self.assertEqual(v, "green")
-        self.assertEqual(seen, ["pending", "green"])
+PR_A = "https://github.com/org/repo/pull/1"
+PR_B = "https://github.com/org/repo/pull/2"
 
 
-class MergeWaitCap(unittest.TestCase):
-    """`merge_wait_secs` keeps its four-hour ceiling (eduralph/pdca-harness#581)."""
-
-    def test_a_huge_value_is_clamped_with_a_message(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        (tmp / "pdca.toml").write_text(
-            '[paths]\nbundle_root = "results"\n[driver]\nmerge_wait_secs = 86400\n',
-            encoding="utf-8")
-        with redirect_stderr(io.StringIO()) as err:
-            cfg = Config.load(tmp)
-        self.assertEqual(cfg.merge_wait_secs, 14400)
-        self.assertIn("exceeds the 14400s cap", err.getvalue())
+def _res(code: int = 0, out: str = "", err: str = "") -> SimpleNamespace:
+    return SimpleNamespace(returncode=code, stdout=out, stderr=err)
 
 
-class SyncBaseBeforeGate(unittest.TestCase):
-    """`merge_sync_base` — the #531 delta. A wave's second merge must not be gated on a
-    rollup computed before its sibling landed, so a behind PR is brought up to date BEFORE
-    the rollup gate reads anything."""
+class _Host:
+    """A stateful fake of GitHub and the local checkout behind `gh`/`git`, keyed by PR URL
+    (issue #531).
+
+    Commits form a small graph (`parents`). On the host, `main` starts as one commit and
+    every PR's head is a commit branched off it. The checkout has only what it fetched:
+    `git fetch <base_remote>` copies `main`'s history and moves `<base_remote>/main` to it,
+    `git fetch origin` copies the PR heads' (one remote does both on an own-repo checkout),
+    and `git rev-parse` / `git merge-base --is-ancestor` answer from that copy — exit 128
+    for a commit it lacks, as git does. `gh pr merge` merges whatever head it is given, like
+    a host whose branch protection does not require up-to-date branches (where a stale PR
+    lands silently), unless it is pinned (`--match-head-commit`) to a SHA that is no longer
+    the head, or `strict` is set and the head lacks `main`'s tip. `gh pr update-branch`
+    makes a merge commit of the head and `main`, which lands after `lag[url]` further
+    `gh pr view` reads of that PR (0: at once; None: never). `_merge_one`'s sleeps are
+    logged in `calls` as `["sleep", secs]`; every `gh pr view` / `gh pr checks` read is
+    logged in `views` / `checks` with the head it reported or described."""
+
+    def __init__(self, *urls: str, strict: bool = False, base_remote: str = "origin") -> None:
+        self.parents: dict[str, tuple[str, ...]] = {}
+        self.main = self._commit()
+        self.head = {u: self._commit(self.main) for u in urls}
+        self.local = set(self.parents)            # publish pushed the heads from this clone
+        self.base_remote = base_remote
+        self.tracking = {base_remote: self.main}  # `<base_remote>/main` in the checkout
+        self.strict = strict
+        self.calls: list[list] = []
+        self.views: list[tuple[str, str]] = []            # (url, head it reported)
+        self.checks: list[tuple[str, str]] = []           # (url, head the rollup described)
+        self.merged: list[tuple[str, str | None]] = []    # (url, SHA the merge was pinned to)
+        self.landed: dict[str, str] = {}                  # url -> its merge commit on main
+        self.updated: dict[str, str] = {}                 # url -> head its update produced
+        self.lag: dict[str, int | None] = {}
+        self.red_after_update: set[str] = set()           # urls whose updated head is red
+        self.update_fails: set[str] = set()
+        self.push_after_checks: dict[str, int] = {}       # url -> pushed to after read N
+        self.move_main_after_checks: dict[str, int] = {}  # url -> main moves after read N
+        self.push_at_merge: set[str] = set()              # a push races the merge itself
+        self.fetch_fails = False
+        self.git_breaks = False
+        self._pending: dict[str, list] = {}               # url -> [reads left, new head]
+        self._red: set[str] = set()
+
+    def _commit(self, *parents: str) -> str:
+        sha = f"{len(self.parents) + 1:040x}"
+        self.parents[sha] = parents
+        return sha
+
+    def history(self, sha: str) -> set[str]:
+        todo, seen = [sha], set()
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(self.parents[c])
+        return seen
+
+    def contains(self, head: str, tip: str) -> bool:
+        return tip in self.history(head)
+
+    def land_on_main(self) -> str:
+        """A commit lands on `main` from outside the run."""
+        self.main = self._commit(self.main)
+        return self.main
+
+    def sleep(self, secs: int) -> None:
+        self.calls.append(["sleep", secs])
+
+    def __call__(self, cmd: list[str], **kw) -> SimpleNamespace:
+        self.calls.append(list(cmd))
+        if cmd[0] == "git":
+            return self._git(cmd[3:])                    # drop `git -C <checkout>`
+        verb, url = cmd[2], cmd[3]
+        if verb == "view":
+            self._land_update(url)
+            self.views.append((url, self.head[url]))
+            return _res(out=json.dumps({"headRefOid": self.head[url], "baseRefName": "main"}))
+        if verb == "update-branch":
+            return self._update(url)
+        if verb == "checks":
+            return self._checks(url)
+        if verb == "merge":
+            return self._merge(url, cmd)
+        return _res()                                    # ready / ready --undo
+
+    def _git(self, args: list[str]) -> SimpleNamespace:
+        if args[0] == "fetch":
+            if self.fetch_fails:
+                return _res(128, err="fatal: unable to access 'https://github.com/org/repo/': "
+                                     "Could not resolve host: github.com")
+            if args[1] == self.base_remote:
+                self.local |= self.history(self.main)
+                self.tracking[args[1]] = self.main
+            if args[1] == "origin":
+                for head in self.head.values():
+                    self.local |= self.history(head)
+            return _res()
+        if args[0] == "rev-parse":
+            remote, _, branch = args[-1].removesuffix("^{commit}").partition("/")
+            sha = self.tracking.get(remote) if branch == "main" else None
+            return _res(out=sha + "\n") if sha else _res(1)
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            tip, head = args[2:4]
+            if self.git_breaks:
+                return _res(128, err=f"fatal: bad object {head}")
+            missing = [c for c in (tip, head) if c not in self.local]
+            if missing:
+                return _res(128, err=f"fatal: Not a valid commit name {missing[0]}")
+            return _res(0 if self.contains(head, tip) else 1)
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def _land_update(self, url: str) -> None:
+        pending = self._pending.get(url)
+        if pending is None or pending[0] is None:
+            return
+        if pending[0]:
+            pending[0] -= 1
+        else:
+            self.head[url] = pending[1]
+            del self._pending[url]
+
+    def _update(self, url: str) -> SimpleNamespace:
+        if url in self.update_fails:
+            return _res(1, err="GraphQL: merge conflict between base and head "
+                               "(updatePullRequestBranch)")
+        new = self._commit(self.head[url], self.main)    # a merge commit, never a rebase
+        self.updated[url] = new
+        if url in self.red_after_update:
+            self._red.add(new)
+        lag = self.lag.get(url, 0)
+        if lag == 0:
+            self.head[url] = new
+        else:
+            self._pending[url] = [lag, new]
+        return _res()
+
+    def _checks(self, url: str) -> SimpleNamespace:
+        head = self.head[url]
+        self.checks.append((url, head))
+        n = sum(1 for u, _ in self.checks if u == url)
+        if self.push_after_checks.get(url) == n:
+            self.head[url] = self._commit(head)          # someone pushes to the PR
+        if self.move_main_after_checks.get(url) == n:
+            self.land_on_main()
+        return _rollup(("ci", "fail"), code=1) if head in self._red else _rollup(("ci", "pass"))
+
+    def _merge(self, url: str, cmd: list[str]) -> SimpleNamespace:
+        if url in self.push_at_merge:
+            self.head[url] = self._commit(self.head[url])   # pushed after the last read
+        head = self.head[url]
+        pin = cmd[cmd.index("--match-head-commit") + 1] if "--match-head-commit" in cmd else None
+        if pin is not None and pin != head:
+            return _res(1, err="GraphQL: Head branch was modified. Review and try the merge "
+                               "again. (mergePullRequest)")
+        if self.strict and not self.contains(head, self.main):
+            return _res(1, err="GraphQL: Head branch is out of date. Review and try the "
+                               "merge again. (mergePullRequest)")
+        self.main = self._commit(self.main, head)
+        self.merged.append((url, pin))
+        self.landed[url] = self.main
+        return _res()
+
+
+class MergeAgainstCurrentBase(unittest.TestCase):
+    """Issue #531: a green rollup describes the head it ran on, built on the base that head
+    contains. A wave's members merge back-to-back, so the second member's green predates the
+    first member's merge, and merging it lands a combination nothing verified. Every test
+    drives the production `merge.merge_wave` against `_Host`."""
 
     def setUp(self) -> None:
-        # The post-sync wait confirms its green one interval later (#582): never for real.
-        sleeper = mock.patch.object(merge, "_sleep")
-        sleeper.start()
-        self.addCleanup(sleeper.stop)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg = _cfg(self.tmp)
+        self._n = 0
 
-    def _drive(self, name, *, behind, cfg_kw=None, update_rc=0, view_rc=0, cmp_rc=0,
-               stays_behind=False, owner="org", checks=None):
-        """`behind` is the INITIAL distance; a successful sync clears it, as a real
-        update-branch does. `stays_behind=True` models a base that keeps moving — the case
-        the round cap exists for."""
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        cfg = _cfg(tmp, **(cfg_kw or {}))
-        d = cfg.bundle(name)
-        d.mkdir(parents=True)
-        (d / "patch.diff").write_text("diff\n", encoding="utf-8")
-        (d / "publish.json").write_text(
-            json.dumps({"pr_url": "https://gh/pr/1", "repo": "org/repo"}), encoding="utf-8")
-        calls = []
-        state_ = {"behind": behind}
-
-        def run(cmd, **kw):
-            calls.append(list(cmd))
-            if cmd[:3] == ["gh", "pr", "view"]:
-                return SimpleNamespace(returncode=view_rc, stderr="", stdout=json.dumps(
-                    {"baseRefName": "main", "headRefName": "fix/x",
-                     "headRepositoryOwner": {"login": owner}}))
-            if cmd[:2] == ["gh", "api"]:
-                return SimpleNamespace(returncode=cmp_rc, stderr="",
-                                       stdout=f"{state_['behind']}\n")
-            if cmd[:3] == ["gh", "pr", "update-branch"]:
-                if update_rc == 0 and not stays_behind:
-                    state_["behind"] = 0
-                return SimpleNamespace(returncode=update_rc, stderr="update failed",
-                                       stdout="")
-            if cmd[:3] == ["gh", "pr", "checks"]:
-                return checks if checks is not None else _rollup(("ci", "pass"))
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        err = io.StringIO()
-        with mock.patch("pdca_harness.merge.subprocess.run", side_effect=run), \
+    def _run(self, host: _Host, urls: list[str], cfg: Config | None = None,
+             method: str = "merge") -> tuple[int, str]:
+        cfg = cfg or self.cfg
+        bundles = []
+        for url in urls:                                 # distinct PR URL per bundle
+            self._n += 1
+            d = cfg.bundle(f"S{self._n}")
+            d.mkdir(parents=True)
+            (d / "patch.diff").write_text("diff\n", encoding="utf-8")
+            (d / "publish.json").write_text(
+                json.dumps({"pr_url": url, "repo": "org/repo"}), encoding="utf-8")
+            bundles.append(d)
+        with mock.patch("pdca_harness.merge.subprocess.run", side_effect=host), \
+                mock.patch.object(merge, "_sleep", side_effect=host.sleep), \
                 mock.patch.object(merge.state, "state", return_value=state.COMPLETE), \
                 mock.patch.object(merge.merged, "is_merged", return_value=False), \
-                redirect_stdout(io.StringIO()), redirect_stderr(err):
-            rc = merge._merge_one(cfg, d, dry_run=False, method="merge", fetched=set())
-        return rc, calls, err.getvalue()
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = merge.merge_wave(cfg, bundles, method=method)
+        return rc, err.getvalue()
 
     @staticmethod
-    def _verbs(calls, verb):
-        return [c for c in calls if c[:3] == ["gh", "pr", verb]]
+    def _at(host: _Host, cmd: list[str]) -> int:
+        """Index in ``host.calls`` of the first call that starts with ``cmd``."""
+        return next(i for i, c in enumerate(host.calls) if c[:len(cmd)] == cmd)
 
-    def test_a_behind_pr_is_synced_before_the_rollup_is_read(self) -> None:
-        # Ordering is the whole point: a sync AFTER the gate would gate the stale tree.
-        rc, calls, _ = self._drive("S1", behind=2)
-        self.assertEqual(rc, 0)
-        self.assertTrue(self._verbs(calls, "update-branch"), "a behind PR must be synced")
-        upd = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "update-branch"])
-        chk = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "checks"])
-        self.assertLess(upd, chk, "the sync must precede the rollup read, not follow it")
+    def test_second_member_is_updated_and_reverified_before_it_merges(self) -> None:
+        # (a): A and B are each green against the original base. Once A merges, B is
+        # behind: its rollup never saw A. B must be updated (a merge commit, never a
+        # rebase), its NEW head's rollup read green, and only then merged, pinned to it.
+        host = _Host(PR_A, PR_B)
+        a_head, b_reviewed = host.head[PR_A], host.head[PR_B]
+        rc, err = self._run(host, [PR_A, PR_B])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["gh", "pr", "update-branch", PR_B], host.calls,
+                      "B was merged without being brought up to date with A's merge")
+        b_updated = host.updated[PR_B]
+        # The update is a merge commit of the reviewed head with the base after A merged.
+        self.assertEqual(host.parents[b_updated], (b_reviewed, host.landed[PR_A]))
+        self.assertEqual(host.merged, [(PR_A, a_head), (PR_B, b_updated)])
+        update = self._at(host, ["gh", "pr", "update-branch", PR_B])
+        merge_b = self._at(host, ["gh", "pr", "merge", PR_B])
+        self.assertLess(self._at(host, ["gh", "pr", "merge", PR_A]), update)
+        reads_b = [i for i, c in enumerate(host.calls) if c[:4] == ["gh", "pr", "checks", PR_B]]
+        self.assertTrue(reads_b)
+        self.assertTrue(all(update < i < merge_b for i in reads_b))
+        self.assertEqual({h for u, h in host.checks if u == PR_B}, {b_updated})
+        self.assertEqual(host.calls[merge_b],
+                         ["gh", "pr", "merge", PR_B, "--merge", "--match-head-commit", b_updated])
+        # A was up to date: not updated. Nothing was ever rebased.
+        self.assertNotIn(["gh", "pr", "update-branch", PR_A], host.calls)
+        self.assertFalse(any("--rebase" in c for c in host.calls))
 
-    def test_an_up_to_date_pr_is_not_synced(self) -> None:
-        rc, calls, _ = self._drive("S2", behind=0)
-        self.assertEqual(rc, 0)
-        self.assertFalse(self._verbs(calls, "update-branch"),
-                         "a current PR must not be pushed for nothing")
-        self.assertTrue(self._verbs(calls, "merge"))
+    def test_update_is_a_merge_commit_whatever_the_merge_method(self) -> None:
+        # merge_method governs only the final merge; the update never rebases the commits
+        # sign-off reviewed.
+        for method in ("merge", "squash", "rebase"):
+            with self.subTest(merge_method=method):
+                host = _Host(PR_A, PR_B)
+                rc, err = self._run(host, [PR_A, PR_B], method=method)
+                self.assertEqual(rc, 0, err)
+                updates = [c for c in host.calls if c[:3] == ["gh", "pr", "update-branch"]]
+                self.assertEqual(updates, [["gh", "pr", "update-branch", PR_B]])
+                self.assertIn(["gh", "pr", "merge", PR_B, f"--{method}",
+                               "--match-head-commit", host.updated[PR_B]], host.calls)
 
-    def test_a_failed_sync_stops_without_merging(self) -> None:
-        # A behind PR that cannot be updated conflicts with a sibling that already merged;
-        # merging it would verify a tree it is not merging into.
-        rc, calls, err = self._drive("S3", behind=1, update_rc=1)
+    def test_head_changed_after_the_green_read_is_not_merged(self) -> None:
+        # (b): someone pushes to the PR right after the read that confirmed its green. That
+        # green described the OLD head; the new one was never verified.
+        host = _Host(PR_A)
+        host.push_after_checks[PR_A] = 2
+        rc, err = self._run(host, [PR_A])
         self.assertEqual(rc, 1)
-        self.assertFalse(self._verbs(calls, "merge"))
-        self.assertIn("could NOT be updated", err)
+        self.assertEqual(host.merged, [])
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in host.calls))
+        self.assertIn("head changed", err)
+        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
 
-    def test_an_unreadable_behind_state_stops_without_merging(self) -> None:
-        # Fail-closed, on the rollup gate's own principle: absence of evidence is not green.
-        rc, calls, err = self._drive("S4", behind=0, cmp_rc=1)
+    def test_pinned_merge_refused_when_the_head_moves_at_merge_time(self) -> None:
+        # (b): the push races the merge itself, after the driver's last read. The pin makes
+        # the host refuse it instead of merging a head nobody verified.
+        host = _Host(PR_A)
+        host.push_at_merge.add(PR_A)
+        verified = host.head[PR_A]
+        rc, err = self._run(host, [PR_A])
         self.assertEqual(rc, 1)
-        self.assertFalse(self._verbs(calls, "merge"))
-        self.assertIn("could NOT determine", err)
+        self.assertEqual(host.merged, [])
+        self.assertEqual([c for c in host.calls if c[:3] == ["gh", "pr", "merge"]],
+                         [["gh", "pr", "merge", PR_A, "--merge", "--match-head-commit", verified]])
+        self.assertIn("did not merge", err)
+        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
 
-    def test_the_knob_off_reproduces_upstream(self) -> None:
-        # merge_sync_base = false must skip the check entirely — including its fail-closed
-        # arm, so an instance opting out is not stopped by an API it never wanted called.
-        rc, calls, _ = self._drive("S5", behind=3, cfg_kw={"merge_sync_base": False})
-        self.assertEqual(rc, 0)
-        self.assertFalse(self._verbs(calls, "update-branch"))
-        self.assertTrue(self._verbs(calls, "merge"))
+    def test_merge_requires_required_call_log_is_unchanged(self) -> None:
+        # (c): "trust the host's protection" — no base read, no update, no rollup read, no
+        # pin: exactly the call log this setting produced before #531, stale merge included.
+        host = _Host(PR_A, PR_B)
+        cfg = _cfg(self.tmp, merge_requires="required")
+        rc, err = self._run(host, [PR_A, PR_B], cfg)
+        self.assertEqual(rc, 0, err)
+        repo = str(merge.publish._checkout_path(cfg, "org/repo"))
+        self.assertEqual(host.calls, [
+            ["gh", "pr", "ready", PR_A],
+            ["gh", "pr", "merge", PR_A, "--merge"],
+            ["git", "-C", repo, "fetch", "origin"],
+            ["gh", "pr", "ready", PR_B],
+            ["gh", "pr", "merge", PR_B, "--merge"],
+        ])
 
-    def test_a_base_that_keeps_moving_stops_rather_than_looping(self) -> None:
-        # PR #230 review: the check must re-run after the wait, or a sibling landing during
-        # `merge_wait_secs` leaves the head behind again with a green rollup for the old
-        # tree. Re-running needs a bound, and exhausting it STOPs rather than merging.
-        rc, calls, err = self._drive("S6", behind=1, stays_behind=True)
+    def test_update_that_lands_late_still_merges_pinned_to_the_updated_head(self) -> None:
+        # GitHub may apply `gh pr update-branch` after the command returns: the two reads
+        # straight after it still show B's old head. The driver keeps polling, within
+        # merge_wait_secs, rather than refusing.
+        host = _Host(PR_A, PR_B)
+        host.lag[PR_B] = 2
+        b_reviewed = host.head[PR_B]
+        rc, err = self._run(host, [PR_A, PR_B])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(PR_B, host.updated)
+        b_updated = host.updated[PR_B]
+        # Read before the update, twice while it had not landed, once when it had, and
+        # once more after the rollup wait.
+        self.assertEqual([h for u, h in host.views if u == PR_B],
+                         [b_reviewed, b_reviewed, b_reviewed, b_updated, b_updated])
+        update = self._at(host, ["gh", "pr", "update-branch", PR_B])
+        first_read = self._at(host, ["gh", "pr", "checks", PR_B])
+        self.assertTrue(any(c[0] == "sleep" for c in host.calls[update:first_read]))
+        self.assertEqual({h for u, h in host.checks if u == PR_B}, {b_updated})
+        self.assertEqual(host.merged[-1], (PR_B, b_updated))
+
+    def test_update_that_never_lands_refuses_readiness_undone(self) -> None:
+        host = _Host(PR_A, PR_B)
+        host.lag[PR_B] = None
+        rc, err = self._run(host, [PR_A, PR_B])
         self.assertEqual(rc, 1)
-        self.assertFalse(self._verbs(calls, "merge"))
-        self.assertEqual(len(self._verbs(calls, "update-branch")), merge._MAX_SYNC_ROUNDS)
-        self.assertIn("moved under this PR", err)
+        self.assertEqual([u for u, _ in host.merged], [PR_A])   # B is NOT merged stale
+        self.assertIn("had not landed", err)
+        self.assertIn(["gh", "pr", "ready", PR_B, "--undo"], host.calls)
+        self.assertNotIn(PR_B, [u for u, _ in host.checks])     # no rollup read of it
+        update = self._at(host, ["gh", "pr", "update-branch", PR_B])
+        polled = [c[1] for c in host.calls[update:] if c[0] == "sleep"]
+        self.assertTrue(polled)                                 # it did wait for it...
+        self.assertLessEqual(sum(polled), self.cfg.merge_wait_secs)   # ...within the bound
 
-    def test_rechecks_the_base_after_the_post_sync_wait(self) -> None:
-        # The positive half of the same finding: one sync, then a re-read that finds the
-        # base still — so exactly two compares, and the merge proceeds.
-        rc, calls, _ = self._drive("S7", behind=1)
-        self.assertEqual(rc, 0)
-        self.assertEqual(len([c for c in calls if c[:2] == ["gh", "api"]]), 2,
-                         "the base must be re-read after the post-sync gate, not once")
-        self.assertTrue(self._verbs(calls, "merge"))
+    def test_updated_head_that_is_not_green_is_not_merged(self) -> None:
+        # The combination is red although A and B were each green alone.
+        host = _Host(PR_A, PR_B)
+        host.red_after_update.add(PR_B)
+        rc, err = self._run(host, [PR_A, PR_B])
+        self.assertEqual(rc, 1)
+        self.assertEqual([u for u, _ in host.merged], [PR_A])
+        self.assertIn("FAILING", err)
+        self.assertIn(PR_B, host.updated)
+        self.assertIn((PR_B, host.updated[PR_B]), host.checks)  # the red read was of it
+        self.assertIn(["gh", "pr", "ready", PR_B, "--undo"], host.calls)
 
-    def test_required_mode_still_waits_after_a_sync(self) -> None:
-        # PR #230 review: `merge_requires = "required"` skips the rollup GATE, but a sync
-        # invalidates the checks — merging straight after would fail on pending required
-        # checks and stop every wave at its second PR. The wait is not optional.
-        rc, calls, _ = self._drive("S8", behind=1, cfg_kw={"merge_requires": "required"})
-        self.assertEqual(rc, 0)
-        self.assertTrue(self._verbs(calls, "checks"),
-                        "a sync must be followed by a rollup wait even in required mode")
-        self.assertTrue(self._verbs(calls, "merge"))
+    def test_update_that_fails_stops_the_wave_readiness_undone(self) -> None:
+        host = _Host(PR_A, PR_B)
+        host.update_fails.add(PR_B)
+        rc, err = self._run(host, [PR_A, PR_B])
+        self.assertEqual(rc, 1)
+        self.assertEqual([u for u, _ in host.merged], [PR_A])
+        self.assertIn("could not be brought up to date", err)
+        self.assertIn(["gh", "pr", "ready", PR_B, "--undo"], host.calls)
 
-    def test_a_fork_head_is_qualified_in_the_compare(self) -> None:
-        # PR #230 review: `headRefName` is a bare branch name; unqualified it resolves
-        # against the BASE repo, where a fork's branch does not exist — 404 => None =>
-        # every merge stops. publish.py:301 qualifies the same way for `gh pr create`.
-        _rc, calls, _ = self._drive("S9", behind=0, owner="contributor")
-        api = [c for c in calls if c[:2] == ["gh", "api"]]
-        self.assertTrue(api)
-        self.assertIn("main...contributor:fix/x", api[0][2])
+    def test_first_member_behind_from_outside_the_run_is_updated(self) -> None:
+        # The base can move between waves or from outside the run: the first PR merged is
+        # held to the same rule.
+        host = _Host(PR_A)
+        outside = host.land_on_main()
+        rc, err = self._run(host, [PR_A])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(PR_A, host.updated)
+        self.assertTrue(host.contains(host.updated[PR_A], outside))
+        self.assertEqual(host.merged, [(PR_A, host.updated[PR_A])])
 
-    def test_a_same_owner_head_is_not_qualified(self) -> None:
-        _rc, calls, _ = self._drive("S10", behind=0, owner="org")
-        api = [c for c in calls if c[:2] == ["gh", "api"]]
-        self.assertIn("main...fix/x", api[0][2])
+    def test_strict_host_completes_a_multi_member_wave(self) -> None:
+        # On a host that requires up-to-date branches the second merge used to be refused,
+        # stopping the wave after its first merge.
+        host = _Host(PR_A, PR_B, strict=True)
+        rc, err = self._run(host, [PR_A, PR_B])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([u for u, _ in host.merged], [PR_A, PR_B])
 
-    def test_config_reads_the_key(self) -> None:
-        # The mutation kill: hard-coding the default in Config.load would leave every test
-        # above green while the knob did nothing in production.
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        (tmp / "pdca.toml").write_text("[driver]\nmerge_sync_base = false\n",
-                                       encoding="utf-8")
-        with redirect_stderr(io.StringIO()):
-            cfg = Config.load(tmp)
-        self.assertFalse(cfg.merge_sync_base, "Config.load must read the key")
+    def test_base_that_moves_while_checks_are_read_is_not_merged(self) -> None:
+        # The last read before `gh pr merge` must find the head up to date.
+        host = _Host(PR_A)
+        host.move_main_after_checks[PR_A] = 2
+        rc, err = self._run(host, [PR_A])
+        self.assertEqual(rc, 1)
+        self.assertEqual(host.merged, [])
+        self.assertIn("base moved", err)
+        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
 
-    def test_default_is_on(self) -> None:
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        (tmp / "pdca.toml").write_text("[driver]\n", encoding="utf-8")
-        with redirect_stderr(io.StringIO()):
-            cfg = Config.load(tmp)
-        self.assertTrue(cfg.merge_sync_base)
+    def test_failed_fetch_refuses_saying_git_failed(self) -> None:
+        host = _Host(PR_A)
+        host.fetch_fails = True
+        rc, err = self._run(host, [PR_A])
+        self.assertEqual(rc, 1)
+        self.assertEqual(host.merged, [])
+        self.assertIn("git failed: `git fetch origin`", err)
+        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
+
+    def test_merge_base_failure_refuses_saying_git_failed(self) -> None:
+        # Exit 0 is up to date and exit 1 is behind; anything else is git failing.
+        host = _Host(PR_A)
+        host.git_breaks = True
+        rc, err = self._run(host, [PR_A])
+        self.assertEqual(rc, 1)
+        self.assertEqual(host.merged, [])
+        self.assertIn("git failed: `git merge-base --is-ancestor", err)
+        self.assertIn("exited 128", err)
+        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
+
+    def test_fork_checkout_reads_the_base_and_the_head_from_their_remotes(self) -> None:
+        # base_remote holds the base; the PR branch (and the update's merge commit) lives on
+        # origin, where publish pushed it. Both are fetched.
+        cfg = _cfg(self.tmp)
+        cfg.base_remote = "upstream"
+        host = _Host(PR_A, PR_B, base_remote="upstream")
+        rc, err = self._run(host, [PR_A, PR_B], cfg)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(PR_B, host.updated)
+        self.assertEqual(host.merged[-1], (PR_B, host.updated[PR_B]))
+        self.assertEqual({c[4] for c in host.calls if c[:1] == ["git"] and c[3] == "fetch"},
+                         {"upstream", "origin"})
+
+    def test_update_poll_and_rollup_wait_share_one_budget(self) -> None:
+        # "Charged to merge_wait_secs": waiting for the update to land and waiting for the
+        # updated head's rollup share ONE bound, so time a slow update took leaves less to
+        # confirm a green with (issue #582), never a fresh budget on top of it.
+        for budget in (0, 5, 10, 14, 15, 20, 25, 29, 30, 31, 300):
+            for lag in (0, 1, 2, 3, None):
+                with self.subTest(budget=budget, lag=lag):
+                    host = _Host(PR_A)
+                    host.land_on_main()                      # behind from the start
+                    host.lag[PR_A] = lag
+                    rc, err = self._run(host, [PR_A], _cfg(self.tmp, merge_wait_secs=budget))
+                    self.assertIn(["gh", "pr", "update-branch", PR_A], host.calls)
+                    sleeps = [c[1] for c in host.calls if c[0] == "sleep"]
+                    self.assertLessEqual(sum(sleeps), budget)
+                    if lag is None:
+                        self.assertEqual(host.merged, [])
+                    if budget == 300 and lag is not None:
+                        self.assertEqual(host.merged, [(PR_A, host.updated[PR_A])])
+                    if not host.merged:
+                        self.assertEqual(rc, 1)
+                        self.assertIn(["gh", "pr", "ready", PR_A, "--undo"], host.calls)
+                        continue
+                    self.assertEqual(rc, 0, err)
+                    self.assertEqual(host.merged, [(PR_A, host.updated[PR_A])])
+                    first_read = self._at(host, ["gh", "pr", "checks", PR_A])
+                    polled = sum(c[1] for c in host.calls[:first_read] if c[0] == "sleep")
+                    # Merged only with a full poll interval (15 s) left after the update to
+                    # confirm the green — or with the wait off (0): one read, as before.
+                    self.assertTrue(budget == 0 or budget - polled >= 15,
+                                    f"merged with {budget - polled}s left after polling")
 
 
 if __name__ == "__main__":
