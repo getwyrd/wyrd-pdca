@@ -149,9 +149,12 @@
       (`git merge --signoff origin/main`, then push; not GitHub's "Update branch" button, which
       doesn't sign off for `dco`) (automating it: #267).
     - *A split parent with no `brief.md`* (eduralph/pdca-harness#597). Upstream's `flow`
-      never drives a bundle past Do that has no brief: it names it and skips it. The
-      instance restored the brief from the iterate-to-Plan archive instead; that restore is
-      gone, so such a parent (pre-#481, e.g. issue_654) needs its brief written by hand.
+      rebuilds the brief `split --accept` writes, from the iterate-to-Plan archive, when the
+      parent's `split-lineage.json` names its children. Without a usable lineage record it
+      names the parent and skips it; the instance's restore fell back to the split proposal
+      there instead, and that fallback is gone. So a pre-lineage split parent (e.g.
+      issue_654, which has `split-proposal.md` but no `split-lineage.json`) needs its brief
+      written by hand.
     - Also retired at the same upgrade: the dependency-graph refusal (#589), the
       stranded-child dependency check (#590), confirm-once on a failed gating row (#371), the
       deferred-findings matching (#335), and the instance's own #332 auto-iterate code with
