@@ -1,265 +1,253 @@
-# Build notes — issue 778 / wyrd-build-identity-derived-and-logged (iteration 3)
+# Build notes — issue 778 / wyrd-build-identity-derived-and-logged (iteration 4)
 
-Target: getwyrd/wyrd. Worktree `$PDCA_WORKTREE` = `/home/eddie/wyrd/wyrd.pdca-wt-l0` at
-`df68932`, the stacked integration base named in `stack-base`
-(`pdca-integration/r-a834e98f67b952c61db7a03084c626e8/main`, which carries #738 and #742 on
-top of `origin/main`). Line numbers are on that tree with the patch applied unless marked
-"base".
+Target: getwyrd/wyrd @ `main`. Worktree `$PDCA_WORKTREE` = `/home/eddie/wyrd/wyrd.pdca-wt-l1`,
+detached at `0fba76c` = `origin/main` (zero commits either side). Line numbers below are on
+that tree with the patch applied unless marked "base".
 
-This round starts from the v2 patch (`iteration-v2/patch.diff`, applies cleanly to
-`df68932`) and changes only the build script's re-run behaviour, which is what every
-round-2 finding was about. The rest of the design (one `#[path]`-shared derivation file,
-three rungs, the `dist` hand-off, the Dockerfile `ARG`, the discriminator test) is
-unchanged; its rationale is in `iteration-v1/build-notes.md` and `iteration-v2/build-notes.md`
-and still holds. In short: the shared resolver is `crates/server/src/version/derivation.rs`,
-compiled by `crates/server/build.rs` (`#[path]`, `build.rs:46-48`), by the crate
-(`version.rs:35`), and by `xtask/src/dist.rs:181-186` (`#[path]`, so the dependency runs
-tooling→product); leg 4 uses the extracted pure function `image_build_args`
-(`xtask/src/dist.rs:207`, `WYRD_VERSION={version}` at `:226`), not the file-read fallback.
+This round starts from the round-3 patch (`iteration-v3/patch.diff`). It applied to
+`origin/main` cleanly this time (one 5-line offset in `cli.rs`): #742 has landed on `main`,
+so the stacked-base mismatch of rounds 1–3 is gone. On top of it, this round changes only how
+the build script reads its two raw byte inputs, which is what the round-3 carry-forward was
+about. The rest of the design is unchanged and its rationale is in
+`iteration-v{1,2,3}/build-notes.md`. In short: the shared resolver is
+`crates/server/src/version/derivation.rs`, compiled by `crates/server/build.rs` (`#[path]`
+module, not `include!`), by the crate (`version.rs:39`), and by `xtask/src/dist.rs:181-182`
+(`#[path]`, so the dependency runs tooling→product). Leg 4 uses the extracted pure function
+`image_build_args` (`xtask/src/dist.rs:207`, `WYRD_VERSION={version}` at `:226`), not the
+file-read fallback.
 
 ## Carry-forward findings → what changed
 
-| Finding (source) | Fix | Where |
+| Finding | Fix | Where |
 |---|---|---|
-| A full clone made shallow keeps the old tag-derived identity: the absent `shallow` file was filtered out of the watch set (T4 ×2 blocking; C5 adversary, `reviewer-evidence/shallow-probe.log:44`) | Absent paths are no longer dropped. A path that exists is watched directly (catches change and deletion). A path that does not exist yet is watched for its **appearance**: the script keeps a symlink to it in a private `OUT_DIR/git-paths-not-yet-present/` directory and watches that directory. | `crates/server/build.rs:98-124` (`watch`), `:126-159` (`link_absent_paths`), `:161-174` (`symlink`, unix / fallback); docs `build.rs:10-38`, `derivation.rs:228-246`, `version.rs:26-30` |
-| Once a build lands on rung 3 it stays there until `cargo clean` (adversary, `build.rs:52` in v2) | Rung 3 now emits a watch on a path that is never created, so cargo re-runs the script on every build until git can answer, plus a warning saying so. Covers no `.git`, `git` missing from `PATH`, a refused checkout, and an unborn `HEAD`. | `crates/server/build.rs:84-94`; docs `version.rs:17-20`, `build.rs:32-37` |
-| "the pure watch-list assertions do not exercise the existence filter … add an incremental-build regression" (C5) | New `#[cfg(all(test, unix))]` module that runs **real cargo builds** of a probe crate whose build script IS `crates/server/build.rs`, across the real git transitions. | `crates/server/src/version/build_script_tests.rs` (declared at `version.rs:37-39`) |
-| "patch.diff does not apply on `origin/main` … something newer has moved. Rebase" (`gate-logs/C4-diff-cov.log:10`) | Not a patch defect; nothing moved. See "Gate notes" below. | — |
+| A `WYRD_VERSION` that is not UTF-8 reads as unset: `std::env::var(..).ok()` drops `VarError::NotUnicode`, so the build bakes the git identity with no error (T4 ×2 blocking, C5 adversary; same defect) | Read with `std::env::var_os` and pass it through a new pure function in the shared module that returns `Err` for a set value that is not UTF-8. The build script panics on it, the same way it does for an invalid UTF-8 value. | `build.rs:69-71`; `derivation.rs:142-150` (`override_from_env`) |
+| An undecodable `git describe` output discards a readable sha: `git_output`'s strict `String::from_utf8(..).ok()?` turns a tag name holding a byte ≥ 0x80 into "no describe", and `resolve` then went to rung 3, `0.0.0+git.unknown` (C5, `build.rs:216` / `derivation.rs:204` in v3) | (1) The build script reads describe as raw bytes (`git_stdout`) and decodes them with a new shared `describe_text` (lossy). The replacement character fails the validator, so `resolve` fails closed to the sha form and the warning quotes what git printed. (2) `resolve` also uses a readable sha when describe gave NO answer, so rung 3 is reached only when the commit cannot be named. | `build.rs:84-88`, `:233-247`; `derivation.rs:152-162` (`describe_text`), `:204-248` (`resolve`) |
+| "Distinguish NotPresent from NotUnicode and add a regression at the environment-reading boundary" / "a unix-only case in `build_script_tests.rs`" | Two new real-cargo-build tests in the existing `#[cfg(all(test, unix))]` module, plus pure unit tests in `derivation.rs`. | below |
+| C4-diff-cov: "patch.diff does not apply on origin/main" (rounds 1–3) | Nothing to change in the patch: the worktree is on `origin/main` this round. `git apply --cached --check` against a throwaway index read from `origin/main` succeeds. | — |
 
-## Decision: how to notice a file that does not exist yet
+One item from the round-3 deferred list was a plain wording error, so I fixed the sentence
+without changing design: `build.rs` claimed the script re-runs "at no other time" than when
+the answer can move, but it watches the whole `refs/` tree. `build.rs:25-28` now says any ref
+change re-runs it, whether or not it changes `describe` of this `HEAD`. Whether to narrow the
+watch is still the human's call.
 
-Facts I measured before choosing (scratch crates under `$PDCA_SCRATCH/pdca-builder-778-*`):
+## Decisions and what I ruled out
 
-1. **A missing watched path re-runs the script AND recompiles the crate on every build.**
-   Toy crate with `rerun-if-changed=/nonexistent-path-for-toy`: second build printed
-   `Dirty toy …: the file '/nonexistent-path-for-toy' is missing`, then rebuilt the lib and
-   the test binary. So the round-2 adversary's "only cargo-level fix" (always emit the
-   absent `shallow` path) would make every build in every full clone recompile `wyrd-server`
-   and relink its test binaries — the cost Decision 1 rules out.
-2. **What a shallow fetch touches.** Full clone one commit past `v1.2.3`, then
-   `git fetch --depth=1 --no-tags origin HEAD`; `find .git -newer marker` lists only
-   `.git` (directory mtime), `.git/FETCH_HEAD` (created), `.git/objects` (directory mtime),
-   `.git/shallow` (created). No ref moves. `describe` went `v1.2.3-1-gafc7b09` → `afc7b09`.
-3. **Cargo's directory scan counts the directory's own mtime** (creating and deleting an
-   entry in a watched dir made the next build Dirty), **follows symlinks, and skips a
-   dangling one** (a watched dir holding a dangling link stayed Fresh; creating the link's
-   target made the next build Dirty; the build after was Fresh again).
-4. **Creating the link inside the script costs one extra re-run** on the next build (the
-   directory's mtime is newer than cargo's reference stamp). Setting the directory's mtime
-   back with std's `File::set_times` removes it: second build Fresh.
+**Env boundary.** Chosen: a pure `override_from_env(Option<&OsStr>)` in the shared module
+(+9 code lines with its doc), called from `build.rs`. Ruled out:
+- inline `match std::env::var(..) { Err(VarError::NotUnicode(_)) => panic!(..), .. }` in
+  `build.rs`: about 5 lines, but then the decision is only testable through a real build;
+  the shared function gets unit tests in both consumers (`version::derivation::tests` and
+  `dist::identity::tests`) for the same cost;
+- changing `resolve` to take `Option<&OsStr>`: changes the signature and every test call
+  (`grep -o 'resolve(\|resolve_ok(' derivation.rs | wc -l` → 23, the two definitions
+  included) for the same result.
 
-Alternatives ruled out:
+**Describe boundary.** Chosen: lossy decode via shared `describe_text` AND the sha fallback
+when describe is absent. Ruled out:
+- making `resolve` take `describe: Option<&[u8]>` and refuse invalid UTF-8 inside it: same
+  observable result, but every test call site changes from `Some("…")` to bytes (the same
+  23 matches);
+- the resolver change alone: it fixes the identity, but the build log would then say
+  "neither `WYRD_VERSION` nor `git describe` … is available", which is false (git did
+  answer). The decode keeps the warning accurate; the resolver change covers describe
+  failing for any other reason while `rev-parse` still answers.
 
-- **(A) Watch the absent path directly** — fact 1: re-run + recompile on every build of
-  every full clone, forever. Rejected on Decision 1's cost axis.
-- **(B) Watch the git common dir** — cargo scans a directory recursively; the common dir
-  holds the main checkout's `index` (rewritten by `git status`) and all of `objects/`
-  (rewritten by `git add`, and a stat per loose object on every build). That is exactly
-  the over-watch the v4 adversary measured. Rejected.
-- **(C) Watch `FETCH_HEAD` as a stand-in** — `git clone` does not write it (absent in the
-  fresh clone of fact 2), so the first-ever `fetch --depth` creates both files unseen — the
-  same hole, one step later. `--no-write-fetch-head` also evades it. Rejected.
-- **(D) Record the T4 findings as rejected**, as the round-2 adversary recommended. The
-  auto-iterate carried the finding forward as implementation work ("Make full→shallow
-  transitions refresh the identity"), and (E) fixes it without the cost the adversary was
-  worried about, so I fixed it rather than argued it.
+Why lossy decode cannot merge two tags into one identity: U+FFFD is not ASCII, so
+`validate_identity` refuses any identity containing it, and the result is always the
+commit's sha form. Pinned by
+`derivation.rs:487` (`an_undecodable_tag_fails_closed_to_the_sha_form_and_never_goes_missing`,
+including two distinct undecodable tags → two identities).
 
-Chosen **(E), the appearance watch**. Cost: `build.rs` grows +122/−15 lines against v2
-(code lines, excluding comments and blanks, 94 → 164). Runtime cost: none on the edit loop
-— measured on this worktree: a no-op `cargo build -p wyrd-server -v` printed
-`Fresh wyrd-server`, and so did one after `git status` + `git update-index --refresh`.
+`dist` was already fine: `capture` decodes lossily (`xtask/src/dist.rs:521`, base) and
+`derive_version` then refuses the result through the shared validator (`:547`), so a release
+on such a tag stops loudly before any build. Not changed.
 
-What it depends on, and how that is guarded: facts 3–4 are cargo behaviour, not documented
-API. Both halves are pinned by the new incremental tests (a change that stops following
-links fails the shallow test; one that treats a dangling link as missing fails every
-"no-op rebuild must not re-run" assertion), so a toolchain bump that changes it turns CI red
-instead of going stale. All facts were re-confirmed on the pinned toolchain: the worktree
-build and the unit tests ran under `1.96.0` (rustup path in the build log, and the tests'
-nested cargo inherits `RUSTUP_TOOLCHAIN`). Symlinks are made only on unix
-(`build.rs:161-174`); elsewhere the script warns and watches the absent paths directly —
-slower, never stale. Every CI runner and the release build are `ubuntu-latest`.
+Non-UTF-8 paths are not handled and do not need to be for the work tree: cargo itself refuses
+to build there. Measured: a toy crate copied under a directory named `dir\xff` →
+`error: path ".../dir\xFF/toy/build.rs" not utf-8`, exit 101 (cargo 1.96.1). A linked
+worktree whose git dir sits at a non-UTF-8 path outside the work tree reads as "no
+repository": rung 3, warned, re-probed every build, never a wrong identity
+(`build.rs:238-242`).
 
-What the OUT_DIR holds on this worktree (a linked worktree) after a build:
-`0 -> …/.git/worktrees/wyrd.pdca-wt-l0/reftable`, `1 -> …/.git/reftable`,
-`2 -> …/.git/shallow`, directory mtime `1970-01-01`; direct watches on the worktree `HEAD`,
-`.git/refs`, `.git/packed-refs`; baked `WYRD_BUILD_IDENTITY=0.0.0+git.df68932`.
+## A gap cargo leaves (measured, documented, not fixable from the build script)
 
-## Decision: rung 3 re-probes on every build
-
-The reviewer's suggestion, taken. Alternative: watch `<root>/.git` for appearance. It only
-covers "no `.git`", not "`git` not on `PATH`" or "git refuses the checkout" (both have a
-`.git`), and a link to an existing `.git` directory would make cargo walk all of it, index
-included. A never-created path covers every cause with one line, and only builds that
-already print a warning pay for it (the one-shot image build pays nothing extra).
-
-## The incremental-build tests
-
-`crates/server/src/version/build_script_tests.rs`:
-
-- `a_full_clone_made_shallow_and_back_rebuilds_with_each_new_identity` (`:236`): full clone
-  one commit past `v1.2.3` → `1.2.3+git.1.<sha>`; no-op rebuild Fresh; `git fetch
-  --depth=1 --no-tags origin HEAD` (fixture asserts `shallow` exists, `git for-each-ref`
-  unchanged, `describe` now the bare sha) → `0.0.0+git.<sha>`; no-op rebuild Fresh;
-  `--unshallow` → back to `1.2.3+git.1.<sha>`; no-op rebuild Fresh.
-- `an_edit_and_the_index_do_not_rerun_the_build_script_but_a_commit_does` (`:311`):
-  Decision 1's cost axis. Edit a tracked file, `git status`, `git add` (fixture asserts the
-  index mtime moved) → Fresh, same identity; then a commit → new identity.
-- `a_build_with_no_repository_reprobes_until_one_exists` (`:359`): no `.git` →
-  `0.0.0+git.unknown`, and the next build re-runs; `git init` + commit →
-  `0.0.0+git.<sha>`; then Fresh.
-
-How: the probe manifest sets `build = '<abs>/crates/server/build.rs'` and sits at
-`<tmp>/workspace/crates/probe`, so the script's `../..` root is the fixture repo. Each build
-is `$CARGO build --offline --message-format=json`; the test reads the bin artifact's
-`fresh` flag and runs the binary to read the baked value. Git runs with
-`GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` (also inherited by the build
-script's git), repository overrides removed; coverage/caching flags (`RUSTFLAGS`,
-`RUSTC_WRAPPER`, `LLVM_PROFILE_FILE`, …) are shed for the probe build. Every step runs
-under a 300 s budget and is killed past it (`:82-108`). A 1.1 s sleep before each repository
-change (`:227`) keeps a change from landing in the same mtime tick as cargo's reference
-stamp (cargo treats equal as unchanged). The 15 `version::` tests take ~3 s.
-
-Placement: a `#[cfg(test)]` module inside the production crate, NOT a `*/tests/*.rs`, so the
-verify classifier still sees exactly one added test file (`run-verify.sh --classify` on the
-final patch: `ADDED_TEST crates/server/tests/build_identity_startup_log.rs`, `CRATE
-crates/server`, `CRATE xtask`). It is reverted with production on the red leg, like legs 3–5.
-
-**Red against the previous build script** (v2's `build.rs` swapped in, everything else
-kept, then restored and `cmp`-checked):
+Toy crate with `rerun-if-env-changed=WYRD_VERSION` and a `var_os` check that panics on
+non-UTF-8, on cargo 1.96.1:
 
 ```
-test version::build_script_tests::a_build_with_no_repository_reprobes_until_one_exists ... FAILED
-test version::build_script_tests::a_full_clone_made_shallow_and_back_rebuilds_with_each_new_identity ... FAILED
-test version::build_script_tests::an_edit_and_the_index_do_not_rerun_the_build_script_but_a_commit_does ... ok
-…build_script_tests.rs:356:5: a build that could not name its commit must re-run the build script
-…build_script_tests.rs:270:5: the clone became shallow and `git describe` changed, but the build kept the old identity
-  left: "1.2.3+git.1.02ab521"
- right: "0.0.0+git.02ab521"
+== build unset                      → ok
+== build non-utf8 after unset       → Finished … rc=0   (script NOT re-run)
+== build non-utf8 again             → Finished          (still not re-run)
+== set to valid (1.2.3)             → 1.2.3
+== non-utf8 after valid             → panicked: non-utf8 WYRD_VERSION "1.2.3\xFF"
+== non-utf8 different bytes         → panicked: non-utf8 WYRD_VERSION "9.9\xFE"
 ```
 
-(Line numbers from before `cargo fmt`; now `:368` and `:282`.) The edit/index test is green
-on both scripts by design: it guards against over-watching, which v2 did not do either.
+So cargo's own `rerun-if-env-changed` check reads a non-UTF-8 value as unset. An incremental
+build going from unset to such a value never runs `build.rs` and keeps the identity it
+had (a correct git identity, not a fabricated one). A fresh build (every image build) and
+one coming from any set value do run it, and fail. `dist` only ever passes a value it has
+validated (`xtask/src/dist.rs:547`), so the dist hand-off is not exposed. Stated in the module
+doc at `build.rs:16-21`. I found no in-tree way to close it: the script is simply not called.
+I did not measure whether rustc's `option_env!` tracking behaves the same. A human may want
+to report this to cargo upstream; it is outside this repo.
 
-## Discriminator evidence (C4-verify, through the project gate)
+The real-build test is ordered so it does not depend on that gap: its first build is fresh,
+and its second non-UTF-8 build comes after a set value.
 
-`PDCA_LANE=0 PDCA_BUNDLE=results/issue_778 PDCA_BASE=df68932f2c633586fc2ce60cc418f878f8010d7d
-./engine/scripts/run-verify.sh`, run on the FINAL `patch.diff`:
+## Tests added this round
+
+Real cargo builds of a probe crate whose build script IS `crates/server/build.rs`
+(`build_script_tests.rs`):
+- `an_undecodable_tag_still_names_the_commit_by_its_sha` (`:459`): tag `v1.0\xff`; the
+  fixture asserts `git describe` really printed non-UTF-8 bytes; the build must bake
+  `0.0.0+git.<sha>` and its build log must quote `` `git describe` printed `v1.0 `` and say
+  `sha-derived` (`:483`).
+- `an_override_is_baked_verbatim_and_one_that_is_not_utf8_fails_the_build` (`:496`), in a
+  repository where rung 2 WOULD answer: fresh build with `1.2.3\xff` must fail with
+  "WYRD_VERSION is not usable … not valid UTF-8"; `0.1.0+git.3.abc12de.dirty` is baked
+  verbatim; non-UTF-8 again fails; `bad value` fails ("Docker tag"); unset → `0.0.0+git.<sha>`.
+- Harness changes: `step` returns status + raw stdout without asserting (`:95`); `try_build`
+  takes an optional raw `WYRD_VERSION` and returns `Err(stderr)` on failure (`:219`);
+  `git_in` takes `OsStr` args; `git_bytes` (`:153`) and `workspace_with_one_commit` (`:164`)
+  helpers. Every step stays under the existing 300 s kill budget.
+
+Pure unit tests (`derivation.rs`, run in both consumers):
+`a_readable_sha_is_used_when_describe_gave_no_answer` (`:469`),
+`an_undecodable_tag_fails_closed_to_the_sha_form_and_never_goes_missing` (`:487`),
+`the_override_variable_is_passed_on_as_text_and_unset_is_none` (`:514`),
+`an_override_that_is_not_utf8_is_an_error_never_unset` (`:526`, unix).
+
+All of these sit in source files, not `*/tests/*.rs`, so the verify classifier still sees one
+added test (`run-verify.sh --classify results/issue_778/patch.diff` →
+`ADDED_TEST crates/server/tests/build_identity_startup_log.rs`, `CRATE crates/server`,
+`CRATE xtask`). The discriminator test file is byte-identical to round 3's (`cmp` against the
+bundle copy).
+
+### Red against round 3
+
+Round-3 `build.rs` and `derivation.rs` swapped in, new tests kept, then restored and
+`cmp`-checked:
+
+```
+test version::build_script_tests::an_override_is_baked_verbatim_and_one_that_is_not_utf8_fails_the_build ... FAILED
+test version::build_script_tests::an_undecodable_tag_still_names_the_commit_by_its_sha ... FAILED
+…build_script_tests.rs:498:22: WYRD_VERSION="1.2.3\xFF" must fail the build, but it baked `0.0.0+git.c7f95c0`
+…build_script_tests.rs:475:5: a tag that is not UTF-8 must not discard the readable sha
+  left: "0.0.0+git.unknown"
+ right: "0.0.0+git.c7f95c0"
+test result: FAILED. 3 passed; 2 failed
+```
+
+(Line numbers from before the tightening edit below; the `must fail the build` panic is now
+`:501`.) Those are exactly the two symptoms the reviewers reported. Split check, only `build.rs`
+reverted: at first the tag test stayed green, because the resolver change alone also
+produces the sha. I tightened it to require the warning to quote git's output (only the
+decode path does that), and re-ran: both tests FAILED with only `build.rs` reverted
+(`:501` "must fail the build"; `:482` "the fail-closed build must say why"). With the fix:
+`test result: ok. 21 passed` for `version::`.
+
+## Discriminator evidence (C4-verify, project gate, final patch)
+
+`PDCA_LANE=1 PDCA_BUNDLE=results/issue_778 PDCA_BASE=0fba76c098a06e79c15a697c24b67958caef0ffe ./engine/scripts/run-verify.sh`:
 
 ```
 run-verify.sh: GREEN — cargo test -p wyrd-server --test build_identity_startup_log (fix applied)
 test result: ok. 1 passed; 0 failed
 run-verify.sh: RED — cargo test -p wyrd-server --test build_identity_startup_log (production reverted, test kept)
 panicked at crates/server/tests/build_identity_startup_log.rs:205:9:
-the `role started` event carries no string `version` field: {"fields":{"dservers":0,"listen":"127.0.0.1:39319","message":"role started","region":"us-east-1","role":"s3"},…}
+the `role started` event carries no string `version` field: {"fields":{"dservers":0,"listen":"127.0.0.1:36493","message":"role started","region":"us-east-1","role":"s3"},…}
 run-verify.sh: PASS — red without the fix, green with it (1 test(s) ran red).
 ```
 
-The green leg printed no `build_identity_startup_log:` note, so neither the skip nor the
-`WYRD_VERSION` override branch fired: leg 2 ran against the verify worktree's own HEAD.
-The discriminator test file is byte-identical to v2's (`cmp` against the bundle copy).
+No `build_identity_startup_log:` note on the green leg, so neither the skip nor the override
+branch fired: leg 2 ran against the verify worktree's own `HEAD`.
 
 ### Refute-your-own-test
 
 - **(a) Genuine red?** Yes. The verify gate reverted production (deleted `build.rs`,
-  `version.rs`, `version/derivation.rs`, `version/build_script_tests.rs`; restored `cli.rs`,
-  `lib.rs`, `dist.rs`, Dockerfile, docs, `dist_templates.rs`), kept the test, compiled it,
-  ran 1 test, and it failed on the missing `version` field (`:205`). For this round's new
-  behaviour, the incremental tests went red against v2's `build.rs` (above).
+  `version.rs`, `version/*`; restored `cli.rs`, `lib.rs`, `dist.rs`, Dockerfile, docs,
+  `dist_templates.rs`), kept the test, ran 1 test, and it failed on the missing `version`
+  field (`build_identity_startup_log.rs:205`). For this round's behaviour, both new
+  real-build tests failed against round 3's `build.rs` + `derivation.rs`, and against
+  round 3's `build.rs` alone (above).
 - **(b) Production path?** Yes. The discriminator spawns the real `CARGO_BIN_EXE_wyrd`,
-  whose real `build.rs` computed the value and whose real `cmd_s3` (`cli.rs:2393`) logged
-  it; its expectation comes from its own `git` calls, not from production code. The
-  incremental tests compile the real `crates/server/build.rs` (by absolute path) with the
-  real cargo of the pinned toolchain — no copy, no mock.
-- **(c) Fixture includes the fault?** Yes. The discriminator runs in a real git worktree
-  checkout and hard-fails on `unknown` or a missing sha whenever the workspace's own
-  repository is visible. The shallow test asserts the fault is really present before it
-  builds: the clone IS shallow, NO ref moved, and `describe` DID change. The no-repo test
-  starts with no `.git`. The edit test asserts the index really was rewritten.
+  whose real `build.rs` computed the value and whose real `cmd_s3` logged it
+  (`cli.rs:2398`); its expectation comes from its own `git` calls, not from production
+  code. The new real-build tests compile the real `crates/server/build.rs` by absolute path
+  with the cargo of the pinned toolchain; the pure tests call the production functions.
+- **(c) Fixture includes the fault?** Yes. The tag test asserts `git describe` really
+  printed non-UTF-8 bytes before building. The env test hands cargo the raw bytes
+  `1.2.3\xff` in a repository where rung 2 would answer, so a value read as unset is
+  visible as the git identity; its first build is fresh, so cargo's own env-check gap cannot
+  hide the fault.
 
-Gate environment: every tree the gates build in (Do worktree, verify worktree
-`wyrd-verify-l0`) is a git worktree; the probe succeeded in both. cargo-mutants' scratch copy
-has no `.git`, so there the discriminator takes its visible skip and `wyrd-server`'s build
-lands on rung 3 (re-runs its script every build — cargo-mutants rebuilds per mutant anyway).
-The incremental tests make their own repositories, so they do not depend on one.
+## CI (`cargo xtask ci`, project runner)
 
-## CI
-
-`PDCA_WORKTREE=… ./engine/xtask.sh ci` (= `cargo xtask ci`) → `xtask ci: all checks passed`,
-exit 0. Steps: typos, docs lint/render, gitlink guard, unsafe guard ("every crate root
-forbids unsafe code" — scans `build.rs`), blackbox guard, `cargo fmt --check`, clippy,
-build, workspace tests, cargo-machete, the three `cargo deny` runs, conformance, statics,
-deploy guard, DST clippy + tests. New/changed tests seen passing: the 3
-`version::build_script_tests::*`, the 12 `version::derivation::tests::*` and the same 12 as
-`dist::identity::tests::*`, `the_s3_role_logs_the_build_identity_derived_from_git`,
+`PDCA_WORKTREE=/home/eddie/wyrd/wyrd.pdca-wt-l1 ./engine/xtask.sh ci` → `xtask ci: all checks
+passed`, exit 0. New/changed tests seen passing: all 17 `version::derivation::tests::*` and
+the same 17 as `dist::identity::tests::*`, the 5 `version::build_script_tests::*`,
+`the_s3_role_logs_the_build_identity_derived_from_git`,
 `the_build_identity_derivation_is_one_file_with_two_consumers`,
 `the_image_build_hands_the_version_to_the_binary`,
 `the_dockerfile_declares_the_version_arg_in_the_build_stage`,
 `dist_validates_its_version_with_the_shared_rule`, and the unmodified
-`normalize_describe_covers_all_three_shapes` (`xtask/tests/dist_templates.rs:336`; the
-patch removes zero lines from that file). Zero `wyrd-server build identity` warnings in
-the CI log.
+`normalize_describe_covers_all_three_shapes` (`xtask/tests/dist_templates.rs:336`, base and
+patched; the patch removes zero lines from that file). Zero `wyrd-server build identity`
+warnings in the CI log (the worktree builds on rung 2).
 
-CI started about a minute before two comment-only edits (a doc line in `build.rs:26-28`
-and one in `build_script_tests.rs:23-25`). I re-ran on the final tree: `typos` over the
-touched server files, `cargo fmt --all -- --check`, `cargo clippy -p wyrd-server
---all-targets` (no warnings), and `cargo test -p wyrd-server --lib version::` (15 passed);
-the verify run above used the final patch.
+CI ran before one comment-only edit (`build.rs:25-28`). On the final tree I re-ran
+`cargo fmt --all -- --check` (clean), `typos` over every touched server file (clean),
+`cargo clippy -p wyrd-server --all-targets -- -D warnings` (exit 0),
+`cargo test -p wyrd-server --lib version::` (21 passed), and the verify gate above (it used
+the final `patch.diff`).
 
 Formatter / hooks: `cargo fmt --all` then `--check` clean. The repo has no
-`.pre-commit-config.yaml`, no `core.hooksPath`, no `.githooks`. `patch.diff` was generated
-with `git diff HEAD` (new files via `git add -N`, index reset afterwards): 11 files,
-+1717/−93, and `git apply --cached --check` succeeds on `df68932`.
+`.pre-commit-config.yaml`, `core.hooksPath` or `.githooks` (as in round 3). `patch.diff` is
+`git diff HEAD` with new files added `-N` (index reset afterwards): 11 files, +2003/−93;
+`git apply --cached --check` succeeds on a throwaway index read from `origin/main`.
 
 ## Gate notes for the human
 
-- **C4-diff-cov will again report "patch.diff does not apply on `origin/main`".** Checked
-  with a throwaway index: on `origin/main` the hunks for `deploy/docker/wyrd/Dockerfile`,
-  `docs/design/architecture/07-deployment-view.md` and `xtask/src/dist.rs` fail — exactly
-  the three files #742 changed; the same patch applies on `df68932`. `origin/main` is an
-  ancestor of `df68932`, 24 commits behind it, and neither #738 nor #742 is on
-  `origin/main`. So nothing "moved": the patch is written against the stacked base the
-  driver gave Do and C4-verify (`PDCA_BASE`), while `run-diff-cov.sh:685` resolves its base
-  through `run-verify.sh --print-base`, which without `PDCA_BASE` falls to the brief's
-  `main`. That is a harness-side base mismatch, not something a rebase of this patch can
-  fix while #742 is unmerged. (The brief says #742 expected THIS slice to land first; the
-  driver stacked them the other way round.)
+- **C4-diff-cov** should now be measurable: the patch applies on `origin/main`.
 - **C5-mutants**: the pre-declared baseline failure (`repo_hygiene_guards.rs:137` needs
-  `git ls-files`; the mutants scratch copy has no `.git`).
-- `review-batch.md`'s two T4 findings are fixed (they should drop out of the next run); no
-  `review-rejected.md` written.
+  `git ls-files`; the mutants scratch copy has no `.git`). There, `wyrd-server` builds on
+  rung 3 and the discriminator takes its visible skip.
+- `review-batch.md`'s two T4 findings (`build.rs:53`, non-UTF-8 `WYRD_VERSION`) are fixed;
+  no `review-rejected.md` written.
 
 ## What this slice does NOT prove (stated plainly, per the brief)
 
 - **End-to-end equality of a shipped binary's identity with its tarball's `VERSION` is not
   demonstrated.** It needs `cargo xtask dist` (Docker + network), outside `ci` by design; I
   did not attempt an image build. What is proven is the coupling: one normalizer
-  (`normalize_describe_covers_all_three_shapes`, unmodified), and `dist` passing the very
-  `version` binding it writes to `VERSION` into the image build (`dist.rs:638` →
-  `image_build_args` `:226`, asserted container-free at `dist_templates.rs:403`) and into
-  the `--host` build (`dist.rs:614`). Two routes exist if the human wants the pair observed
+  (`normalize_describe_covers_all_three_shapes`, unmodified) and `dist` passing the very
+  `version` binding it writes to `VERSION` into the image build (`image_build_args`,
+  `xtask/src/dist.rs:207`/`:226`, asserted container-free in `dist_templates.rs`) and into the
+  `--host` build (`dist.rs:614`). Two routes exist if the human wants the pair observed
   before a tag: the release workflow's `workflow_dispatch`, or a local `cargo xtask dist`
   then comparing `target/dist/wyrd-*/VERSION`'s `version:` line with the extracted
-  `bin/wyrd s3 … --log-format json` startup event's `version`. The release-smoke
-  comparison is #779's.
+  `bin/wyrd s3 … --log-format json` startup event's `version`. The release-smoke comparison
+  is #779's.
 - On an untagged checkout with no override the identity is `0.0.0+git.<sha>`: a real build
   identity, not a release version.
 - A hand-built binary from an edited tree advertises its base commit (Decision 1).
+- The cargo env-check gap above (incremental unset → non-UTF-8 `WYRD_VERSION`).
+
+## Still for the human (deferred from earlier rounds, untouched here)
+
+- C1: the discriminator asserts equality with `WYRD_VERSION` and skips the git leg only when
+  the TEST was compiled with a non-empty `WYRD_VERSION` (`build_identity_startup_log.rs:25`,
+  `:216`). Every gate run has it unset.
 - Compose-built images (`deploy/small-multi-node-fdb/docker-compose.yml` builds this
-  Dockerfile with only `FEATURES`) log `0.0.0+git.unknown`, warned at build time. Not
-  changed here (outside scope (c)); still a human call from round 2's deferred list.
-- Known limits of the watch set, unchanged from v2: `config` (`core.abbrev`) and the
-  deprecated `info/grafts` are not watched.
-
-## Still for the human (deferred in round 2, untouched here)
-
-- C1: the discriminator's `WYRD_VERSION` branch asserts equality with the override and
-  skips the git leg only when the TEST was compiled with a non-empty `WYRD_VERSION`
-  (`build_identity_startup_log.rs:25`, `:216`). Every gate run has it unset.
-- The compose-fixture item above.
-- The round-2 adversary's "reject T4 as out of Decision 1" recommendation is moot: the
-  appearance watch fixes the finding without the per-build cost it was worried about.
+  Dockerfile with only `FEATURES`) log `0.0.0+git.unknown`, warned at build time. Outside
+  scope (c).
+- Whether to narrow the `refs/` watch (only the doc sentence was corrected this round).
+- Known watch-set limits, unchanged: `config` (`core.abbrev`) and `info/grafts` are not
+  watched.
 
 No external dependency beyond what the brief lists was needed (git and cargo were already
-required by the discriminator). Scratch work is under
-`$PDCA_SCRATCH/pdca-builder-778-{shallow,rerun,redleg,applycheck}` and the two
-`pdca-builder-778-{verify,verify2,ci}.log` files; left for the harness to reclaim.
+required). Scratch work is under `$PDCA_SCRATCH/pdca-builder-778-r4-*` (toy crates, the
+round-3 file copies, the throwaway apply-check index, and the gate logs); left for the harness
+to reclaim.

@@ -1,0 +1,30 @@
+# Adversarial review — #722 (a drain over a `seg:`-resident fragment completes)
+
+**Verdict: I could not refute the fix.** One test gap is worth a small rebuild. The rest are notes.
+
+What I re-ran myself, on a scratch copy of `$PDCA_TARGET`:
+
+- **Red→green reproduced.** Patched: `segmented_map_evacuate` 11/11 green and `segmented_map_rebalance` 5/5 green. With the base `rebalance.rs` restored: 10 failed and 1 passed (leg 3). Legs 1 and 2 fail on their first real assertion (`Blocked` instead of `Changed`, `crates/custodian/tests/segmented_map_evacuate.rs:407`, `:464`), so they fail for the right reason. Both go through the real `reconcile_step` and check the store, not a copy of the production code.
+- **The DST property's named negations hold** (DST = the deterministic simulation suite). At `MADSIM_TEST_NUM=50` the property is green. Deleting the `seg:` `require` in `repoint_chunk` (`crates/core/src/metadata.rs:3324`) turns it red at `crates/dst/tests/custodian.rs:6167`, because a lost move publishes an orphan mark. Deleting the root pin (`metadata.rs:3257`) turns it red at `:6163`, because a lost move rewrites the record.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — `crates/custodian/src/rebalance.rs:298-302` and `:439`: no test checks the claim that every move pins "the generation the resolve ANSWERED FROM". I made a hand mutation, `prior: record.clone()`, which pins the scanned snapshot instead of `resolved.record`. It passes the whole `wyrd-custodian` test suite. The DST property can't catch it either, because its racer fires inside `commit()`, after the resolve. **Concrete case:** a segmented root R1 sits at `inode:3`. Between the resolver's `seg:` page read and its root re-read, a supersede installs R2 (a new group naming the same drained chunk), so the resolve restarts onto R2. **Patched:** `Changed`, R2's `seg:` record is repointed, and the drain status is `Satisfied`. **Mutant:** the move walks R1's table and pins R1's root. It copies the fragment to the free server, loses the CAS (compare-and-swap), and answers `Blocked` with a `conflict` line. That leaves an unreferenced, unmarked copy (the #723 leak class) and wastes a pass. This is not a safety hole, only lost progress. But it is the one property the new `EvacObject` refactor introduces, and nothing tests it. **Fix:** add a drain leg with a `scan_page` hook that supersedes the root after the first `seg:` page. I ran exactly that as a probe, and it is about 25 lines on the existing fixture.
+- `crates/custodian/tests/segmented_map_evacuate.rs:447-449`: leg 2's doc comment says an object left naming the drained server "would name a fragment GC is free to reclaim once the other object's move orphan-marks it". That is false. GC (garbage collection) never reclaims a fragment that any committed map names (`crates/custodian/src/gc.rs:442-445`). That was the brief's own reason (a) for dropping cross-object dedup. The real cost of a missed reference is that the drain never certifies. This is a one-line comment fix, so the test doesn't argue for the dedup the brief rejected. Fold it into the rebuild above. It is cosmetic, so it is not a NEEDS-HUMAN item.
+- Leg 3 departs from the brief, and the build is right. The brief said to key the fixture to V/2 because "#721 settles that a `seg:` record is weighed at V/2". The base primitive actually weighs a `seg:` record against the full `MAX_VALUE_BYTES` (`crates/core/src/metadata.rs:593-600`, `:3218-3219`), so a fixture keyed to V/2 would commit instead of being refused. The test keys to `MAX_VALUE_BYTES` and says why (`segmented_map_evacuate.rs:520-521`). The brief's premise was wrong, not the build. As the brief declared, leg 3 also passes on the base. It shows only that the drain copies nothing ahead of a refusal.
+- `crates/custodian/src/rebalance.rs:747`: the `emit_conflict` audit line says "copied fragments are collectable garbage". The patch now sends two arms there that copy nothing: the `Repoint::Conflict` returned while preparing the move (`:618`), and a stale `Refused`/`VersionExhausted` (`:605-609`). The "collectable garbage" wording belongs to #723, which is settled, so I'm not raising it here. When #723 rewrites that line, it should cover these two no-copy arms too.
+
+## Refutation attempts that did not land
+
+Each was run as a probe through `reconcile_step` on the patched tree:
+
+- Two drained chunks in one `seg:` record both move in one pass, with no conflict. The move re-reads the `seg:` record (`metadata.rs:3288`), so the second plan sees the first commit.
+- A zero-length drained chunk at a segment boundary moves and answers `Changed`, whether it trails segment 0 or leads segment 1 (`metadata.rs:3354-3359`, `rebalance.rs:383-385`).
+- The same `ChunkRef` appearing twice in one object (two segments): both copies are repointed in one pass.
+- A chunk shared between a flat object and a segmented object: both are repointed, and the status is `Satisfied`.
+- A sibling chunk edited just before the move's `seg:` re-read is merged: the answer is `Changed` and the sibling's edit is kept.
+- In a flat map, a drained chunk that comes before a length overflow still moves. The object is contained and named once, and the pass answers `Blocked` (`rebalance.rs:418-424`). It is never an anonymous conflict.
+- A flat object with two drained chunks: pass 1 is `Blocked` with one conflict, because the second plan pins the root as it was before the first commit. Pass 2 is `Changed`. The base `rebalance.rs` behaves identically, so this is pre-existing and not this diff.
+- Gate claims check out. C4-ci's failed first attempt was `a_hanging_health_probe_fails_closed_within_a_bounded_wait` (`crates/server/tests/health_probe.rs:537`, `gate-logs/C4-ci.log:2534`), which is unrelated to this diff. The madsim DST suite ran, and the new property passed (`gate-logs/C4-ci.log:5934`). C4-verify's "11 test(s) ran red" is a count of tests run; the real split was 10 failing and 1 passing. I found nothing that contradicts T4's "0 blocking".
+
+<!-- pdca:leaf-complete -->

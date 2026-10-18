@@ -1,0 +1,2566 @@
+diff --git a/crates/core/src/multipart.rs b/crates/core/src/multipart.rs
+index 120a4dd..34df8fd 100644
+--- a/crates/core/src/multipart.rs
++++ b/crates/core/src/multipart.rs
+@@ -5,8 +5,9 @@
+ //! This is slices 1–3 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). This
+ //! file is deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
+ //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
+-//! what this file defines: the first is [`create`], `CreateMultipartUpload`'s admission and
+-//! session creation (#894). After this file a reader can name every key the protocol will ever
++//! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
++//! (#894), and [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
++//! fence's batch (#895). After this file a reader can name every key the protocol will ever
+ //! write (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
+ //! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
+ //! derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence` singleton
+@@ -99,8 +100,10 @@
+ //! #841, and [`SessionRecord::completing_teardown`], #842), the generation record that pass
+ //! keeps ([`FenceGeneration`], #810), and one creation route each for a fresh session and for
+ //! the admission ledger, which [`create::create_session`] commits (#894). So Create now writes
+-//! `mpuctl`, `mpu:` and `seggrp:`, with no production caller until the S3 verb is wired (#668);
+-//! every other first writer is a store round trip still to land (#657–#659).
++//! `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes `mpu:` and
++//! `retire:bytes:` through the one fence batch builder the restore fence also commits
++//! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
++//! (#668). Every other first writer is a store round trip still to land (#657–#659).
+ //! An earlier revision of this header deferred the living-architecture update to "the slice
+ //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
+ //! the convention ended up saying. The living architecture doc describes the system **as it
+@@ -108,10 +111,11 @@
+ //! system the moment it is merged — `AGENTS.md:154-158` makes updating it in the same PR a
+ //! merge requirement, not a follow-up. Its metadata model
+ //! (`docs/design/architecture/05-building-block-view.md:206`) therefore records these
+-//! record **types**, says which of them Create now writes, and lists the answer table and the
+-//! multipart ETag and Complete fingerprint a `Completed` session stores; it defers the rest of
+-//! the *protocol* — the fenced transitions, staged publication and the retirement drain — to the
+-//! proposal, whose §1 (`0016:333-356`) stays the normative description of this key space.
++//! record **types**, says which of them Create and Abort now write, and lists the answer table
++//! and the multipart ETag and Complete fingerprint a `Completed` session stores; it defers the
++//! rest of the *protocol* — the other fenced transitions, staged publication and the retirement
++//! drain — to the proposal, whose §1 (`0016:333-356`) stays the normative description of this
++//! key space.
+ //!
+ //! One type here does reach a live path: the owned entry's value is the shared
+ //! [`crate::metadata::PendingEntry`], which every streaming write already puts under
+@@ -143,6 +147,7 @@ use crate::metadata::{
+     MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES,
+ };
+ 
++pub mod abort;
+ pub mod create;
+ 
+ // ===========================================================================
+@@ -3900,9 +3905,10 @@ pub fn decode_retire_obligation(
+ 
+ /// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
+ /// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its only
+-/// constructors are the restore fence's rows ([`SessionRecord::open_teardown`],
+-/// [`SessionRecord::completing_teardown`]); a later writer's row is added as its own constructor,
+-/// never as a payload handed in beside a key the caller chose.
++/// constructors are the teardown fence's rows ([`SessionRecord::open_teardown`], which the
++/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]); a later writer's
++/// row is added as its own constructor, never as a payload handed in beside a key the caller
++/// chose. That is what lets [`abort::fence_batch`] write only obligations this decoder accepts.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct RetireObligation {
+     mode: RetireMode,
+@@ -4625,8 +4631,8 @@ pub enum CompleteOutcome {
+     Refused(Refusal),
+ }
+ 
+-/// What `AbortMultipartUpload` answers (#656) — the body half of the verb; the *lifecycle*
+-/// half is [`AbortAnswer`], decision 3's table cell.
++/// What `AbortMultipartUpload` answers ([`abort::abort_session`], #895) — the body half of the
++/// verb; the *lifecycle* half is [`AbortAnswer`], decision 3's table cell.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum AbortOutcome {
+     /// The fence landed: the session is `Aborting` and its teardown obligation is durable.
+diff --git a/crates/core/src/multipart/abort.rs b/crates/core/src/multipart/abort.rs
+new file mode 100644
+index 0000000..6d27299
+--- /dev/null
++++ b/crates/core/src/multipart/abort.rs
+@@ -0,0 +1,447 @@
++//! `AbortMultipartUpload`'s **teardown fence**, and the one builder of the fence batch that every
++//! writer of the `Open → Aborting` edge commits (#895, slice 3b of #636).
++//!
++//! [`abort_session`] moves an `Open@E` session to `Aborting@E+1` and installs its retirement
++//! obligation in the **same** batch (proposal 0016's *Abort / reap fence* row, `0016:665`), and
++//! answers every other state as decision 3's table does (`0016:977`, [`super::abort_answer`]):
++//!
++//! | State read | Answer | Written |
++//! |---|---|---|
++//! | `Open@E` | [`AbortOutcome::Fenced`] | the [`fence_batch`]: `require(mpu:<id> == bytes read)`, `require_absent(retire:bytes:s:<id>:<E>)`; put the session at `Aborting@E+1`, put its `{session, all}` obligation ([`SessionRecord::open_teardown`]) |
++//! | `Aborting` | [`AbortOutcome::AlreadyAborting`] | nothing |
++//! | `Completing` | [`Refusal::OperationAborted`] | nothing |
++//! | `Completed`, or no record | [`Refusal::NoSuchUpload`] | nothing |
++//!
++//! A client Abort carries no slot preconditions (`0016:665`). The fence never touches `mpuctl`: a
++//! fenced session still holds its staged bytes and its `mpu:` record, so it stays counted until
++//! the terminal delete, the one place the count goes down (#659).
++//!
++//! # One batch builder, two writers
++//!
++//! [`fence_batch`] is the only place the teardown fence's [`WriteBatch`] is built. The client
++//! Abort here and the post-restore session fence (`crates/custodian/src/restore.rs`,
++//! `fence_session`) both commit what it builds, so the two writers of the `Open → Aborting` edge
++//! cannot drift apart in their preconditions or their puts.
++//!
++//! Production calls no client Abort yet: the S3 verb that will is #668, under 0016's rule that
++//! the reaper and operator abort ship in the same release (`0016:236-268`). The restore fence is
++//! the one production caller of [`fence_batch`].
++//!
++//! # Runtime-free (ADR-0009)
++//!
++//! Core reads no clock, draws no randomness and never sleeps here. The fence stamps no time: the
++//! `Aborting` record carries the session's own `created_at_millis` and `clock_source` unchanged,
++//! and a round that lost is retried at once, with no backoff to wait out.
++
++use std::fmt;
++use std::slice;
++
++use bytes::Bytes;
++use wyrd_traits::{BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, WriteBatch};
++
++use super::{
++    abort_answer, decode_session_record, mpu_key, AbortAnswer, AbortOutcome, RecordError, Refusal,
++    RetireObligation, SessionRecord, UploadId, MAX_COMPLETE_ATTEMPTS,
++};
++use crate::metadata;
++
++/// How many fence commits one [`abort_session`] makes at most: [`MAX_COMPLETE_ATTEMPTS`] `+ 1`.
++///
++/// A session goes back to `Open` only when a Complete fence is released, and it spends at most
++/// [`MAX_COMPLETE_ATTEMPTS`] Complete fences, so a session that keeps moving to a later `Open@E'`
++/// under the Abort can cost it at most that many rounds. The one more is the round that fences.
++/// A round is also spent by a conflict no re-read explains (on TiKV, a lock another writer held,
++/// with nothing moved) and by a commit whose outcome the store could not report; those share
++/// the same budget. It is sized from the shipped value of that knob, and it bounds the work one
++/// Abort does, not its correctness: an Abort that spends it ends with an error that says whether
++/// a fence of it may still land, never with a wrong answer.
++pub const ABORT_ROUNDS: u32 = MAX_COMPLETE_ATTEMPTS + 1;
++
++/// **The teardown fence's batch** (`0016:665`), the one builder of it: given the session's
++/// `mpu:` key, the exact bytes read there, the session as the fence leaves it and the obligations
++/// the fence installs, it
++///
++/// 1. `require`s `session_key` to hold exactly `read`;
++/// 2. `require_absent`s every obligation's key (`0016:369-373`), in the order given;
++/// 3. puts `session` at `session_key`;
++/// 4. puts every obligation's payload under its key, in the order given.
++///
++/// It takes a list because the restore fence also fences `Completing` sessions, whose teardown
++/// installs two obligations ([`SessionRecord::completing_teardown`]); the client Abort passes the
++/// one [`SessionRecord::open_teardown`] mints.
++///
++/// It writes only obligations that [`super::decode_retire_obligation`] accepts at the key they go
++/// under. That is a property of the type: a [`RetireObligation`] is minted only by the teardown
++/// rows, whose key and payload come from one constructor and are pinned to decode against each
++/// other, so a caller cannot hand this builder a payload under a key it chose.
++pub fn fence_batch(
++    session_key: &[u8],
++    read: &[u8],
++    session: &SessionRecord,
++    obligations: &[RetireObligation],
++) -> WriteBatch {
++    let keys: Vec<Vec<u8>> = obligations.iter().map(RetireObligation::key).collect();
++    let mut batch = WriteBatch::new().require(session_key.to_vec(), read.to_vec());
++    for key in &keys {
++        batch = batch.require_absent(key.clone());
++    }
++    batch = batch.put(session_key.to_vec(), metadata::encode(session));
++    for (obligation, key) in obligations.iter().zip(keys) {
++        batch = batch.put(key, metadata::encode(obligation.payload()));
++    }
++    batch
++}
++
++/// An Abort that ended with neither an answer nor a refusal.
++///
++/// # Error class
++///
++/// [`wyrd_traits::classify`] reads [`Self::InDoubt`] as
++/// [`ErrorClass::Indeterminate`](wyrd_traits::ErrorClass::Indeterminate), whatever stopped the
++/// Abort: its [`source`](std::error::Error::source) is the store's own [`CommitUnknownResult`].
++/// [`Self::Stopped`] keeps its cause's class: a [`Stop::Store`] wrapping a
++/// [`TransientFault`](wyrd_traits::TransientFault) is transient, because nothing is in doubt.
++#[derive(Debug)]
++pub enum AbortError {
++    /// A fence batch of this Abort may have landed, or may still land, and the Abort stopped
++    /// before a read could say which. Never "nothing was written".
++    InDoubt(Box<InDoubt>),
++    /// The Abort stopped, and no fence batch of it is in doubt: none landed, and none can land
++    /// later.
++    Stopped {
++        /// The upload the Abort was for.
++        upload_id: UploadId,
++        /// What stopped it.
++        cause: Stop,
++    },
++}
++
++/// What an [`AbortError::InDoubt`] reports.
++#[derive(Debug)]
++pub struct InDoubt {
++    /// The upload whose fence is in doubt.
++    pub upload_id: UploadId,
++    /// Whether a fence batch of this Abort may still be applied **after** it returned
++    /// ([`CommitUnknownResult::may_still_commit`]). Once a fence of this Abort said so, only a read
++    /// that found the session moved clears it, so later outcomes, failed reads and store faults
++    /// leave it `true`.
++    pub may_still_commit: bool,
++    /// The store's report of the unknown outcome that keeps the doubt: the first that said
++    /// `may_still_commit`, or else the latest one no successful read has settled. It is the
++    /// error's [`source`](std::error::Error::source).
++    pub outcome: CommitUnknownResult,
++    /// What stopped the Abort before it could settle the doubt.
++    pub cause: Stop,
++}
++
++/// What stopped an Abort ([`AbortError::Stopped`], [`InDoubt::cause`]).
++#[derive(Debug)]
++pub enum Stop {
++    /// All [`ABORT_ROUNDS`] fence commits were made and the session was still `Open`.
++    RoundsSpent {
++        /// Fence commits made.
++        rounds: u32,
++    },
++    /// The fence's obligation key is already present while the session is still exactly the
++    /// bytes the fence read: two reads of the session, one on each side of the key's read, found
++    /// it unchanged. A token is minted once (`0016:358-373`), so this is damage a retry cannot
++    /// settle.
++    ObligationKeyTaken {
++        /// The `retire:` key, as UTF-8 (lossy).
++        key: String,
++    },
++    /// The session is `Open` at the last epoch, so no fence can bump it (`0016:704-708`).
++    EpochExhausted,
++    /// The stored `mpu:` value is not a valid session record (ADR-0045).
++    Record(RecordError),
++    /// A store operation failed.
++    Store(BoxError),
++}
++
++impl fmt::Display for AbortError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::InDoubt(doubt) => write!(
++                f,
++                "multipart abort: upload {} is in doubt: a fence batch of this abort {}; re-read \
++                 the session to learn whether it is Aborting ({})",
++                doubt.upload_id,
++                if doubt.may_still_commit {
++                    "may still be applied"
++                } else {
++                    "may have been applied"
++                },
++                doubt.cause,
++            ),
++            Self::Stopped { upload_id, cause } => write!(
++                f,
++                "multipart abort: upload {upload_id}: {cause}; no fence batch of this abort is in \
++                 doubt (none landed, and none can land later)"
++            ),
++        }
++    }
++}
++
++impl fmt::Display for Stop {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::RoundsSpent { rounds } => write!(
++                f,
++                "all {rounds} fence rounds were spent and the session is still Open"
++            ),
++            Self::ObligationKeyTaken { key } => write!(
++                f,
++                "the obligation key {key} is already taken while the session is unchanged; this \
++                 is damage a retry cannot settle"
++            ),
++            Self::EpochExhausted => {
++                f.write_str("the session is Open at the last epoch, so no fence can bump it")
++            }
++            Self::Record(torn) => write!(f, "the stored session record is invalid: {torn}"),
++            Self::Store(fault) => write!(f, "store fault: {fault}"),
++        }
++    }
++}
++
++impl std::error::Error for AbortError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            // The unknown outcome, never the stop cause: `classify` stops at the first seam type
++            // on the chain, and a doubtful Abort must read `Indeterminate` even when a transient
++            // fault is what stopped it.
++            Self::InDoubt(doubt) => Some(&doubt.outcome),
++            Self::Stopped { cause, .. } => match cause {
++                Stop::Record(torn) => Some(torn),
++                Stop::Store(fault) => Some(fault.as_ref()),
++                Stop::RoundsSpent { .. }
++                | Stop::ObligationKeyTaken { .. }
++                | Stop::EpochExhausted => None,
++            },
++        }
++    }
++}
++
++/// **`AbortMultipartUpload`**: fence the session `upload_id` names (`0016:665`), answering in the
++/// landed vocabulary ([`AbortOutcome`], [`Refusal`]) per decision 3's table (`0016:977`). No
++/// production path calls this yet (#668 will).
++///
++/// # The fence
++///
++/// Read `mpu:<id>`. An `Open@E` session is fenced by one commit of [`fence_batch`]: the session
++/// at `Aborting@E+1` and its `retire:bytes:s:<id>:<E>` obligation `{session, all}`, under
++/// `require` on the exact bytes read and `require_absent` on the obligation key. `{session, all}`
++/// rather than a part list, because a list can outgrow the value ceiling for a sparse session and
++/// `all` is sound: no part commits outside `Open` (`0016:712-717`). Every other state is
++/// answered from the table and nothing is written.
++///
++/// # A commit that did not say `Committed`
++///
++/// The Abort runs at most [`ABORT_ROUNDS`] fence commits, and after each one reads the session
++/// again and answers from what it finds, the last round's read included:
++///
++/// * **`Conflict`, session moved**: answer from the new state. A rival Abort that won leaves
++///   `Aborting`, which answers [`AbortOutcome::AlreadyAborting`]; two racing Aborts never get a
++///   `409`. A session at a later `Open@E'` is fenced again, at `E'`.
++/// * **`Conflict`, session unchanged**: read the obligation key. Absent, the conflict is one no
++///   read explains (TiKV answers `Conflict` when its locking read meets another writer's lock,
++///   with nothing moved), so the Abort spends a round and tries again. Present, it reads the
++///   session once more before naming anything: a rival fence that landed between the two reads
++///   moved the session in the same batch that wrote the key, so a moved session is answered from
++///   its new state. Only a session **still** exactly the bytes this round read makes the key
++///   damage, [`Stop::ObligationKeyTaken`].
++/// * **[`CommitUnknownResult`]**: never read as `Conflict`. The next read answers it: a session
++///   found exactly as a fence of this Abort leaves it is [`AbortOutcome::Fenced`].
++///
++/// # Two kinds of doubt, both kept
++///
++/// * **May still land** (`may_still_commit: true`): kept while the session is unchanged, across
++///   later out-of-flight unknowns, failed reads, store faults and unexplained conflicts. Only a
++///   read that finds the session moved clears it: every fence requires the exact bytes it read,
++///   and the epoch only rises, so a fence of bytes that are gone can never land.
++/// * **Out of flight, outcome not read** (`may_still_commit: false`): the batch cannot land
++///   later, but may already have landed. One successful read of `mpu:<id>` settles it.
++///
++/// When the rounds run out or a fault ends the Abort, it returns [`AbortError::InDoubt`] with the
++/// first outcome that said `may_still_commit` if a fence of it may still land; else, if one of
++/// its unknown outcomes was never settled by a read, [`AbortError::InDoubt`] with that outcome;
++/// only otherwise [`AbortError::Stopped`]. There is no settling read before it returns: a fence
++/// that lands after the Abort returned cannot be found by a look taken before, so the Abort
++/// returns the doubt instead.
++///
++/// # Termination
++///
++/// At most [`ABORT_ROUNDS`] commits, each followed by at most three reads, after one first read.
++/// Each store call is bounded by the store's own contract (every operation terminates,
++/// `crates/traits/src/lib.rs`, "Operational envelope").
++///
++/// **Not cancel-safe once a commit is sent.** Dropping the future after that can leave a fence
++/// that lands with no answer naming it. The fence still installs its obligation in the same
++/// batch, so the session stays in reach of the drain, but the caller is told nothing. Bound an
++/// Abort through the store's own deadlines, never by dropping the future: a commit the store
++/// abandons at its deadline comes back as a [`CommitUnknownResult`], which this function reports.
++pub async fn abort_session(
++    store: &impl MetadataStore,
++    upload_id: &UploadId,
++) -> Result<AbortOutcome, AbortError> {
++    let session_key = mpu_key(upload_id);
++    let mut doubt = Doubt::default();
++    let mut rounds = 0u32;
++    let mut found = match store.get(&session_key).await {
++        Ok(found) => found,
++        Err(fault) => return Err(doubt.end(upload_id, Stop::Store(fault))),
++    };
++    loop {
++        // `found` is always the result of a read that succeeded.
++        if doubt.landed(found.as_ref()) {
++            return Ok(AbortOutcome::Fenced);
++        }
++        doubt.settle(found.as_ref());
++        let Some(read) = found else {
++            return Ok(AbortOutcome::Refused(Refusal::NoSuchUpload));
++        };
++        let record = match decode_session_record(&read) {
++            Ok(record) => record,
++            Err(torn) => return Err(doubt.end(upload_id, Stop::Record(torn))),
++        };
++        match abort_answer(Some(record.state())) {
++            AbortAnswer::Fences => {}
++            AbortAnswer::AlreadyAborting => return Ok(AbortOutcome::AlreadyAborting),
++            AbortAnswer::Refused(refusal) => return Ok(AbortOutcome::Refused(refusal)),
++        }
++        let Some(teardown) = record.open_teardown(upload_id) else {
++            return Err(doubt.end(upload_id, Stop::EpochExhausted));
++        };
++        if rounds == ABORT_ROUNDS {
++            return Err(doubt.end(upload_id, Stop::RoundsSpent { rounds }));
++        }
++        rounds += 1;
++        let obligation = teardown.obligation();
++        let obligation_key = obligation.key();
++        let batch = fence_batch(
++            &session_key,
++            &read,
++            teardown.session(),
++            slice::from_ref(obligation),
++        );
++        found = match store.commit(batch).await {
++            Ok(CommitOutcome::Committed) => return Ok(AbortOutcome::Fenced),
++            Ok(CommitOutcome::Conflict) => {
++                match lost(store, &session_key, &read, &obligation_key).await {
++                    Ok(Lost::Moved(now)) => now,
++                    // Spend the round; the session is still `read`.
++                    Ok(Lost::Unexplained) => Some(read),
++                    Ok(Lost::Taken) => {
++                        let key = String::from_utf8_lossy(&obligation_key).into_owned();
++                        return Err(doubt.end(upload_id, Stop::ObligationKeyTaken { key }));
++                    }
++                    Err(fault) => return Err(doubt.end(upload_id, Stop::Store(fault))),
++                }
++            }
++            Err(fault) => {
++                let Some(unknown) = fault.downcast_ref::<CommitUnknownResult>() else {
++                    // A definite failure of this batch; an earlier batch's doubt still stands.
++                    return Err(doubt.end(upload_id, Stop::Store(fault)));
++                };
++                doubt.observe(unknown, &read, metadata::encode(teardown.session()));
++                match store.get(&session_key).await {
++                    Ok(found) => found,
++                    Err(fault) => return Err(doubt.end(upload_id, Stop::Store(fault))),
++                }
++            }
++        };
++    }
++}
++
++/// What a fence commit that answered `Conflict` lost to ([`lost`]).
++enum Lost {
++    /// The session is no longer the bytes the round read: this is what a read found there.
++    Moved(Option<Bytes>),
++    /// The session is unchanged and the obligation key absent: nothing a read can see explains
++    /// the conflict.
++    Unexplained,
++    /// The obligation key is present, and the session was unchanged on both sides of that read.
++    Taken,
++}
++
++/// Classify a fence commit that answered `Conflict`, from what the store holds, never by
++/// inference: the session first; if unchanged, the obligation key; if that is present, the
++/// session again, since every fence puts its session and its obligation in one batch and each
++/// read is its own transaction, so a rival fence can land between the first two reads.
++async fn lost(
++    store: &impl MetadataStore,
++    session_key: &[u8],
++    read: &Bytes,
++    obligation_key: &[u8],
++) -> Result<Lost, BoxError> {
++    let now = store.get(session_key).await?;
++    if now.as_ref() != Some(read) {
++        return Ok(Lost::Moved(now));
++    }
++    if store.get(obligation_key).await?.is_none() {
++        return Ok(Lost::Unexplained);
++    }
++    let now = store.get(session_key).await?;
++    if now.as_ref() != Some(read) {
++        return Ok(Lost::Moved(now));
++    }
++    Ok(Lost::Taken)
++}
++
++/// What this Abort knows about its own fence commits whose outcome the store could not report.
++#[derive(Debug, Default)]
++struct Doubt {
++    /// The session record each such fence puts: `Aborting@E+1` for the `Open@E` it required.
++    /// Finding one of these at `mpu:<id>` is finding that fence landed.
++    puts: Vec<Bytes>,
++    /// **Held**: the first outcome that said `may_still_commit`, with the session bytes its batch
++    /// requires. Kept, never replaced by a later outcome; only a read that finds the session no
++    /// longer those bytes clears it.
++    held: Option<(CommitUnknownResult, Bytes)>,
++    /// **Unsettled**: the latest out-of-flight outcome no successful read has followed yet.
++    unsettled: Option<CommitUnknownResult>,
++}
++
++impl Doubt {
++    fn observe(&mut self, outcome: &CommitUnknownResult, required: &Bytes, puts: Bytes) {
++        self.puts.push(puts);
++        if !outcome.may_still_commit {
++            self.unsettled = Some(outcome.clone());
++        } else if self.held.is_none() {
++            self.held = Some((outcome.clone(), required.clone()));
++        }
++    }
++
++    /// Whether a read that found `found` found a fence of this Abort landed.
++    fn landed(&self, found: Option<&Bytes>) -> bool {
++        found.is_some_and(|found| self.puts.contains(found))
++    }
++
++    /// A successful read of `mpu:<id>` that found `found`, and not a fence of this Abort: no
++    /// out-of-flight fence of it landed, and a held fence whose required bytes are gone can never
++    /// land.
++    fn settle(&mut self, found: Option<&Bytes>) {
++        self.unsettled = None;
++        if self
++            .held
++            .as_ref()
++            .is_some_and(|(_, required)| found != Some(required))
++        {
++            self.held = None;
++        }
++    }
++
++    /// The error an Abort stopped by `cause` ends with: in doubt while a fence of it may still
++    /// land or was never settled, else stopped.
++    fn end(self, upload_id: &UploadId, cause: Stop) -> AbortError {
++        let upload_id = upload_id.clone();
++        match self.held.map(|(outcome, _)| outcome).or(self.unsettled) {
++            Some(outcome) => AbortError::InDoubt(Box::new(InDoubt {
++                upload_id,
++                may_still_commit: outcome.may_still_commit,
++                outcome,
++                cause,
++            })),
++            None => AbortError::Stopped { upload_id, cause },
++        }
++    }
++}
+diff --git a/crates/core/tests/multipart_abort.rs b/crates/core/tests/multipart_abort.rs
+new file mode 100644
+index 0000000..c2ba521
+--- /dev/null
++++ b/crates/core/tests/multipart_abort.rs
+@@ -0,0 +1,1333 @@
++//! Issue #895 — `AbortMultipartUpload`'s **teardown fence**,
++//! `wyrd_core::multipart::abort::abort_session`, and the one fence batch builder it shares with
++//! the post-restore fence (`wyrd_core::multipart::abort::fence_batch`), driven over a real store
++//! (`RedbMetadataStore::in_memory()`) on a multi-thread tokio runtime (proposal 0016's
++//! *Abort / reap fence* row, `0016:665`, and decision 3's Abort row, `0016:977`).
++//!
++//! Every `Open` session here is made by Create (`create_session`, #894), so it is counted by
++//! `mpuctl`; a `Completing` or `Completed` session, or the same session moved to a later epoch,
++//! is that session's record overwritten with canonical bytes the decoder accepts.
++//!
++//! * **(D)** Abort per decision 3: `Open@E` is fenced to `Aborting@E+1` with its `{session, all}`
++//!   obligation in the same batch; a second Abort, and the loser of two forced to race, answer
++//!   `AlreadyAborting`; `Completing` is refused `OperationAborted` writing nothing; `Completed`
++//!   and an absent record answer `NoSuchUpload`; the last round's re-read is answered like any
++//!   other; a plain store fault with nothing in doubt is returned as that fault. Beside those: a
++//!   session moved to a later `Open` epoch is fenced there, and an `Open` session at the last
++//!   epoch or a torn record is a typed error writing nothing.
++//! * **(E)** Abort never moves `mpuctl`: every leg asserts the count is unchanged, a `Completed`
++//!   tombstone included.
++//! * **(H)** a lost commit is classified from what the store holds: a wrapper answers
++//!   `Ok(Conflict)` without applying anything, as TiKV does when its locking read meets another
++//!   writer's lock (`crates/metadata-tikv/src/lib.rs:1388-1393`), and places a rival fence between
++//!   two of the Abort's reads.
++//! * **(I)** the doubt of a fence that may still land is kept until a read finds the session
++//!   moved, and a read that does find it moved clears it; **(I2)** an out-of-flight outcome no
++//!   read settled stays unknown, and one a read did settle is not kept.
++//! * **(J)** the shared builder puts restore's preconditions and records in restore's order.
++//!
++//! The wrappers keep their state in struct fields, never in a `static` (ADR-0035).
++
++#![forbid(unsafe_code)]
++
++use std::collections::VecDeque;
++use std::future::Future;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_core::metadata::{self, InodeId, SegmentGroup, SegmentNonce};
++use wyrd_core::multipart::abort::{
++    abort_session, fence_batch, AbortError, InDoubt, Stop, ABORT_ROUNDS,
++};
++use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
++use wyrd_core::multipart::{
++    decode_admission_record, decode_retire_obligation, decode_session_record, mpu_key, retire_key,
++    AbortOutcome, Budget, CreateOutcome, PartScope, Refusal, RetireMode, RetireToken, SessionState,
++    UploadId, MAX_COMPLETE_ATTEMPTS, MPUCTL_KEY, MPU_PREFIX, RETIRE_BYTES_PREFIX,
++    RETIRE_RECORDS_PREFIX,
++};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_traits::{
++    classify, BoxError, CommitOutcome, CommitUnknownResult, ErrorClass, MetadataStore,
++    Precondition, Result as StoreResult, ScanPage, TransientFault, WriteBatch,
++};
++
++// ─────────────────────────────── fixtures ───────────────────────────────
++
++const BUCKET: &str = "photos";
++/// The root inode every Alpha object dirent lives under, as `<bucket>/<key>` (ADR-0046).
++const ROOT: InodeId = 0;
++const CLOCK: &str = "wall";
++const CREATED_AT: u64 = 1_000;
++const MARKER: &[u8] = br#"{"name":"photos","created_at_millis":1}"#;
++/// No leg may hang the suite: a schedule that never settles fails here instead.
++const LEG_TIMEOUT: Duration = Duration::from_secs(120);
++/// More commits than any Abort may make. An Abort past it never stops committing.
++const RUNAWAY_COMMITS: usize = 100;
++
++async fn within<T>(leg: impl Future<Output = T>) -> T {
++    tokio::time::timeout(LEG_TIMEOUT, leg)
++        .await
++        .expect("the leg settled in time")
++}
++
++/// A profile admitting `n` sessions: every per-session cap at 1, so `U_ref` is 2.
++fn profile_of(n: u64) -> Budget {
++    let json = format!(
++        "{{\"w_ref\":{},\"max_part_chunks\":1,\"max_parts_per_session\":1,\
++         \"max_inflight_parts\":1,\"max_staged_chunks\":1}}",
++        2 * n
++    );
++    let profile: Budget = metadata::decode(json.as_bytes()).expect("a legal profile");
++    assert_eq!(profile.max_sessions(), n);
++    profile
++}
++
++/// Identity number `n`: upload id `n` and a nonce derived from it, both 32 lowercase hex.
++fn identity(n: u128) -> (UploadId, SegmentNonce) {
++    (
++        UploadId::new(format!("{n:032x}")).unwrap(),
++        SegmentNonce::new(format!("{:032x}", n ^ 0x5a5a_5a5a)).unwrap(),
++    )
++}
++
++/// The runtime Create needs: one fixed identity, no jitter, no wait.
++struct Fixed(Option<(UploadId, SegmentNonce)>);
++
++impl CreateRuntime for Fixed {
++    fn mint(&mut self) -> (UploadId, SegmentNonce) {
++        self.0.take().expect("one identity per create")
++    }
++
++    fn jitter(&mut self) -> u64 {
++        0
++    }
++
++    fn wait(&mut self, _millis: u64) -> impl Future<Output = ()> + Send {
++        std::future::ready(())
++    }
++}
++
++async fn store_with_bucket() -> RedbMetadataStore {
++    let store = RedbMetadataStore::in_memory().unwrap();
++    store
++        .commit(WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER))
++        .await
++        .unwrap();
++    store
++}
++
++/// Create session `n` through Create (#894): `Open@0`, counted by `mpuctl`. Returns its id and
++/// the exact bytes Create stored.
++async fn open_session(store: &impl MetadataStore, n: u128) -> (UploadId, Bytes) {
++    let object = format!("{BUCKET}/object-{n}");
++    let request = CreateRequest {
++        bucket: BUCKET,
++        parent: ROOT,
++        object: &object,
++        content_type: None,
++        created_at_millis: CREATED_AT,
++        clock_source: CLOCK,
++    };
++    let outcome = create_session(
++        store,
++        &profile_of(8),
++        &request,
++        &mut Fixed(Some(identity(n))),
++    )
++    .await
++    .expect("the create ran");
++    let CreateOutcome::Created { upload_id } = outcome else {
++        panic!("expected Created, got {outcome:?}");
++    };
++    let bytes = store.get(&mpu_key(&upload_id)).await.unwrap().unwrap();
++    let record = decode_session_record(&bytes).unwrap();
++    assert!(matches!(record.state(), SessionState::Open {}));
++    assert_eq!(record.epoch(), 0);
++    (upload_id, bytes)
++}
++
++/// `mpuctl.count()`.
++async fn count(store: &impl MetadataStore) -> u64 {
++    let bytes = store.get(MPUCTL_KEY).await.unwrap().expect("a ledger");
++    decode_admission_record(&bytes).expect("a ledger").count()
++}
++
++/// Every record in the store, in key order.
++async fn snapshot(store: &impl MetadataStore) -> Vec<(Vec<u8>, Bytes)> {
++    let mut all = store.scan(b"").await.unwrap();
++    all.sort();
++    all
++}
++
++/// Every `retire:` key in the store.
++async fn obligations(store: &impl MetadataStore) -> Vec<Vec<u8>> {
++    let mut keys = Vec::new();
++    for prefix in [RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX] {
++        keys.extend(
++            store
++                .scan(prefix)
++                .await
++                .unwrap()
++                .into_iter()
++                .map(|(k, _)| k),
++        );
++    }
++    keys.sort();
++    keys
++}
++
++/// The JSON spelling of a string, escapes included — the encoder's own.
++fn json_string(text: &str) -> String {
++    String::from_utf8(metadata::encode(&text).to_vec()).unwrap()
++}
++
++/// `open`'s session at `epoch` and `attempts` in `state` (a JSON state object), in the codec's
++/// canonical spelling — checked by decoding it and re-encoding it.
++fn session_bytes(open: &Bytes, epoch: u64, attempts: u32, state: &str) -> Bytes {
++    let record = decode_session_record(open).unwrap();
++    let bytes = format!(
++        "{{\"parent\":{},\"object\":{},\"created_at_millis\":{},\"clock_source\":{},\
++         \"segment_nonce\":\"{}\",\"epoch\":{epoch},\"attempts\":{attempts},\"state\":{state}}}",
++        record.parent(),
++        json_string(record.object()),
++        record.created_at_millis(),
++        json_string(record.clock_source()),
++        record.segment_nonce(),
++    );
++    let decoded = decode_session_record(bytes.as_bytes()).expect("a canonical session");
++    assert_eq!(metadata::encode(&decoded), bytes.as_bytes());
++    Bytes::from(bytes)
++}
++
++/// `open`'s session fenced by a Complete at epoch 1: `Completing@1`, one attempt spent.
++fn completing(open: &Bytes) -> Bytes {
++    let record = decode_session_record(open).unwrap();
++    let state = format!(
++        "{{\"kind\":\"Completing\",\"fenced_at_millis\":2000,\"segments_written\":0,\
++         \"publish_target\":{{\"parent\":{},\"name\":{},\"epoch\":1}}}}",
++        record.parent(),
++        json_string(record.object()),
++    );
++    session_bytes(open, 1, 1, &state)
++}
++
++/// `open`'s session published: a `Completed` tombstone at epoch 2.
++fn completed(open: &Bytes) -> Bytes {
++    let state = format!(
++        "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":7,\"version\":1,\"etag\":\
++         \"{}-1\",\"completed_at_millis\":3000,\"complete_fingerprint\":\"{}\"}}}}",
++        "ab".repeat(32),
++        "cd".repeat(32)
++    );
++    session_bytes(open, 2, 1, &state)
++}
++
++/// Overwrite `id`'s session record with `bytes`.
++async fn plant(store: &impl MetadataStore, id: &UploadId, bytes: Bytes) {
++    let put = WriteBatch::new().put(mpu_key(id), bytes);
++    assert_eq!(store.commit(put).await.unwrap(), CommitOutcome::Committed);
++}
++
++/// The `retire:bytes:s:<id>:<epoch>` key — the `{session, all}` obligation's (`0016:2187`).
++fn obligation_key(id: &UploadId, epoch: u64) -> Vec<u8> {
++    let token = RetireToken::Session {
++        upload_id: id.clone(),
++        epoch,
++        part: None,
++    };
++    retire_key(RetireMode::Bytes, &token)
++}
++
++/// **(D)** The store holds `id`'s `Open@E` session (`open`) fenced: `Aborting@E+1`, exactly as
++/// `SessionRecord::open_teardown` leaves it, and `retire:bytes:s:<id>:<E>` holding exactly the
++/// `{session, all}` obligation it mints — decoding against its own key — and no other `retire:`
++/// key.
++async fn assert_fenced(store: &impl MetadataStore, id: &UploadId, open: &Bytes) {
++    let opened = decode_session_record(open).unwrap();
++    let epoch = opened.epoch();
++    let teardown = opened.open_teardown(id).expect("Open@E has a teardown");
++    let stored = store.get(&mpu_key(id)).await.unwrap().expect("the session");
++    let record = decode_session_record(&stored).expect("a valid session");
++    assert!(
++        matches!(record.state(), SessionState::Aborting {}),
++        "{id}: the fence leaves the session Aborting"
++    );
++    assert_eq!(record.epoch(), epoch + 1, "{id}: Aborting@E+1");
++    assert_eq!(stored, metadata::encode(teardown.session()));
++    let key = obligation_key(id, epoch);
++    assert_eq!(teardown.obligation().key(), key);
++    let value = store.get(&key).await.unwrap().expect("the obligation");
++    assert_eq!(value, metadata::encode(teardown.obligation().payload()));
++    let (mode, token, payload) = decode_retire_obligation(&key, &value).expect("it decodes");
++    assert_eq!(mode, RetireMode::Bytes);
++    assert_eq!(
++        token,
++        RetireToken::Session {
++            upload_id: id.clone(),
++            epoch,
++            part: None,
++        }
++    );
++    assert!(payload.session() && payload.parts() == Some(&PartScope::All));
++    assert_eq!(
++        obligations(store).await,
++        vec![key],
++        "one obligation, no other"
++    );
++}
++
++/// `id`'s `Open@0` session is still exactly `open`, and no obligation exists.
++async fn assert_still_open(store: &impl MetadataStore, id: &UploadId, open: &Bytes) {
++    assert_eq!(store.get(&mpu_key(id)).await.unwrap().as_ref(), Some(open));
++    assert!(obligations(store).await.is_empty(), "no obligation");
++}
++
++/// The fence batch [`fence_batch`] builds for `id`'s `open` session.
++fn expected_fence(id: &UploadId, open: &Bytes) -> WriteBatch {
++    let teardown = decode_session_record(open)
++        .unwrap()
++        .open_teardown(id)
++        .unwrap();
++    fence_batch(
++        &mpu_key(id),
++        open,
++        teardown.session(),
++        std::slice::from_ref(teardown.obligation()),
++    )
++}
++
++fn unknown(may_still_commit: bool) -> BoxError {
++    BoxError::from(CommitUnknownResult {
++        backend: "test wrapper",
++        code: None,
++        detail: "the wrapper withheld the outcome".to_owned(),
++        may_still_commit,
++    })
++}
++
++/// What a scripted plain fault says.
++const FAULT: &str = "the test wrapper's store failed";
++
++fn fault(transient: bool) -> BoxError {
++    if transient {
++        BoxError::from(TransientFault::new(FAULT))
++    } else {
++        BoxError::from(FAULT)
++    }
++}
++
++/// An Abort that ended in doubt: `InDoubt` naming `id`, with `may_still_commit` as given;
++/// [`classify`] reads it as `Indeterminate` (never transient), whatever stopped the Abort; its
++/// source is the store's own `CommitUnknownResult`; and its `Display` names the upload id.
++fn in_doubt(
++    outcome: Result<AbortOutcome, AbortError>,
++    id: &UploadId,
++    may_still_commit: bool,
++) -> Box<InDoubt> {
++    let err = match outcome {
++        Err(err @ AbortError::InDoubt(_)) => err,
++        other => panic!("expected InDoubt naming {id}, got {other:?}"),
++    };
++    assert_eq!(
++        classify(&err),
++        ErrorClass::Indeterminate,
++        "an Abort in doubt reads as indeterminate, whatever stopped it: {err}"
++    );
++    let source = std::error::Error::source(&err)
++        .and_then(|source| source.downcast_ref::<CommitUnknownResult>())
++        .expect("the source is the store's unknown outcome");
++    assert_eq!(source.may_still_commit, may_still_commit);
++    let text = err.to_string();
++    assert!(text.contains(id.as_str()), "it names the upload id: {text}");
++    assert!(text.contains("in doubt"), "{text}");
++    let AbortError::InDoubt(doubt) = err else {
++        unreachable!()
++    };
++    assert_eq!(&doubt.upload_id, id);
++    assert_eq!(doubt.may_still_commit, may_still_commit);
++    doubt
++}
++
++/// An Abort that ended with nothing in doubt, stopped by the scripted transient commit fault:
++/// `Stopped` naming `id`, by [`Stop::Store`] wrapping that fault, and [`classify`] reads it as
++/// `Transient` — never `Indeterminate`, which a kept doubt would make it.
++fn stopped_by_a_transient_fault(outcome: Result<AbortOutcome, AbortError>, id: &UploadId) {
++    let err = match outcome {
++        Err(err @ AbortError::Stopped { .. }) => err,
++        other => panic!("expected Stopped with nothing in doubt, got {other:?}"),
++    };
++    assert_eq!(
++        classify(&err),
++        ErrorClass::Transient,
++        "nothing is in doubt, so the fault keeps its class: {err}"
++    );
++    let AbortError::Stopped { upload_id, cause } = err else {
++        unreachable!()
++    };
++    assert_eq!(&upload_id, id);
++    assert!(
++        matches!(&cause, Stop::Store(fault) if fault.is::<TransientFault>()),
++        "{cause:?}"
++    );
++}
++
++// ──────────────────────────── the scripted wrapper ────────────────────────────
++
++/// What [`Scripted`] does with the Abort's next commit.
++#[derive(Debug, Clone)]
++enum OnCommit {
++    /// Delegate unchanged.
++    Pass,
++    /// Answer `Ok(Conflict)` without applying the batch or changing any record, as TiKV does when
++    /// a locking read meets another writer's lock.
++    ConflictUnmoved,
++    /// Answer a plain store error (not an unknown outcome), unapplied.
++    Fail { transient: bool },
++    /// Apply the batch or not, then answer `CommitUnknownResult { may_still_commit }`.
++    Unknown {
++        applied: bool,
++        may_still_commit: bool,
++    },
++    /// Keep the batch unapplied and answer `CommitUnknownResult { may_still_commit: true }`; it
++    /// lands when the test releases it.
++    Hold,
++    /// As [`Self::Hold`], and before answering, overwrite the session with these bytes (a
++    /// Complete fence moving it on).
++    HoldThenMove(Bytes),
++    /// Overwrite the session with these bytes first (a Complete fence and its release moving it
++    /// to a later `Open` epoch); then delegate, so the batch conflicts for real.
++    MoveFirst(Bytes),
++    /// A real rival Abort of the same session runs on the inner store first; then delegate.
++    RivalFirst,
++}
++
++#[derive(Default)]
++struct ScriptState {
++    plan: VecDeque<OnCommit>,
++    /// What every commit past `plan` does (`Pass` when unset).
++    then: Option<OnCommit>,
++    /// Once the Abort under test has made this many commits, every read of an `mpu:` key fails
++    /// with a plain fault.
++    fail_session_reads_after: Option<usize>,
++    /// On the Abort's first read of a `retire:` key, a real rival Abort of this upload runs on
++    /// the inner store first.
++    rival_on_obligation_read: Option<UploadId>,
++    /// What the rival Abort answered.
++    rival: Option<String>,
++    held: Option<WriteBatch>,
++    /// Every batch the Abort under test committed through this wrapper.
++    commits: Vec<WriteBatch>,
++}
++
++/// A store wrapper that acts on the Abort's commits, and some of its reads, as scripted. Rival
++/// Aborts it starts run directly on the inner store, so only the Abort under test is scripted.
++struct Scripted {
++    inner: RedbMetadataStore,
++    state: Mutex<ScriptState>,
++}
++
++impl Scripted {
++    async fn new() -> Self {
++        Self {
++            inner: store_with_bucket().await,
++            state: Mutex::new(ScriptState::default()),
++        }
++    }
++
++    fn script(&self, plan: Vec<OnCommit>, then: Option<OnCommit>) {
++        let mut state = self.state();
++        state.plan = plan.into();
++        state.then = then;
++    }
++
++    fn state(&self) -> std::sync::MutexGuard<'_, ScriptState> {
++        self.state.lock().unwrap()
++    }
++
++    fn commits(&self) -> Vec<WriteBatch> {
++        self.state().commits.clone()
++    }
++
++    /// Run a real rival Abort of `id` on the inner store, and record its answer.
++    async fn rival(&self, id: &UploadId) {
++        let outcome = abort_session(&self.inner, id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Fenced)),
++            "the rival fences: {outcome:?}"
++        );
++        self.state().rival = Some(format!("{outcome:?}"));
++    }
++
++    /// Apply the held batch now; what it met.
++    async fn release_held(&self) -> CommitOutcome {
++        let held = self.state().held.take().expect("a batch is held");
++        self.inner.commit(held).await.unwrap()
++    }
++}
++
++/// The upload id a fence batch's session put names.
++fn upload_of(batch: &WriteBatch) -> UploadId {
++    let key = batch
++        .puts
++        .iter()
++        .map(|(key, _)| key)
++        .find(|key| key.starts_with(MPU_PREFIX))
++        .expect("a fence puts its session");
++    wyrd_core::multipart::parse_mpu_key(key).unwrap()
++}
++
++#[async_trait]
++impl MetadataStore for Scripted {
++    async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
++        let (fails, rival) = {
++            let mut state = self.state();
++            let fails = key.starts_with(MPU_PREFIX)
++                && state
++                    .fail_session_reads_after
++                    .is_some_and(|after| state.commits.len() >= after);
++            let rival = if key.starts_with(RETIRE_BYTES_PREFIX) {
++                state.rival_on_obligation_read.take()
++            } else {
++                None
++            };
++            (fails, rival)
++        };
++        if fails {
++            return Err(fault(false));
++        }
++        if let Some(id) = rival {
++            self.rival(&id).await;
++        }
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> StoreResult<ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> StoreResult<CommitOutcome> {
++        let (act, made) = {
++            let mut state = self.state();
++            state.commits.push(batch.clone());
++            let act = state.plan.pop_front().or_else(|| state.then.clone());
++            (act.unwrap_or(OnCommit::Pass), state.commits.len())
++        };
++        assert!(
++            made <= RUNAWAY_COMMITS,
++            "the abort never stopped committing ({made} commits)"
++        );
++        match act {
++            OnCommit::Pass => self.inner.commit(batch).await,
++            OnCommit::ConflictUnmoved => {
++                // A real store yields here; so must this one, or no timeout could fire.
++                tokio::task::yield_now().await;
++                Ok(CommitOutcome::Conflict)
++            }
++            OnCommit::Fail { transient } => Err(fault(transient)),
++            OnCommit::Unknown {
++                applied,
++                may_still_commit,
++            } => {
++                if applied {
++                    assert_eq!(self.inner.commit(batch).await?, CommitOutcome::Committed);
++                }
++                Err(unknown(may_still_commit))
++            }
++            OnCommit::Hold => {
++                self.state().held = Some(batch);
++                Err(unknown(true))
++            }
++            OnCommit::HoldThenMove(bytes) => {
++                let id = upload_of(&batch);
++                self.state().held = Some(batch);
++                plant(&self.inner, &id, bytes).await;
++                Err(unknown(true))
++            }
++            OnCommit::MoveFirst(bytes) => {
++                plant(&self.inner, &upload_of(&batch), bytes).await;
++                self.inner.commit(batch).await
++            }
++            OnCommit::RivalFirst => {
++                self.rival(&upload_of(&batch)).await;
++                self.inner.commit(batch).await
++            }
++        }
++    }
++}
++
++/// A scripted store holding one `Open@0` session made by Create, with its id and bytes, and the
++/// ledger count before the leg.
++async fn scripted_open() -> (Scripted, UploadId, Bytes, u64) {
++    let store = Scripted::new().await;
++    let (id, open) = open_session(&store.inner, 1).await;
++    let before = count(&store.inner).await;
++    assert_eq!(before, 1, "Create counted the session");
++    (store, id, open, before)
++}
++
++// ──────────────────────── (D) decision 3, and (E) ────────────────────────
++
++/// **(D, E)** On `Open@0` the Abort answers `Fenced`, in **one** commit: the batch requires the
++/// exact bytes read and the obligation key absent, and puts the session at `Aborting@1` and the
++/// `{session, all}` obligation together — exactly what [`fence_batch`] builds, and nothing on
++/// `mpuctl`. Afterwards the session decodes `Aborting@1` and `retire:bytes:s:<id>:0` holds the
++/// obligation `open_teardown` mints. A second Abort answers `AlreadyAborting` and writes nothing.
++/// `mpuctl.count()` is unchanged throughout.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_an_open_session_is_fenced_with_its_obligation_in_one_batch() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Fenced)),
++            "Open@0 is fenced: {outcome:?}"
++        );
++        let commits = store.commits();
++        assert_eq!(commits.len(), 1, "one commit");
++        let batch = &commits[0];
++        let expected = expected_fence(&id, &open);
++        assert_eq!(batch.preconditions, expected.preconditions);
++        assert_eq!(batch.puts, expected.puts);
++        assert!(batch.deletes.is_empty());
++        let key = obligation_key(&id, 0);
++        assert_eq!(
++            batch.preconditions,
++            vec![
++                Precondition {
++                    key: mpu_key(&id),
++                    expected: Some(open.clone()),
++                },
++                Precondition {
++                    key: key.clone(),
++                    expected: None,
++                },
++            ],
++            "require the exact bytes read, and the obligation key absent"
++        );
++        let put_keys: Vec<&Vec<u8>> = batch.puts.iter().map(|(k, _)| k).collect();
++        assert_eq!(
++            put_keys,
++            vec![&mpu_key(&id), &key],
++            "the session and its obligation, in one batch"
++        );
++        assert!(
++            !batch.puts.iter().any(|(k, _)| k == MPUCTL_KEY),
++            "the fence never touches mpuctl"
++        );
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++
++        let fenced = snapshot(&store.inner).await;
++        let again = abort_session(&store, &id).await;
++        assert!(
++            matches!(again, Ok(AbortOutcome::AlreadyAborting)),
++            "a second Abort is idempotent: {again:?}"
++        );
++        assert_eq!(store.commits().len(), 1, "a second Abort commits nothing");
++        assert_eq!(snapshot(&store.inner).await, fenced, "and writes nothing");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// The wrapper that forces two Aborts to race: each one's first commit waits until both Aborts
++/// have built theirs, from the same `Open@0` read, and only then reaches the store.
++struct Racing {
++    inner: RedbMetadataStore,
++    barrier: tokio::sync::Barrier,
++    commits: AtomicUsize,
++}
++
++#[async_trait]
++impl MetadataStore for Racing {
++    async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> StoreResult<ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> StoreResult<CommitOutcome> {
++        if self.commits.fetch_add(1, Ordering::SeqCst) < 2 {
++            self.barrier.wait().await;
++        }
++        self.inner.commit(batch).await
++    }
++}
++
++/// **(D, E) Two Aborts forced to race one `Open` session** answer one `Fenced` and one
++/// `AlreadyAborting`, never `OperationAborted`: both read `Open@0` and build their fence before
++/// either commits, so one commit lands and the other conflicts, re-reads, and finds the rival's
++/// `Aborting`. The store holds one fence and one obligation; `mpuctl.count()` is unchanged.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn d_two_aborts_forced_to_race_answer_fenced_and_already_aborting() {
++    within(async {
++        let store = Arc::new(Racing {
++            inner: store_with_bucket().await,
++            barrier: tokio::sync::Barrier::new(2),
++            commits: AtomicUsize::new(0),
++        });
++        let (id, open) = open_session(&store.inner, 1).await;
++        let before = count(&store.inner).await;
++        let tasks: Vec<_> = (0..2)
++            .map(|_| {
++                let store = Arc::clone(&store);
++                let id = id.clone();
++                tokio::spawn(async move { abort_session(store.as_ref(), &id).await })
++            })
++            .collect();
++        let mut answers = Vec::new();
++        for task in tasks {
++            answers.push(task.await.unwrap().expect("each Abort answers"));
++        }
++        assert_eq!(
++            store.commits.load(Ordering::SeqCst),
++            2,
++            "each Abort committed once: the loser answered from its re-read"
++        );
++        answers.sort_by_key(|answer| format!("{answer:?}"));
++        assert_eq!(
++            answers,
++            vec![AbortOutcome::AlreadyAborting, AbortOutcome::Fenced],
++            "one Fenced and one AlreadyAborting, never OperationAborted"
++        );
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** Abort of a `Completing` session answers `Refused(OperationAborted)` and leaves the
++/// store byte-identical: no commit is made.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_completing_session_is_refused_operation_aborted_and_nothing_is_written() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        plant(&store.inner, &id, completing(&open)).await;
++        let unchanged = snapshot(&store.inner).await;
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(
++                outcome,
++                Ok(AbortOutcome::Refused(Refusal::OperationAborted))
++            ),
++            "Completing answers 409: {outcome:?}"
++        );
++        assert!(store.commits().is_empty(), "no commit");
++        assert_eq!(snapshot(&store.inner).await, unchanged, "byte-identical");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** Abort of a `Completed` tombstone, or of an upload id with no record, answers
++/// `Refused(NoSuchUpload)` and writes nothing. The tombstone stays counted.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_completed_session_or_an_absent_one_answers_no_such_upload() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        plant(&store.inner, &id, completed(&open)).await;
++        let unchanged = snapshot(&store.inner).await;
++        let tombstone = abort_session(&store, &id).await;
++        assert!(
++            matches!(tombstone, Ok(AbortOutcome::Refused(Refusal::NoSuchUpload))),
++            "Completed answers 404: {tombstone:?}"
++        );
++        let (absent, _) = identity(99);
++        let outcome = abort_session(&store, &absent).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Refused(Refusal::NoSuchUpload))),
++            "no record answers 404: {outcome:?}"
++        );
++        assert!(store.commits().is_empty(), "no commit");
++        assert_eq!(snapshot(&store.inner).await, unchanged, "byte-identical");
++        assert_eq!(
++            count(&store.inner).await,
++            before,
++            "(E) a Completed tombstone stays counted"
++        );
++    })
++    .await;
++}
++
++/// **(D, E) The last round's re-read is answered like any other.** Every round but the last loses
++/// an unexplained conflict; the last returns `CommitUnknownResult` with its batch applied. The
++/// re-read finds this Abort's own fence, so the answer is `Fenced` — not "rounds spent".
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_an_unknown_outcome_on_the_last_round_whose_batch_landed_answers_fenced() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let mut plan = vec![OnCommit::ConflictUnmoved; ABORT_ROUNDS as usize - 1];
++        plan.push(OnCommit::Unknown {
++            applied: true,
++            may_still_commit: false,
++        });
++        store.script(plan, None);
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Fenced)),
++            "the last round's landed fence is Fenced: {outcome:?}"
++        );
++        assert_eq!(store.commits().len(), ABORT_ROUNDS as usize);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** Every round but the last loses an unexplained conflict; on the last, a rival Abort
++/// fences first, so this Abort's commit conflicts for real. The re-read finds the rival's
++/// `Aborting`: the answer is `AlreadyAborting`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_rival_abort_winning_the_last_round_answers_already_aborting() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let mut plan = vec![OnCommit::ConflictUnmoved; ABORT_ROUNDS as usize - 1];
++        plan.push(OnCommit::RivalFirst);
++        store.script(plan, None);
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::AlreadyAborting)),
++            "the rival won the last round: {outcome:?}"
++        );
++        assert_eq!(store.commits().len(), ABORT_ROUNDS as usize);
++        assert!(store.state().rival.is_some(), "the rival ran");
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** A plain store fault on the fence commit, with nothing in doubt, is returned as that
++/// fault: it keeps its own class (transient stays transient, anything else terminal), its source
++/// is that fault, and the session is untouched.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_plain_fault_with_nothing_in_doubt_is_returned_as_that_fault() {
++    within(async {
++        for (transient, class) in [(true, ErrorClass::Transient), (false, ErrorClass::Terminal)] {
++            let (store, id, open, before) = scripted_open().await;
++            store.script(vec![OnCommit::Fail { transient }], None);
++            let outcome = abort_session(&store, &id).await;
++            let err = match outcome {
++                Err(err @ AbortError::Stopped { .. }) => err,
++                other => panic!("expected the fault, got {other:?}"),
++            };
++            assert_eq!(classify(&err), class, "{err}");
++            let source = std::error::Error::source(&err).expect("the fault is the source");
++            assert!(source.to_string().contains(FAULT), "{source}");
++            assert_eq!(source.is::<TransientFault>(), transient);
++            let AbortError::Stopped { upload_id, cause } = err else {
++                unreachable!()
++            };
++            assert_eq!(upload_id, id);
++            assert!(matches!(cause, Stop::Store(_)), "{cause:?}");
++            assert_eq!(store.commits().len(), 1, "one commit, not retried");
++            assert_still_open(&store.inner, &id, &open).await;
++            assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++        }
++    })
++    .await;
++}
++
++/// **(D, E) A session moved to a later `Open` epoch is fenced again there.** Before the first
++/// fence reaches the store, a Complete fence and its release move the session to `Open@2`, so the
++/// fence conflicts for real. The re-read finds the session moved and still `Open`: the Abort
++/// fences it at epoch 2, and `retire:bytes:s:<id>:2` holds the obligation.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_session_moved_to_a_later_open_epoch_is_fenced_there() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let reopened = session_bytes(&open, 2, 1, r#"{"kind":"Open"}"#);
++        store.script(vec![OnCommit::MoveFirst(reopened.clone())], None);
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Fenced)),
++            "the later epoch is fenced: {outcome:?}"
++        );
++        let commits = store.commits();
++        assert_eq!(commits.len(), 2, "the lost fence, then the one at epoch 2");
++        let second = &commits[1];
++        assert_eq!(
++            second.preconditions,
++            expected_fence(&id, &reopened).preconditions
++        );
++        assert_fenced(&store.inner, &id, &reopened).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** An `Open` session at the last epoch cannot be fenced (every fence bumps it): the
++/// Abort ends with a typed error, nothing in doubt, and writes nothing.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_an_open_session_at_the_last_epoch_is_a_typed_error_writing_nothing() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        plant(
++            &store.inner,
++            &id,
++            session_bytes(&open, u64::MAX, 0, r#"{"kind":"Open"}"#),
++        )
++        .await;
++        let unchanged = snapshot(&store.inner).await;
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(
++                &outcome,
++                Err(AbortError::Stopped {
++                    cause: Stop::EpochExhausted,
++                    ..
++                })
++            ),
++            "{outcome:?}"
++        );
++        assert!(store.commits().is_empty(), "no commit");
++        assert_eq!(snapshot(&store.inner).await, unchanged, "byte-identical");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(D, E)** A stored `mpu:` value that is not a valid session record is a typed error, never a
++/// value (ADR-0045): the Abort names the decode fault, classifies terminal, and writes nothing.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_a_torn_session_record_is_a_typed_error_writing_nothing() {
++    within(async {
++        let (store, id, _, before) = scripted_open().await;
++        plant(&store.inner, &id, Bytes::from_static(br#"{"epoch":0}"#)).await;
++        let unchanged = snapshot(&store.inner).await;
++        let outcome = abort_session(&store, &id).await;
++        let err = match outcome {
++            Err(err @ AbortError::Stopped { .. }) => err,
++            other => panic!("expected the decode fault, got {other:?}"),
++        };
++        assert_eq!(classify(&err), ErrorClass::Terminal, "{err}");
++        let AbortError::Stopped { cause, .. } = err else {
++            unreachable!()
++        };
++        assert!(matches!(cause, Stop::Record(_)), "{cause:?}");
++        assert!(store.commits().is_empty(), "no commit");
++        assert_eq!(snapshot(&store.inner).await, unchanged, "byte-identical");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++// ────────────────── (H) a lost commit is classified, not inferred ──────────────────
++
++/// **H1.** One `Conflict` that applied nothing, with the session unchanged and the obligation key
++/// absent: the Abort reads the key, does **not** report it taken, spends a round, and answers
++/// `Fenced` on the next.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn h1_an_unexplained_conflict_spends_a_round_and_the_abort_fences() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(vec![OnCommit::ConflictUnmoved], None);
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::Fenced)),
++            "an unexplained conflict is not damage: {outcome:?}"
++        );
++        assert_eq!(store.commits().len(), 2, "one round spent, then the fence");
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **H2.** Round 1 returns `CommitUnknownResult { may_still_commit: true }` with its batch held;
++/// every later round gets a `Conflict` that applied nothing, until all [`ABORT_ROUNDS`] are
++/// spent. The Abort ends `InDoubt` saying `may_still_commit: true`, stopped by the spent rounds —
++/// never by a "taken" key it did not read. Released after the Abort returned, the held batch
++/// lands: the session is `Aborting` with its one obligation.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn h2_a_held_fence_and_unexplained_conflicts_end_in_doubt_and_the_fence_lands() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(vec![OnCommit::Hold], Some(OnCommit::ConflictUnmoved));
++        let outcome = abort_session(&store, &id).await;
++        let doubt = in_doubt(outcome, &id, true);
++        assert!(
++            matches!(doubt.cause, Stop::RoundsSpent { rounds } if rounds == ABORT_ROUNDS),
++            "every round was spent: {:?}",
++            doubt.cause
++        );
++        assert_eq!(store.commits().len(), ABORT_ROUNDS as usize);
++        assert_still_open(&store.inner, &id, &open).await;
++        assert_eq!(store.release_held().await, CommitOutcome::Committed);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **H3.** The obligation key really present (planted) and the session unchanged: the commit
++/// conflicts, the key is read present, and the session read again is still unchanged. The Abort
++/// ends with a typed fault naming that key, nothing in doubt, and writes nothing.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn h3_a_taken_obligation_key_under_an_unchanged_session_is_named_damage() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let key = obligation_key(&id, 0);
++        let minted = expected_fence(&id, &open).puts[1].1.clone();
++        let squatter = WriteBatch::new().put(key.clone(), minted);
++        assert_eq!(
++            store.inner.commit(squatter).await.unwrap(),
++            CommitOutcome::Committed
++        );
++        let unchanged = snapshot(&store.inner).await;
++        let outcome = abort_session(&store, &id).await;
++        let err = match outcome {
++            Err(err @ AbortError::Stopped { .. }) => err,
++            other => panic!("expected the damage fault, got {other:?}"),
++        };
++        assert_eq!(classify(&err), ErrorClass::Terminal, "{err}");
++        let text = err.to_string();
++        let named = String::from_utf8(key).unwrap();
++        assert!(text.contains(&named), "the fault names the key: {text}");
++        let AbortError::Stopped { cause, .. } = err else {
++            unreachable!()
++        };
++        assert!(
++            matches!(&cause, Stop::ObligationKeyTaken { key } if *key == named),
++            "{cause:?}"
++        );
++        assert_eq!(store.commits().len(), 1, "damage is not retried");
++        assert_eq!(snapshot(&store.inner).await, unchanged, "nothing written");
++        let session = store.inner.get(&mpu_key(&id)).await.unwrap();
++        assert_eq!(session, Some(open), "the session is still Open@0");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **H4, a rival fence between the two reads is not damage.** Abort A's commit gets a `Conflict`
++/// that applied nothing, and A re-reads the session: `Open@0`, unchanged. Before A reads the
++/// obligation key, the wrapper lets Abort B commit its fence (session and obligation, one batch).
++/// A finds the key present, reads the session again, finds it moved, and answers
++/// `AlreadyAborting` — not a damage fault.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn h4_a_rival_fence_between_the_reads_answers_already_aborting() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(vec![OnCommit::ConflictUnmoved], None);
++        store.state().rival_on_obligation_read = Some(id.clone());
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            store.state().rival.is_some(),
++            "B fenced between A's session read and its key read"
++        );
++        assert!(
++            matches!(outcome, Ok(AbortOutcome::AlreadyAborting)),
++            "a rival's fence is a valid transition, not damage: {outcome:?}"
++        );
++        assert_eq!(store.commits().len(), 1, "A made one commit");
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++// ──────────────── (I) the doubt of a fence that may still land is kept ────────────────
++
++/// **(I) across a later out-of-flight unknown.** Round 1 is held (`may_still_commit: true`);
++/// round 2 returns `CommitUnknownResult { may_still_commit: false }`, unapplied; then every read
++/// of the session fails. The Abort ends `InDoubt` still saying `may_still_commit: true` — the
++/// held outcome, not the latest one — and the batch released after it returned lands.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i_a_held_fence_survives_a_later_out_of_flight_unknown() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(
++            vec![
++                OnCommit::Hold,
++                OnCommit::Unknown {
++                    applied: false,
++                    may_still_commit: false,
++                },
++            ],
++            None,
++        );
++        store.state().fail_session_reads_after = Some(2);
++        let outcome = abort_session(&store, &id).await;
++        let doubt = in_doubt(outcome, &id, true);
++        assert!(doubt.outcome.may_still_commit, "the held outcome is kept");
++        assert_eq!(store.commits().len(), 2);
++        assert_eq!(store.release_held().await, CommitOutcome::Committed);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(I) across a failed re-read.** Round 1 is held, and the re-read of the session fails. The
++/// Abort ends `InDoubt` saying `may_still_commit: true`, stopped by that fault; the batch
++/// released after it returned lands.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i_a_held_fence_survives_a_failed_re_read() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(vec![OnCommit::Hold], None);
++        store.state().fail_session_reads_after = Some(1);
++        let outcome = abort_session(&store, &id).await;
++        let doubt = in_doubt(outcome, &id, true);
++        assert!(matches!(doubt.cause, Stop::Store(_)), "{:?}", doubt.cause);
++        assert_eq!(store.release_held().await, CommitOutcome::Committed);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(I) across a later plain store fault.** Round 1 is held; the re-read finds the session
++/// unchanged; round 2's commit fails with a transient fault. The Abort ends `InDoubt` saying
++/// `may_still_commit: true` and classifies indeterminate, never transient; the batch released
++/// after it returned lands.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i_a_held_fence_survives_a_later_plain_fault() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(
++            vec![OnCommit::Hold, OnCommit::Fail { transient: true }],
++            None,
++        );
++        let outcome = abort_session(&store, &id).await;
++        let doubt = in_doubt(outcome, &id, true);
++        assert!(matches!(doubt.cause, Stop::Store(_)), "{:?}", doubt.cause);
++        assert_eq!(store.commits().len(), 2);
++        assert_eq!(store.release_held().await, CommitOutcome::Committed);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(I) only a moved session clears the doubt.** Round 1 is held, and before the re-read a
++/// Complete fence moves the session to `Completing@1`. The re-read finds it moved: the held
++/// batch can never land, so the Abort answers from the new state, `OperationAborted`, with no
++/// doubt — and the batch released afterwards loses.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i_a_session_moved_under_a_held_fence_ends_without_the_doubt() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let moved = completing(&open);
++        store.script(vec![OnCommit::HoldThenMove(moved.clone())], None);
++        let outcome = abort_session(&store, &id).await;
++        assert!(
++            matches!(
++                outcome,
++                Ok(AbortOutcome::Refused(Refusal::OperationAborted))
++            ),
++            "the moved session is answered, without the doubt: {outcome:?}"
++        );
++        assert_eq!(store.release_held().await, CommitOutcome::Conflict);
++        assert_eq!(
++            store.inner.get(&mpu_key(&id)).await.unwrap(),
++            Some(moved),
++            "the released fence lost"
++        );
++        assert!(obligations(&store.inner).await.is_empty(), "no obligation");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(I) a moved session clears the doubt, and an Abort that goes on fencing shows it.** Round 1
++/// is held (`may_still_commit: true`), and before the re-read a Complete fence and its release
++/// move the session to `Open@2`. The re-read finds the session moved, so the held batch, which
++/// requires `Open@0`, can never land. The Abort fences again at epoch 2, and that commit fails
++/// with a plain transient fault. Nothing of this Abort is in doubt any more, so it ends
++/// `Stopped` and classifies transient, not `InDoubt` and indeterminate; the batch released
++/// afterwards loses.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i_a_session_moved_to_a_later_open_epoch_clears_the_held_doubt() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        let reopened = session_bytes(&open, 2, 1, r#"{"kind":"Open"}"#);
++        store.script(
++            vec![
++                OnCommit::HoldThenMove(reopened.clone()),
++                OnCommit::Fail { transient: true },
++            ],
++            None,
++        );
++        let outcome = abort_session(&store, &id).await;
++        stopped_by_a_transient_fault(outcome, &id);
++        let commits = store.commits();
++        assert_eq!(commits.len(), 2, "the held fence, then the one at epoch 2");
++        assert_eq!(
++            commits[1].preconditions,
++            expected_fence(&id, &reopened).preconditions,
++            "the second round fenced the session it found moved"
++        );
++        assert_eq!(store.release_held().await, CommitOutcome::Conflict);
++        assert_eq!(
++            store.inner.get(&mpu_key(&id)).await.unwrap(),
++            Some(reopened),
++            "the released fence lost; the session is still Open@2"
++        );
++        assert!(obligations(&store.inner).await.is_empty(), "no obligation");
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++// ──────────────── (I2) an unsettled out-of-flight outcome stays unknown ────────────────
++
++/// **(I2)** With no earlier `may_still_commit: true`: the wrapper applies the fence, returns
++/// `CommitUnknownResult { may_still_commit: false }`, and then fails every read of `mpu:<id>`
++/// until the Abort returns. The fence landed but the Abort never learned it, so it ends with an
++/// error of the unknown-outcome class naming the upload id — not the read's own fault, and not
++/// "no fence of this Abort can land". The store holds `Aborting@1` with its one obligation.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i2_an_out_of_flight_outcome_no_read_settled_ends_indeterminate() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(
++            vec![OnCommit::Unknown {
++                applied: true,
++                may_still_commit: false,
++            }],
++            None,
++        );
++        store.state().fail_session_reads_after = Some(1);
++        let outcome = abort_session(&store, &id).await;
++        let doubt = in_doubt(outcome, &id, false);
++        assert!(matches!(doubt.cause, Stop::Store(_)), "{:?}", doubt.cause);
++        assert_eq!(store.commits().len(), 1);
++        assert_fenced(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++/// **(I2) one successful read settles an out-of-flight outcome.** Round 1 returns
++/// `CommitUnknownResult { may_still_commit: false }`, unapplied, and the re-read succeeds and
++/// finds the session unchanged: that fence did not land and cannot land later. Round 2's commit
++/// fails with a plain transient fault. Nothing of this Abort is in doubt, so it ends `Stopped`
++/// and classifies transient, not `InDoubt` and indeterminate, and the session is still `Open@0`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn i2_an_out_of_flight_outcome_a_read_settled_is_not_kept() {
++    within(async {
++        let (store, id, open, before) = scripted_open().await;
++        store.script(
++            vec![
++                OnCommit::Unknown {
++                    applied: false,
++                    may_still_commit: false,
++                },
++                OnCommit::Fail { transient: true },
++            ],
++            None,
++        );
++        let outcome = abort_session(&store, &id).await;
++        stopped_by_a_transient_fault(outcome, &id);
++        let commits = store.commits();
++        assert_eq!(commits.len(), 2, "the unknown round, then the failed one");
++        let expected = expected_fence(&id, &open);
++        for commit in &commits {
++            assert_eq!(
++                commit.preconditions, expected.preconditions,
++                "both rounds fenced the unchanged Open@0"
++            );
++        }
++        assert_still_open(&store.inner, &id, &open).await;
++        assert_eq!(count(&store.inner).await, before, "(E) mpuctl unchanged");
++    })
++    .await;
++}
++
++// ──────────────── (J) one builder, restore's shape ────────────────
++
++/// **(J)** The shared builder puts what restore's `fence_session` put before it, in the same
++/// order, for the restore fence's widest case — a `Completing@E` teardown with two obligations:
++/// `require(mpu:<id> == read)`, then `require_absent` on each obligation key in order; then the
++/// session, then each obligation in order; no delete. Every obligation it writes decodes against
++/// the key it goes under.
++#[test]
++fn j_the_shared_builder_keeps_restores_preconditions_and_puts_in_order() {
++    let (id, nonce) = identity(7);
++    let open = Bytes::from(format!(
++        "{{\"parent\":0,\"object\":\"photos/o\",\"created_at_millis\":1000,\
++         \"clock_source\":\"wall\",\"segment_nonce\":\"{nonce}\",\"epoch\":0,\"attempts\":0,\
++         \"state\":{{\"kind\":\"Open\"}}}}"
++    ));
++    let read = completing(&open);
++    let teardown = decode_session_record(&read)
++        .unwrap()
++        .completing_teardown(&id)
++        .expect("Completing@1 has a teardown");
++    let owed = vec![teardown.bytes().clone(), teardown.records().clone()];
++    let key = mpu_key(&id);
++    let batch = fence_batch(&key, &read, teardown.session(), &owed);
++
++    let token = RetireToken::Session {
++        upload_id: id.clone(),
++        epoch: 1,
++        part: None,
++    };
++    let bytes_key = retire_key(RetireMode::Bytes, &token);
++    let records_key = retire_key(RetireMode::Records, &token);
++    assert_eq!(
++        batch.preconditions,
++        vec![
++            Precondition {
++                key: key.clone(),
++                expected: Some(read.clone()),
++            },
++            Precondition {
++                key: bytes_key.clone(),
++                expected: None,
++            },
++            Precondition {
++                key: records_key.clone(),
++                expected: None,
++            },
++        ]
++    );
++    assert_eq!(
++        batch.puts,
++        vec![
++            (key, metadata::encode(teardown.session())),
++            (bytes_key, metadata::encode(teardown.bytes().payload())),
++            (records_key, metadata::encode(teardown.records().payload())),
++        ]
++    );
++    assert!(batch.deletes.is_empty());
++    for (at, value) in &batch.puts[1..] {
++        decode_retire_obligation(at, value).expect("every obligation decodes at its key");
++    }
++    let group = SegmentGroup::from_nonce(nonce, 1);
++    let (_, _, records) = decode_retire_obligation(&batch.puts[2].0, &batch.puts[2].1).unwrap();
++    assert_eq!(records.segments(), Some(&group));
++}
++
++/// The round budget is sized from `MAX_COMPLETE_ATTEMPTS`, as its derivation says: one round more
++/// than the Complete fences that can move a session back to `Open`.
++#[test]
++fn the_round_budget_outlasts_every_complete_fence_by_one() {
++    assert_eq!(ABORT_ROUNDS, MAX_COMPLETE_ATTEMPTS + 1);
++}
+diff --git a/crates/custodian/src/restore.rs b/crates/custodian/src/restore.rs
+index f6145d7..ed7ab96 100644
+--- a/crates/custodian/src/restore.rs
++++ b/crates/custodian/src/restore.rs
+@@ -106,6 +106,7 @@ use wyrd_core::metadata::{
+     self, parse_seg_key, seg_range_prefix, ChunkMapError, InodeRecord, InodeState, SegmentGroup,
+     SegmentRecord,
+ };
++use wyrd_core::multipart::abort::fence_batch;
+ use wyrd_core::multipart::{
+     decode_fence_generation, decode_part_record, decode_retire_obligation, decode_session_record,
+     parse_mpu_key, parse_part_key, part_range, retire_key, FenceGeneration, RetireMode,
+@@ -501,10 +502,13 @@ impl std::error::Error for FenceGenerationFault {}
+ /// after Pass 3 the pass re-lists `mpu:` in bounded pages and moves each `Open@E` session to
+ /// `Aborting@E+1` in **one** commit with its `{session, all}` obligation
+ /// ([`wyrd_core::multipart::SessionRecord::open_teardown`]), requiring the bytes it read and the
+-/// obligation key absent (`0016:369-373`). What it cannot fence is named, classified once and
+-/// never retried ([`RestoreReport::sessions_unsettled`]). A failed commit — an unknown outcome
+-/// included, never read as a `Conflict` — ends the pass with that `Err` after the summary records
+-/// every count as INCOMPLETE, never clean; the re-run is idempotent.
++/// obligation key absent (`0016:369-373`). That batch is built by
++/// [`wyrd_core::multipart::abort::fence_batch`], the one builder the client Abort commits too, so
++/// the two writers of the `Open → Aborting` edge cannot drift apart. What it cannot fence is
++/// named, classified once and never retried ([`RestoreReport::sessions_unsettled`]). A failed
++/// commit — an unknown outcome included, never read as a `Conflict` — ends the pass with that
++/// `Err` after the summary records every count as INCOMPLETE, never clean; the re-run is
++/// idempotent.
+ ///
+ /// A `Completing@E` session is fenced the same way, its commit also installing its attempt's
+ /// `retire:records:{seg}` ([`SessionRecord::completing_teardown`]), that key required absent too;
+@@ -1047,14 +1051,8 @@ async fn fence_session(
+         .iter()
+         .map(RetireObligation::key)
+         .collect();
+-    let mut batch = WriteBatch::new().require(key.to_vec(), read.to_vec());
+-    for obligation in &keys {
+-        batch = batch.require_absent(obligation.clone());
+-    }
+-    batch = batch.put(key.to_vec(), metadata::encode(&fence.session));
+-    for (obligation, at) in fence.obligations.iter().zip(&keys) {
+-        batch = batch.put(at.clone(), metadata::encode(obligation.payload()));
+-    }
++    // The one teardown fence batch builder, shared with the client Abort (#895).
++    let batch = fence_batch(key, read, &fence.session, &fence.obligations);
+     match meta.commit(batch).await {
+         Ok(CommitOutcome::Committed) => {
+             let named: Vec<String> = keys.iter().map(|at| object_name(at)).collect();
+diff --git a/crates/dst/tests/multipart_abort.rs b/crates/dst/tests/multipart_abort.rs
+new file mode 100644
+index 0000000..cfaca93
+--- /dev/null
++++ b/crates/dst/tests/multipart_abort.rs
+@@ -0,0 +1,630 @@
++//! **Multipart Abort under commit ambiguity** — concurrent `CreateMultipartUpload`s
++//! (`wyrd_core::multipart::create::create_session`, #894) and concurrent `AbortMultipartUpload`s
++//! (`wyrd_core::multipart::abort::abort_session`, #895), two of them racing for some sessions, on
++//! the simulated-FoundationDB store with the commit-ambiguity nemesis armed, inside the
++//! deterministic simulator. A new concurrent path lands with seeded Tier-0 DST coverage
++//! (`AGENTS.md`, review rubric, *Test fidelity*).
++//!
++//! The racing legs run [`CREATORS`] tasks. Each creates its session and then aborts it: an even
++//! task with two concurrent Aborts, an odd one with one. The nemesis strikes more commits than a
++//! seed makes, so nearly every commit comes back ambiguous and some Aborts spend all their
++//! rounds. One leg per shape of the ambiguity class (`crates/metadata-fdb/src/lib.rs:159-166`):
++//!
++//! * **1021** — the transaction is out of flight; a re-read settles it.
++//! * **1031** — the batch may land after the Abort's re-read, or later still, at
++//!   [`SimFdbMetadataStore::quiesce`].
++//! * **mixed** — each strike's code is a seed-derived coin, so one Abort can meet a 1031 and
++//!   then a 1021.
++//! * **witness** — the sessions are created first with the nemesis disarmed; then each gets one
++//!   Abort with 1031 armed, on a store whose in-flight batches land only at `quiesce`
++//!   ([`SimFdbMetadataStore::defer_in_flight_landings`]). An Abort whose every fence stays in
++//!   flight then spends all its rounds and ends in doubt, and its fence lands after it returned.
++//!   The sweep must see that at least once: it is the case the in-doubt error exists for.
++//!
++//! Every Abort runs on its own store wrapper, which records the fault history of **that
++//! invocation** — never keyed by session and operation, which would merge two concurrent Aborts
++//! of one session. After every seed, on the store after `quiesce`:
++//!
++//! 1. the number of `mpu:` records equals `mpuctl.count()`: an Abort never moves the counter;
++//! 2. every `Aborting` session has its `retire:bytes:` `{session, all}` obligation, decoding
++//!    against its own key, and no obligation is without its fenced session;
++//! 3. a session none of whose Aborts answered `Fenced` or `AlreadyAborting`, and none of whose
++//!    Aborts ended with an error saying a fence may still land, is still `Open`; one an Abort
++//!    answered `Fenced` or `AlreadyAborting` for is `Aborting`;
++//! 4. every Abort ended in one of the endings this scenario can reach: `Fenced`,
++//!    `AlreadyAborting`, `NoSuchUpload` (for a create still in doubt), in doubt with a fence that
++//!    may still land, or out of rounds with nothing in doubt. Never `OperationAborted`, never a
++//!    damage fault, and never an out-of-flight outcome left unsettled: every read here succeeds,
++//!    so one always settles it.
++//!
++//! **Demonstrated red — invariant (3) is load-bearing.** A store wrapper reports each struck 1031
++//! to the Abort as `Conflict`, which the trait forbids, since `Conflict` asserts nothing was
++//! written. In the witness leg the Abort then finds the session unchanged and the key absent,
++//! spends its rounds, and says no fence of it can land, while a fence it sent is still in flight
++//! and lands at `quiesce`: a fenced session no Abort reported. Invariant (3) catches it.
++//!
++//! Requires `--cfg madsim` (set by `cargo xtask dst`, which sweeps 50 seeds over the
++//! `#[madsim::test]` entry point); without it this file compiles to nothing.
++
++#![forbid(unsafe_code)]
++#![cfg(madsim)]
++
++use std::collections::BTreeMap;
++use std::future::Future;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_core::metadata::{self, InodeId, SegmentNonce};
++use wyrd_core::multipart::abort::{abort_session, AbortError, Stop, ABORT_ROUNDS};
++use wyrd_core::multipart::create::{create_session, CreateError, CreateRequest, CreateRuntime};
++use wyrd_core::multipart::{
++    decode_admission_record, decode_retire_obligation, decode_session_record, parse_mpu_key,
++    retire_key, AbortOutcome, Budget, CreateOutcome, PartScope, Refusal, RetireMode, RetireToken,
++    SessionRecord, SessionState, UploadId, MPUCTL_KEY, MPU_PREFIX, RETIRE_BYTES_PREFIX,
++    RETIRE_RECORDS_PREFIX,
++};
++use wyrd_traits::{
++    CommitOutcome, CommitUnknownResult, MetadataStore, Result as StoreResult, ScanPage, WriteBatch,
++};
++
++#[path = "support/mod.rs"]
++mod support;
++use support::{
++    FdbFidelity, FdbObservations, SimFdbMetadataStore, SIM_COMMIT_UNKNOWN_RESULT,
++    SIM_TRANSACTION_TIMED_OUT,
++};
++
++const BUCKET: &str = "photos";
++const ROOT: InodeId = 0;
++const MARKER: &[u8] = br#"{"name":"photos","created_at_millis":1}"#;
++const CREATED_AT: u64 = 1_000;
++const CLOCK: &str = "wall";
++/// Sessions per seed: one creator task each.
++const CREATORS: usize = 6;
++/// The ledger's room: every creator fits, so a refusal is contention, never a full ledger.
++const ROOM: u64 = 8;
++/// Commits the nemesis strikes per seed: more than a seed makes (six creates, nine Aborts of at
++/// most [`ABORT_ROUNDS`] commits each), so nearly every commit comes back ambiguous.
++const STRIKES: u64 = 128;
++/// Seeds each plain-`#[test]` sweep drives.
++const SWEEP_SEEDS: u64 = 64;
++
++/// Which shape of the ambiguity class a leg arms.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Leg {
++    Unknown1021,
++    TimedOut1031,
++    Mixed,
++    /// Sessions created with the nemesis disarmed, then one Abort each with 1031 armed, and every
++    /// in-flight batch landing only at `quiesce`.
++    Witness,
++}
++
++/// What an Abort's store wrapper tells it about a struck commit.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Report {
++    /// The truth: the simulator's own `CommitUnknownResult`.
++    Faithful,
++    /// **Violating**: a struck 1031 reported as `Conflict`.
++    TimedOut1031AsConflict,
++}
++
++/// A profile admitting exactly `n` sessions: every per-session cap at 1, so `U_ref` is 2.
++fn profile_of(n: u64) -> Budget {
++    let json = format!(
++        "{{\"w_ref\":{},\"max_part_chunks\":1,\"max_parts_per_session\":1,\
++         \"max_inflight_parts\":1,\"max_staged_chunks\":1}}",
++        2 * n
++    );
++    let profile: Budget = metadata::decode(json.as_bytes()).expect("a legal profile");
++    assert_eq!(profile.max_sessions(), n);
++    profile
++}
++
++/// One Abort invocation's store: the shared simulator, with the codes of the struck commits
++/// **this invocation** met recorded in order, and reported to it as [`Report`] says.
++struct Aborter {
++    inner: Arc<SimFdbMetadataStore>,
++    report: Report,
++    codes: Mutex<Vec<i32>>,
++    commits: Mutex<u32>,
++}
++
++#[async_trait]
++impl MetadataStore for Aborter {
++    async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> StoreResult<ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> StoreResult<CommitOutcome> {
++        *self.commits.lock().unwrap() += 1;
++        let result = self.inner.commit(batch).await;
++        let Err(err) = &result else {
++            return result;
++        };
++        let unknown = err
++            .downcast_ref::<CommitUnknownResult>()
++            .unwrap_or_else(|| {
++                panic!("a simulated-FDB commit returned a non-ambiguous Err: {err}")
++            });
++        let code = unknown.code.expect("the simulator names its code");
++        self.codes.lock().unwrap().push(code);
++        match (self.report, code) {
++            (Report::TimedOut1031AsConflict, SIM_TRANSACTION_TIMED_OUT) => {
++                Ok(CommitOutcome::Conflict)
++            }
++            _ => result,
++        }
++    }
++}
++
++/// The creator's runtime: identities and jitter from a seed-derived stream (never the wall
++/// clock, never thread scheduling), and the backoff wait on madsim's virtual clock.
++struct SimRuntime {
++    rng: rand_chacha::ChaCha8Rng,
++}
++
++impl SimRuntime {
++    fn next(&mut self) -> u64 {
++        use rand::Rng;
++        self.rng.next_u64()
++    }
++
++    fn token(&mut self) -> String {
++        format!("{:016x}{:016x}", self.next(), self.next())
++    }
++}
++
++impl CreateRuntime for SimRuntime {
++    fn mint(&mut self) -> (UploadId, SegmentNonce) {
++        (
++            UploadId::new(self.token()).unwrap(),
++            SegmentNonce::new(self.token()).unwrap(),
++        )
++    }
++
++    fn jitter(&mut self) -> u64 {
++        self.next()
++    }
++
++    fn wait(&mut self, millis: u64) -> impl Future<Output = ()> + Send {
++        madsim::time::sleep(Duration::from_millis(millis))
++    }
++}
++
++/// How one Abort invocation ended.
++struct Ended {
++    upload_id: UploadId,
++    outcome: Result<AbortOutcome, AbortError>,
++    /// The codes of the struck commits this invocation met, in order.
++    codes: Vec<i32>,
++    /// Fence commits this invocation made.
++    commits: u32,
++}
++
++impl Ended {
++    /// It answered that the session is fenced: `Fenced` or `AlreadyAborting`.
++    fn reported_fence(&self) -> bool {
++        matches!(
++            self.outcome,
++            Ok(AbortOutcome::Fenced | AbortOutcome::AlreadyAborting)
++        )
++    }
++
++    /// It ended with an error saying a fence of it may still land.
++    fn may_still_land(&self) -> bool {
++        matches!(&self.outcome, Err(AbortError::InDoubt(doubt)) if doubt.may_still_commit)
++    }
++
++    /// It made all its fence commits and the session was still `Open`.
++    fn spent_every_round(&self) -> bool {
++        let cause = match &self.outcome {
++            Err(AbortError::InDoubt(doubt)) => &doubt.cause,
++            Err(AbortError::Stopped { cause, .. }) => cause,
++            Ok(_) => return false,
++        };
++        matches!(cause, Stop::RoundsSpent { rounds } if *rounds == ABORT_ROUNDS)
++            && self.commits == ABORT_ROUNDS
++    }
++
++    /// It met a 1031 and, later, a 1021.
++    fn met_1031_then_1021(&self) -> bool {
++        self.codes
++            .iter()
++            .position(|code| *code == SIM_TRANSACTION_TIMED_OUT)
++            .is_some_and(|first| self.codes[first..].contains(&SIM_COMMIT_UNKNOWN_RESULT))
++    }
++}
++
++/// Run `n` concurrent Aborts of `upload_id`, each on its own [`Aborter`].
++async fn aborts(
++    meta: &Arc<SimFdbMetadataStore>,
++    upload_id: UploadId,
++    n: usize,
++    report: Report,
++) -> Vec<Ended> {
++    let tasks: Vec<_> = (0..n)
++        .map(|_| {
++            let store = Aborter {
++                inner: Arc::clone(meta),
++                report,
++                codes: Mutex::new(Vec::new()),
++                commits: Mutex::new(0),
++            };
++            let upload_id = upload_id.clone();
++            madsim::task::spawn(async move {
++                let outcome = abort_session(&store, &upload_id).await;
++                Ended {
++                    upload_id,
++                    outcome,
++                    codes: store.codes.into_inner().unwrap(),
++                    commits: store.commits.into_inner().unwrap(),
++                }
++            })
++        })
++        .collect();
++    let mut ended = Vec::new();
++    for task in tasks {
++        ended.push(task.await.unwrap());
++    }
++    ended
++}
++
++/// Creator `i`'s create: the upload id it told its caller about, by `Created` or by an in-doubt
++/// error, if any.
++async fn create(meta: &SimFdbMetadataStore, i: usize, seed: u64) -> Option<UploadId> {
++    let object = format!("{BUCKET}/object-{i}");
++    let request = CreateRequest {
++        bucket: BUCKET,
++        parent: ROOT,
++        object: &object,
++        content_type: None,
++        created_at_millis: CREATED_AT,
++        clock_source: CLOCK,
++    };
++    let mut runtime = SimRuntime {
++        rng: rand::SeedableRng::seed_from_u64(seed ^ (0x9e37_79b9 * (i as u64 + 1))),
++    };
++    match create_session(meta, &profile_of(ROOM), &request, &mut runtime).await {
++        Ok(CreateOutcome::Created { upload_id }) => Some(upload_id),
++        Err(CreateError::InDoubt(doubt)) => Some(doubt.upload_id),
++        Ok(CreateOutcome::Refused(_)) | Err(CreateError::IdentityCollisions { .. }) => None,
++        Err(other) => panic!("{object}: an unexpected create end in the simulator: {other}"),
++    }
++}
++
++/// What one seed of a leg left behind.
++struct Swept {
++    observations: FdbObservations,
++    ended: Vec<Ended>,
++    /// Sessions two Aborts raced for.
++    raced: usize,
++    /// Aborts that ended saying a fence may still land, whose session is `Aborting` after
++    /// `quiesce`: a fence that landed after its Abort returned, and was reported.
++    held_and_landed: usize,
++}
++
++/// The scenario body: the leg's creates and Aborts with its nemesis armed, then `quiesce`, then
++/// the invariants.
++async fn abort_under_ambiguity(meta: Arc<SimFdbMetadataStore>, leg: Leg, report: Report) -> Swept {
++    // The fixture's commit is made with the nemesis disarmed.
++    let marker = WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER);
++    meta.commit(marker).await.unwrap();
++    let seed = madsim::runtime::Handle::current().seed();
++    let mut ended = Vec::new();
++    let mut raced = 0;
++    if leg == Leg::Witness {
++        let mut ids = Vec::new();
++        for i in 0..CREATORS {
++            ids.extend(create(&meta, i, seed).await);
++        }
++        meta.defer_in_flight_landings();
++        meta.arm_commit_ambiguity(SIM_TRANSACTION_TIMED_OUT, STRIKES);
++        let tasks: Vec<_> = ids
++            .into_iter()
++            .map(|id| {
++                let meta = Arc::clone(&meta);
++                madsim::task::spawn(async move { aborts(&meta, id, 1, report).await })
++            })
++            .collect();
++        for task in tasks {
++            ended.extend(task.await.unwrap());
++        }
++    } else {
++        match leg {
++            Leg::Unknown1021 => meta.arm_commit_ambiguity(SIM_COMMIT_UNKNOWN_RESULT, STRIKES),
++            Leg::TimedOut1031 => meta.arm_commit_ambiguity(SIM_TRANSACTION_TIMED_OUT, STRIKES),
++            Leg::Mixed => meta.arm_mixed_commit_ambiguity(STRIKES),
++            Leg::Witness => unreachable!(),
++        }
++        let tasks: Vec<_> = (0..CREATORS)
++            .map(|i| {
++                let meta = Arc::clone(&meta);
++                madsim::task::spawn(async move {
++                    let Some(id) = create(&meta, i, seed).await else {
++                        return Vec::new();
++                    };
++                    let n = if i % 2 == 0 { 2 } else { 1 };
++                    aborts(&meta, id, n, report).await
++                })
++            })
++            .collect();
++        for task in tasks {
++            let mine = task.await.unwrap();
++            if mine.len() == 2 {
++                raced += 1;
++            }
++            ended.extend(mine);
++        }
++    }
++    meta.quiesce();
++    assert_eq!(meta.in_flight(), 0, "quiesce settles every in-flight batch");
++    let held_and_landed = assert_invariants(&meta, &ended).await;
++    Swept {
++        observations: meta.observations(),
++        ended,
++        raced,
++        held_and_landed,
++    }
++}
++
++/// The four invariants over the store after `quiesce`, against how every Abort ended. Returns how
++/// many Aborts ended saying a fence may still land whose session is now `Aborting`.
++async fn assert_invariants(meta: &SimFdbMetadataStore, ended: &[Ended]) -> usize {
++    let mut sessions: BTreeMap<String, SessionRecord> = BTreeMap::new();
++    for (key, value) in meta.scan(MPU_PREFIX).await.unwrap() {
++        let id = parse_mpu_key(&key).expect("a canonical mpu: key");
++        let record = decode_session_record(&value).expect("a valid session record");
++        sessions.insert(id.as_str().to_owned(), record);
++    }
++    let count = match meta.get(MPUCTL_KEY).await.unwrap() {
++        Some(bytes) => decode_admission_record(&bytes)
++            .expect("a valid ledger")
++            .count(),
++        None => 0,
++    };
++
++    // (1) the ledger counts every session, fenced or not.
++    assert_eq!(
++        sessions.len() as u64,
++        count,
++        "the number of mpu: records must equal mpuctl.count()"
++    );
++
++    // (2) every Aborting session has its {session, all} obligation, and no obligation is
++    // without its fenced session.
++    let mut owed = Vec::new();
++    for (id, record) in &sessions {
++        let state = record.state();
++        if !matches!(state, SessionState::Aborting {}) {
++            assert!(
++                matches!(state, SessionState::Open {}),
++                "{id}: only Open and Aborting are reachable here, found {state:?}"
++            );
++            continue;
++        }
++        let token = RetireToken::Session {
++            upload_id: UploadId::new(id.clone()).unwrap(),
++            epoch: record.epoch().checked_sub(1).expect("a fenced epoch"),
++            part: None,
++        };
++        let key = retire_key(RetireMode::Bytes, &token);
++        let Some(value) = meta.get(&key).await.unwrap() else {
++            panic!("{id} is Aborting without its retire:bytes: obligation");
++        };
++        let (mode, decoded, payload) =
++            decode_retire_obligation(&key, &value).expect("the obligation decodes at its key");
++        assert_eq!((mode, decoded), (RetireMode::Bytes, token), "{id}");
++        assert!(
++            payload.session() && payload.parts() == Some(&PartScope::All),
++            "{id}: the obligation owes {{session, all}}"
++        );
++        owed.push(key);
++    }
++    let mut stored: Vec<Vec<u8>> = Vec::new();
++    for prefix in [RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX] {
++        stored.extend(meta.scan(prefix).await.unwrap().into_iter().map(|(k, _)| k));
++    }
++    stored.sort();
++    owed.sort();
++    assert_eq!(stored, owed, "no obligation is without its fenced session");
++
++    // (4) every ending is one this scenario can reach.
++    for end in ended {
++        let id = &end.upload_id;
++        match &end.outcome {
++            Ok(AbortOutcome::Fenced | AbortOutcome::AlreadyAborting) => {}
++            Ok(AbortOutcome::Refused(Refusal::NoSuchUpload)) => {}
++            Err(AbortError::InDoubt(doubt)) => assert!(
++                doubt.may_still_commit,
++                "{id}: an out-of-flight outcome left unsettled, though every read succeeds: \
++                 {doubt:?}"
++            ),
++            Err(AbortError::Stopped {
++                cause: Stop::RoundsSpent { .. },
++                ..
++            }) => {}
++            other => panic!("{id}: an Abort ended in a way this scenario cannot reach: {other:?}"),
++        }
++    }
++
++    // (3) a session is Aborting exactly when an Abort of it said it is, or may be.
++    let mut by_session: BTreeMap<&str, Vec<&Ended>> = BTreeMap::new();
++    for end in ended {
++        by_session
++            .entry(end.upload_id.as_str())
++            .or_default()
++            .push(end);
++    }
++    let mut held_and_landed = 0;
++    for (id, ends) in &by_session {
++        let Some(record) = sessions.get(*id) else {
++            // A create still in doubt whose batch never landed: no Abort can have fenced it.
++            assert!(
++                ends.iter().all(|end| !end.reported_fence()),
++                "{id}: an Abort reported a fence of a session that does not exist"
++            );
++            continue;
++        };
++        let aborting = matches!(record.state(), SessionState::Aborting {});
++        for end in ends {
++            if end.reported_fence() {
++                assert!(
++                    aborting,
++                    "{id}: an Abort answered {:?}, but the session is {:?}",
++                    end.outcome,
++                    record.state()
++                );
++            }
++            if end.may_still_land() && aborting {
++                held_and_landed += 1;
++            }
++        }
++        let reported = ends
++            .iter()
++            .any(|end| end.reported_fence() || end.may_still_land());
++        if !reported {
++            assert!(
++                matches!(record.state(), SessionState::Open {}),
++                "session {id} is {:?}, not Open: no Abort of it answered Fenced or \
++                 AlreadyAborting, or ended saying a fence may still land",
++                record.state()
++            );
++        }
++    }
++    held_and_landed
++}
++
++/// One seed of `leg`, start to finish.
++fn run(seed: u64, leg: Leg, report: Report) -> Swept {
++    let rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
++    rt.block_on(async move {
++        let meta = Arc::new(SimFdbMetadataStore::with_fidelity(
++            FdbFidelity::CommitUnknownResult,
++        ));
++        abort_under_ambiguity(meta, leg, report).await
++    })
++}
++
++/// A sweep of `leg` over [`SWEEP_SEEDS`]: every invariant at every seed, the nemesis striking
++/// at every seed, and at least one Abort that spent every round. Returns the swept seeds.
++fn sweep(leg: Leg) -> Vec<Swept> {
++    let swept: Vec<Swept> = (0..SWEEP_SEEDS)
++        .map(|seed| run(seed, leg, Report::Faithful))
++        .collect();
++    for (seed, one) in swept.iter().enumerate() {
++        assert!(
++            one.observations.ambiguous_commits >= 1,
++            "{leg:?}: the nemesis struck at seed {seed}"
++        );
++    }
++    let spent = swept
++        .iter()
++        .flat_map(|one| &one.ended)
++        .filter(|end| end.spent_every_round())
++        .count();
++    assert!(
++        spent >= 1,
++        "vacuous: no Abort in {leg:?} 0..{SWEEP_SEEDS} spent all {ABORT_ROUNDS} rounds"
++    );
++    swept
++}
++
++/// **The seed sweep `cargo xtask dst` drives** (`MADSIM_TEST_NUM=50`): all four legs, each on
++/// its own store, every invariant at every seed.
++#[madsim::test]
++async fn multipart_abort_invariants_hold_under_the_dst_seed_sweep() {
++    for leg in [
++        Leg::Unknown1021,
++        Leg::TimedOut1031,
++        Leg::Mixed,
++        Leg::Witness,
++    ] {
++        let meta = Arc::new(SimFdbMetadataStore::with_fidelity(
++            FdbFidelity::CommitUnknownResult,
++        ));
++        let swept = abort_under_ambiguity(meta, leg, Report::Faithful).await;
++        assert!(
++            swept.observations.ambiguous_commits >= 1,
++            "{leg:?}: the nemesis must strike — a sweep that never fires it is vacuous"
++        );
++        assert!(!swept.ended.is_empty(), "{leg:?}: some Abort ran");
++    }
++}
++
++/// **1021.** Every invariant holds at every seed, two Aborts raced for a session, and some Abort
++/// spent every round with the session still `Open`.
++#[test]
++fn the_1021_leg_holds_and_some_aborts_spend_every_round() {
++    let swept = sweep(Leg::Unknown1021);
++    assert!(swept.iter().any(|one| one.raced >= 1), "two Aborts raced");
++}
++
++/// **1031.** Every invariant holds at every seed, including the seeds where a fence was left in
++/// flight and landed, or was rejected, after its Abort had returned.
++#[test]
++fn the_1031_leg_holds_and_some_aborts_spend_every_round() {
++    let swept = sweep(Leg::TimedOut1031);
++    let in_flight: u64 = swept
++        .iter()
++        .map(|one| one.observations.commits_left_in_flight)
++        .sum();
++    assert!(in_flight >= 1, "no 1031 in the sweep was left in flight");
++}
++
++/// **Mixed.** Every invariant holds at every seed, and at least one Abort met a 1031 and then a
++/// 1021: the codes one invocation met, in order, include both.
++#[test]
++fn the_mixed_leg_holds_and_one_abort_meets_1031_then_1021() {
++    let swept = sweep(Leg::Mixed);
++    let witnessed = swept
++        .iter()
++        .flat_map(|one| &one.ended)
++        .filter(|end| end.met_1031_then_1021())
++        .count();
++    assert!(
++        witnessed >= 1,
++        "no Abort in 0..{SWEEP_SEEDS} met a 1031 and then a 1021"
++    );
++}
++
++/// **Witness: a kept doubt whose fence lands.** Every invariant holds at every seed, and across
++/// the sweep at least one Abort ended saying a fence may still land, and that fence landed by
++/// `quiesce`: the session is `Aborting` with its obligation, and the error named it.
++#[test]
++fn the_witness_leg_holds_and_a_held_fence_lands_after_its_abort_returned() {
++    let swept = sweep(Leg::Witness);
++    let landed: usize = swept.iter().map(|one| one.held_and_landed).sum();
++    assert!(
++        landed >= 1,
++        "vacuous: no Abort in 0..{SWEEP_SEEDS} ended in doubt with a fence that then landed"
++    );
++}
++
++/// **Demonstrated red — invariant (3) is load-bearing.** The wrapper reports each struck 1031 as
++/// `Conflict`. An Abort whose fences all stay in flight finds the session unchanged and the key
++/// absent each time, spends its rounds, and says nothing is in doubt; its fence then lands at
++/// `quiesce`, leaving a fenced session no Abort reported. If no seed reached that, this would not
++/// panic and `should_panic` would fail it.
++#[test]
++#[should_panic(expected = "not Open")]
++fn a_1031_misreported_as_conflict_leaves_a_fence_no_abort_reported() {
++    for seed in 0..SWEEP_SEEDS {
++        run(seed, Leg::Witness, Report::TimedOut1031AsConflict);
++    }
++}
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index adfa6bd..3d019f3 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -203,7 +203,7 @@ same atomic commit as the chunk map). The repair paths — reconstruction, backf
+ rebalance — re-commit the *same* content, so they **preserve** the stored trio: a
+ placement-maintenance commit never moves `Last-Modified` or drops the content type.
+ 
+-The record **types** of the multipart commit protocol (proposal 0016, still a draft) are landed ahead of most of their writers, under disjoint key prefixes: the `mpuctl` admission ledger singleton (a `Budget` profile and the session count it derives `MAX_SESSIONS` from), and per-upload `mpu:<id>` (a session's target, lifecycle state and epoch, and its segment-group nonce — stored in every state from Create to the terminal delete, so the batch that ends a `Completing` attempt can name that attempt's segment records, the nonce at the attempt's fence epoch, and the terminal delete can name the group's reservation marker even for an upload that never reached Complete), `slot:<id>:<k>` (an in-flight part reservation), `part:<id>:<n>` (a committed part's chunk list, length and digest) and `psum:<id>:<n>` (that part's summary), and the reclamation pair `retire:bytes:<token>` (bytes to orphan-mark, then the records that named them) and `retire:records:<token>` (records to delete whose bytes something else still protects), whose value names what one obligation owes — a session's staged residue, a range-encoded set of its part numbers, one part attempt's chunk list, a superseded generation (by the chunk list a flat root carried, or by the segment group a segmented one named — the two shapes a published map has, never both) or a rolled-back completion attempt's segment records, in the combinations the protocol installs as single obligations — every one validated structurally at decode (ADR-0045) rather than trusted on successful JSON parsing alone, so a stored record whose fields disagree with each other (a session whose publish target names another object or another fence epoch, a part whose length is not its chunks' summed length, a slot born already lapsed) is a typed error rather than a live value. A retirement obligation's identity lives partly in its `<token>` — which session at which fence epoch, which part attempt of it, which superseded generation — so its value is decoded **against its own key**, and a payload whose mode, token scope, generation identity or segment epoch disagrees with the token naming it is likewise a typed error rather than an obligation that would reclaim one attempt's bytes while clearing another's. The owned staging entry `sidx:<id>:<n>:<chunk>` is the lease record a streaming write stores under `pending:<chunk>`, plus the owning upload id (`owner`) and the chunk's planned placement (`staged` — an erasure scheme the coder must support, and a D server per planned fragment, a count that decode leaves unchecked as for a committed chunk). Both are present on an owned entry and absent on an ordinary lease, and each is omitted when absent, so a `pending:` record written before them decodes and re-encodes byte-identically — load-bearing because a renewal puts a freshly encoded entry over the bytes it read. A value whose fields disagree with each other or with its key (one field alone, an owned entry under `pending:`, an ordinary lease under `sidx:`, an owner other than the key's) is refused by every reader and both `pending:` writers, and an expiry sweep skips it without reclaiming its chunk; GC's expired-lease input, off unless an operator arms it, also names it on the audit seam, and the post-restore reconciliation holds its chunk unmarked and reports the entry as needing a human, as it does an unreadable chunk map. An ownership field spelled `null` is refused too: the encoder never emits that spelling, so a lease that carried it would be rewritten by its next renewal. Their first production reader and writer is the post-restore session fence (`wyrd custodian --reconcile-after-restore`, `crates/custodian/src/restore.rs`): after its reference passes it re-lists `mpu:` in bounded pages and moves each `Open@E` session to `Aborting@E+1` in one commit with its `retire:` `{session, all}` obligation, so a session resurrected by the restore cannot be completed over reclaimed bytes (proposal 0016 D-B). `CreateMultipartUpload`'s admission writes them too: `wyrd_core::multipart::create::create_session` (#894) writes `mpuctl`, `mpu:` and `seggrp:`, and has no production caller until the S3 verb is wired (#668). It admits a session through `mpuctl` and installs it in one batch: the ledger's compare-and-set on its exact bytes (or, on a store with no ledger yet, the ledger's first value, taken from the caller's profile), the session at `Open`, and its `seggrp:` reservation, each new key under `require_absent`, with the bucket marker required on its exact bytes. So every session it installs is counted in the batch that installs it. A full ledger, a caller whose profile differs from the stored one, a missing or replaced bucket marker, and a session whose record could grow past the value ceiling in a later state are refused, with nothing written. A contention refusal means the create lost or could not settle its commit as many times as the profile in effect admits sessions; each loss is the ledger moving, an outcome the store could not report, or, on TiKV, a lock another writer held with nothing moved, so on TiKV lock contention alone can refuse a create on a ledger with room. A minted identity already in the store is minted again, on a separate budget. A commit with an unknown outcome is re-driven under the same upload id with every precondition read again; a session found under that id afterwards is answered as created only when it is byte for byte the record its batch puts. One that keeps the create's nonce and request but has moved on since its batch landed (a teardown fence, say) is the create's own session, never a collision, and it ends the create in the same error as a batch the create cannot settle: an error that names the upload id and nonce and classifies as indeterminate, so no session it installs goes unreported. Nothing else writes or consumes them in production yet — the rest of the protocol (the gateway's fenced state transitions, staged publication, the retirement drain) arrives with the later store round trips (#657–#659) and is specified in the proposal, not here. Because every transition it specifies is a compare-and-set on the record's exact bytes, the decoders enforce serialization identity now, before the protocol's writers exist to depend on it: the accepted set is exactly the encoder's image, byte for byte — an absent `content_type` is spelled only by omitting the field (the inode trio's omitted-when-absent rule), a noncanonical spelling of an accepted value (fields reordered, whitespace inserted) is a decode error rather than bytes a CAS could never match, and a part record's chunk values are read through a closed wire shape of their own, so an unknown or omitted chunk field is a decode error rather than a silent rewrite.
++The record **types** of the multipart commit protocol (proposal 0016, still a draft) are landed ahead of most of their writers, under disjoint key prefixes: the `mpuctl` admission ledger singleton (a `Budget` profile and the session count it derives `MAX_SESSIONS` from), and per-upload `mpu:<id>` (a session's target, lifecycle state and epoch, and its segment-group nonce — stored in every state from Create to the terminal delete, so the batch that ends a `Completing` attempt can name that attempt's segment records, the nonce at the attempt's fence epoch, and the terminal delete can name the group's reservation marker even for an upload that never reached Complete), `slot:<id>:<k>` (an in-flight part reservation), `part:<id>:<n>` (a committed part's chunk list, length and digest) and `psum:<id>:<n>` (that part's summary), and the reclamation pair `retire:bytes:<token>` (bytes to orphan-mark, then the records that named them) and `retire:records:<token>` (records to delete whose bytes something else still protects), whose value names what one obligation owes — a session's staged residue, a range-encoded set of its part numbers, one part attempt's chunk list, a superseded generation (by the chunk list a flat root carried, or by the segment group a segmented one named — the two shapes a published map has, never both) or a rolled-back completion attempt's segment records, in the combinations the protocol installs as single obligations — every one validated structurally at decode (ADR-0045) rather than trusted on successful JSON parsing alone, so a stored record whose fields disagree with each other (a session whose publish target names another object or another fence epoch, a part whose length is not its chunks' summed length, a slot born already lapsed) is a typed error rather than a live value. A retirement obligation's identity lives partly in its `<token>` — which session at which fence epoch, which part attempt of it, which superseded generation — so its value is decoded **against its own key**, and a payload whose mode, token scope, generation identity or segment epoch disagrees with the token naming it is likewise a typed error rather than an obligation that would reclaim one attempt's bytes while clearing another's. The owned staging entry `sidx:<id>:<n>:<chunk>` is the lease record a streaming write stores under `pending:<chunk>`, plus the owning upload id (`owner`) and the chunk's planned placement (`staged` — an erasure scheme the coder must support, and a D server per planned fragment, a count that decode leaves unchecked as for a committed chunk). Both are present on an owned entry and absent on an ordinary lease, and each is omitted when absent, so a `pending:` record written before them decodes and re-encodes byte-identically — load-bearing because a renewal puts a freshly encoded entry over the bytes it read. A value whose fields disagree with each other or with its key (one field alone, an owned entry under `pending:`, an ordinary lease under `sidx:`, an owner other than the key's) is refused by every reader and both `pending:` writers, and an expiry sweep skips it without reclaiming its chunk; GC's expired-lease input, off unless an operator arms it, also names it on the audit seam, and the post-restore reconciliation holds its chunk unmarked and reports the entry as needing a human, as it does an unreadable chunk map. An ownership field spelled `null` is refused too: the encoder never emits that spelling, so a lease that carried it would be rewritten by its next renewal. Their first production reader and writer is the post-restore session fence (`wyrd custodian --reconcile-after-restore`, `crates/custodian/src/restore.rs`): after its reference passes it re-lists `mpu:` in bounded pages and moves each `Open@E` session to `Aborting@E+1` in one commit with its `retire:` `{session, all}` obligation, so a session resurrected by the restore cannot be completed over reclaimed bytes (proposal 0016 D-B). `CreateMultipartUpload`'s admission writes them too: `wyrd_core::multipart::create::create_session` (#894) writes `mpuctl`, `mpu:` and `seggrp:`, and has no production caller until the S3 verb is wired (#668). It admits a session through `mpuctl` and installs it in one batch: the ledger's compare-and-set on its exact bytes (or, on a store with no ledger yet, the ledger's first value, taken from the caller's profile), the session at `Open`, and its `seggrp:` reservation, each new key under `require_absent`, with the bucket marker required on its exact bytes. So every session it installs is counted in the batch that installs it. A full ledger, a caller whose profile differs from the stored one, a missing or replaced bucket marker, and a session whose record could grow past the value ceiling in a later state are refused, with nothing written. A contention refusal means the create lost or could not settle its commit as many times as the profile in effect admits sessions; each loss is the ledger moving, an outcome the store could not report, or, on TiKV, a lock another writer held with nothing moved, so on TiKV lock contention alone can refuse a create on a ledger with room. A minted identity already in the store is minted again, on a separate budget. A commit with an unknown outcome is re-driven under the same upload id with every precondition read again; a session found under that id afterwards is answered as created only when it is byte for byte the record its batch puts. One that keeps the create's nonce and request but has moved on since its batch landed (a teardown fence, say) is the create's own session, never a collision, and it ends the create in the same error as a batch the create cannot settle: an error that names the upload id and nonce and classifies as indeterminate, so no session it installs goes unreported. `AbortMultipartUpload`'s fence writes them too: `wyrd_core::multipart::abort::abort_session` (#895) moves an `Open@E` session to `Aborting@E+1` and installs its `retire:bytes:` `{session, all}` obligation in the same batch, with the session required on the exact bytes read and the obligation key required absent. The client Abort and the post-restore fence build that batch in one place (`abort::fence_batch`), so the two writers of the `Open → Aborting` edge cannot differ. The fence never moves the admission count: a fenced session still holds its `mpu:` record and its staged bytes, and stays counted until the terminal delete. A `Completing` session is refused `OperationAborted`, and a `Completed` or absent one answers `NoSuchUpload`, with nothing written. Two Aborts racing for one session answer one fenced and one already aborting when the store reports both commits' outcomes; an Abort whose own commit's outcome was unknown cannot tell its fence from a rival's byte-identical one, so it answers fenced too, which is harmless, since the session was fenced once, with one obligation. A lost commit is judged from what the store holds, never inferred: a conflict no re-read explains (on TiKV, a lock another writer held) is retried within a bounded number of rounds, and an obligation key found taken is damage only if the session is still unchanged when read again. An Abort that ends while a fence of it may still land, or before a read could say whether one landed, ends with that unknown outcome: an error that names the upload id and classifies as indeterminate, never one that says nothing was written. It has no production caller until the S3 verb is wired (#668). Nothing else writes or consumes them in production yet — the rest of the protocol (the gateway's fenced state transitions, staged publication, the retirement drain) arrives with the later store round trips (#657–#659) and is specified in the proposal, not here. Because every transition it specifies is a compare-and-set on the record's exact bytes, the decoders enforce serialization identity now, before the protocol's writers exist to depend on it: the accepted set is exactly the encoder's image, byte for byte — an absent `content_type` is spelled only by omitting the field (the inode trio's omitted-when-absent rule), a noncanonical spelling of an accepted value (fields reordered, whitespace inserted) is a decode error rather than bytes a CAS could never match, and a part record's chunk values are read through a closed wire shape of their own, so an unknown or omitted chunk field is a decode error rather than a silent rewrite.
+ 
+ The post-restore reconciliation keeps one more singleton beside them, `mpufence`: the **restore-fence generation** that proposal 0016 requires to complete before any gateway serves multipart verbs on a restored image (0016 names the generation but gives it no key). Its value is `{"generation":N,"complete":B}`, closed and canonical like `mpuctl`'s. `generation` numbers that pass's runs from 1, so the record is absent until the first run, and absent is the only spelling of "no run has happened". `complete` says whether that run finished its session fence. Each run first writes the next generation as not complete, and marks or fences nothing until that write is acknowledged. After its last write it records the generation complete, but only if every write it made was acknowledged and no upload session is left for a human: one it could not read or fence, or a fenced one whose segment records need a human. Every run judges those sessions afresh from their records, so a session an earlier run fenced but could not clear holds back every later run until someone repairs it. Findings that are not about a session, such as a lost or misplaced chunk or an unreadable object or staged record, do not hold the generation back. Both writes are conditioned on the bytes last read there, so a completion that lands late never overwrites a newer run's generation. What the record cannot tell: a restore rewinds it with everything else, so an image captured after an earlier run completed comes back reading complete until the next run starts. No gateway reads it yet. The gateway gate (#508) needs a restore-scoped signal beside it, and until then what keeps multipart off a restored image is the runbook's order: the reconciliation runs with writers stopped, before any gateway is re-enabled.
+ 

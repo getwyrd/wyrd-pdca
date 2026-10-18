@@ -1,0 +1,1854 @@
+diff --git a/crates/custodian/src/rebalance.rs b/crates/custodian/src/rebalance.rs
+index 926461e..2a07082 100644
+--- a/crates/custodian/src/rebalance.rs
++++ b/crates/custodian/src/rebalance.rs
+@@ -25,13 +25,14 @@
+ //! (`0005:298-299`, `0005:486`): the fragment is written to its new home **before** the
+ //! commit, so a crash mid-move leaves only **collectable garbage** (an orphaned
+ //! fragment GC reclaims), never a torn / hybrid chunk; the repoint is CAS'd on the
+-//! prior inode record, so a superseded custodian or racing writer loses the commit
+-//! rather than corrupting the placement record. Unlike reconstruction it needs **no**
++//! prior inode record — and, for a segmented object, on the `seg:` record that holds the
++//! chunk ([`metadata::repoint_chunk`]) — so a superseded custodian or racing writer loses
++//! the commit rather than corrupting the placement record. Unlike reconstruction it needs **no**
+ //! erasure rebuild — the fragment is intact on the (alive, draining) server, so it is
+ //! **copied**, not reconstructed; the shared piece is the failure-domain selector and
+ //! the atomic repoint, not the decode.
+ //!
+-//! Four load-bearing invariants:
++//! Five load-bearing invariants:
+ //!
+ //! - **Spread wins** (`0005:302-303`, durability is gate-zero): where a move cannot keep
+ //!   the chunk on `n` distinct domains (no free distinct domain remains off the draining
+@@ -49,13 +50,16 @@
+ //!   server, and an operator reading a satisfied drain pulls the box.
+ //! - **One damaged object never stops the drain, and an incomplete pass never certifies
+ //!   one** (#696): every committed record is read through the ONE resolver every other
+-//!   consumer shares ([`metadata::resolve_chunk_map`], proposal 0016 decision 7(e)), a
+-//!   fault it meets is contained to the object that owns it — named on the durability
+-//!   seam and skipped, with the walk going on — and an evacuation this pass may not
+-//!   perform is **refused**, which writes nothing at all. Either way the pass answers
+-//!   [`Reconciled::Blocked`] rather than report a drain satisfied over work it did not do:
+-//!   an operator reading `Satisfied` is being told the server is safe to decommission, and
+-//!   will act on it (`docs/principles.md` §5 C-1).
++//!   consumer shares ([`metadata::resolve_chunk_map`], proposal 0016 decision 7(e)), and a
++//!   fault it meets — or the move's own re-read meets — is contained to the object that owns
++//!   it: named ONCE on the durability seam and skipped, with the walk going on. The pass
++//!   then answers [`Reconciled::Blocked`] rather than report a drain satisfied over a store
++//!   it could only partly read: an operator reading `Satisfied` is being told the server is
++//!   safe to decommission, and will act on it (`docs/principles.md` §5 C-1).
++//! - **Every shape of committed map drains** (#722): the fragment is moved in whichever
++//!   record holds its `ChunkRef` — the flat inode record or one `seg:` record — through the
++//!   one placement move reconstruction also uses ([`metadata::repoint_chunk`]), so a
++//!   decommission converges over a multipart object instead of waiting on it forever.
+ //!
+ //! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
+ //! `traits` / `core` seams plus `tracing` — the placement selector and the fragment
+@@ -68,7 +72,7 @@ use wyrd_core::metadata::{self, ChunkMapError, ChunkRef, InodeId, InodeRecord, I
+ use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
+ use wyrd_core::repair;
+ use wyrd_traits::{
+-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result,
+ };
+ 
+ use crate::desired_state;
+@@ -94,21 +98,31 @@ pub struct RebalanceContext<'a> {
+     pub topology: &'a Topology,
+ }
+ 
++/// One committed object this pass owes an evacuation inside, as the resolve answered it —
++/// held ONCE per object and shared by every plan in it (an index into [`EvacScan::objects`],
++/// never a copy), so a multipart object owing many moves is one snapshot of its root rather
++/// than one deep copy per plan.
++struct EvacObject {
++    inode_id: InodeId,
++    /// The root record **the resolve answered from** — this scan's own snapshot, or the live
++    /// one a retired resolution restarted onto ([`metadata::ResolvedChunkMap::record`]). It is
++    /// the generation the move pins and, for a flat object, the record it re-encodes.
++    prior: InodeRecord,
++}
++
+ /// One chunk's evacuation plan: which fragment(s) sit on a draining server, where the
+ /// chunk lives (for the CAS), and the failure domains its surviving fragments occupy
+ /// (to keep the move disjoint).
+ struct EvacPlan {
+-    inode_id: InodeId,
+-    prior: InodeRecord,
+-    /// The **scanned** generation's flat chunk list — the bytes the repoint is built from
+-    /// and conditioned on, carried from the scan rather than read again at commit time.
+-    ///
+-    /// Only a **flat** scanned record ever produces a plan (a segmented one is refused in
+-    /// [`plan_evacuations`]), so this list always exists and [`evacuate_chunk`] needs no
+-    /// second reading of the map's shape — which is what removes the pass's second
+-    /// "a segmented map ends everything" site rather than guarding it.
+-    prior_chunks: Vec<ChunkRef>,
+-    chunk_index: usize,
++    /// Index into [`EvacScan::objects`] — the ONE snapshot of the object holding this chunk.
++    object: usize,
++    /// The first object byte this chunk covers: the address [`metadata::repoint_chunk`]
++    /// finds it by, in whichever record holds its `ChunkRef`. A flat map and a segmented
++    /// one are both byte tilings, so the scan never branches on the map's shape.
++    byte_offset: u64,
++    /// The committed reference this plan was built from: the scheme the intact-fragment
++    /// check verifies against, and the reference the move requires to be unchanged.
++    prior: ChunkRef,
+     chunk_id: ChunkId,
+     /// The chunk's FULL fragment placement (length `n` == `fragment_count()`),
+     /// resolved through the same authoritative identity-placement fallback the read
+@@ -125,9 +139,9 @@ struct EvacPlan {
+ 
+ /// One rebalance reconciliation pass over `ctx` at logical time `now_millis`.
+ /// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
+-/// parallel entry. Returns [`Reconciled::Blocked`] if the pass met a committed object it
+-/// could not read, an evacuation it may not perform ([`EvacScan::withheld`]), or a planned
+-/// move that did **not** persist ([`EvacOutcome::persisted`]); [`Reconciled::Changed`] if
++/// parallel entry. Returns [`Reconciled::Blocked`] if the pass contained a committed object
++/// it could not read or rewrite ([`EvacScan::contained`]), or a planned move did **not**
++/// persist ([`EvacOutcome::persisted`]); [`Reconciled::Changed`] if
+ /// every planned move landed and at least one placement record was repointed; and
+ /// [`Reconciled::Satisfied`] only where reality already matched the desired state.
+ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Result<Reconciled> {
+@@ -145,7 +159,7 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+     let draining_set: BTreeSet<DServerId> = draining.keys().copied().collect();
+ 
+     // Plan an evacuation for each committed chunk with a fragment on a draining server.
+-    let scan = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
++    let mut scan = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
+ 
+     let mut changed = false;
+     // Set by any planned move that did NOT persist — the drain's one certification rule,
+@@ -156,7 +170,8 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+     // certify over none of them.
+     let mut unmoved = false;
+     for plan in &scan.plans {
+-        let outcome = evacuate_chunk(ctx, &stores, plan, &draining_set, now_millis).await?;
++        let object = &scan.objects[plan.object];
++        let outcome = evacuate_chunk(ctx, &stores, object, plan, &draining_set, now_millis).await?;
+         // Apply the ONE certification rule to the outcome itself, and apply it FIRST — ahead
+         // of the arms that merely name it, so the drain's answer neither depends on an arm nor
+         // can be dropped by one. An arm forgetting to withhold certification is the whole
+@@ -170,6 +185,12 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+             EvacOutcome::Refused { bytes, ceiling } => {
+                 emit_ceiling_refused(plan.chunk_id, bytes, ceiling)
+             }
++            // Named once per OBJECT, however many of its chunks meet the same fault.
++            EvacOutcome::Contained { fault } => contain(
++                &mut scan.contained,
++                &metadata::inode_key(object.inode_id),
++                &fault,
++            ),
+             // An ordinary abort (no free distinct domain, an off-fleet / missing /
+             // checksum-failing fragment) keeps the base's silence here — the selector's own
+             // refusal is already the operator's signal for it, and it is transient — but it
+@@ -182,7 +203,7 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+         }
+     }
+ 
+-    Ok(if scan.withheld || unmoved {
++    Ok(if !scan.contained.is_empty() || unmoved {
+         // Refuse to certify. Whatever was evacuated above is durable either way — every
+         // plan was built from a record this pass READ, and a refusal wrote nothing. What
+         // answering `Changed` / `Satisfied` would destroy is the only signal that this pass
+@@ -206,15 +227,20 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
+ /// What one scan of the committed namespace produced: the evacuations this pass may
+ /// perform, and whether it met anything it must not certify over.
+ struct EvacScan {
++    /// One snapshot per committed object this pass owes an evacuation inside, shared by
++    /// every plan in it.
++    objects: Vec<EvacObject>,
+     /// One plan per chunk this pass may evacuate.
+     plans: Vec<EvacPlan>,
+-    /// Whether the scan met something that **withholds the drain's certification**: a
+-    /// committed object it could not read at all (contained and named, exactly as GC
+-    /// contains one — `crate::gc::reconcile`), or an evacuation it may not perform (a chunk
+-    /// whose bytes live in a `seg:` record, refused and never written). Either way this
+-    /// pass has no picture of the whole store, so it answers [`Reconciled::Blocked`].
++    /// Every committed object this pass **contained**, by the store's own key bytes — one it
++    /// could not read at all, or could read but the move cannot address (a segmented row
++    /// under a non-canonical key, chunk lengths past `u64`), or whose records the move's own
++    /// re-read found unusable ([`EvacOutcome::Contained`]). Each is named exactly once
++    /// ([`contain`]), as GC contains one (`crate::gc::reconcile`). Non-empty withholds the
++    /// drain's certification: this pass then has no picture of the whole store, so it
++    /// answers [`Reconciled::Blocked`].
+     ///
+-    /// Deliberately **not** set by two conditions this slice leaves exactly as the base
++    /// Deliberately **not** added to by two conditions this slice leaves exactly as the base
+     /// answers them:
+     ///
+     /// * a **malformed** committed placement — skipped + NEEDS-HUMAN ([`emit_needs_human`],
+@@ -225,7 +251,16 @@ struct EvacScan {
+     /// A move that did not persist ([`EvacOutcome::persisted`]) is **not** folded in here
+     /// either — that is a property of one *move*, which the work loop above tracks itself,
+     /// not of this scan of the namespace. Both withhold the same certification.
+-    withheld: bool,
++    contained: BTreeSet<Vec<u8>>,
++}
++
++/// Contain one committed object: name it on the durability seam the FIRST time this pass
++/// meets it — a line per chunk floods the seam for exactly the multipart objects it names —
++/// and record that the pass may not certify.
++fn contain(contained: &mut BTreeSet<Vec<u8>>, key: &[u8], fault: &str) {
++    if contained.insert(key.to_vec()) {
++        emit_unresolvable(&crate::gc::object_name(key), fault);
++    }
+ }
+ 
+ /// Scan the committed chunk maps for fragments sitting on a draining server, building
+@@ -260,15 +295,16 @@ struct EvacScan {
+ /// propagates, by exactly the downcast rule GC uses: a walk that cannot reach the metadata
+ /// store has no answer for any object, not one unreadable object.
+ ///
+-/// **Whether this pass may write for an object is decided from the generation the SCAN
+-/// returned** — this record's own `chunk_map` shape, already in hand — never from the shape
+-/// of whatever a resolve answered after restarting onto a newer root. That needs no
+-/// machinery of its own: a flat snapshot resolves to a borrow of the record and reads
+-/// nothing, so it can never be superseded and never restarts
+-/// (`crates/core/src/metadata.rs:2585`, `:2629`); only a segmented snapshot can, and a
+-/// segmented snapshot is one this pass refuses. So the restart path reaches no write at
+-/// all, by construction — no generation comparison and no counter of its own (the
+-/// fleet-wide version of that question is deferred: #699).
++/// **Every move is conditioned on the generation the resolve ANSWERED FROM** — the record
++/// this scan read, or the live one a retired resolution restarted onto — so the chunk a plan
++/// is built from and the root its CAS pins come from the same generation. A generation that
++/// moves on after that costs the move its CAS and nothing else (the fleet-wide version of
++/// that question is deferred: #699).
++///
++/// Planning stays per *(object, chunk)*: two objects naming one `ChunkId` get one plan
++/// each, so EVERY committed reference to a drained fragment is repointed. Deduplicating by
++/// `ChunkId` (first reference wins) would leave the second object naming a server the drain
++/// is emptying.
+ ///
+ /// Attribution is emitted **per object, where the object is read** — and therefore before
+ /// the caller's work loop, mirroring `crate::gc::reconcile` — so a later transient store
+@@ -278,8 +314,9 @@ async fn plan_evacuations(
+     topology: &Topology,
+     draining: &BTreeSet<DServerId>,
+ ) -> Result<EvacScan> {
++    let mut objects: Vec<EvacObject> = Vec::new();
+     let mut plans = Vec::new();
+-    let mut withheld = false;
++    let mut contained = BTreeSet::new();
+     for (key, value) in meta.scan(b"inode:").await? {
+         // The record's own bytes are in hand, so a decode failure is THIS object's fault
+         // and no store's — contained, and conservatively without first asking whether the
+@@ -289,8 +326,7 @@ async fn plan_evacuations(
+         let record: InodeRecord = match metadata::decode(&value) {
+             Ok(record) => record,
+             Err(fault) => {
+-                emit_unresolvable(&crate::gc::object_name(&key), &fault.to_string());
+-                withheld = true;
++                contain(&mut contained, &key, &fault.to_string());
+                 continue;
+             }
+         };
+@@ -317,8 +353,7 @@ async fn plan_evacuations(
+                 // The resolver's own typed verdict that THIS generation cannot be read —
+                 // recovered by downcast because the trait seam boxes every error. Contained.
+                 Ok(fault) => {
+-                    emit_unresolvable(&crate::gc::object_name(&key), &fault.to_string());
+-                    withheld = true;
++                    contain(&mut contained, &key, &fault.to_string());
+                     continue;
+                 }
+                 // Not a chunk-map anomaly: a store fault under the read. Not this object's
+@@ -326,15 +361,28 @@ async fn plan_evacuations(
+                 Err(err) => return Err(err),
+             },
+         };
+-        // The eligibility decision, read off the scanned generation's own shape (above).
+-        // For a flat record this IS `resolved.chunks` — a flat map resolves to a borrow of
+-        // exactly this list (`crates/core/src/metadata.rs:2585`), so `chunk_index` indexes
+-        // both the same way.
+-        let scanned_flat = record.chunk_map.as_flat();
+-        // One refusal per OBJECT, not one per chunk: a multipart object owing a thousand
+-        // evacuations is one blocker to repair, not a thousand lines on the seam.
+-        let mut refused = false;
+-        for (chunk_index, chunk) in resolved.chunks.iter().enumerate() {
++        let metadata::ResolvedChunkMap {
++            record: prior,
++            chunks,
++        } = resolved;
++        // A SEGMENTED record under a non-canonical spelling of its id (`inode:03`): the move
++        // pins the root at the key re-derived from the id, which is not the row this scan
++        // read, so every pass would copy the fragment, lose that CAS and never name the
++        // object. Contained on the first chunk it owes instead, exactly as the reconstruction
++        // pass contains it. The guard is this shape's alone: a flat record under such a key
++        // is #698's, as it is there.
++        let canonical =
++            record.chunk_map.as_flat().is_some() || key == metadata::inode_key(inode_id);
++        // The ONE snapshot of this object, taken on the first chunk it owes a move on and
++        // shared by every later one; an object owing none is never copied.
++        let mut object = None;
++        // The chunk's address in the object's bytes, summed over the resolved list — the same
++        // tiling the move walks. `None` once the lengths leave `u64`, which only a flat map
++        // can reach (a segmented one is checked at decode).
++        let mut next_offset = Some(0u64);
++        for chunk in chunks.iter() {
++            let at = next_offset;
++            next_offset = at.and_then(|at| at.checked_add(chunk.len));
+             // Resolve the FULL `0..fragment_count()` index space through the shared
+             // STRICT companion (`ChunkRef::checked_fragments`, `core/src/metadata.rs`,
+             // ADR-0040 decision 4) — classify the committed placement BEFORE expanding it,
+@@ -362,15 +410,17 @@ async fn plan_evacuations(
+             if evac.is_empty() {
+                 continue;
+             }
+-            // An evacuation this pass may NOT perform: the chunk's bytes live in a `seg:`
+-            // record, and the evacuation write path for one is #682's. REFUSED — nothing at
+-            // all is written for it, the record and its `seg:` records are left
+-            // byte-identical, and the drain is not certified below. Refusing (rather than
+-            // aborting the whole pass, or silently dropping the chunk) is what keeps every
+-            // OTHER object in the store draining while this one waits for #682.
+-            let Some(prior_chunks) = scanned_flat else {
+-                refused = true;
+-                continue;
++            if !canonical {
++                let fault = "the row's key is not the canonical `inode:<id>` key";
++                contain(&mut contained, &key, fault);
++                break;
++            }
++            let Some(byte_offset) = at else {
++                // No address the move could find this chunk by: contained and named, never
++                // a conflict every pass with the drain stuck behind it.
++                let fault = "the chunk lengths overflow the object's byte range";
++                contain(&mut contained, &key, fault);
++                break;
+             };
+             // The domains the fragments that STAY occupy — resolved through the same
+             // fallback as `placement` above, so a mixed-era chunk's spread is computed
+@@ -383,30 +433,39 @@ async fn plan_evacuations(
+                 .filter(|(index, _)| !evac.contains(index))
+                 .filter_map(|(_, server)| topology.domain_of(*server).cloned())
+                 .collect();
++            let object = *object.get_or_insert_with(|| {
++                objects.push(EvacObject {
++                    inode_id,
++                    prior: prior.as_ref().clone(),
++                });
++                objects.len() - 1
++            });
+             plans.push(EvacPlan {
+-                inode_id,
+-                prior: record.clone(),
+-                prior_chunks: prior_chunks.to_vec(),
+-                chunk_index,
++                object,
++                byte_offset,
++                prior: chunk.clone(),
+                 chunk_id: chunk.id,
+                 placement,
+                 evac,
+                 survivor_domains,
+             });
+         }
+-        if refused {
+-            emit_refused(&crate::gc::object_name(&key));
+-            withheld = true;
+-        }
+     }
+-    Ok(EvacScan { plans, withheld })
++    Ok(EvacScan {
++        objects,
++        plans,
++        contained,
++    })
+ }
+ 
+ /// The outcome of evacuating one chunk.
+ enum EvacOutcome {
+     /// The version-conditional commit landed; the fragment(s) were re-placed.
+     Committed,
+-    /// The commit lost the CAS race (the copied fragments are now collectable garbage).
++    /// The move lost its race: the record holding the chunk had already moved when the move
++    /// was prepared (nothing was written, not even a fragment copy), or the commit itself
++    /// lost the CAS (the copied fragments are left in place; nothing is retracted). Either
++    /// way the fragment is still on the draining server and the next pass re-plans.
+     Conflict,
+     /// The move could not proceed — spread could not be preserved (no free distinct
+     /// domain), or a fragment was missing / corrupt / off-fleet; nothing was committed.
+@@ -425,6 +484,15 @@ enum EvacOutcome {
+         /// The ceiling it crossed.
+         ceiling: usize,
+     },
++    /// The move found this committed object's own records unusable — a `seg:` record that
++    /// is absent, torn, or disagrees with a root that still names it, or a flat record whose
++    /// `version` cannot advance — so nothing was written. Not a race: the object is contained
++    /// as one the scan could not read would be, and named once however many plans meet it
++    /// ([`contain`]).
++    Contained {
++        /// What the move found.
++        fault: String,
++    },
+ }
+ 
+ impl EvacOutcome {
+@@ -448,6 +516,7 @@ impl EvacOutcome {
+ async fn evacuate_chunk(
+     ctx: &RebalanceContext<'_>,
+     stores: &HashMap<DServerId, &dyn ChunkStore>,
++    object: &EvacObject,
+     plan: &EvacPlan,
+     draining: &BTreeSet<DServerId>,
+     now_millis: u64,
+@@ -466,13 +535,6 @@ async fn evacuate_chunk(
+         Err(_) => return Ok(EvacOutcome::Aborted),
+     };
+ 
+-    // The chunk list this commit is built from and conditioned on is the one the SCAN read
+-    // ([`EvacPlan::prior_chunks`]) — the map's shape is never read a second time here, so a
+-    // segmented map has no site left in this function to end the pass from. Only a flat
+-    // scanned record produces a plan at all; a segmented one is refused in
+-    // [`plan_evacuations`] and never reaches this far.
+-    let prior_chunk_map = &plan.prior_chunks;
+-
+     // Resolve every fragment this move would copy — its source and target stores, and its
+     // intact bytes — WITHOUT writing any of them yet.
+     //
+@@ -503,49 +565,70 @@ async fn evacuate_chunk(
+         let Some(bytes) = source_store.get_fragment(frag).await? else {
+             return Ok(EvacOutcome::Aborted);
+         };
+-        if !repair::fragment_intact(&bytes, frag, prior_chunk_map[plan.chunk_index].scheme) {
++        if !repair::fragment_intact(&bytes, frag, plan.prior.scheme) {
+             return Ok(EvacOutcome::Aborted);
+         }
+         copies.push((source, *target_store, frag, bytes));
+         new_placement[index] = target;
+     }
+ 
+-    // The record THE binding commit below would leave behind, built here from the selector's
+-    // answer alone — no store touched yet — so the move is judged on it before anything is
+-    // written. That commit is ONE version-conditional mutation that atomically repoints the
+-    // placement record and orphans the displaced fragments on the draining server; the CAS on
+-    // the prior inode record is the second fence (`0005:200-203`, ADR-0015), so a racing
+-    // writer / superseded custodian loses there rather than corrupting the record.
+-    let mut next_chunk_map = prior_chunk_map.to_vec();
+-    next_chunk_map[plan.chunk_index].placement = new_placement;
+-    let next = InodeRecord {
+-        size: plan.prior.size,
+-        chunk_map: next_chunk_map.into(),
+-        state: InodeState::Committed,
+-        version: plan.prior.version + 1,
+-        // A rebalance re-places the SAME content, so it PRESERVES the object metadata
+-        // (ADR-0047): a placement-maintenance commit must not move `Last-Modified` or drop
+-        // the content type.
+-        ..plan.prior.clone()
++    // THE placement move the binding commit below is built from, prepared from the
++    // selector's answer alone with no fragment written yet, so the move is judged before
++    // anything is written. It addresses whichever record holds the chunk's `ChunkRef` — the
++    // flat inode record or one `seg:` record — and pins three things: the root generation
++    // the scan resolved, the holding `seg:` record as the move itself re-reads it (not the
++    // bytes the scan's resolve saw), and the chunk's own reference. The orphan marks join
++    // that same batch below, so ONE version-conditional mutation repoints the placement and
++    // orphans the displaced fragments (`0005:298-299`, `0005:200-203`, ADR-0015): a racing
++    // writer or superseded custodian loses the CAS rather than corrupting the record. That
++    // re-read is bounded by the `MetadataStore` implementation (#508/#636), fail-closed.
++    //
++    // Every answer but `Prepared` WRITES NOTHING AT ALL, and each is judged ahead of the
++    // fragment copies below. The value-ceiling refusal is weighed inside the move, on the
++    // very bytes it would commit (`metadata::flat_value_ceiling_crossed`); see
++    // `crates/core/src/metadata.rs:333-341` for what committing a record past it costs.
++    let move_ = metadata::repoint_chunk(
++        ctx.meta,
++        object.inode_id,
++        &object.prior,
++        plan.byte_offset,
++        &plan.prior,
++        new_placement,
++    )
++    .await;
++    let mut batch = match move_ {
++        Ok(metadata::Repoint::Prepared(batch)) => batch,
++        // The two terminal verdicts are weighed on the PLANNED generation alone — they carry
++        // no batch, so no root pin tested it. On a generation the root has since left they are
++        // a stale plan, the same retry a lost CAS is; only while it is still live are they the
++        // object's own defect.
++        Ok(metadata::Repoint::Refused { .. } | metadata::Repoint::VersionExhausted { .. })
++            if !still_current(ctx.meta, object).await? =>
++        {
++            return Ok(EvacOutcome::Conflict)
++        }
++        Ok(metadata::Repoint::Refused { bytes, ceiling }) => {
++            return Ok(EvacOutcome::Refused { bytes, ceiling })
++        }
++        Ok(metadata::Repoint::VersionExhausted { version }) => {
++            return Ok(EvacOutcome::Contained {
++                fault: format!("the record's version {version} cannot be advanced"),
++            })
++        }
++        Ok(metadata::Repoint::Conflict) => return Ok(EvacOutcome::Conflict),
++        // The move's typed verdict that THIS object's records cannot be rewritten, recovered
++        // by downcast as the scan recovers the resolver's. Anything else — a store fault
++        // under the read — is not this object's, and ends the pass.
++        Err(err) => match err.downcast::<ChunkMapError>() {
++            Ok(fault) => {
++                return Ok(EvacOutcome::Contained {
++                    fault: fault.to_string(),
++                })
++            }
++            Err(err) => return Err(err),
++        },
+     };
+ 
+-    // REFUSE, AND WRITE NOTHING AT ALL. A repoint whose re-encoded record would cross the
+-    // value ceiling the tightest backend enforces must never be attempted: on a store with
+-    // native enforcement it returns a raw `Err` indistinguishable from a transient fault,
+-    // and on one without it, it COMMITS a record every later repair of the object then fails
+-    // to overwrite (`crates/core/src/metadata.rs:333-341`). Judged here — after the
+-    // transient checks above, and still ahead of the fragment copies below — so a refusal
+-    // leaves no unreferenced copy on the target for GC to hold with no grace evidence for
+-    // it. The very bytes weighed are the bytes committed, so no re-encode can drift past
+-    // the check.
+-    let next_bytes = metadata::encode(&next);
+-    if let Some(ceiling) = metadata::flat_value_ceiling_crossed(&next_bytes) {
+-        return Ok(EvacOutcome::Refused {
+-            bytes: next_bytes.len(),
+-            ceiling,
+-        });
+-    }
+-
+     // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
+     // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
+     let mut displaced = Vec::new();
+@@ -554,10 +637,6 @@ async fn evacuate_chunk(
+         displaced.push((source, frag));
+     }
+ 
+-    let inode_key = metadata::inode_key(plan.inode_id);
+-    let mut batch = WriteBatch::new()
+-        .require(inode_key.clone(), metadata::encode(&plan.prior))
+-        .put(inode_key, next_bytes);
+     for (dserver, frag) in &displaced {
+         batch = batch.put(
+             crate::gc::orphan_key(*dserver, *frag),
+@@ -576,6 +655,15 @@ async fn evacuate_chunk(
+     }
+ }
+ 
++/// Whether the object's root still holds exactly the generation the move was planned from —
++/// the bytes [`metadata::repoint_chunk`]'s root pin would require, read fresh. A store fault
++/// is the pass's, not the object's, and ends it; the read is bounded by the `MetadataStore`
++/// implementation (#508/#636).
++async fn still_current(meta: &dyn MetadataStore, object: &EvacObject) -> Result<bool> {
++    let current = meta.get(&metadata::inode_key(object.inode_id)).await?;
++    Ok(current.as_deref() == Some(&metadata::encode(&object.prior)[..]))
++}
++
+ fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
+     std::str::from_utf8(key)
+         .ok()?
+@@ -648,26 +736,6 @@ fn emit_unresolvable(object: &str, fault: &str) {
+     );
+ }
+ 
+-/// Emit an evacuation this pass **may not perform** on the same seam: the chunk's bytes
+-/// live in a `seg:` record, whose evacuation write path is not built yet (deferred: #682).
+-///
+-/// A refusal writes **nothing at all** — the root and its `seg:` records are left
+-/// byte-identical — and it withholds the drain's certification, because an operator reading
+-/// a satisfied drain is being told the server is safe to decommission and will act on it.
+-///
+-/// Once per **object**, not once per chunk: the operator's unit of repair is the object, and
+-/// a line per chunk floods the seam for exactly the multipart objects this names.
+-fn emit_refused(object: &str) {
+-    tracing::warn!(monotonic_counter.rebalance_refused_records = 1_u64);
+-    tracing::warn!(
+-        target: "wyrd.custodian.rebalance.audit",
+-        action = "refused-segmented",
+-        inode = %object,
+-        reason = "segmented-chunk-map",
+-        "rebalance refused an evacuation it may not perform: this object's chunks live in seg: records and the write path for one is not built yet (#682); nothing was written and the drain is NOT certified",
+-    );
+-}
+-
+ /// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the
+ /// copied fragments are now collectable garbage.
+ fn emit_conflict(chunk: ChunkId) {
+@@ -681,9 +749,8 @@ fn emit_conflict(chunk: ChunkId) {
+ }
+ 
+ /// Emit a move **refused** because the repointed record would cross the backend value
+-/// ceiling ([`metadata::flat_value_ceiling_crossed`]) on the same seam. Like
+-/// [`emit_refused`]'s segmented refusal, nothing at all was written — not even a fragment
+-/// copy — and the drain is not certified.
++/// ceiling ([`metadata::flat_value_ceiling_crossed`]) on the same seam: nothing at all was
++/// written — not even a fragment copy — and the drain is not certified.
+ ///
+ /// Distinct from [`emit_conflict`] and from a plain abort, which are transient and worth
+ /// retrying next pass: this chunk's object will refuse every move until its record shrinks,
+diff --git a/crates/custodian/tests/segmented_map_evacuate.rs b/crates/custodian/tests/segmented_map_evacuate.rs
+new file mode 100644
+index 0000000..d36f4e8
+--- /dev/null
++++ b/crates/custodian/tests/segmented_map_evacuate.rs
+@@ -0,0 +1,842 @@
++//! Issue #722: **a D-server drain holding a `seg:`-resident fragment completes.**
++//!
++//! #696 stopped the rebalance pass aborting on a segmented object, but deliberately wrote
++//! nothing for one: an evacuation owed by a chunk whose `ChunkRef` lives in a `seg:` record was
++//! refused and stayed owed, every pass, forever — so the drain never certified and the server
++//! could never be retired. This file drives the drain through the placement move that
++//! addresses whichever record holds a chunk, and observes the **store** and the audit seam.
++//!
++//! Every leg goes through the REAL fenced control point
++//! [`reconcile_step`](wyrd_custodian::reconcile_step) over in-memory trait doubles:
++//!
++//! 1. a `seg:`-resident fragment is moved off the draining server, the `seg:` record is
++//!    repointed, the vacated position is orphan-marked, and the root is untouched;
++//! 2. two objects naming ONE chunk are BOTH repointed, so neither still names the drained
++//!    server and every fragment either names exists where it says;
++//! 3. a repoint that would push a `seg:` record past the value ceiling is refused: nothing is
++//!    written, nothing copied, and the drain does not certify;
++//! 4. a competing writer that takes the `seg:` record before the move commits wins: the move
++//!    writes no metadata, publishes no orphan mark, and the copied fragment is left in place.
++//!
++//! Legs 5–11 pin how the drain answers each verdict the move can give before anything is
++//! written, and the objects the scan must contain because the move cannot address them: a
++//! ceiling refusal on a superseded root is a retry, not an operator signal (5); a version that
++//! cannot advance (6) and a `seg:` record torn under the move (7) contain the object, named
++//! ONCE however many of its chunks meet it; a store fault under the move ends the pass (8); a
++//! chunk edited before the move reads it is a conflict that copied nothing (9); chunk lengths
++//! past `u64` (10) and a segmented root under a non-canonical key (11) contain the object at
++//! the scan, and the rest of the store still drains.
++//!
++//! On the base legs 1, 2 and 4 are red (the refusal plans no move at all — so leg 4 is red for
++//! the ordinary reason, not because it caught a race); leg 3 passes there for the other reason.
++//! Legs 5–11 are red on the base too: it refuses every segmented object outright, panics on
++//! leg 6's version, and moves leg 10's chunk instead of containing the object.
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::{Arc, Mutex, Once};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tracing::instrument::WithSubscriber;
++use tracing_subscriber::prelude::*;
++use wyrd_chunk_format::{encode as encode_fragment, EcSchemeType, FragmentHeader};
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{
++    decode, encode, inode_key, orphan_key, seg_key, ChunkMap, ChunkRef, EcScheme, InodeId,
++    InodeRecord, InodeState, SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap,
++    MAX_VALUE_BYTES,
++};
++use wyrd_core::placement::Topology;
++use wyrd_custodian::desired_state::{
++    reconciliation_status, set_lifecycle, DServerLifecycle, ReconciliationStatus,
++};
++use wyrd_custodian::{reconcile_step, Custodian, FencedZone, RebalanceContext, Reconciled};
++use wyrd_traits::{
++    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
++    ScanPage, WriteBatch,
++};
++
++// ---- the fixture's fleet ----
++
++/// The server the operator marks draining.
++const DRAINING: DServerId = 0;
++/// The chunk's two other fragments, which stay put.
++const SURVIVORS: [DServerId; 2] = [1, 2];
++/// The ONLY server in a failure domain distinct from every survivor's, so an evacuation that
++/// keeps the chunk's spread must land here. Twenty digits on purpose: leg 3's growth vector.
++const FREE: DServerId = u64::MAX;
++/// RS(2,1): three fragments, one per domain — the drained one at index 0.
++const SCHEME: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
++const CHUNK: ChunkId = 0xC4_A1;
++const SIBLING: ChunkId = 0x51_B1;
++const OTHER: ChunkId = 0x07_E4;
++const CHUNK_LEN: u64 = 5;
++const NONCE: &str = "0123456789abcdef0123456789abcdef";
++const A: InodeId = 3;
++const B: InodeId = 4;
++/// Leg 8's injected fault — a plain STORE error, deliberately not a typed chunk-map anomaly.
++const STORE_FAULT: &str = "metadata store unavailable";
++
++/// What the fenced step answers.
++type Answer = std::result::Result<Reconciled, wyrd_custodian::ReconcileError>;
++
++// ---- in-memory trait stores ----
++
++/// What the move's own re-read of a `seg:` record meets. The resolve reads a group's `seg:`
++/// records with `scan_page`, never `get`, so a `seg:` `get` during a pass is the move's.
++enum AtMoveRead {
++    /// A competing write lands just before the read.
++    Write(Vec<u8>, Bytes),
++    /// The store fails under the read.
++    Fail,
++}
++
++/// A `BTreeMap` metadata store with two seams: a write or fault at the move's own `seg:` read
++/// (before the move has prepared anything), and a competing write applied inside `commit`,
++/// AFTER the move has read and prepared its batch and BEFORE the batch's preconditions are
++/// checked — the window a racing writer takes the record in.
++#[derive(Default)]
++struct MemMeta {
++    kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
++    /// Leg 4: `(key, bytes)` written by the first commit that `put`s a `seg:` key.
++    racer: Mutex<Option<(Vec<u8>, Bytes)>>,
++    /// Legs 5 and 7–9: fired, once, by the first `seg:` `get`.
++    at_move_read: Mutex<Option<AtMoveRead>>,
++}
++
++#[async_trait]
++impl MetadataStore for MemMeta {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        if key.starts_with(b"seg:") {
++            let armed = self.at_move_read.lock().unwrap().take();
++            match armed {
++                Some(AtMoveRead::Write(key, bytes)) => {
++                    self.kv.lock().unwrap().insert(key, bytes);
++                }
++                Some(AtMoveRead::Fail) => return Err(STORE_FAULT.into()),
++                None => {}
++            }
++        }
++        Ok(self.kv.lock().unwrap().get(key).cloned())
++    }
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        let kv = self.kv.lock().unwrap();
++        let hits = kv.iter().filter(|(k, _)| k.starts_with(prefix));
++        Ok(hits.map(|(k, v)| (k.clone(), v.clone())).collect())
++    }
++    async fn scan_page(&self, prefix: &[u8], after: Option<&[u8]>, n: usize) -> Result<ScanPage> {
++        wyrd_testkit::test_double_scan_page(self, prefix, after, n).await
++    }
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let mut kv = self.kv.lock().unwrap();
++        if batch.puts.iter().any(|(k, _)| k.starts_with(b"seg:")) {
++            if let Some((key, bytes)) = self.racer.lock().unwrap().take() {
++                kv.insert(key, bytes);
++            }
++        }
++        let mut checks = batch.preconditions.iter();
++        if checks.any(|pre| kv.get(&pre.key).cloned() != pre.expected) {
++            return Ok(CommitOutcome::Conflict);
++        }
++        assert!(batch.deletes.is_empty(), "no leg deletes metadata");
++        kv.extend(batch.puts);
++        Ok(CommitOutcome::Committed)
++    }
++}
++
++#[derive(Default)]
++struct MemDServer(Mutex<HashMap<FragmentId, Bytes>>);
++
++#[async_trait]
++impl ChunkStore for MemDServer {
++    async fn put_fragment(&self, id: FragmentId, bytes: Bytes, _: Option<u64>) -> Result<()> {
++        self.0.lock().unwrap().insert(id, bytes);
++        Ok(())
++    }
++    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
++        Ok(self.0.lock().unwrap().get(&id).cloned())
++    }
++    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
++        Ok(self.0.lock().unwrap().keys().copied().collect())
++    }
++    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
++        self.0.lock().unwrap().remove(&id);
++        Ok(())
++    }
++    async fn health(&self) -> Result<Health> {
++        Ok(Health::Healthy)
++    }
++}
++
++// ---- the fixture ----
++
++fn frag(chunk: ChunkId, index: u16) -> FragmentId {
++    FragmentId { chunk, index }
++}
++
++/// The chunk every leg drains: RS(2,1), index 0 on [`DRAINING`].
++fn drained(id: ChunkId) -> ChunkRef {
++    ChunkRef {
++        id,
++        scheme: SCHEME,
++        len: CHUNK_LEN,
++        placement: vec![DRAINING, SURVIVORS[0], SURVIVORS[1]],
++    }
++}
++
++/// A chunk holding nothing on the draining server.
++fn settled(id: ChunkId, len: u64) -> ChunkRef {
++    ChunkRef {
++        id,
++        scheme: SCHEME,
++        len,
++        placement: vec![SURVIVORS[0], SURVIVORS[1], FREE],
++    }
++}
++
++fn answered(answer: Answer) -> Reconciled {
++    answer.unwrap_or_else(|err| panic!("the pass must COMPLETE and answer: {err}"))
++}
++
++/// Exactly one containment on the audit seam — one event and one counter tick — naming
++/// `object` by its store key.
++fn assert_contained_once(logged: &str, object: &str) {
++    let events = logged
++        .matches(r#""action":"unresolvable-chunk-map""#)
++        .count();
++    let ticks = r#""monotonic_counter.rebalance_unresolvable_records":1"#;
++    let counted = logged.matches(ticks).count();
++    assert_eq!((events, counted), (1, 1), "once per object: {logged}");
++    let named = logged.contains(&format!(r#""inode":"{object}""#));
++    assert!(named, "{object} not named: {logged}");
++}
++
++struct Fixture {
++    meta: MemMeta,
++    d: [(DServerId, MemDServer); 4],
++    topology: Topology,
++}
++
++impl Fixture {
++    /// Four failure domains, one server each; [`DRAINING`] marked draining.
++    async fn new() -> Self {
++        let meta = MemMeta::default();
++        set_lifecycle(&meta, DRAINING, DServerLifecycle::Draining)
++            .await
++            .unwrap();
++        let mut topology = Topology::default();
++        topology
++            .register(DRAINING, "A")
++            .register(SURVIVORS[0], "B")
++            .register(SURVIVORS[1], "C")
++            .register(FREE, "D");
++        let d = [DRAINING, SURVIVORS[0], SURVIVORS[1], FREE].map(|id| (id, MemDServer::default()));
++        Self { meta, d, topology }
++    }
++
++    /// ONE pass through the real fenced control point, its audit stream captured as JSON into
++    /// a per-pass temp file.
++    async fn pass(&self) -> (Answer, String) {
++        // `tracing` caches each callsite's interest process-globally on first hit, so a sibling
++        // test hitting an audit callsite with no subscriber installed would leave the capture
++        // below empty (wyrd #214). A permissive global default, installed once.
++        static INIT: Once = Once::new();
++        let permissive = || tracing::subscriber::set_global_default(tracing_subscriber::registry());
++        INIT.call_once(|| permissive().unwrap());
++        let fleet: Vec<(DServerId, &dyn ChunkStore)> = self
++            .d
++            .iter()
++            .map(|(id, s)| (*id, s as &dyn ChunkStore))
++            .collect();
++        let ctx = RebalanceContext {
++            meta: &self.meta,
++            fleet: &fleet,
++            topology: &self.topology,
++        };
++        let coord = MemCoordination::new();
++        let leader = Custodian::elect(&coord, "zone-722").await.unwrap();
++        let mut zone = FencedZone::new();
++        zone.install(leader.leadership());
++        let audit = tempfile::NamedTempFile::new().unwrap();
++        let json = tracing_subscriber::fmt::layer().json();
++        let layer = json.with_writer(Arc::new(audit.reopen().unwrap()));
++        let logging = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
++        let step = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), 10_000);
++        let answer = step.with_subscriber(logging).await;
++        (answer, std::fs::read_to_string(audit.path()).unwrap())
++    }
++
++    /// Arm the move's own `seg:` read; [`Self::fired`] then proves the move reached it.
++    fn arm(&self, at: AtMoveRead) {
++        *self.meta.at_move_read.lock().unwrap() = Some(at);
++    }
++
++    fn fired(&self) -> bool {
++        self.meta.at_move_read.lock().unwrap().is_none()
++    }
++
++    fn store(&self, dserver: DServerId) -> &MemDServer {
++        &self.d.iter().find(|(id, _)| *id == dserver).unwrap().1
++    }
++
++    /// Seed a committed **segmented** object: raw `seg:` records plus a segmented root (this
++    /// build ships no committer of segmented maps). Segment `i` holds `segments[i]`; returns
++    /// the `seg:` keys in table order. Epoch = inode, so two objects never share a range.
++    async fn seed_segmented(&self, inode: InodeId, segments: Vec<SegmentRecord>) -> Vec<Vec<u8>> {
++        let group = SegmentGroup::new(NONCE, inode).unwrap();
++        let mut table = Vec::new();
++        let mut keys = Vec::new();
++        for (index, record) in segments.iter().enumerate() {
++            let index = index as u32;
++            table.push(SegmentRef {
++                index,
++                byte_offset: record.byte_offset(),
++                byte_len: record.byte_len(),
++            });
++            let key = seg_key(&group, index).unwrap();
++            self.put(key.clone(), encode(record)).await;
++            keys.push(key);
++        }
++        let size = segments.iter().map(SegmentRecord::byte_len).sum();
++        let map = ChunkMap::Segmented(SegmentedMap::new(group, table).unwrap());
++        self.seed_root(inode, size, map, 0).await;
++        keys
++    }
++
++    /// Seed a committed root record at `inode` (`version` as given).
++    async fn seed_root(&self, inode: InodeId, size: u64, chunk_map: ChunkMap, version: u64) {
++        let root = InodeRecord {
++            size,
++            chunk_map,
++            state: InodeState::Committed,
++            version,
++            ..InodeRecord::new_empty()
++        };
++        self.put(inode_key(inode), encode(&root)).await;
++    }
++
++    /// Store each fragment of `chunk` on the server its placement names, as the on-disk
++    /// writer stamps it, so the intact-fragment check accepts it.
++    async fn put_fragments(&self, chunk: &ChunkRef) {
++        for (index, dserver) in chunk.placement.iter().enumerate() {
++            let id = frag(chunk.id, index as u16);
++            let bytes = fragment_bytes(id);
++            self.store(*dserver)
++                .put_fragment(id, bytes, None)
++                .await
++                .unwrap();
++        }
++    }
++
++    async fn put(&self, key: Vec<u8>, value: impl Into<Bytes>) {
++        let landed = self.meta.commit(WriteBatch::new().put(key, value)).await;
++        assert_eq!(landed.unwrap(), CommitOutcome::Committed);
++    }
++
++    async fn get(&self, key: &[u8]) -> Bytes {
++        let bytes = self.meta.get(key).await.unwrap();
++        bytes.expect("fixture: record present")
++    }
++
++    async fn segment(&self, key: &[u8]) -> SegmentRecord {
++        decode(&self.get(key).await).unwrap()
++    }
++
++    async fn holds(&self, dserver: DServerId, id: FragmentId) -> bool {
++        self.store(dserver)
++            .get_fragment(id)
++            .await
++            .unwrap()
++            .is_some()
++    }
++
++    async fn orphaned(&self, dserver: DServerId, id: FragmentId) -> bool {
++        let mark = self.meta.get(&orphan_key(dserver, id)).await.unwrap();
++        mark.is_some()
++    }
++
++    async fn no_orphan_marks(&self) -> bool {
++        self.meta.scan(b"orphan:").await.unwrap().is_empty()
++    }
++
++    async fn status(&self) -> ReconciliationStatus {
++        reconciliation_status(&self.meta, DRAINING).await.unwrap()
++    }
++}
++
++fn fragment_bytes(id: FragmentId) -> Bytes {
++    let header = FragmentHeader {
++        ec_scheme_type: EcSchemeType::ReedSolomon,
++        ec_k: 2,
++        ec_m: 1,
++        ec_fragment_index: id.index,
++        ..FragmentHeader::new_v1(id.chunk, CHUNK_LEN)
++    };
++    Bytes::from(encode_fragment(&header, b"drain"))
++}
++
++fn segment(chunks: Vec<ChunkRef>, byte_offset: u64) -> SegmentRecord {
++    SegmentRecord::new(chunks, byte_offset).unwrap()
++}
++
++// ---- leg 1 ----
++
++/// **Leg 1 — BINDING.** A segmented object whose second segment holds a chunk with a fragment
++/// on the draining server. The pass must copy that fragment to the one server whose domain is
++/// distinct from the survivors', repoint the `seg:` record (and only it), orphan-mark the
++/// vacated position, and answer `Changed`. On the base it is refused and nothing moves.
++#[tokio::test]
++async fn a_seg_resident_fragment_is_evacuated_off_a_draining_server() {
++    let fx = Fixture::new().await;
++    let lead = settled(SIBLING, CHUNK_LEN);
++    let chunk = drained(CHUNK);
++    let segments = vec![
++        segment(vec![lead.clone()], 0),
++        segment(vec![chunk.clone()], CHUNK_LEN),
++    ];
++    let keys = fx.seed_segmented(A, segments).await;
++    fx.put_fragments(&lead).await;
++    fx.put_fragments(&chunk).await;
++    let root_before = fx.get(&inode_key(A)).await;
++    let lead_before = fx.get(&keys[0]).await;
++
++    let (answer, _) = fx.pass().await;
++
++    assert_eq!(answered(answer), Reconciled::Changed, "the move landed");
++    let moved = fx.segment(&keys[1]).await;
++    let placement = &moved.chunks()[0].placement;
++    assert_eq!(
++        placement,
++        &vec![FREE, SURVIVORS[0], SURVIVORS[1]],
++        "seg: repointed"
++    );
++    assert!(
++        !placement.contains(&DRAINING),
++        "still names the draining server"
++    );
++    assert!(
++        fx.holds(FREE, frag(CHUNK, 0)).await,
++        "fragment copied to its new home"
++    );
++    assert!(
++        fx.orphaned(DRAINING, frag(CHUNK, 0)).await,
++        "vacated position orphan-marked"
++    );
++    assert_eq!(
++        fx.get(&inode_key(A)).await,
++        root_before,
++        "the root is never rewritten"
++    );
++    assert_eq!(
++        fx.get(&keys[0]).await,
++        lead_before,
++        "an untouched segment stays untouched"
++    );
++    assert_eq!(
++        fx.status().await,
++        ReconciliationStatus::Satisfied,
++        "drain converged"
++    );
++}
++
++// ---- leg 2 ----
++
++/// **Leg 2 — BINDING.** Two committed segmented objects whose maps both name ONE chunk, one of
++/// whose fragments is on the draining server. Every committed reference must be repointed: an
++/// object left naming the drained server would name a fragment GC is free to reclaim once the
++/// other object's move orphan-marks it. On the base both are refused.
++#[tokio::test]
++async fn every_committed_reference_to_a_shared_chunk_is_repointed() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let a = fx
++        .seed_segmented(A, vec![segment(vec![chunk.clone()], 0)])
++        .await;
++    let b = fx
++        .seed_segmented(B, vec![segment(vec![chunk.clone()], 0)])
++        .await;
++    fx.put_fragments(&chunk).await;
++
++    let (answer, _) = fx.pass().await;
++
++    assert_eq!(answered(answer), Reconciled::Changed, "both moves landed");
++    for key in [&a[0], &b[0]] {
++        let record = fx.segment(key).await;
++        let named = &record.chunks()[0];
++        assert!(
++            !named.placement.contains(&DRAINING),
++            "still names the drained server"
++        );
++        for (index, dserver) in named.placement.iter().enumerate() {
++            let present = fx.holds(*dserver, frag(named.id, index as u16)).await;
++            assert!(present, "fragment {index} absent from server {dserver}");
++        }
++    }
++    assert_eq!(
++        fx.status().await,
++        ReconciliationStatus::Satisfied,
++        "drain converged"
++    );
++}
++
++// ---- leg 3 ----
++
++/// A `seg:` record encoding to EXACTLY `target` bytes: `head` first, then one-byte filler
++/// chunks, the first four of which have their id widened digit by digit to land on the byte.
++fn padded_segment(head: ChunkRef, target: usize) -> SegmentRecord {
++    let filler = |id: ChunkId| settled(id, 1);
++    let build = |fillers: &[ChunkId]| {
++        let mut chunks = vec![head.clone()];
++        chunks.extend(fillers.iter().copied().map(filler));
++        segment(chunks, 0)
++    };
++    let len = |fillers: &[ChunkId]| encode(&build(fillers)).len();
++    let mut fillers: Vec<ChunkId> = vec![1; 4];
++    while len(&[fillers.as_slice(), &[1]].concat()) <= target {
++        fillers.push(1);
++    }
++    // Each widened digit adds one byte; four ids give up to 152, more than one filler adds.
++    for slot in 0..4 {
++        while len(&fillers) < target && fillers[slot] < 10u128.pow(38) {
++            fillers[slot] *= 10;
++        }
++    }
++    let record = build(&fillers);
++    assert_eq!(
++        encode(&record).len(),
++        target,
++        "fixture: exact record length"
++    );
++    record
++}
++
++/// **Leg 3 — the ceiling refusal holds over a `seg:` record on the drain arm.** The record
++/// sits exactly ON the value ceiling ([`MAX_VALUE_BYTES`], admissible); moving the drained
++/// fragment to [`FREE`] widens one placement entry from one digit to twenty, pushing it past.
++/// Refused: the record is byte-identical, nothing is copied, and the drain does not certify.
++///
++/// Keyed to [`MAX_VALUE_BYTES`] because that is the ceiling the placement move weighs a `seg:`
++/// record against (`flat_value_ceiling_crossed`); a crossing of half of it would commit.
++/// Passes on the base too (refused for the segmented reason). Its negation is deleting the
++/// ceiling check: the move then commits an oversized record.
++#[tokio::test]
++async fn a_seg_repoint_past_the_value_ceiling_is_refused_and_writes_nothing() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let record = padded_segment(chunk.clone(), MAX_VALUE_BYTES);
++    let keys = fx.seed_segmented(A, vec![record]).await;
++    fx.put_fragments(&chunk).await;
++    let before = fx.meta.scan(b"").await.unwrap();
++
++    let (answer, _) = fx.pass().await;
++
++    assert_eq!(
++        answered(answer),
++        Reconciled::Blocked,
++        "the drain is not certified"
++    );
++    assert_eq!(
++        fx.meta.scan(b"").await.unwrap(),
++        before,
++        "a refusal wrote metadata"
++    );
++    assert!(
++        fx.get(&keys[0]).await.len() <= MAX_VALUE_BYTES,
++        "past the ceiling"
++    );
++    assert!(
++        !fx.holds(FREE, frag(CHUNK, 0)).await,
++        "a refused move copied a fragment"
++    );
++    assert!(
++        fx.holds(DRAINING, frag(CHUNK, 0)).await,
++        "fragment stays put"
++    );
++    assert_eq!(
++        fx.status().await,
++        ReconciliationStatus::Pending,
++        "drain still owed"
++    );
++}
++
++// ---- leg 4 ----
++
++/// **Leg 4 — a lost CAS writes no metadata and retracts nothing.** A competing writer edits a
++/// sibling chunk of the same `seg:` record after the move has read it and before its commit.
++/// The record must hold exactly the competing writer's bytes, no orphan mark for this move may
++/// exist, the drain is not certified — and the fragment already copied to [`FREE`] is LEFT IN
++/// PLACE, not deleted: a losing write never retracts what it published.
++///
++/// On the base no move is planned, so the racer never fires and this leg is red for that
++/// ordinary reason. Its conflict property is bound by the mutation oracle (delete the `seg:`
++/// precondition and the move overwrites the competing bytes) and by the DST property.
++#[tokio::test]
++async fn a_lost_cas_writes_no_metadata_and_leaves_the_copy_in_place() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let sibling = settled(SIBLING, CHUNK_LEN);
++    let seeded = segment(vec![chunk.clone(), sibling.clone()], 0);
++    let keys = fx.seed_segmented(A, vec![seeded]).await;
++    fx.put_fragments(&chunk).await;
++    fx.put_fragments(&sibling).await;
++    let mut edited = sibling.clone();
++    edited.placement = vec![SURVIVORS[1], FREE, SURVIVORS[0]];
++    let competing = encode(&segment(vec![chunk.clone(), edited], 0));
++    *fx.meta.racer.lock().unwrap() = Some((keys[0].clone(), competing.clone()));
++
++    let (answer, _) = fx.pass().await;
++
++    assert!(
++        fx.meta.racer.lock().unwrap().is_none(),
++        "the racer never fired"
++    );
++    assert_eq!(
++        answered(answer),
++        Reconciled::Blocked,
++        "a lost move does not certify"
++    );
++    assert_eq!(
++        fx.get(&keys[0]).await,
++        competing,
++        "the competing write was overwritten"
++    );
++    let marks = fx.meta.scan(b"orphan:").await.unwrap();
++    assert!(
++        marks.is_empty(),
++        "a lost move published orphan evidence: {marks:?}"
++    );
++    assert!(
++        fx.holds(FREE, frag(CHUNK, 0)).await,
++        "the copied fragment was retracted"
++    );
++    assert!(
++        fx.holds(DRAINING, frag(CHUNK, 0)).await,
++        "the source fragment moved"
++    );
++    assert_eq!(
++        fx.status().await,
++        ReconciliationStatus::Pending,
++        "drain still owed"
++    );
++}
++
++// ---- legs 5–9: the drain's answer to each verdict the move gives before it writes ----
++
++/// **Leg 5 — a ceiling refusal on a SUPERSEDED root is a retry, not an operator signal.** Leg
++/// 3's at-ceiling record, but a supersede moves the root to a fresh flat generation just before
++/// the move re-reads the (not yet collected) `seg:` record. The refusal was weighed on a
++/// generation the root has left, so the drain names a conflict — never `refused-ceiling`,
++/// which tells an operator the object must shrink — and writes and copies nothing.
++#[tokio::test]
++async fn a_ceiling_refusal_on_a_superseded_root_is_a_conflict() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let record = padded_segment(chunk.clone(), MAX_VALUE_BYTES);
++    let keys = fx.seed_segmented(A, vec![record]).await;
++    fx.put_fragments(&chunk).await;
++    let seg_before = fx.get(&keys[0]).await;
++    let successor = InodeRecord {
++        state: InodeState::Committed,
++        version: 1,
++        ..InodeRecord::new_empty()
++    };
++    fx.arm(AtMoveRead::Write(inode_key(A), encode(&successor)));
++
++    let (answer, logged) = fx.pass().await;
++
++    assert!(fx.fired(), "the move never re-read the seg: record");
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    let conflict = logged.contains(r#""action":"conflict""#);
++    let refused = logged.contains(r#""action":"refused-ceiling""#);
++    assert!(conflict && !refused, "a stale plan escalated: {logged}");
++    assert_eq!(fx.get(&keys[0]).await, seg_before, "a refusal wrote");
++    assert!(!fx.holds(FREE, frag(CHUNK, 0)).await, "a refusal copied");
++}
++
++/// **Leg 6 — a flat record whose version cannot advance is contained, named ONCE.** Two chunks
++/// owe a move in one flat object at `version == u64::MAX`; the move refuses to wrap the version
++/// for each. The object is named once — one line per chunk floods the seam — and nothing is
++/// written or copied. (The base wraps-or-panics on `version + 1`.)
++#[tokio::test]
++async fn a_version_that_cannot_advance_contains_the_object_once() {
++    let fx = Fixture::new().await;
++    let (one, two) = (drained(CHUNK), drained(SIBLING));
++    let map = ChunkMap::Flat(vec![one.clone(), two.clone()]);
++    fx.seed_root(A, 2 * CHUNK_LEN, map, u64::MAX).await;
++    fx.put_fragments(&one).await;
++    fx.put_fragments(&two).await;
++    let before = fx.meta.scan(b"").await.unwrap();
++
++    let (answer, logged) = fx.pass().await;
++
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    assert_contained_once(&logged, "inode:3");
++    let after = fx.meta.scan(b"").await.unwrap();
++    assert_eq!(after, before, "a contained move wrote metadata");
++    for id in [CHUNK, SIBLING] {
++        assert!(
++            !fx.holds(FREE, frag(id, 0)).await,
++            "a contained move copied"
++        );
++    }
++}
++
++/// **Leg 7 — a `seg:` record torn under the move contains the object, named ONCE.** Two chunks
++/// owe a move in one `seg:` record, which is torn just before the move re-reads it while the
++/// root still names it. Both moves find it unusable; the object is named once, and nothing is
++/// marked or copied.
++#[tokio::test]
++async fn a_seg_record_torn_under_the_move_contains_the_object_once() {
++    let fx = Fixture::new().await;
++    let (one, two) = (drained(CHUNK), drained(SIBLING));
++    let keys = fx
++        .seed_segmented(A, vec![segment(vec![one.clone(), two.clone()], 0)])
++        .await;
++    fx.put_fragments(&one).await;
++    fx.put_fragments(&two).await;
++    let root_before = fx.get(&inode_key(A)).await;
++    fx.arm(AtMoveRead::Write(
++        keys[0].clone(),
++        Bytes::from_static(b"torn"),
++    ));
++
++    let (answer, logged) = fx.pass().await;
++
++    assert!(fx.fired(), "the move never re-read the seg: record");
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    assert_contained_once(&logged, "inode:3");
++    assert_eq!(fx.get(&inode_key(A)).await, root_before, "root rewritten");
++    assert!(fx.no_orphan_marks().await, "a contained move marked");
++    for id in [CHUNK, SIBLING] {
++        assert!(
++            !fx.holds(FREE, frag(id, 0)).await,
++            "a contained move copied"
++        );
++    }
++}
++
++/// **Leg 8 — a store fault under the move's own read ends the pass.** Not this object's
++/// fault, so it is not contained as one: the pass answers `Err`, carrying the fault, with
++/// nothing copied and nothing marked.
++#[tokio::test]
++async fn a_store_fault_under_the_moves_read_ends_the_pass() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    fx.seed_segmented(A, vec![segment(vec![chunk.clone()], 0)])
++        .await;
++    fx.put_fragments(&chunk).await;
++    fx.arm(AtMoveRead::Fail);
++
++    let (answer, _) = fx.pass().await;
++
++    let err = answer.expect_err("a store fault under the move must end the pass");
++    assert!(
++        err.to_string().contains(STORE_FAULT),
++        "not the fault: {err}"
++    );
++    assert!(
++        !fx.holds(FREE, frag(CHUNK, 0)).await,
++        "copied before failing"
++    );
++    assert!(fx.no_orphan_marks().await, "marked before failing");
++}
++
++/// **Leg 9 — a chunk edited before the move reads it is a conflict that copied nothing.** A
++/// competing writer re-places the planned chunk's last fragment (bytes first) just before the
++/// move re-reads the `seg:` record. The move no longer finds the chunk it planned, so it
++/// prepares nothing: the competing bytes stand, nothing is marked, and — unlike leg 4's
++/// commit-time loss — no fragment was copied to [`FREE`].
++#[tokio::test]
++async fn a_chunk_edited_before_the_move_reads_it_is_a_conflict_with_nothing_copied() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let sibling = settled(SIBLING, CHUNK_LEN);
++    let seeded = segment(vec![chunk.clone(), sibling.clone()], 0);
++    let keys = fx.seed_segmented(A, vec![seeded]).await;
++    fx.put_fragments(&chunk).await;
++    fx.put_fragments(&sibling).await;
++    let mut edited = chunk.clone();
++    edited.placement[2] = FREE;
++    let last = frag(CHUNK, 2);
++    let store = fx.store(FREE);
++    store
++        .put_fragment(last, fragment_bytes(last), None)
++        .await
++        .unwrap();
++    let competing = encode(&segment(vec![edited, sibling], 0));
++    fx.arm(AtMoveRead::Write(keys[0].clone(), competing.clone()));
++
++    let (answer, logged) = fx.pass().await;
++
++    assert!(fx.fired(), "the move never re-read the seg: record");
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    assert!(logged.contains(r#""action":"conflict""#), "{logged}");
++    assert_eq!(fx.get(&keys[0]).await, competing, "competing write lost");
++    assert!(fx.no_orphan_marks().await, "a stale plan marked");
++    assert!(!fx.holds(FREE, frag(CHUNK, 0)).await, "a stale plan copied");
++}
++
++// ---- legs 10–11: objects the move cannot address are contained at the scan ----
++
++/// **Leg 10 — chunk lengths past `u64` contain the object, and the walk goes on.** A flat
++/// object (flat lengths are not bounded at decode) whose drained chunk starts past
++/// `u64::MAX`: no offset can address it, so the object is named once — never a conflict every
++/// pass — and nothing of it moves, while a healthy object later in key order still drains.
++#[tokio::test]
++async fn chunk_lengths_past_u64_contain_the_object_and_the_rest_still_drains() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let lengths = vec![settled(SIBLING, u64::MAX), settled(1, 1), chunk.clone()];
++    fx.seed_root(A, u64::MAX, ChunkMap::Flat(lengths), 0).await;
++    fx.put_fragments(&chunk).await;
++    let healthy = drained(OTHER);
++    let keys = fx
++        .seed_segmented(B, vec![segment(vec![healthy.clone()], 0)])
++        .await;
++    fx.put_fragments(&healthy).await;
++    let root_before = fx.get(&inode_key(A)).await;
++
++    let (answer, logged) = fx.pass().await;
++
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    assert_contained_once(&logged, "inode:3");
++    assert_eq!(fx.get(&inode_key(A)).await, root_before, "root rewritten");
++    assert!(
++        !fx.holds(FREE, frag(CHUNK, 0)).await,
++        "an unaddressable copy"
++    );
++    let moved = fx.segment(&keys[0]).await;
++    let placement = &moved.chunks()[0].placement;
++    assert!(!placement.contains(&DRAINING), "the walk stopped");
++    assert!(
++        fx.holds(FREE, frag(OTHER, 0)).await,
++        "healthy bytes not moved"
++    );
++}
++
++/// **Leg 11 — a segmented root under a non-canonical key is contained, nothing copied.** The
++/// root sits at `inode:03`; the move would pin `inode:3`, which is not the row the scan read,
++/// so it could only copy the fragment and lose its CAS every pass. Contained and named by the
++/// row's own key instead, with nothing written, copied or marked.
++#[tokio::test]
++async fn a_segmented_root_under_a_non_canonical_key_is_contained() {
++    let fx = Fixture::new().await;
++    let chunk = drained(CHUNK);
++    let keys = fx
++        .seed_segmented(A, vec![segment(vec![chunk.clone()], 0)])
++        .await;
++    fx.put_fragments(&chunk).await;
++    let root = fx.meta.kv.lock().unwrap().remove(&inode_key(A)).unwrap();
++    fx.put(b"inode:03".to_vec(), root).await;
++    let seg_before = fx.get(&keys[0]).await;
++
++    let (answer, logged) = fx.pass().await;
++
++    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
++    assert_contained_once(&logged, "inode:03");
++    assert_eq!(fx.get(&keys[0]).await, seg_before, "seg: rewritten");
++    assert!(fx.no_orphan_marks().await, "a contained object marked");
++    assert!(!fx.holds(FREE, frag(CHUNK, 0)).await, "a doomed copy");
++}
+diff --git a/crates/custodian/tests/segmented_map_rebalance.rs b/crates/custodian/tests/segmented_map_rebalance.rs
+index 76dde74..c5f086e 100644
+--- a/crates/custodian/tests/segmented_map_rebalance.rs
++++ b/crates/custodian/tests/segmented_map_rebalance.rs
+@@ -12,7 +12,11 @@
+ //! anyway because they are the only two that go red against an **over-broad** fix: one that
+ //! blocks every store holding a segmented object (then no decommission ever certifies — this
+ //! slice's own defect in mirror image), or one that contains a store fault as if it were one
+-//! object's. Every leg drives the REAL fenced control point
++//! object's.
++//!
++//! Leg 2 originally pinned #696's refusal of a segmented evacuation; #722 built the move for a
++//! `seg:`-resident chunk, so it now pins the evacuation landing instead (the deeper legs live in
++//! `tests/segmented_map_evacuate.rs`). Every leg drives the REAL fenced control point
+ //! [`reconcile_step`](wyrd_custodian::reconcile_step) over in-memory trait doubles —
+ //! `rebalance::reconcile` is `pub(crate)`, and a test-only entry would prove nothing.
+ 
+@@ -326,37 +330,58 @@ async fn a_segmented_object_no_longer_ends_the_pass_and_the_flat_work_still_happ
+     fx.assert_flat_evacuated().await;
+ }
+ 
+-/// **Leg 2 — an evacuation this pass may not perform is refused ONCE, mutates nothing, and the
+-/// pass does not certify.** Three chunks, two of them on the draining server: two evacuations
+-/// owed, one object to name.
++/// **Leg 2 — an owed segmented evacuation now LANDS (#722), writing only the `seg:` records
++/// that hold the moved chunks.** Three chunks, two of them on the draining server: both are
++/// copied to [`TARGET`], each one's `seg:` record is repointed, each vacated position is
++/// orphan-marked, and the root and the untouched segment stay byte-identical.
+ #[tokio::test]
+-async fn an_owed_segmented_evacuation_is_refused_once_and_mutates_nothing() {
++async fn an_owed_segmented_evacuation_lands_in_the_seg_records() {
+     let fx = Fixture::new().await;
+     let owing = [(SEG[0], DRAINING), (SEG[1], DRAINING), (SEG[2], 2)];
+     fx.seed_segmented(SEGMENTED, &owing, true).await;
+-    let before = fx.meta.scan(b"").await.unwrap();
++    let group = SegmentGroup::new(NONCE, SEGMENTED).unwrap();
++    let key = |index: u32| seg_key(&group, index).unwrap();
++    let root_before = fx.meta.get(&inode_key(SEGMENTED)).await.unwrap();
++    let untouched_before = fx.meta.get(&key(2)).await.unwrap();
+ 
+     let (answer, logged) = fx.pass().await;
+ 
+-    assert_eq!(answered(answer), Reconciled::Blocked, "drain withheld");
+-    for chunk in [SEG[0], SEG[1]] {
+-        assert!(fx.holds(DRAINING, chunk).await, "fragment stayed put");
++    assert_eq!(answered(answer), Reconciled::Changed, "both moves landed");
++    for (index, chunk) in [(0, SEG[0]), (1, SEG[1])] {
++        let record: SegmentRecord =
++            decode(&fx.meta.get(&key(index)).await.unwrap().unwrap()).unwrap();
++        assert_eq!(
++            record.chunks()[0].placement,
++            vec![TARGET],
++            "seg: {index} repointed"
++        );
++        assert!(
++            fx.holds(TARGET, chunk).await,
++            "fragment copied to its new home"
++        );
++        let vacated = orphan_key(DRAINING, FragmentId { chunk, index: 0 });
++        assert!(
++            fx.meta.get(&vacated).await.unwrap().is_some(),
++            "vacated position marked"
++        );
+     }
+-    // A refusal writes NOTHING — the segmented write path is #682's. The compare is over EVERY
+-    // key the store holds, byte for byte: every `seg:` record and the root record, whose
+-    // encoding carries its `version` — so an unchanged root generation is part of the equality.
+-    let after = fx.meta.scan(b"").await.unwrap();
+-    assert_eq!(after, before, "a refusal wrote something");
+-    // Once per OBJECT, not once per chunk — two evacuations are owed here.
+-    let refusals = logged.matches(r#""action":"refused-segmented""#).count();
+-    assert_eq!(refusals, 1, "one refusal per object: {logged}");
+-    // ...and attributed: a blocker an operator cannot name is a stall with no way out. The
+-    // counter is matched by its WHOLE emitted field, prefix and value — a bare name substring
+-    // still passes if the emitter loses the `monotonic_counter.` prefix the metric needs.
+-    let named = logged.contains(&format!(r#""inode":"inode:{SEGMENTED}""#));
+-    let reason = logged.contains(r#""reason":"segmented-chunk-map""#);
+-    let counted = logged.contains(r#""monotonic_counter.rebalance_refused_records":1"#);
+-    assert!(named && reason && counted, "unattributed: {logged}");
++    let root_after = fx.meta.get(&inode_key(SEGMENTED)).await.unwrap();
++    assert_eq!(
++        root_after, root_before,
++        "a placement move never rewrites the root"
++    );
++    let untouched_after = fx.meta.get(&key(2)).await.unwrap();
++    assert_eq!(
++        untouched_after, untouched_before,
++        "a segment owing nothing was rewritten"
++    );
++    // The audit seam names each move, and no refusal survives.
++    assert_eq!(
++        logged.matches(r#""action":"evacuate""#).count(),
++        2,
++        "{logged}"
++    );
++    assert!(!logged.contains("refused-segmented"), "{logged}");
+ }
+ 
+ /// **Leg 3 — an unreadable committed object is named, the walk continues, and nothing
+diff --git a/crates/dst/tests/custodian.rs b/crates/dst/tests/custodian.rs
+index 92567a3..f5043db 100644
+--- a/crates/dst/tests/custodian.rs
++++ b/crates/dst/tests/custodian.rs
+@@ -5900,6 +5900,302 @@ async fn prop_restore_fence_reaches_the_contested_window() {
+     }
+ }
+ 
++// ---- property 19: a drain's placement move inside a `seg:` record versus a writer that
++//      changes what it pinned — every attempt is all-or-nothing (#722, 0016 decision 7(f)) ----
++//
++// The rebalance pass moves a fragment off a draining server by repointing the `seg:` record
++// that holds its chunk, conditioned on two records: the ROOT generation it resolved (a
++// supersede always moves the root first, `0016:2452-2462`) and the `seg:` record as the move
++// itself re-reads it. A racing writer can change either before the move's commit. The seed
++// picks which record it changes and which write the store applies first, and each
++// interleaving has its own declared outcome:
++//
++// * the racing write lands FIRST — the move's precondition fails, so it writes NOTHING: no
++//   placement and no orphan mark, and the object still names its pre-move fragment;
++// * the move lands FIRST — it commits in full, placement AND orphan mark together, and the
++//   racer then loses its own CAS (same `seg:` key) or lands on a different key (the root).
++//
++// Across both: all-or-nothing per attempt, and the live generation never names a fragment
++// that does not exist.
++//
++// **What this proves, and what it does not.** It proves the move's two CAS preconditions —
++// delete either `require` from `metadata::repoint_chunk` and it goes red within the
++// `MADSIM_TEST_NUM` sweep. It does NOT reach the read→prepare window: the racing batch is
++// applied inside the move's own `commit()`, strictly after the move's read of the `seg:`
++// record, so it never exercises what the drain does with an answer the move gives BEFORE it
++// prepares a batch. That is scripted, not swept: the shared primitive's own re-read by the
++// deterministic legs of `crates/custodian/tests/segmented_map_repoint.rs` (which drive the
++// reconstruction caller), and the drain's handling of each prepare-time answer — a chunk
++// edited under the move, a ceiling refusal on a superseded root, a torn `seg:` record, a
++// store fault — by legs 5–9 of `crates/custodian/tests/segmented_map_evacuate.rs`.
++
++/// The segment-group nonce this property's fixture is keyed by (32 lowercase hex characters).
++const DRAIN_RACE_NONCE: &str = "abcdef0123456789abcdef0123456789";
++
++/// Which pinned record the racing writer changes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum DrainRacer {
++    /// The **root**: a fresh flat generation supersedes the segmented one, its own fragments
++    /// already on the fleet. The move never rewrites the root, so this write and a landed move
++    /// touch different keys — both may commit, in either order.
++    Supersede,
++    /// The **`seg:` record**: a competing writer moves the same fragment itself. Same key as
++    /// the move, so whichever commits second loses its CAS and writes nothing.
++    Rewrite,
++}
++
++/// A store that applies `pending` inside the move's own commit — the one batch a rebalance
++/// pass sends carrying a positive precondition, as [`CrashMeta`] identifies it.
++/// `move_first` picks the order the two batches are applied in.
++struct RaceAtDrainMove {
++    inner: MemMeta,
++    pending: Mutex<Option<WriteBatch>>,
++    move_first: bool,
++    /// What the racing write did once applied — `None` until it has run.
++    racer_outcome: Mutex<Option<CommitOutcome>>,
++}
++
++#[async_trait]
++impl MetadataStore for RaceAtDrainMove {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<wyrd_traits::ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let pinned = batch.preconditions.iter().any(|pre| pre.expected.is_some());
++        let racer = if pinned {
++            self.pending.lock().unwrap().take()
++        } else {
++            None
++        };
++        let Some(racer) = racer else {
++            return self.inner.commit(batch).await;
++        };
++        if self.move_first {
++            let landed = self.inner.commit(batch).await?;
++            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
++            Ok(landed)
++        } else {
++            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
++            self.inner.commit(batch).await
++        }
++    }
++}
++
++/// Re-spell the committed RS(2,1) object at [`INODE`] as a **segmented** generation: one `seg:`
++/// record holding its chunk, plus a segmented root naming that group. Raw records written by
++/// hand, never a committer (this build ships no producer of segmented maps).
++async fn respell_as_one_segment(meta: &MemMeta, chunk: ChunkRef) -> Vec<u8> {
++    let group = metadata::SegmentGroup::new(DRAIN_RACE_NONCE, 1).unwrap();
++    let record = metadata::SegmentRecord::new(vec![chunk], 0).unwrap();
++    let table = vec![metadata::SegmentRef {
++        index: 0,
++        byte_offset: 0,
++        byte_len: record.byte_len(),
++    }];
++    let root = InodeRecord {
++        size: record.byte_len(),
++        chunk_map: metadata::ChunkMap::Segmented(
++            metadata::SegmentedMap::new(group.clone(), table).unwrap(),
++        ),
++        state: InodeState::Committed,
++        version: 2,
++        ..Default::default()
++    };
++    let key = seg_row(&group, 0);
++    let batch = WriteBatch::new()
++        .put(key.clone(), metadata::encode(&record))
++        .put(metadata::inode_key(INODE), metadata::encode(&root));
++    assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
++    key
++}
++
++async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8Rng) {
++    let d = servers();
++    let fleet = fleet_of(&d);
++    let meta = MemMeta::default();
++    write_rs_2_1(&meta, &fleet).await;
++    let chunk = read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].clone();
++    let seg_key = respell_as_one_segment(&meta, chunk.clone()).await;
++    let seeded = meta.get(&seg_key).await.unwrap().unwrap();
++    let root_key = metadata::inode_key(INODE);
++    let root_before = meta.get(&root_key).await.unwrap().unwrap();
++
++    // The seed picks the draining server (fragment `i` lives on server `i`), which pinned
++    // record the racer changes, and which of the two writes the store applies first.
++    let drained = (rng.next_u32() as usize % N) as u16;
++    wyrd_custodian::desired_state::set_lifecycle(
++        &meta,
++        u64::from(drained),
++        wyrd_custodian::desired_state::DServerLifecycle::Draining,
++    )
++    .await
++    .unwrap();
++    let racer = if rng.next_u32().is_multiple_of(2) {
++        DrainRacer::Supersede
++    } else {
++        DrainRacer::Rewrite
++    };
++    let move_first = rng.next_u32().is_multiple_of(2);
++
++    // With the drained server's domain out of the pool, the only domain distinct from both
++    // survivors is D (server 3), so the move's answer is known up front.
++    let mut moved = chunk.clone();
++    moved.placement[drained as usize] = 3;
++    let repointed = metadata::encode(&metadata::SegmentRecord::new(vec![moved], 0).unwrap());
++    let (pending, after_racer) = match racer {
++        DrainRacer::Supersede => {
++            // A fresh generation, its fragments really on the fleet, CAS'd on the root the
++            // move pinned, as a real publish is.
++            let mut next = 0x2000u128;
++            let plan = write::plan_write(b"the superseding generation", 8, EcScheme::None, || {
++                next += 1;
++                next
++            })
++            .unwrap();
++            write::write_fragments(&fleet, &plan).await.unwrap();
++            let new_root = InodeRecord {
++                size: plan.size,
++                chunk_map: plan.chunk_refs().into(),
++                state: InodeState::Committed,
++                version: 3,
++                ..Default::default()
++            };
++            let batch = WriteBatch::new()
++                .require(root_key.clone(), root_before.clone())
++                .put(root_key.clone(), metadata::encode(&new_root));
++            (batch, seeded.clone())
++        }
++        DrainRacer::Rewrite => {
++            // A competing writer that already moved this very fragment to server 3 — bytes
++            // first, then the record, so whichever write wins names bytes that exist.
++            let bytes = d[drained as usize]
++                .get_fragment(frag(drained))
++                .await
++                .unwrap();
++            let bytes = bytes.expect("the fixture placed every fragment");
++            d[3].put_fragment(frag(drained), bytes, None).await.unwrap();
++            let batch = WriteBatch::new()
++                .require(seg_key.clone(), seeded.clone())
++                .put(seg_key.clone(), repointed.clone());
++            (batch, repointed.clone())
++        }
++    };
++
++    let store = RaceAtDrainMove {
++        inner: meta,
++        pending: Mutex::new(Some(pending)),
++        move_first,
++        racer_outcome: Mutex::new(None),
++    };
++    let topo = four_domains();
++    let all: Vec<(DServerId, &dyn ChunkStore)> = (0u64..4)
++        .map(|id| (id, &d[id as usize] as &dyn ChunkStore))
++        .collect();
++    let ctx = wyrd_custodian::RebalanceContext {
++        meta: &store,
++        fleet: &all,
++        topology: &topo,
++    };
++    let coord = MemCoordination::new();
++    let (zone, custodian) = elect(&coord, "zone-drain-race").await;
++    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
++        .await
++        .expect("a raced move is a lost CAS, never an error that ends the pass");
++
++    let arm = format!("drained {drained}, racer {racer:?}, move first: {move_first}");
++    assert!(
++        store.racer_outcome.lock().unwrap().is_some(),
++        "the racer never fired — the move never reached its commit ({arm})"
++    );
++    let stored = store.get(&seg_key).await.unwrap().expect("the seg: record");
++    let orphans: Vec<Vec<u8>> = store
++        .scan(b"orphan:")
++        .await
++        .unwrap()
++        .into_iter()
++        .map(|(key, _)| key)
++        .collect();
++    if move_first {
++        // The move landed WHOLE: placement and orphan mark are one commit.
++        assert_eq!(
++            stored, repointed,
++            "the move went first and its placement is missing ({arm})"
++        );
++        let vacated = metadata::orphan_key(u64::from(drained), frag(drained));
++        assert_eq!(
++            orphans,
++            vec![vacated],
++            "exactly the vacated position is marked ({arm})"
++        );
++        assert_eq!(
++            answer,
++            Reconciled::Changed,
++            "a landed move converges ({arm})"
++        );
++        // A writer that pinned the same record loses; one that pinned only the root does not,
++        // because a move never rewrites the root.
++        let expected = match racer {
++            DrainRacer::Supersede => CommitOutcome::Committed,
++            DrainRacer::Rewrite => CommitOutcome::Conflict,
++        };
++        let outcome = *store.racer_outcome.lock().unwrap();
++        assert_eq!(
++            outcome,
++            Some(expected),
++            "the racing write's outcome ({arm})"
++        );
++    } else {
++        // The move lost, so it wrote NOTHING: not the placement, not the orphan mark.
++        assert_eq!(
++            stored, after_racer,
++            "a lost move still rewrote the record ({arm})"
++        );
++        assert!(
++            orphans.is_empty(),
++            "a lost move still marked a fragment for reclamation ({arm}): {orphans:?}"
++        );
++        assert_eq!(
++            answer,
++            Reconciled::Blocked,
++            "a lost move never certifies ({arm})"
++        );
++        let outcome = *store.racer_outcome.lock().unwrap();
++        assert_eq!(
++            outcome,
++            Some(CommitOutcome::Committed),
++            "the racer went first ({arm})"
++        );
++    }
++
++    // However the race resolved, the LIVE generation names only fragments that exist.
++    let live = metadata::resolve_current_chunk_map(&store, &root_key)
++        .await
++        .expect("the live generation resolves")
++        .expect("the object is live here");
++    for (dserver, fragment) in fragments_of(&live.chunks) {
++        let held = d[dserver as usize].get_fragment(fragment).await.unwrap();
++        assert!(
++            held.is_some(),
++            "the live generation names {fragment:?} on server {dserver}, which holds no such \
++             bytes ({arm})"
++        );
++    }
++}
++
+ // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
+ 
+ /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
+@@ -6084,6 +6380,12 @@ dst_campaign_test! {
+     }
+ }
+ 
++dst_campaign_test! {
++    async fn drain_repoint_versus_supersede_is_all_or_nothing() {
++        prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rand_seed()).await;
++    }
++}
++
+ // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
+ 
+ /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
+@@ -6125,6 +6427,7 @@ dst_campaign_test! {
+             prop_staged_replace_under_the_fence_strands_nothing(&mut rng).await;
+             prop_restore_fence_never_shares_the_epoch(&mut rng).await;
+             prop_restore_fence_settles_an_ambiguous_commit(&mut rng).await;
++            prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rng).await;
+         }
+     }
+ }
