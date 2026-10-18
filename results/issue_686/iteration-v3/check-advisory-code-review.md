@@ -1,0 +1,6 @@
+- No introduced correctness defects found. The owned flat path moves the original chunk list and framing fields (`crates/core/src/metadata.rs:3122`), and the streamed GET moves them into its response and reader (`crates/server/src/lib.rs:432`, `crates/server/src/lib.rs:454`). Restart framing and terminal deletion behavior are preserved (`crates/core/src/metadata.rs:3155`). The regression test checks non-empty outer and placement buffers plus unchanged contents (`crates/core/tests/streamed_read_chunk_map_ownership.rs:115`).
+- No actionable reuse, simplification, or efficiency findings. Both resolver entries share segment assembly (`crates/core/src/metadata.rs:3010`) and the existing segment reader; the owned entry delegates restarts to the existing current-root resolver (`crates/core/src/metadata.rs:3146`). No record or chunk-list copy occurs on the primary flat path.
+
+Validation: reviewed the supplied frozen gate evidence; no builds were rerun. The four new tests and all four GET suites named in the brief passed; instrumentable diff coverage was 100%. Full CI remains failed on unchanged TiKV/rustls dependency advisories. The pre-fix verification leg is UNVERIFIABLE because the new API is absent on the reverted base, as declared in the brief. These existing gate outcomes are not additional findings against this diff.
+
+<!-- pdca:leaf-complete -->

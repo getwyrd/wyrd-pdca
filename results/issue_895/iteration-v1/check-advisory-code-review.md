@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/tests/multipart_abort.rs:1113`: The test claiming that a moved session clears commit doubt does not detect failure to clear it. It moves directly to `Completing`, whose refusal returns without consulting the retained doubt (`crates/core/src/multipart/abort.rs:309`). The frozen C5 log confirms that replacing `Doubt::settle` with a no-op survives. Add a deterministic case that holds the first fence, moves the session to a later `Open` epoch, then fails the next commit with a transient fault; assert `AbortError::Stopped` with `ErrorClass::Transient` and that releasing the old fence conflicts. Also cover an unapplied `may_still_commit: false` outcome followed by a successful unchanged read and a plain fault. These cases make both clearing branches observable and catch stale uncertainty incorrectly turning a definite failure into `Indeterminate`.
+
+No introduced production correctness bug or actionable reuse, simplification, or efficiency issue found. Reviewed the target source and frozen gate evidence; no builds or mutations were run against the read-only target.
+
+<!-- pdca:leaf-complete -->

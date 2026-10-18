@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/src/multipart/create.rs:351`: Recovery can discard an identity that this create successfully admitted. If a commit applies but returns `CommitUnknownResult { may_still_commit: false }`, and a teardown fences its session before recovery reads it, the stored record is now `Aborting@1`, not R. The loop clears `unsettled` and re-mints at line 370, potentially admitting a second session while never reporting the first identity. `SessionRecord::open_teardown` (`crates/core/src/multipart.rs:2509`) provides exactly this state change without deleting the session, so the #659 terminal-delete deferral does not exclude the trace. Preserve the original identity when the differing record may be this create's transitioned session (for example, report `InDoubt`), and add an applied-1021-then-fence regression. The brief's row-3 rule needs the same distinction. This confirms the frozen T4 finding.
+
+No additional correctness or actionable reuse, simplification, or efficiency findings. Validation used target-source inspection and the frozen gate logs; tests were not rerun.
+
+<!-- pdca:leaf-complete -->

@@ -1,90 +1,19 @@
-# Adversarial review — issue 778 (wyrd-build-identity-derived-and-logged)
+# Adversarial review — issue 778 (build identity derived and logged)
 
-The toolchain was available (cargo 1.96.0, git 2.53.0), so every claim below was re-run against
-the patch's own `build.rs` and `derivation.rs` in throwaway probe crates. Overall: the red→green
-proof holds and the core design survived every correctness attack I tried. Three findings remain,
-and one of them is the same defect T4 already reported.
+**Verdict:** the red→green evidence holds. T4's one blocking finding is real. I reproduced it end to end with a real git tag and the patch's own `build.rs`. Fixing only the line T4 cites would not be enough. One lower-priority impersonation case is left for a human to decide.
 
-## Findings
+## Refutations that landed
 
-- NEEDS-HUMAN [impl] — `crates/server/build.rs:53` (used at `:55`): `std::env::var("WYRD_VERSION").ok()`
-  turns a **non-UTF-8 override into "unset"**, so the build silently drops to rung 2 with no
-  error and no `cargo:warning`. I reproduced it with the patch's build script in a probe
-  crate: `WYRD_VERSION='bad value'` panics with a clear message ("WYRD_VERSION is not usable …"),
-  but `WYRD_VERSION=$'\xff\xfe'` exits 0 and bakes `0.0.0+git.1f0a62e`. That breaks the
-  contract stated at `crates/server/src/version/derivation.rs:137` ("an invalid one is an `Err`:
-  … a silent substitute would break exactly the equality it exists for"). It is also the
-  rubric's *absent or unsupported entries → never a silent skip* class. This **confirms T4's two
-  blocking items** (`gate-logs/T4-batch-review.log`); they are one defect, not new. Fix: read
-  `std::env::var_os`, and when the value is present but not UTF-8, panic the same way an invalid
-  value does. The pure `resolve` takes `&str`, so it cannot pin this. A unix-only case in
-  `src/version/build_script_tests.rs` can: build with `OsStr::from_bytes(b"\xff")` and assert
-  the build fails.
+- NEEDS-HUMAN [impl] — `crates/server/src/version/derivation.rs:205` **and** `:42`: Rust's `str::trim` strips *Unicode* whitespace, and git accepts any byte from 0x80 up in a tag name. So a tag `v1.2.3<U+00A0>` (U+00A0 is the no-break space) becomes `1.2.3`, the same identity as the real `v1.2.3`. It gets `Rung::Describe` (the git-derived rung) with **no warning**. That breaks the brief's rule "distinct inputs must not become one identity". **Reproduced end to end:** I made two repos, one with `git tag v1.2.3` on commit `6d78c19` and one with `git tag $'v1.2.3\xc2\xa0'` on commit `57c56ba`. I built a probe crate whose `build =` is the patch's `crates/server/build.rs` in each repo. **Both binaries baked `1.2.3`**, and neither build printed a `cargo:warning`. The resolver alone gives the same result for `\u{3000}v1.2.3` (ideographic space) and `v1.2.3\u{0085}` (NEL). **Fixing only `:205` is not enough.** `resolve` hands the text to `normalize_describe`, which trims again at `:42`. I patched a copy with `trim_ascii()` at `:205` only, and it still returned `identity="1.2.3" rung=Describe`. With `trim_ascii()` at **both** `:205` and `:42`, rung 2 fails closed to `0.0.0+git.bbbb222`. All five inputs of the pinned `normalize_describe_covers_all_three_shapes` (`xtask/tests/dist_templates.rs:336-357`), plus a `\n`-terminated one, still normalize the same. On the dist side, `derive_version` (`xtask/src/dist.rs:546-554`) then refuses the tag with a clear error instead of silently writing `1.2.3` to `VERSION`. That is safe, because git forbids ASCII whitespace in ref names, so `trim_ascii` only drops the newline. **The discriminator test cannot catch this:** its probe also uses Unicode `trim` (`crates/server/tests/build_identity_startup_log.rs:94`). On such a tag its exact-match branch computes `tag_version = "1.2.3"` and accepts `version.ends_with("1.2.3")` (`:262-264`). Pin it with resolver unit cases in `derivation.rs`'s test module instead: NBSP, U+3000 and U+0085, leading and trailing, should all give `Rung::ShaFallback`.
 
-- NEEDS-HUMAN [human] — `gate-logs/C4-diff-cov.log:10`: the bundle **still does not apply on
-  `origin/main`**. This is the third round in a row; the round-2 carry-forward already said
-  "rebase and re-run the gates". The target tree is the patch on the "pre-fix base df68932f",
-  and the `cmd_s3` hunk sits at `crates/server/src/cli.rs:2388` (the brief cites `:2199`). So the
-  C4-ci and C4-verify greens are evidence for that old base, not for the merge result, and diff
-  coverage was never measured. The builder has now failed to move off this base twice when told
-  to, which suggests the driver is handing Do a stale base. A human should rebase, or tell the
-  driver to, before sign-off trusts these gates.
+- NEEDS-HUMAN [human] — `crates/server/src/version/derivation.rs:48-68` (used by rung 2 at `:208-225`): rung 2 trusts the *shape* of the describe text and never checks the sha it parses against HEAD's sha, even though `resolve` already receives `short_sha`. The resolver gave these results: tag `v0.0.0+git.abc12de` on commit `9999fff` → `0.0.0+git.abc12de` (`Rung::Describe`). That is byte-equal to an untagged build of commit `abc12de`. A non-`v` tag `deadbeef` on `1234abc` → `0.0.0+git.deadbeef`, an identity that names a commit the binary was not built from. By the same parse, a tag literally named `v1.0-3-gfoo` gives `1.0+git.3.foo`. The exact-match branch of the integration test (`build_identity_startup_log.rs:262-264`) accepts all of these. This is the same impersonation class the `dirty` refusal at `:209` was added for. A cheap guard: when the normalized form is the bare-sha or past-a-tag shape, require its sha part to match `short_sha`, otherwise fail closed. Every case needs a deliberately odd tag name, and the brief's validator list (leading `-`/`.`/`+`, length, tag-legal bytes) does not mention this. So it is a scope call whether to harden here, and it is fine to decline with a recorded reason. It should not trigger a rebuild on its own.
 
-- NEEDS-HUMAN [human] — `crates/server/src/version/derivation.rs:257` (`common_dir.join("refs")`,
-  watched recursively) against the doc claim at `crates/server/build.rs:13` ("re-runs when an
-  input to that answer can have moved, **and at no other time**"). That claim is false. The
-  whole `refs/` tree is watched, so a ref that cannot change `git describe --tags` of *this*
-  HEAD still re-runs the script and recompiles the crate. I reproduced this with the patch's
-  build script, a main repo, and two linked worktrees, building the probe in `wtA`:
-  - no-op rebuild → `fresh:true`
-  - `git commit` on branch `b` in sibling worktree `wtB` → `fresh:false`, identity unchanged
-    (`0.0.0+git.1f0a62e`)
-  - `git update-ref refs/remotes/origin/feature HEAD` (what `git fetch` does) → `fresh:false`,
-    identity unchanged
+## Attempted and could not refute
 
-  In `wyrd-server` each of these means recompiling the crate and relinking its ~41
-  integration-test binaries. That is the relink churn Decision 1 was meant to remove, now moved
-  from `git status` to sibling-worktree commits and fetches. It hits hardest in a
-  shared-common-dir, many-worktree setup like the harness's own `wyrd.pdca-wt-*` worktrees.
-  The brief's wording ("covers exactly that [HEAD/refs] and nothing wider") can be read either
-  way, so this is a judgment call:
-  - accept the churn and fix the doc's "at no other time" (an impl nit), or
-  - narrow the watch to `HEAD`, the branch ref HEAD names, `refs/tags/`, `packed-refs`,
-    `reftable/` and `shallow`. A branch switch already rewrites `HEAD`, which would re-resolve
-    the branch ref.
+- Red→green evidence: `gate-logs/C4-verify.log` goes RED at `crates/server/tests/build_identity_startup_log.rs:205` because the field is missing (the event shows `dservers, listen, message, region, role` only), and GREEN with the fix. It runs the production path: the built binary (`:19`, `CARGO_BIN_EXE_wyrd`) logs the field from `crates/server/src/cli.rs:2398`. Leg 2 really ran on the green leg. `note()` writes past libtest's capture (`:45-47`), and the verbatim log has no `SKIP provenance leg` line. Leg 2 binds to HEAD's short sha, so a constant could not pass.
+- Hand-off coupling: `obtain_binaries` passes the same `version` binding to `image_build_args` (`xtask/src/dist.rs:638`) that `run_dist` uses for `VERSION` (`:767`, `:711-716`). The Dockerfile declares `ARG WYRD_VERSION=""` globally (`deploy/docker/wyrd/Dockerfile:49`) and again in the build stage right before `RUN cargo build` (`:89-90`). An empty value falls through to rung 3 with a warning, never an empty identity (`derivation.rs:195`).
+- Leg 3: `normalize_describe_covers_all_three_shapes` is untouched by the diff (all hunks in `xtask/tests/dist_templates.rs` start at `:367`).
+- Rerun set (`derivation.rs:292-312`, `build.rs:122-181`): I tried `core.abbrev` changes (config is unwatched), `git maintenance` prefetch writing under `refs/`, a permission-denied `exists()`, and shifting symlink indexes. They are either deliberate tradeoffs the brief chose (Decision 1, documented as "coarse" at `build.rs:25-28`) or fail safe. None is a concrete wrong identity.
+- `C5-mutants` red: this is the declared environment noise (`xtask/tests/repo_hygiene_guards.rs:137` needs `.git`). The patch's own tests ran in that no-`.git` baseline and passed: the `wyrd-server` lib tests, including `build_script_tests` (`gate-logs/C5-mutants.log:1084-1162`), and the integration test (`:1187-1190`). The integration test printed its `SKIP provenance leg` reason visibly, which shows the skip path is not silent. So C5 produced no mutation signal on this diff, but the patch did not cause the red.
 
-- No action needed for this slice (informational): the `--host` hand-off at
-  `xtask/src/dist.rs:614` (`.env("WYRD_VERSION", version)`) is not asserted by any test. Deleting
-  it would survive `ci`, and a `--host` tarball built on a dirty tree would then carry a
-  binary without `.dirty` next to a `VERSION` that has it. Brief leg 4 names only the image
-  build, so this is outside the required criterion.
-
-## Refutation attempts that failed (the fix held)
-
-- **Red→green is genuine and uses the production path.** `gate-logs/C4-verify.log`: with
-  production reverted, the test panics at `crates/server/tests/build_identity_startup_log.rs:205`
-  (leg 1, "carries no string `version` field") against the real spawned `CARGO_BIN_EXE_wyrd`'s
-  `role started` JSON. With the fix, it passes. The green log has no `SKIP provenance leg` and
-  no `WYRD_VERSION=` note. `note()` writes straight to stderr, bypassing libtest capture (`:46`),
-  so it would have shown even on a passing run. That means leg 2's sha check actually ran;
-  it was not skipped.
-- **The shallow-boundary regression test really depends on the appearance watch.** I made a
-  mutant of `build.rs` that drops the `rerun-if-changed=<appear_dir>` line. On a full clone one
-  commit past `v1.2.3`, after `git fetch --depth=1 --no-tags origin HEAD`, the mtimes of
-  `HEAD`, `packed-refs` and `refs` did not change, `describe` printed `cd57dec`, and the mutant
-  still baked `1.2.3+git.1.cd57dec`. `a_full_clone_made_shallow_and_back_rebuilds_with_each_new_identity`
-  would go red against that mutant, so the test is not a tautology.
-- **Rung 1 / Docker hand-off.** `deploy/docker/wyrd/Dockerfile:49` (global `ARG WYRD_VERSION=""`)
-  plus `:89` (stage-scoped `ARG WYRD_VERSION`, before the `RUN cargo build` at `:90`): an unset
-  argument inherits `""`, which falls through to rung 2, then to rung 3 with a warning. It never
-  bakes an empty identity. `dist` hands the image build (`xtask/src/dist.rs:638`) and the
-  `VERSION` file (`:715`) the one `version` binding from `:759`; there is no re-derivation.
-- **Single source (leg 3).** `normalize_describe_covers_all_three_shapes` is untouched by the diff
-  and passes (`gate-logs/C4-ci.log:3100`). `xtask` includes the product file by `#[path]`, so the
-  dependency runs tooling→product only.
-- **Scope.** Nothing in `crates/gateway-s3`, no `S3Config` change, and only the `version` field
-  is added to the `s3` role's event. `build.rs` carries `#![forbid(unsafe_code)]`, and the
-  architecture doc is updated.
-- **C5-mutants** fails on its unmutated baseline at `xtask/tests/repo_hygiene_guards.rs:137`
-  (`git ls-files` in a scratch copy with no `.git`). The brief declared this as environment
-  noise, and it is not evidence against this patch.
+<!-- pdca:leaf-complete -->

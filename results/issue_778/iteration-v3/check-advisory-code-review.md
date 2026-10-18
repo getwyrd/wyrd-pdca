@@ -1,0 +1,3 @@
+- NEEDS-HUMAN [impl] — `crates/server/build.rs:53`: Reject a non-UTF-8 `WYRD_VERSION` instead of treating it as absent. `std::env::var(...).ok()` discards `VarError::NotUnicode`, bypassing the explicit-override validator and silently substituting a Git-derived or fallback identity. Running the target build script with `WYRD_VERSION` bytes `1.2.3\xff` succeeded and emitted `0.0.0+git.unknown`; an invalid ASCII override correctly failed. Distinguish `NotPresent` from `NotUnicode` and add a regression at the environment-reading boundary. The two frozen T4 entries describe this same defect.
+
+No additional correctness or actionable reuse, simplification, or efficiency findings.

@@ -1,0 +1,5 @@
+# Advisory review — SKIPPED (builder-declared external dependency confirmed, #341)
+
+The builder declared an unmet external dependency in build-notes.md and the claim was CONFIRMED deterministically (the named [[doctor.checks]] row's detect cmd exited non-zero), so the Check beat was not spent adjudicating a patch already stated to be unverifiable. Gates are recorded N/A; no reviewer or adversary ran. The bundle is resumable.
+
+- NEEDS-HUMAN — External dependency `deny-all-features-advisories` confirmed absent (detect cmd `cd "${WYRD_REPO:-../wyrd}" && cargo deny --offline --all-features --config deny-all-features.toml check advisories >/dev/null 2>&1` exited 1). Install hint: the target's base fails the all-features advisory wall (ADR-0003, #543), so the gating C4-ci row goes red on EVERY bundle for a reason in none of them. Land the advisory decision on main first (an ignore entry in deny-all-features.toml + the fdb_harness list, or a dependency bump), then re-gate. Provide it and answer iterate-do to resume the full Do+Check band, or discontinue at sign-off.

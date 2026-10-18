@@ -1,0 +1,37 @@
+# Adversarial review — issue 671 / put-object-flat-ceiling
+
+Verdict: the S3 fix holds against every wire input I tried. The red→green proof is real: it runs through the actual wire and `Gateway`, the 9 red legs fail for the right reasons, and the chunk counter is not vacuous. I refuted three things: the claim that the guard covers every single-PUT path, the test coverage of the server-side length guard, and the claim that the related docs are current. All probes ran on a scratch copy of `$PDCA_TARGET` (cargo 1.96) and have been removed.
+
+## Findings
+
+- NEEDS-HUMAN [human] — **`wyrd put` still publishes over-budget flat maps; the patch's "every single-PUT path" claim is false.** `crates/server/src/lib.rs:290` says "Every single-PUT path calls this before it writes anything", and the brief's invariant says "on any backend". But `cmd_put` (`crates/server/src/cli.rs:590`, `--chunk-size` with no bounds) writes through `write::write_new_object` (`crates/server/src/cli.rs:655` local path, `:2267` cluster path → `crates/core/src/write.rs:353-366`) and never calls `admit_single_put`. Concrete case on the patched tree: a 1,265-byte file with `wyrd put payload --key over --data-dir D --chunk-size 8` printed `put ok: key=over inode=1 chunks=159 bytes=1265`, and `wyrd get over` returned it byte-identical (redb). At the default 1 MiB chunk, any file over 158 MiB does the same. On FDB it writes every fragment and then fails the commit, which is the exact behaviour #671 set out to remove. The brief's SELF-TEST named only three paths, so this is a scope call. The fix is small either way: put the check in core `write_new_object` / `write_new_object_placed` (beside `max_single_put_bytes`) so no caller can skip it. Or soften the comment at `:290` and file a follow-up.
+
+- NEEDS-HUMAN [impl] — **No test pins the server-side length guard.** In the scratch copy I replaced `HashingSource::new(DeclaredLengthSource::new(source, declared_len))` at `crates/server/src/lib.rs:418` with `HashingSource::new(source)`. All 45 tests in `s3_put_object_ceiling`, `s3_http_wire`, `s3_streaming_trailer` and `e2e` still passed. On the S3 wire, hyper frames single-shot bodies and the aws-chunked decoder (`crates/gateway-s3/src/streaming.rs:370`) catches over-runs first, so the server guard is never reached. The seam contract at `crates/gateway-core/src/lib.rs:324-329` ("holds `source` to `declared_len`") is the only thing that protects any other caller. Concrete failing case with the guard unwired: on the 8-byte gateway, `gateway.put_object_streaming("wyrd-bucket/seam-overrun", <1,265 bytes in 64-byte frames>, 1_000, ContentHash::Unverified, None)` returned `Ok`, published 1,265 bytes, and left 159 chunks on disk. With the patch as written it returns `Err`, publishes nothing, and leaves 120 chunks, so the code is right; only the proof is missing. Add this as a seam-level integration test. `s3_http_wire.rs`'s `streaming_behaviour` already calls the seam directly, so it fits there.
+
+- NEEDS-HUMAN [impl] — **The new `LengthMismatch → 400 IncompleteBody` mapping is dead on the wire and untested.** It lives at `crates/gateway-s3/src/lib.rs:3593-3597`. C5 shows that deleting the arm survives, and nothing in the tree asserts `IncompleteBody`. The one wire case S3 uses that code for still answers differently. Probe: an `UNSIGNED-PAYLOAD` PUT that declares `Content-Length: 1000`, sends 500 bytes, and half-closes gets `500 InternalError` (HEAD stays `404`, so it is still refused, not accepted). Low severity: either map hyper's incomplete-body error onto `IncompleteBody`, or drop the code and say the case answers 500.
+
+- NEEDS-HUMAN [human] — **Draft proposal 0017 now contradicts the code.** The brief knew about this (prior-art check) but scoped only 0016. These passages in `docs/design/proposals/draft/0017-blackbox-validation-tool.md` are now false:
+  - `:291-292`: "5 GiB … **must succeed**" and `EntityTooLarge` "**unimplemented today**";
+  - `:313`: per-PUT `chunk_size_effective = max(...)`;
+  - `:323`: "the gateway overrides it above the flat-map ceiling";
+  - `:326`: the guard is "not a routine path".
+
+  After this patch, every PUT over 158 × c is refused, including 5 GiB at every legal chunk size. Decide whether to correct 0017 in this PR (it is a draft) or file a follow-up. Otherwise the validate tool's size matrix gets built on a premise this patch removed.
+
+- NEEDS-HUMAN [impl] — **The evidence was taken on a stale base.** `gate-logs/C4-diff-cov.log`: "patch.diff does not apply on origin/main — the bundle is stale". C4-verify, C4-ci and C5 all measured base `596249a`. The brief lists conflicts with #620, #666 and #768 on this exact PUT arm (`crates/gateway-s3/src/lib.rs:1827-1864`) and seam (`crates/gateway-core/src/lib.rs:330`). Rebase, then re-run C4-verify. In particular, re-check the order of the new 411/EntityTooLarge refusals against #620's header-time refusal once both are on the same arm.
+
+- NEEDS-HUMAN [human] — **The C4-ci gating red is not caused by this diff.** The only failing step is `cargo deny … check advisories`: RUSTSEC-2026-0349 plus the rustls `Debug`-secrets advisory, both in `rustls 0.21.12` via `tikv-client 0.4.0` (`gate-logs/C4-ci.log:3520-3597`). This patch's `Cargo.lock` change only adds `wyrd-core` to `wyrd-validate`'s dependencies. fmt, clippy, build and every test passed in the same log, including all 11 new ceiling tests. The human should waive it or fix the advisory separately; it is not a refutation of the fix.
+
+- Gate wording (not a defect): C4-verify reports "11 test(s) ran red", but its own log shows 9 failed and 2 passed on the reverted base. The two passes are `a_put_at_the_ceiling_round_trips` and the signer sanity check, which is expected. The 9 reds are the right kind: 200 where 400/411 was expected, legs (3) and (4) hitting the 10 s bound, and the buffered PUT returning `Ok`.
+
+## Attacks I tried and could not land
+
+- **Vacuous chunk counter.** It is not vacuous. A probe saw exactly 158 chunk directories after a 1,264-byte buffered PUT. `count_chunk_dirs` (`crates/server/tests/s3_put_object_ceiling.rs:130`) matches the fs store's `root/<32-hex>/<05>.frag` layout (`crates/chunkstore-fs/src/lib.rs:597-599`).
+- **`Expect: 100-continue`** with `Content-Length: 5000`: the first status line is `HTTP/1.1 400`, with `EntityTooLarge`. No `100` is sent and the body is never read.
+- **Body forms that could slip past.** `UNSIGNED-PAYLOAD` past the ceiling gets `400 EntityTooLarge` and writes 0 chunks. An empty PUT with `Content-Length: 0` still returns 200. An aws-chunked body inside an outer `Transfer-Encoding: chunked`, with a decoded length, returns 200, so the TE→411 rule does not break that SDK form.
+- **Overflow and grammar.** A `u64::MAX` declared length is refused by `admit_single_put`. Values past `u64`, `+5`, and padded values are `Malformed` before the body is read.
+- **Other front doors.** The only production `ObjectGateway` implementer is `crates/server/src/lib.rs:384`, and DST does not call the PUT seam.
+- **Unsigned decoded length.** An `x-amz-decoded-content-length` sent outside `SignedHeaders` is trusted (200). But every chunk is signed and the body is held to that length, so tampering with it can only cause a refusal.
+- **Migrated validate test.** `chunk_for_single_put` (`crates/validate/tests/s3_client_roundtrip.rs:172`) keeps the chunk at about 5% of the window, so the window property still holds. The other legs use fixed objects of 2 MiB or less.
+
+<!-- pdca:leaf-complete -->

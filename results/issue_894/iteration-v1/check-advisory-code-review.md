@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/src/multipart/create.rs:305` (also `crates/core/src/multipart/create.rs:498`): Recovery treats any existing `mpu:<id>` as this invocation's session. A concrete schedule is: A reads upload ID U and nonce NA absent, submits a batch that is held with `CommitUnknownResult { may_still_commit: true }`, then B commits U with a different nonce NB and object. A's recovery returns `Created(U)` for B's session without checking its contents; A's held batch subsequently conflicts. This does not violate the documented exclusion at `crates/core/src/multipart/create.rs:256`, which excludes concurrent reuse of both the upload ID and nonce. Keep the absence-read/unknown-commit history requirement, but also decode and check the recovered record's immutable identity and request fields before returning `Created`, sharing that check between both recovery paths. Add a forced-schedule regression with the same upload ID and distinct nonces/objects.
+
+No additional reuse, simplification, or efficiency findings. Validation used target-source inspection and the frozen gate evidence; no gates were re-run.
+
+<!-- pdca:leaf-complete -->
