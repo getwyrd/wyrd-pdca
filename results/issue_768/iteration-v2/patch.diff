@@ -1,0 +1,475 @@
+diff --git a/crates/core/src/metadata.rs b/crates/core/src/metadata.rs
+index a2f3a64..16261a2 100644
+--- a/crates/core/src/metadata.rs
++++ b/crates/core/src/metadata.rs
+@@ -1584,8 +1584,13 @@ pub struct ObjectMeta {
+     pub etag: Option<String>,
+     /// The `Content-Type` the writing client declared, round-tripped verbatim.
+     pub content_type: Option<String>,
+-    /// Content-publication time in epoch milliseconds; rendered RFC-7231 IMF-fixdate
+-    /// as `Last-Modified` on the wire.
++    /// The file's last-modified time in epoch milliseconds (its content-publication
++    /// time); rendered RFC-7231 IMF-fixdate as `Last-Modified` on the wire. Never
++    /// decreases across overwrites that record a time: such an overwrite commits
++    /// `max(publishing clock, prior modified + 1 ms)` ([`overwrite_modified`]). A
++    /// generation published without one records none and resets the order — only core's
++    /// API can do that; both gateway PUT paths always stamp. Repairs preserve it
++    /// unchanged. The content-identity token is `etag`, not this.
+     pub modified: Option<u64>,
+ }
+ 
+@@ -1635,7 +1640,12 @@ pub struct InodeRecord {
+     /// see `etag` — required for the CAS round trip on legacy records.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub content_type: Option<String>,
+-    /// Content-publication time (epoch millis), rendered `Last-Modified` on the wire.
++    /// The file's last-modified time (epoch millis, its content-publication time),
++    /// rendered `Last-Modified` on the wire. Never decreases across overwrites that record
++    /// a time: such an overwrite commits `max(publishing clock, prior modified + 1 ms)`
++    /// ([`overwrite_modified`]); a generation published without one records none and
++    /// resets the order (only core's API can — both gateway PUT paths always stamp).
++    /// Repairs preserve it unchanged; `etag` is the content-identity token.
+     /// `Option` + `#[serde(default)]` for stored-record compatibility.
+     /// `skip_serializing_if`: see `etag` — required for the CAS round trip on legacy
+     /// records.
+@@ -2202,10 +2212,10 @@ pub async fn commit_chunk_map_superseding(
+         version: prior.version + 1,
+         // A content **overwrite** is a fresh publication (ADR-0047), so it stamps the new
+         // object metadata (digest / content type / publication time) rather than carrying
+-        // the prior version's forward.
++        // the prior version's forward — the time ordered after the prior's (#768).
+         etag: meta.etag.clone(),
+         content_type: meta.content_type.clone(),
+-        modified: meta.modified,
++        modified: overwrite_modified(prior.modified, meta.modified),
+     };
+     let key = inode_key(id);
+     let mut batch = WriteBatch::new()
+@@ -2232,6 +2242,38 @@ pub async fn commit_chunk_map_superseding(
+     store.commit(batch).await
+ }
+ 
++/// The `modified` an **overwrite** commits, given the superseded generation's stamp
++/// (`prior`) and the publisher's (`published`): `max(published, prior + 1 ms)`, so a file's
++/// last-modified time never goes backwards across overwrites that each record a time (#768).
++///
++/// Each gateway of an active/active fleet stamps from its own clock, so a prior written by a
++/// gateway whose clock runs fast would otherwise be followed by an earlier stamp on newer
++/// content — and a sync tool comparing size and `Last-Modified` skips a same-size overwrite.
++/// The prior stamp is the one this commit supersedes: both callers CAS on the exact `prior`
++/// bytes, so the ordering is against the generation actually replaced.
++///
++/// - `published == None` → `None`: a generation published with no time records none. The
++///   chain resets there, and the next stamped overwrite starts from its own clock, because
++///   carrying the prior's time forward (or inventing one) would put a time on content its
++///   publisher never stamped. Both gateway PUT paths always stamp one; only core's API can
++///   publish without it.
++/// - `prior == None` (a legacy record, ADR-0047) → the publisher's stamp stands.
++/// - The `+ 1` saturates: a prior of `u64::MAX` (decodable, ADR-0045) stays `u64::MAX`.
++///
++/// Every path that publishes content **over** a prior generation must call this — today
++/// [`commit_chunk_map_superseding`] and [`commit_chunk_map_superseding_leased`]. The multipart
++/// Complete flip (#658) publishes through its own committer (proposal 0016 rules out reusing
++/// the leased one), so it must call this explicitly; it does not inherit it. Repair commits
++/// ([`commit_chunk_map`], reconstruction, backfill, rebalance) re-commit the same content and
++/// keep preserving `modified` unchanged instead.
++pub fn overwrite_modified(prior: Option<u64>, published: Option<u64>) -> Option<u64> {
++    let published = published?;
++    Some(match prior {
++        Some(prior) => published.max(prior.saturating_add(1)),
++        None => published,
++    })
++}
++
+ /// Like [`commit_chunk_map_superseding`], but the overwrite CAS lands only if every chunk in
+ /// `pending_chunks` still holds a **live, unexpired** `pending:<id>` lease at `now_millis`,
+ /// enforced **atomically** with the inode CAS and the prior fragments' orphaning (issue #490).
+@@ -2281,10 +2323,11 @@ pub async fn commit_chunk_map_superseding_leased(
+         state: InodeState::Committed,
+         version: prior.version + 1,
+         // A content **overwrite** is a fresh publication (ADR-0047): stamp the new object
+-        // metadata rather than carrying the prior version's forward.
++        // metadata rather than carrying the prior version's forward — the time ordered
++        // after the prior's (#768).
+         etag: meta.etag.clone(),
+         content_type: meta.content_type.clone(),
+-        modified: meta.modified,
++        modified: overwrite_modified(prior.modified, meta.modified),
+     };
+     let key = inode_key(id);
+     let mut batch = WriteBatch::new()
+diff --git a/crates/server/tests/last_modified_monotonic.rs b/crates/server/tests/last_modified_monotonic.rs
+new file mode 100644
+index 0000000..60ce644
+--- /dev/null
++++ b/crates/server/tests/last_modified_monotonic.rs
+@@ -0,0 +1,344 @@
++//! A file's `Last-Modified` never goes backwards across an overwrite (issue #768).
++//!
++//! Each gateway of an active/active fleet stamps `modified` from its own clock, so a
++//! gateway whose clock is behind the one that wrote the prior generation would commit an
++//! earlier stamp on newer content — and a sync tool that compares size and
++//! `Last-Modified` silently skips a same-size overwrite. The rule: an overwrite that
++//! records a time commits `max(publishing clock, prior modified + 1 ms)`.
++//!
++//! Real two-host skew is not reproducible in-process (the gateway reads the host clock),
++//! so legs (1)–(2) seed a prior whose stamp is an hour **ahead** of this host's clock —
++//! exactly the record a fast-clocked gateway leaves behind; the store keeps no record of
++//! which gateway wrote a stamp. Leg (5) drives both public core overwrite commits with an
++//! explicit publisher stamp, to pin the rule's exact values.
++//!
++//! Seeding follows `crates/server/tests/segmented_object_read.rs` (`write_flat`): the
++//! prior generation is written through `wyrd_core::write` before the store moves into
++//! `Gateway::new`. Every symbol used here exists on the reverted base, so the file
++//! compiles there and fails as assertions.
++
++#![forbid(unsafe_code)]
++
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use bytes::Bytes;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_core::metadata::{self, encode, inode_key, EcScheme, InodeRecord, InodeState, ObjectMeta};
++use wyrd_core::{read, write};
++use wyrd_gateway_core::{ContentHash, ObjectGateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++use wyrd_traits::{CommitOutcome, MetadataStore, WriteBatch};
++
++const ROOT: u64 = 0;
++const NOW: u64 = 1_000;
++const TTL: u64 = 5_000;
++const CHUNK: usize = 4;
++const KEY: &str = "doc";
++const HOUR_MS: u64 = 60 * 60 * 1_000;
++const OLD: &[u8] = b"old-bytes-of-file";
++const NEW: &[u8] = b"NEW-BYTES-OF-FILE";
++
++/// This host's wall clock in epoch millis — the same source the gateway's `now_millis`
++/// reads (`crates/server/src/lib.rs`), so readings taken around a call bracket its stamp.
++// wall-clock exempt: the test brackets the gateway's own wall-clock stamp, so it must
++// read the same source the gateway does.
++#[allow(clippy::disallowed_methods)]
++fn wall_millis() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .expect("clock after epoch")
++        .as_millis() as u64
++}
++
++fn backends() -> (RedbMetadataStore, FsChunkStore, tempfile::TempDir) {
++    let meta = RedbMetadataStore::in_memory().expect("in-memory redb");
++    let dir = tempfile::tempdir().expect("temp dir");
++    let chunks = FsChunkStore::open(dir.path()).expect("fs chunk store");
++    (meta, chunks, dir)
++}
++
++/// Publish `data` under `KEY` through the ordinary write path, with `modified` stamped
++/// as the given prior generation's.
++async fn seed(meta: &RedbMetadataStore, chunks: &FsChunkStore, data: &[u8], modified: u64) {
++    let mut next = 0x100u128;
++    let mut plan = write::plan_write(data, CHUNK, EcScheme::None, || {
++        next += 1;
++        next
++    })
++    .expect("plan");
++    plan.object_meta.etag = Some("etag-of-the-prior-generation".to_owned());
++    plan.object_meta.modified = Some(modified);
++    write::intent(meta, &plan, NOW + TTL).await.expect("intent");
++    write::write_fragments(chunks, &plan)
++        .await
++        .expect("fan out");
++    assert_eq!(
++        write::commit_create(meta, ROOT, KEY, 1, &plan, NOW)
++            .await
++            .expect("commit"),
++        CommitOutcome::Committed
++    );
++    write::release(meta, &plan).await.expect("release");
++}
++
++fn gateway(
++    meta: RedbMetadataStore,
++    chunks: FsChunkStore,
++) -> Gateway<RedbMetadataStore, FsChunkStore, MemCoordination> {
++    Gateway::new(meta, chunks, MemCoordination::new()).with_chunk_size(CHUNK)
++}
++
++async fn put_streaming(
++    gw: &Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>,
++    data: &'static [u8],
++) -> String {
++    let source = futures_util::stream::iter([Ok(Bytes::from_static(data))]);
++    gw.put_object_streaming(
++        KEY,
++        source,
++        data.len() as u64,
++        ContentHash::Unverified,
++        None,
++    )
++    .await
++    .expect("streaming put")
++}
++
++async fn head(
++    gw: &Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>,
++) -> wyrd_gateway_core::ObjectMeta {
++    gw.head_object(KEY)
++        .await
++        .expect("head")
++        .expect("the object is committed")
++}
++
++fn sha256_hex(data: &[u8]) -> String {
++    use sha2::{Digest, Sha256};
++    Sha256::digest(data)
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect()
++}
++
++/// (1) A streaming overwrite on a gateway whose clock is behind the prior's stamp
++/// commits exactly `prior + 1`, with the new content's ETag.
++#[tokio::test]
++async fn streaming_overwrite_after_a_fast_clock_steps_one_millisecond_past_it() {
++    assert_eq!(
++        OLD.len(),
++        NEW.len(),
++        "a same-size overwrite is the case sync tools miss"
++    );
++    let (meta, chunks, _dir) = backends();
++    let seeded = wall_millis() + HOUR_MS;
++    seed(&meta, &chunks, OLD, seeded).await;
++    let gw = gateway(meta, chunks);
++
++    let etag = put_streaming(&gw, NEW).await;
++
++    let after = head(&gw).await;
++    assert_eq!(
++        after.modified,
++        Some(seeded + 1),
++        "Last-Modified must not go backwards"
++    );
++    assert_eq!(after.etag.as_deref(), Some(etag.as_str()));
++    assert_eq!(after.etag, Some(sha256_hex(NEW)), "the new content's ETag");
++    assert_eq!(gw.get_object(KEY).await.unwrap().as_deref(), Some(NEW));
++}
++
++/// (2) The same through the buffered `Gateway::put_object`.
++#[tokio::test]
++async fn buffered_overwrite_after_a_fast_clock_steps_one_millisecond_past_it() {
++    let (meta, chunks, _dir) = backends();
++    let seeded = wall_millis() + HOUR_MS;
++    seed(&meta, &chunks, OLD, seeded).await;
++    let gw = gateway(meta, chunks);
++
++    gw.put_object(KEY, NEW).await.expect("buffered put");
++
++    let after = head(&gw).await;
++    assert_eq!(
++        after.modified,
++        Some(seeded + 1),
++        "Last-Modified must not go backwards"
++    );
++    assert_eq!(after.etag, Some(sha256_hex(NEW)), "the new content's ETag");
++}
++
++/// (3) Over a prior stamped in the past, an overwrite records the current clock — not
++/// `prior + 1` — on both PUT paths.
++#[tokio::test]
++async fn overwrite_over_a_past_stamp_records_the_current_clock() {
++    for buffered in [false, true] {
++        let (meta, chunks, _dir) = backends();
++        let seeded = wall_millis() - HOUR_MS;
++        seed(&meta, &chunks, OLD, seeded).await;
++        let gw = gateway(meta, chunks);
++
++        let before = wall_millis();
++        if buffered {
++            gw.put_object(KEY, NEW).await.expect("buffered put");
++        } else {
++            put_streaming(&gw, NEW).await;
++        }
++        let after = wall_millis();
++
++        let modified = head(&gw).await.modified.expect("stamped");
++        assert!(
++            (before..=after).contains(&modified),
++            "buffered={buffered}: {modified} must be the clock, within [{before}, {after}]"
++        );
++    }
++}
++
++/// (4) A create has no prior and records the current clock, as before.
++#[tokio::test]
++async fn create_records_the_current_clock() {
++    for buffered in [false, true] {
++        let (meta, chunks, _dir) = backends();
++        let gw = gateway(meta, chunks);
++
++        let before = wall_millis();
++        if buffered {
++            gw.put_object(KEY, NEW).await.expect("buffered put");
++        } else {
++            put_streaming(&gw, NEW).await;
++        }
++        let after = wall_millis();
++
++        let modified = head(&gw).await.modified.expect("stamped");
++        assert!(
++            (before..=after).contains(&modified),
++            "buffered={buffered}: {modified} must be the clock, within [{before}, {after}]"
++        );
++    }
++}
++
++// ---- (5) the rule's exact values, on both public core overwrite commits ----
++
++const T: u64 = 1_700_000_000_000;
++const ID: u64 = 7;
++
++/// `(case, prior modified, publisher stamp, committed modified)`.
++type Case = (&'static str, Option<u64>, Option<u64>, Option<u64>);
++
++#[derive(Clone, Copy, Debug)]
++enum Api {
++    Superseding,
++    SupersedingLeased,
++}
++
++/// Seed a committed record with the given `modified`.
++async fn seed_record(store: &RedbMetadataStore, modified: Option<u64>) {
++    let record = InodeRecord {
++        size: 0,
++        chunk_map: Vec::new().into(),
++        state: InodeState::Committed,
++        version: 1,
++        etag: Some("prior".to_owned()),
++        content_type: None,
++        modified,
++    };
++    assert_eq!(
++        store
++            .commit(WriteBatch::new().put(inode_key(ID), encode(&record)))
++            .await
++            .expect("seed"),
++        CommitOutcome::Committed
++    );
++}
++
++/// Overwrite the record through `api` with publisher stamp `published`, and return the
++/// committed `modified`.
++async fn overwrite(store: &RedbMetadataStore, api: Api, published: Option<u64>) -> Option<u64> {
++    let prior = read::read_inode(store, ID)
++        .await
++        .expect("read")
++        .expect("seeded");
++    let meta = ObjectMeta {
++        etag: Some("next".to_owned()),
++        content_type: None,
++        modified: published,
++    };
++    let outcome = match api {
++        Api::Superseding => {
++            metadata::commit_chunk_map_superseding(store, ID, &prior, vec![], 0, 0, &meta).await
++        }
++        // An empty pending set needs no leases.
++        Api::SupersedingLeased => {
++            metadata::commit_chunk_map_superseding_leased(
++                store,
++                ID,
++                &prior,
++                vec![],
++                0,
++                0,
++                &[],
++                0,
++                &meta,
++            )
++            .await
++        }
++    }
++    .expect("commit");
++    assert_eq!(outcome, CommitOutcome::Committed, "{api:?}");
++    read::read_inode(store, ID)
++        .await
++        .expect("read")
++        .expect("committed")
++        .modified
++}
++
++#[tokio::test]
++async fn core_overwrite_commits_apply_the_rule_exactly() {
++    let single: [Case; 8] = [
++        ("equal (same millisecond)", Some(T), Some(T), Some(T + 1)),
++        ("prior ahead", Some(T + 5_000), Some(T), Some(T + 5_001)),
++        ("prior behind", Some(T - 5_000), Some(T), Some(T)),
++        ("legacy prior", None, Some(T), Some(T)),
++        ("unstamped over stamped", Some(T + 5_000), None, None),
++        ("unstamped over legacy", None, None, None),
++        ("unstamped over max", Some(u64::MAX), None, None),
++        ("saturates at max", Some(u64::MAX), Some(T), Some(u64::MAX)),
++    ];
++    for api in [Api::Superseding, Api::SupersedingLeased] {
++        for (case, prior, published, want) in single {
++            let store = RedbMetadataStore::in_memory().expect("in-memory redb");
++            seed_record(&store, prior).await;
++            assert_eq!(
++                overwrite(&store, api, published).await,
++                want,
++                "{api:?}: {case}"
++            );
++        }
++
++        // Three overwrites in a row in one clock millisecond build a pinned lead.
++        let store = RedbMetadataStore::in_memory().expect("in-memory redb");
++        seed_record(&store, Some(T)).await;
++        for step in 1..=3 {
++            assert_eq!(
++                overwrite(&store, api, Some(T)).await,
++                Some(T + step),
++                "{api:?}: repeated overwrite {step}"
++            );
++        }
++
++        // The chain resets across an unstamped publication — the rule's documented bound.
++        let store = RedbMetadataStore::in_memory().expect("in-memory redb");
++        seed_record(&store, Some(T + 5_000)).await;
++        assert_eq!(
++            overwrite(&store, api, None).await,
++            None,
++            "{api:?}: an unstamped generation records no time"
++        );
++        assert_eq!(
++            overwrite(&store, api, Some(T)).await,
++            Some(T),
++            "{api:?}: the overwrite after it starts from its own clock"
++        );
++    }
++}
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 3009468..e9a4674 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -202,6 +202,20 @@ Object metadata is stamped only at **content publication** (create / overwrite,
+ same atomic commit as the chunk map). The repair paths — reconstruction, backfill,
+ rebalance — re-commit the *same* content, so they **preserve** the stored trio: a
+ placement-maintenance commit never moves `Last-Modified` or drops the content type.
++Across overwrites that each record a time, a file's `modified` **never decreases**: an
++overwrite commits `max(publishing clock, prior modified + 1 ms)` (`overwrite_modified`,
++called by both overwrite commits), so on an active/active fleet a gateway whose clock is
++behind the one that wrote the prior generation cannot move `Last-Modified` backwards while
++the content moves forwards. Because every S3 surface reports whole seconds (above), the
++`+1 ms` step usually lands in the same second: on the wire a later generation's
++`Last-Modified` is never earlier than the one it replaced, but it can be equal. A
++generation published with no time records none, and the overwrite after it starts from
++its own clock; only core's API can publish without a time — both gateway PUT paths
++always stamp one. `ETag` is the content-identity token;
++`Last-Modified` orders generations of one file and is not a precise wall-clock reading.
++This rule is within ADR-0047's file-level meaning of `modified` (the file's last-modified
++time): the `+1 ms` adjustment for a skewed or same-millisecond clock is an implementation
++detail below that decision, not a change to it.
+ 
+ The record **types** of the multipart commit protocol (proposal 0016, still a draft) are landed ahead of their writers, under disjoint key prefixes: the `mpuctl` admission ledger singleton (a `Budget` profile and the session count it derives `MAX_SESSIONS` from), and per-upload `mpu:<id>` (a session's target, lifecycle state and epoch, and its segment-group nonce — stored in every state from Create to the terminal delete, so the batch that ends a `Completing` attempt can name that attempt's segment records, the nonce at the attempt's fence epoch, and the terminal delete can name the group's reservation marker even for an upload that never reached Complete), `slot:<id>:<k>` (an in-flight part reservation), `part:<id>:<n>` (a committed part's chunk list, length and digest) and `psum:<id>:<n>` (that part's summary), and the reclamation pair `retire:bytes:<token>` (bytes to orphan-mark, then the records that named them) and `retire:records:<token>` (records to delete whose bytes something else still protects), whose value names what one obligation owes — a session's staged residue, a range-encoded set of its part numbers, one part attempt's chunk list, a superseded generation (by the chunk list a flat root carried, or by the segment group a segmented one named — the two shapes a published map has, never both) or a rolled-back completion attempt's segment records, in the combinations the protocol installs as single obligations — every one validated structurally at decode (ADR-0045) rather than trusted on successful JSON parsing alone, so a stored record whose fields disagree with each other (a session whose publish target names another object or another fence epoch, a part whose length is not its chunks' summed length, a slot born already lapsed) is a typed error rather than a live value. A retirement obligation's identity lives partly in its `<token>` — which session at which fence epoch, which part attempt of it, which superseded generation — so its value is decoded **against its own key**, and a payload whose mode, token scope, generation identity or segment epoch disagrees with the token naming it is likewise a typed error rather than an obligation that would reclaim one attempt's bytes while clearing another's. The owned staging entry `sidx:<id>:<n>:<chunk>` is the lease record a streaming write stores under `pending:<chunk>`, plus the owning upload id (`owner`) and the chunk's planned placement (`staged` — an erasure scheme the coder must support, and a D server per planned fragment, a count that decode leaves unchecked as for a committed chunk). Both are present on an owned entry and absent on an ordinary lease, and each is omitted when absent, so a `pending:` record written before them decodes and re-encodes byte-identically — load-bearing because a renewal puts a freshly encoded entry over the bytes it read. A value whose fields disagree with each other or with its key (one field alone, an owned entry under `pending:`, an ordinary lease under `sidx:`, an owner other than the key's) is refused by every reader and both `pending:` writers, and an expiry sweep skips it without reclaiming its chunk; GC's expired-lease input, off unless an operator arms it, also names it on the audit seam, and the post-restore reconciliation holds its chunk unmarked and reports the entry as needing a human, as it does an unreadable chunk map. An ownership field spelled `null` is refused too: the encoder never emits that spelling, so a lease that carried it would be rewritten by its next renewal. Their first production reader and writer is the post-restore session fence (`wyrd custodian --reconcile-after-restore`, `crates/custodian/src/restore.rs`): after its reference passes it re-lists `mpu:` in bounded pages and moves each `Open@E` session to `Aborting@E+1` in one commit with its `retire:` `{session, all}` obligation, so a session resurrected by the restore cannot be completed over reclaimed bytes (proposal 0016 D-B). Nothing else writes or consumes them in production yet — the rest of the protocol (the gateway's fenced state transitions, staged publication, the retirement drain) arrives with the store round trip (#656–#659) and is specified in the proposal, not here. Because every transition it specifies is a compare-and-set on the record's exact bytes, the decoders enforce serialization identity now, before the protocol's writers exist to depend on it: the accepted set is exactly the encoder's image, byte for byte — an absent `content_type` is spelled only by omitting the field (the inode trio's omitted-when-absent rule), a noncanonical spelling of an accepted value (fields reordered, whitespace inserted) is a decode error rather than bytes a CAS could never match, and a part record's chunk values are read through a closed wire shape of their own, so an unknown or omitted chunk field is a decode error rather than a silent rewrite.
+ 
