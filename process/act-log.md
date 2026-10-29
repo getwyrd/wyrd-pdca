@@ -2552,3 +2552,207 @@ PR: https://github.com/getwyrd/wyrd-pdca/pull/237
 - **Index coverage:** until #608 and #636 land, each Act review also sweeps archived
   `iteration-v*/SUMMARY.md` §10 and `pr-description.md` "Known limits" / "Follow-ups". At the
   next review, record how many items only that sweep found; zero means it can stop.
+
+# Act review — 2026-10-14 — cycles considered: 656, 666, 671, 686, 722, 767, 778, 779, 894, 895 (decided by Eduard Ralph in session)
+
+> These are the ten frozen cycles the 2026-09-30 reviews did not cover. The index holds 143;
+> the other 133 were reviewed before. No disposition is re-decided.
+
+## What the records exposed
+
+- **The gating T4 batch review leaves no evidence that it reviewed the diff.** 779 (26.8 s,
+  31 KB patch) and 895 (13.03 s, 134 KB patch) each passed with `0 blocking, 0
+  recorded-rejected, 0 noise-dropped`. Two independent reviewers flagged that a cached or empty
+  pass would leave the same one-line log. There are two causes in `scripts/review-branch`.
+  `:283` runs `codex exec` with no model and no effort, while every other Codex leaf is pinned to
+  `gpt-6-astra` (`pdca.toml:613`, `:729`, `:911`, `:976`), against the 2026-07-24 "pin every
+  leaf" decision. And `:486-488` prints a pass's note only when the pass fails, so a clean run's
+  `review-batch.md` is 563 bytes of boilerplate.
+- **One base-wide advisory turned every bundle red, and each planner named it differently.**
+  RUSTSEC-2026-0346/0349 (rustls 0.21.12 via tikv-client 0.4.0) failed the all-features
+  `cargo deny` step on base `7bf7eb9` for 666, 671, 686 and 767. The planners declared it as
+  `wyrd-base-advisories`, `deny-all-features-advisories` and `all-features-advisory-baseline`;
+  686 recorded 3 automatic rebuilds per bundle. The fixes are on wyrd main: the waiver
+  (`deny-all-features.toml:160,167`, getwyrd/wyrd#900) and `xtask ci` running every step instead
+  of stopping at the first failure (getwyrd/wyrd#901, PR #904). This answers the 666 §10 "gate"
+  item. What remained was a single standing id for this failure.
+- **The 2026-09-30 open item on C4-diff-cov's base came back positive, and the cause is in this
+  repo's config.** For 779 (`Depends on: 778`, `stack-base` = `pdca-integration/main-r6da1b5689252`),
+  `coverage/diff-cov.json` records `"base_ref": "origin/main"`. The build therefore lacked 778's
+  `version` module (`E0433`), and the row misreported "executed 0 tests". The cause is
+  `verifies_base = false` on the C4-diff-cov row (`pdca.toml:1527`), added by `8ad0df6`
+  (2026-09-28). Its message says run-verify.sh is "the only script that reads" the base, but
+  `run-diff-cov.sh:685` reads it too, through `run-verify.sh --print-base`. So the driver gives
+  the row no base, and the ladder falls through to `origin/main` without the fallback warning.
+  This is an instance config value, not an upstream bug.
+- **Planning patterns already owned upstream.** 778's absolute rule ("distinct inputs never
+  become one identity") cost 4 rounds on a ~3-line feature (101 KB). That is
+  eduralph/pdca-harness#705, which is open. The brief's scope fence clashed with the repo's
+  docs-currency and deferral-marker rules in 767, 894 and 895 (and in 843 before them). That is
+  eduralph/pdca-harness#640, also open. No new delta.
+- **No delta warranted for the rest.** The new-API "no isolable red" items (894, 895) are the
+  expected cost the 2026-09-20 review chose to keep. The size backstop (671, 722, 778, 894, 895)
+  is owned by getwyrd/wyrd-pdca#275. Fitness-to-purpose is always the human's call. The split
+  disposition (656) is already owned by #239 and harness#545.
+
+## Process deltas
+
+- **Gate, filed as getwyrd/wyrd-pdca#276** (https://github.com/getwyrd/wyrd-pdca/issues/276):
+  `scripts/review-branch:283` pins the passes' model and effort, using the same pin as the other
+  Codex leaves. `review-batch.md` and the gate log record, for every pass (clean ones included),
+  its index, wall time, stdout bytes, note and model/effort, plus the sha256 of the reviewed
+  `patch.diff`. It needs a code change and a stub-codex test, so it is filed rather than patched
+  in this session.
+- **Doctor row, applied by Eduard Ralph 2026-10-15 (issue_620 re-plan), recorded here:**
+  `[[doctor.checks]] id = "cargo deny all-features advisories"` (`pdca.toml:1394-1407`). It checks
+  the base's all-features advisory wall with `--frozen`. Kept at `level = "WARN"`.
+- **Agent skills, applied here: one standing id for that failure.**
+  - Planner (`.claude/agents/planner.md:143-147`): reuse an already-registered doctor row's id,
+    and name the base-advisory failure `cargo deny all-features advisories`.
+  - Builder (`.claude/agents/builder.md:155-159`): when the unpatched base fails the advisory
+    wall, declare exactly that token and propose no new row.
+  - Verified: `dependency_halt.declared_dependencies` parses the spaced token whole, both bare
+    and backticked.
+
+## Follow-ups routed
+
+- **getwyrd/wyrd-pdca** (this repo's config, not upstream):
+  - #277 (https://github.com/getwyrd/wyrd-pdca/issues/277): C4-diff-cov measures stacked
+    bundles against `origin/main`, because `verifies_base = false` at `pdca.toml:1527` cuts it
+    off from the base ladder. This closes the 2026-09-30 open item about #841. It was checked
+    against wyrd main `71e9b9f` and the template (v0.59.0 ships no `run-diff-cov.sh`), so it is
+    not an upstream bug. A second case went on as comment 6244100178: in issue_895 (stacked on
+    894) the same cause filed a red `fail` row ("patch.diff does not apply on origin/main")
+    against a sound patch, where 779 had only got a wrong reason.
+  - #278 (https://github.com/getwyrd/wyrd-pdca/issues/278): `engine/scripts/run-verify.sh`'s
+    exit-77 branches (`:487-491`, `:521-541`) print no `PDCA-UNVERIFIABLE:` line. The harness
+    falls back to the last output line, so §6 shows only "…why this slice has no isolable red
+    (the cargo output is above)." That affects 12 summaries (655, 691, 692, 693, 715, 716, 741,
+    771, 772, 852, 894, 895), and it is the index's 12× "c4 per-fix red->green" signal. The
+    template's `run-verify.sh` has no such branch, so this is an instance bug.
+- **Watch, not filed:** 895, a split child of 656, has no `notes.json` while its sibling 894
+  does, so its plan reviewer could not check the brief's tracker-sourced "settled" claims. The
+  review gap is upstream #641 (open). The missing file is a single case; file it if it recurs.
+- **getwyrd/wyrd**, the §10 follow-ups that were not in the tracker (checked against main
+  `71e9b9f`, 2026-10-18):
+  - #910: 778, Unicode `trim()` collapses a whitespace-suffixed tag into the clean tag's
+    identity (`crates/server/src/version/derivation.rs:42`, `:205`).
+  - #911: 722, `repoint_chunk` should weigh `seg:` records at V/2 (`metadata.rs:593-600`).
+  - #912: 671 item 4, no test pins the streaming PUT's length guard
+    (`crates/server/src/lib.rs:418`).
+  - #913: 671 item 5, a short `Content-Length` body answers 500, and the `IncompleteBody` arm is
+    unreachable.
+  - #914: 671 item 6, proposal 0017 still says a 5 GiB single PUT must succeed (`:291-293`).
+  - #915: 671 item 9, the duplicate base64 encoder (`s3_put_object_ceiling.rs:623`).
+  - #916: 686, no test pins the streamed GET to `resolve_chunk_map_owned` (`lib.rs:479`).
+  - #917: 895, pin Abort's `InDoubt` branch (`multipart/abort.rs:335`); depends on PR #909.
+  - #435, comment 6244015561: 666, tikv-client is abandoned and keeps drawing rustls-0.21
+    advisories; we may need our own TiKV client.
+  - 767's proposal-0017 fix is already on main (`777eb07`), so nothing was filed for it.
+- **Upstream (eduralph/pdca-harness):**
+  - #741 (https://github.com/eduralph/pdca-harness/issues/741): a documentation fix. The
+    template's `verifies_base` guidance (`template/pdca.toml.jinja:992-999`, the
+    `template/src/pdca_harness/gates.py` docstring and `:557` comment) says "exactly one such
+    row". It should say that every row which resets to the bundle's base needs the flag. That
+    framing led to `8ad0df6` and to #277 here.
+  - Already covered: 778's absolute-rule rounds are #705, and the scope fence vs. the docs and
+    deferral-marker rules (767, 894, 895) is #640. Both are open.
+
+## How effectiveness will be judged
+
+- **#276:** once it lands, every `review-batch.md` lists 3 passes with times, byte counts, the
+  pinned model and the patch sha256. At the next review, compare clean-pass times before and
+  after the pin; if clean passes stay under ~30 s on 100 KB+ diffs, consider a floor.
+- **Standing advisory id:** the next base-wide advisory is declared as
+  `cargo deny all-features advisories` in every affected bundle, and no bundle proposes a new
+  row for it.
+- **C4-diff-cov:** once fixed, the next wave>0 bundle's `diff-cov.json` shows its stack base,
+  not `origin/main`.
+
+# Act review — 2026-10-19 — cycles considered: 620, 653, 657, 743, 744, 768, 853, 926, 932, 933, 938 (decided by Eduard Ralph in session)
+
+> These are the eleven frozen cycles the 2026-10-14 review did not cover. The index holds 154;
+> the other 143 were reviewed before. No disposition is re-decided.
+
+## What the records exposed
+
+**No new process delta is warranted.** Every recurring signal in this batch already has an open
+owner. The work this review produced is evidence on those owners and 12 code follow-ups.
+
+- **The gating T4 batch review still leaves no evidence** (getwyrd/wyrd-pdca#276, open). 744
+  (20.63 s, 121,798 B patch), 932 (21.18 s, 284,643 B) and 933 (38.65 s, 212,520 B) each passed
+  with "0/0/0" and a 563-byte boilerplate `review-batch.md`, and each became a §6 item. The
+  sentinel check is not the cause: the prompt's "NO FINDINGS" is mid-line
+  (`scripts/review-branch:158`) and `NO_FINDINGS_RE` (`:102`) needs it on its own line, so Codex
+  really answered "NO FINDINGS". 932's sign-off asked that the gate fail on such a run.
+- **C4-diff-cov still measures stacked bundles against `origin/main`** (#277, open). 853 and 933
+  (both `stack-base` = `pdca-integration/main-r42c5348f203d`) got a red `fail` row; 933's
+  adversary then advised a rebase, the wrong action. Four cases now (779, 895, 853, 933).
+  `verifies_base = false` is now at `pdca.toml:1533`.
+- **Plan findings the revision already settled come back in §6** (eduralph/pdca-harness#692,
+  open). 620, 744 and 933: the revised brief narrows the promise (620 `brief.md:34-36`, 744
+  `:31-36`, 933 `:56-61`), but §6 still quotes the old wording.
+- **Prior art cannot be checked on the reviewer's one-commit target** (harness#575, open): 620,
+  653, 932.
+- **"No isolable red" reaches §6 as a fragment** (#278, open): 653, 744, 932.
+- **Already owned, nothing new:** size backstop (653, 744, 768, 932 oversized) → #275; split
+  closes (657, 743, 926, 938) → #239 / harness#545, both closed and working as designed; scope
+  fence vs. repo rules → harness#640; fitness-to-purpose is always the human's call.
+- **Last review's standing advisory id works.** 620 and 768 both declared
+  `cargo deny all-features advisories` (620 `brief.md:138`, 768 `brief.md:295`) and proposed no
+  new doctor row.
+- **The archived-iteration sweep found nothing.** Across the iterated bundles (620, 653, 744,
+  768, 853), `iteration-v*/SUMMARY.md` §10 held no item missing from the final §10, and the only
+  PR "Known limits" section (853) repeats its §10. The 2026-09-30 rule was "zero means it can
+  stop", so the sweep is retired. harness#608 and #636 stay open for the root cause.
+
+## Process deltas
+
+- **No delta warranted.** A one-line config fix for #277 (`pdca.toml:1533`,
+  `verifies_base = true`) was offered and declined by Eduard Ralph: fixes stay with their issues,
+  this review only files. The sweep retirement above is a change to how Act reads the records,
+  not to the system.
+
+## Follow-ups routed
+
+- **getwyrd/wyrd** (§10 code follow-ups, none previously filed; checked against main `9b1a3e2`):
+  - #966 (https://github.com/getwyrd/wyrd/issues/966): 653, the flat-or-segmented choice counts
+    chunks, not bytes (`crates/core/src/staged_publication.rs:418`, `:534`).
+  - #967: 653, missing refusal and byte-boundary tests (root ceiling, `ChunkTooLarge`,
+    `VersionOverflow`, two-row budget, resume pin).
+  - #968: 653, **design issue**: a central cluster settings record (`KnobSet` is never loaded).
+    Needs a design phase outside the PDCA cycle; for Eduard Ralph to schedule. No brief authored.
+  - #969: 768, a repair tool for a far-future stored `modified`.
+  - #970: 853, mismatched `x-amz-checksum-*` on a 503 splits GET from PUT/DELETE.
+  - #971: 853, the 64 KiB budget counts decoded bytes, not wire bytes.
+  - #972: 853, a plain GET answered 203/204/206 is accepted as the whole object.
+  - #973: 932, staging tests (held intent + Abort, the reserve's `doubt.settle()`, the intent's
+    session fence).
+  - #974: 932, the adopt path ignores the session; `max_part_chunks = 0` passes the check.
+  - #975: 932, assign an owner for the post-deadline publication gap before the multipart verbs
+    ship (relates #566, #508, #927).
+  - #976: 933, three untested renewal-race branches and the half-TTL wording (cites PR #965's
+    branch).
+  - #977: 933, proposal 0016's knob table lacks the renewal clamp.
+  - #927, comment 6401209849: 932's over-limit body returns `StageOutcome::Staged`; an API-shape
+    call for the #927 owner.
+  - 620's native key-length gap is already #893; nothing filed.
+- **getwyrd/wyrd-pdca** (this repo), evidence on open issues:
+  - #276, comment 6401216001: 744, 932, 933, plus 932's request that an evidence-free clean run
+    count as UNVERIFIABLE.
+  - #277, comment 6401216258: 853, 933.
+  - #278, comment 6401216419: 653, 744, 932.
+- **Upstream (eduralph/pdca-harness)**, evidence on open issues:
+  - #575, comment 6401216675: 620, 653, 932.
+  - #692, comment 6401216905: 620, 744, 933.
+
+## How effectiveness will be judged
+
+- **#276:** the open item is now the most costly one. Until it lands, every bundle over ~100 KB
+  pays one §6 item for T4. At the next review, count those items; if #276 has landed, check that
+  each `review-batch.md` lists 3 passes with times, bytes, model pin and patch sha256.
+- **#277:** the next stacked bundle's `diff-cov.json` shows its stack base, not `origin/main`.
+- **Standing advisory id:** still holding if the next base-wide advisory is declared under
+  `cargo deny all-features advisories` in every affected bundle.
+- **Sweep retired:** if a later review finds a §10 item that only lived in an archived
+  iteration, restart the sweep and add the case to harness#608.

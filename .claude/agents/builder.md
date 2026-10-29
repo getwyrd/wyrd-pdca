@@ -152,6 +152,12 @@ hint  = "<how a human installs or provides it>"
 level = "MISSING"        # or "WARN" if the slice degrades but still builds without it
 ```
 
+One case is already registered, so don't propose a row for it: if the **unpatched base**
+fails `cargo deny --all-features --config deny-all-features.toml check advisories` (a
+RustSec advisory against an unchanged dependency), the `<dependency>` is exactly
+`cargo deny all-features advisories`. Use that token so the driver matches the standing
+row (Act 2026-10-14).
+
 Then leave the criterion honestly unverified so it surfaces at sign-off. The marker is how
 the declaration reaches the human even when no gate covers the dependency (`build-notes.md`
 is otherwise withheld from the reviewer); prose alone about it would be lost. Plan should
