@@ -1,0 +1,2851 @@
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index f298270..36ee10e 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -14,4 +14,5 @@ pub mod multipart;
+ pub mod placement;
+ pub mod read;
+ pub mod repair;
++pub mod staged_publication;
+ pub mod write;
+diff --git a/crates/core/src/staged_publication.rs b/crates/core/src/staged_publication.rs
+new file mode 100644
+index 0000000..7174a5e
+--- /dev/null
++++ b/crates/core/src/staged_publication.rs
+@@ -0,0 +1,1048 @@
++//! **Staged publication** of an inode's chunk map (proposal 0016 decision 7(b)–(d),
++//! `0016:2342-2401`): the committer that publishes a chunk list as a flat root, or — past
++//! [`MAX_MAP_CHUNKS`] — writes it as `seg:<nonce>:<epoch>:<index>` records in bounded
++//! batches, verifies every one of them durable, and then flips the inode root in **one**
++//! batch.
++//!
++//! A segmented map exists because a large map cannot fit one metadata value, and for the
++//! same reason it cannot be published in one transaction (`0016:2494`). So publication has
++//! two phases: the **segment phase** (rows of the batch inventory's *Segment write*,
++//! `0016:662`) and the **flip** (*Root flip*, `0016:663`). The flip is the publication
++//! instant: the root that names the segments commits only after every one of them was read
++//! back durable and byte-identical to the plan.
++//!
++//! # What the caller supplies, and what it owns
++//!
++//! The committer knows nothing about multipart sessions. The caller (#658's Complete, its
++//! only producer) passes a **fence record** — any key — and, for each batch, a
++//! **contribution**: a [`WriteBatch`] of its own preconditions and mutations committed in
++//! the same transaction as the committer's rows. For #658 a segment batch's contribution is
++//! `require(mpu == Completing@E, segments_written = first_index)` plus the cursor move to
++//! `written` (`0016:613-620`), and the flip's is the session's move to `Completed` plus its
++//! `retire:` obligations, including `retire:bytes:{generation}` for a superseded
++//! generation, which this module never installs. [`planned_segments`] gives the caller the
++//! segment count its flip contribution must require the cursor at.
++//!
++//! # The fence rules, checked before anything is read or written
++//!
++//! * every contribution **pins** the fence record with exactly one precondition, at a value
++//!   ([`PublicationError::Unfenced`]);
++//! * no segment batch deletes it ([`PublicationError::FenceDeleted`]);
++//! * **the fence is a function of the cursor.** The value a segment batch requires depends
++//!   only on its `first_index`, and the value it leaves only on its `written`; so is the
++//!   value the flip requires: the one the phase leaves at `segment_count`
++//!   ([`PublicationError::FenceOffCursor`]). The committer reads that value at every cursor
++//!   position `0..=segment_count` off the hook's one-segment batches, and checks every batch
++//!   it commits against it;
++//! * the flip **moves** the fence ([`PublicationError::FenceNotMoved`]) — otherwise a
++//!   rollback keyed on the value the flip required still holds after the flip and deletes
++//!   the segments the live root names;
++//! * the fence never returns to a value it already left ([`PublicationError::FenceCycled`]):
++//!   `A → B → A` re-arms a rollback keyed on `A`. This is checked over **every** cursor
++//!   position, not only the ones this call's split stops at, because a resume, or a run with
++//!   another budget, splits elsewhere. So the cycle verdict depends only on the hook, the
++//!   plan and the flip contribution — never on `resume_from` or the budgets — and a hook
++//!   that is a function of the cursor passes the per-batch check on every split: a
++//!   publication whose first attempt passed is never refused on a recovery for a history it
++//!   did not have, and a history that would cycle on some split is refused before its first
++//!   write. Every committed batch moves the fence from the value at its first cursor
++//!   position to the value at its last, so across attempts the fence only ever walks
++//!   forward along those values;
++//! * no contribution puts, deletes or preconditions a key this committer **owns** — the
++//!   target inode, the target dirent, or any key in the group's `seg:<nonce>:<epoch>:`
++//!   range ([`PublicationError::OwnedKey`]). A contribution that deleted a segment in the
++//!   very batch that publishes the root naming it would make the verify step check the
++//!   wrong state.
++//!
++//! The hook must be a **pure function of its [`SegmentBatchInfo`]**, and the same on every
++//! attempt at one epoch: it is asked more often than the phase commits (once per cursor
++//! position, and once per candidate batch size while the split is measured).
++//!
++//! **These checks are necessary, not sufficient.** The guarantee that no committed root
++//! names a missing `seg:` record (C-1, `docs/principles.md` §5) also rests on two caller
++//! obligations:
++//!
++//! 1. **A rollback deletes a group's `seg:` records only after it has committed a move of
++//!    the fence record off every value a publisher batch requires**, and never authorizes
++//!    a delete from a fence value it merely read. The flip requires the fence at the
++//!    publication value and moves it, so the flip and that fence move cannot both land.
++//!    Reads protect nothing here: [`MetadataStore::scan_page`] gives no snapshot isolation
++//!    and only one batch is atomic. The target's rollback is
++//!    [`SessionRecord::completing_teardown`](crate::multipart::SessionRecord::completing_teardown)
++//!    (`Completing@E → Aborting@E+1` with its `retire:records:{seg}` obligation).
++//! 2. **Contributions never touch a committer-owned key.** Enforced: such a contribution is
++//!    refused (above).
++//!
++//! # Errors
++//!
++//! A refusal is a [`PublicationError`] inside the returned error. A store fault, a lost
++//! precondition ([`CommitOutcome::Conflict`]) and a `CommitUnknownResult` are returned as the
++//! store gave them, never reinterpreted: the retry loop around a lost flip (`R_publish`,
++//! `0016:926-941`) and the re-read after an unknown result are the caller's.
++//!
++//! **Clock.** This module reads no clock. The root's `modified` is the caller's stamp,
++//! ordered after a superseded prior's by [`overwrite_modified`] (#768), which reads none
++//! either (ADR-0009).
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::fmt;
++
++use bytes::Bytes;
++use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
++
++use crate::metadata::{
++    dirent_key, encode, inode_key, overwrite_modified, parse_seg_key, seg_key, seg_range_prefix,
++    ChunkMap, ChunkMapError, ChunkRef, DirentRecord, InodeId, InodeRecord, InodeState, ObjectMeta,
++    SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap, UnstampedOverwrite, MAX_ROOT_SEGMENTS,
++    MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES, SEGMENT_PAGE_LIMIT,
++};
++use crate::multipart::{MAX_BATCH_BYTES, MAX_BATCH_OPS, MAX_MAP_CHUNKS, MAX_SEG_CHUNKS};
++
++/// The root the flip installs.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RootTarget<'a> {
++    /// The name is unbound: create inode `id` at version 1 and the dirent naming it, both
++    /// under `require_absent`, as [`crate::metadata::create_leased`] does.
++    Fresh {
++        /// The freshly minted inode id.
++        id: InodeId,
++    },
++    /// The name is bound to inode `id`, whose committed record the caller re-read as
++    /// `prior`. The flip requires the dirent and `prior`'s exact bytes, and writes version
++    /// `prior.version + 1`, as
++    /// [`crate::metadata::commit_chunk_map_superseding_leased`] does. Retiring the
++    /// superseded generation is the caller's flip contribution (`0016:663`).
++    Supersede {
++        /// The inode the dirent names.
++        id: InodeId,
++        /// Its committed record, as the caller read it.
++        prior: &'a InodeRecord,
++    },
++}
++
++impl RootTarget<'_> {
++    fn id(&self) -> InodeId {
++        match *self {
++            Self::Fresh { id } | Self::Supersede { id, .. } => id,
++        }
++    }
++}
++
++/// The cursor positions one segment-write batch moves between: what the caller's fence
++/// contribution for that batch must require and what it leaves.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SegmentBatchInfo {
++    /// The first segment index the batch writes, which is also how many segments are
++    /// durable before it: the cursor value the batch requires.
++    pub first_index: u32,
++    /// How many segments are durable once the batch commits: the cursor value it leaves.
++    pub written: u32,
++}
++
++/// One publication: everything [`publish`] needs.
++pub struct Publication<'a> {
++    /// The directory inode the target's name lives in.
++    pub parent: InodeId,
++    /// The target's name.
++    pub name: &'a str,
++    /// Fresh key or supersede.
++    pub root: RootTarget<'a>,
++    /// The segment group `(nonce, epoch)` the `seg:` records are keyed by. Unused by a flat
++    /// publication, whose root names no group.
++    pub group: SegmentGroup,
++    /// The ordered chunk list to publish.
++    pub chunks: &'a [ChunkRef],
++    /// The object metadata to stamp (ADR-0047).
++    pub meta: &'a ObjectMeta,
++    /// The key of the record every batch is fenced on (the caller's; see the module docs).
++    pub fence_key: &'a [u8],
++    /// The caller's contribution to the segment-write batch described by its argument.
++    pub segment_contribution: &'a (dyn Fn(SegmentBatchInfo) -> WriteBatch + Sync),
++    /// How many leading segments the caller believes are already durable (a recovered
++    /// cursor). A hint for where to start writing, never evidence: the whole range is read
++    /// and checked before anything is written and again before the flip.
++    pub resume_from: u32,
++    /// The byte envelope of one batch. `None` is [`MAX_BATCH_BYTES`]; a larger value is
++    /// clamped to it, a smaller one honoured.
++    pub byte_budget: Option<u64>,
++    /// The operation envelope of one batch. `None` is [`MAX_BATCH_OPS`]; a larger value is
++    /// clamped to it, a smaller one honoured.
++    pub ops_budget: Option<u32>,
++    /// The caller's contribution to the flip: its preconditions and mutations, committed
++    /// atomically with the root.
++    pub flip_contribution: WriteBatch,
++}
++
++/// Which batch a refusal is about.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Phase {
++    /// The segment-write batch starting at this segment index.
++    Segments {
++        /// Its first segment index.
++        first_index: u32,
++    },
++    /// The root flip.
++    Flip,
++}
++
++impl fmt::Display for Phase {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Segments { first_index } => {
++                write!(f, "the segment batch starting at segment {first_index}")
++            }
++            Self::Flip => f.write_str("the root flip"),
++        }
++    }
++}
++
++/// A publication [`publish`] refused. Every variant down to [`Self::Unstamped`] is decided
++/// from the inputs alone, before the store is read or written; the rest are decided by the
++/// range read, before the batch that would have depended on it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PublicationError {
++    /// The plan needs more segments than one root may name ([`MAX_ROOT_SEGMENTS`]).
++    TooManySegments {
++        /// Segments the plan needs.
++        segments: usize,
++    },
++    /// One chunk reference encodes too large for any segment value.
++    ChunkTooLarge {
++        /// Its position in the chunk list.
++        position: usize,
++        /// Its encoded size.
++        bytes: usize,
++    },
++    /// The chunk list does not form a representable map.
++    Shape(ChunkMapError),
++    /// `resume_from` is past the plan.
++    ResumePastPlan {
++        /// The cursor the caller passed.
++        resume_from: u32,
++        /// Segments the plan has.
++        segments: u32,
++    },
++    /// A contribution does not pin the fence record with exactly one precondition, at a
++    /// value.
++    Unfenced {
++        /// The batch.
++        phase: Phase,
++    },
++    /// A segment-batch contribution deletes the fence record, which every later batch pins.
++    FenceDeleted {
++        /// The batch.
++        phase: Phase,
++    },
++    /// A contribution's fence values are not the ones the cursor positions it moves between
++    /// hold: the hook is not a function of the cursor, or the flip requires a value the
++    /// segment phase does not leave.
++    FenceOffCursor {
++        /// The batch.
++        phase: Phase,
++    },
++    /// The flip contribution pins the fence record without moving it.
++    FenceNotMoved,
++    /// The fence returns to a value it already left.
++    FenceCycled {
++        /// The batch that returns to it.
++        phase: Phase,
++    },
++    /// A contribution puts, deletes or preconditions a key the committer owns.
++    OwnedKey {
++        /// The batch.
++        phase: Phase,
++        /// The key, lossily rendered.
++        key: String,
++    },
++    /// A contribution mutates one key twice, whose outcome no backend defines.
++    DuplicateMutation {
++        /// The batch.
++        phase: Phase,
++        /// The key, lossily rendered.
++        key: String,
++    },
++    /// A put whose value is over [`MAX_VALUE_BYTES`].
++    ValueOverCeiling {
++        /// The batch.
++        phase: Phase,
++        /// The key, lossily rendered.
++        key: String,
++        /// The value's size.
++        bytes: usize,
++    },
++    /// A batch over the byte envelope (for a segment batch: one row plus its contribution).
++    BatchOverBytes {
++        /// The batch.
++        phase: Phase,
++        /// Its size.
++        bytes: u64,
++        /// The envelope.
++        budget: u64,
++    },
++    /// A batch over the operation envelope.
++    BatchOverOps {
++        /// The batch.
++        phase: Phase,
++        /// Its operations.
++        ops: u64,
++        /// The envelope.
++        budget: u64,
++    },
++    /// The prior's version is `u64::MAX`; no next version exists.
++    VersionOverflow {
++        /// The inode.
++        inode: InodeId,
++    },
++    /// An overwrite with no `modified` over a stamped prior (#768).
++    Unstamped(UnstampedOverwrite),
++    /// A key under the group's range that is not one of its segment keys.
++    ForeignRow {
++        /// The key, lossily rendered.
++        key: String,
++    },
++    /// A durable segment record past the end of the plan, which the resolver would refuse.
++    StrandedRow {
++        /// Its index.
++        index: u32,
++    },
++    /// A segment record that must be durable is absent.
++    SegmentNotDurable {
++        /// Its index.
++        index: u32,
++    },
++    /// A durable segment record whose bytes differ from the plan's.
++    SegmentMismatch {
++        /// Its index.
++        index: u32,
++    },
++}
++
++impl fmt::Display for PublicationError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::TooManySegments { segments } => write!(
++                f,
++                "the map needs {segments} segments, over the {MAX_ROOT_SEGMENTS} one root may name"
++            ),
++            Self::ChunkTooLarge { position, bytes } => write!(
++                f,
++                "chunk {position} encodes to {bytes} bytes, too large for a {SEGMENT_VALUE_BUDGET}-byte segment value"
++            ),
++            Self::Shape(err) => write!(f, "the chunk list is not a publishable map: {err}"),
++            Self::ResumePastPlan {
++                resume_from,
++                segments,
++            } => write!(
++                f,
++                "resume_from {resume_from} is past the plan's {segments} segments"
++            ),
++            Self::Unfenced { phase } => write!(
++                f,
++                "{phase}: the contribution does not pin the fence record at exactly one value"
++            ),
++            Self::FenceDeleted { phase } => {
++                write!(f, "{phase}: the contribution deletes the fence record")
++            }
++            Self::FenceOffCursor { phase } => write!(
++                f,
++                "{phase}: the contribution's fence values are not the ones its cursor positions hold"
++            ),
++            Self::FenceNotMoved => {
++                f.write_str("the flip contribution pins the fence record without moving it")
++            }
++            Self::FenceCycled { phase } => write!(
++                f,
++                "{phase}: the fence record returns to a value it already left"
++            ),
++            Self::OwnedKey { phase, key } => write!(
++                f,
++                "{phase}: the contribution touches {key:?}, which the committer owns"
++            ),
++            Self::DuplicateMutation { phase, key } => {
++                write!(f, "{phase}: the contribution mutates {key:?} twice")
++            }
++            Self::ValueOverCeiling { phase, key, bytes } => write!(
++                f,
++                "{phase}: {key:?} is {bytes} bytes, over the {MAX_VALUE_BYTES}-byte value ceiling"
++            ),
++            Self::BatchOverBytes {
++                phase,
++                bytes,
++                budget,
++            } => write!(
++                f,
++                "{phase} is {bytes} bytes, over the {budget}-byte batch envelope"
++            ),
++            Self::BatchOverOps { phase, ops, budget } => write!(
++                f,
++                "{phase} is {ops} operations, over the {budget}-operation batch envelope"
++            ),
++            Self::VersionOverflow { inode } => {
++                write!(f, "inode {inode} is at the last version; no next one exists")
++            }
++            Self::Unstamped(err) => err.fmt(f),
++            Self::ForeignRow { key } => {
++                write!(f, "{key:?} is in the group's range but is not one of its segment keys")
++            }
++            Self::StrandedRow { index } => write!(
++                f,
++                "segment {index} is durable past the end of the plan: a root over it would not resolve"
++            ),
++            Self::SegmentNotDurable { index } => write!(f, "segment {index} is not durable"),
++            Self::SegmentMismatch { index } => {
++                write!(f, "segment {index} is durable with bytes the plan does not write")
++            }
++        }
++    }
++}
++
++impl std::error::Error for PublicationError {}
++
++/// The bytes one segment value may encode to: `V/2` (`0016:1467`), the one-value rule
++/// [`MAX_SEG_CHUNKS`] is derived from, so the other half is margin, never needed.
++const SEGMENT_VALUE_BUDGET: usize = MAX_ROOT_VALUE_BYTES;
++
++/// A segment record's encoding around its chunk array at the widest `u64` renderings:
++/// `{"chunks":[` `],"byte_offset":` 20 digits `,"byte_len":` 20 digits `}`.
++const SEGMENT_ENVELOPE_BYTES: usize = 80;
++
++/// How many `seg:` records [`publish`] writes for `chunks`: 0 for a flat map (at most
++/// [`MAX_MAP_CHUNKS`] chunks). It is the cursor value the last segment batch leaves, so it is
++/// what the caller's flip contribution must require.
++///
++/// Usually `⌈chunks / MAX_SEG_CHUNKS⌉` (`0016:2345-2347`), but not always: a segment is also
++/// closed early once its encoding would pass the `V/2` value budget, so chunk refs wider than
++/// the sizing scheme's [`crate::multipart::MAX_CHUNKREF_BYTES`] (more fragments, or wider
++/// placement ids) give more segments. Callers ask this function; they never re-derive it.
++pub fn planned_segments(chunks: &[ChunkRef]) -> std::result::Result<u32, PublicationError> {
++    if chunks.len() <= MAX_MAP_CHUNKS as usize {
++        return Ok(0);
++    }
++    // At most `MAX_ROOT_SEGMENTS` spans, so the count fits.
++    Ok(split_segments(chunks)?.len() as u32)
++}
++
++/// Publish `publication`. Returns `Committed` when the root flipped, and `Conflict` when a
++/// segment batch or the flip lost a precondition (nothing after it was committed).
++///
++/// The order is the protocol:
++///
++/// 1. every refusal decidable from the inputs ([`PublicationError`] down to
++///    [`PublicationError::Unstamped`]) — so such a refusal leaves zero commits;
++/// 2. read the group's whole range (at most [`MAX_ROOT_SEGMENTS`] records, paged): a row
++///    below `resume_from` must be durable and identical, no row may differ from the plan,
++///    and none may lie past it;
++/// 3. the segment batches, in order, each creating its rows under `require_absent` or —
++///    for a row the read found durable and identical — pinning it with `require` rather
++///    than rewriting it, so a recovery at the same epoch never double-writes
++///    (`0016:2392-2401`);
++/// 4. read the whole range again and require **every** planned record durable and
++///    identical — never only `0..resume_from`;
++/// 5. the flip: the root CAS, the dirent pin and the caller's whole flip contribution in
++///    one batch.
++///
++/// A flat publication (at most [`MAX_MAP_CHUNKS`] chunks) is step 5 alone.
++pub async fn publish(
++    store: &impl MetadataStore,
++    publication: &Publication<'_>,
++) -> Result<CommitOutcome> {
++    let prepared = prepare(publication)?;
++    if !prepared.rows.is_empty() {
++        let count = prepared.rows.len();
++        let resume = publication.resume_from as usize;
++        let durable = read_group(store, &publication.group, count).await?;
++        let witnessed = check_durable(&prepared.rows, &durable, resume)?;
++        for batch in &prepared.batches {
++            let assembled = assemble_segments(&prepared.rows, batch, &witnessed);
++            if store.commit(assembled).await? == CommitOutcome::Conflict {
++                return Ok(CommitOutcome::Conflict);
++            }
++        }
++        let durable = read_group(store, &publication.group, count).await?;
++        check_durable(&prepared.rows, &durable, count)?;
++    }
++    store.commit(prepared.flip).await
++}
++
++/// One planned segment record.
++struct Row {
++    key: Vec<u8>,
++    value: Bytes,
++}
++
++/// One planned segment-write batch: rows `start..end` plus the caller's contribution.
++struct SegmentBatch {
++    start: usize,
++    end: usize,
++    contribution: WriteBatch,
++}
++
++/// Everything [`publish`] commits, assembled and checked before any I/O.
++struct Prepared {
++    rows: Vec<Row>,
++    batches: Vec<SegmentBatch>,
++    flip: WriteBatch,
++}
++
++/// Every refusal decidable from the inputs, and the batches they were decided on.
++fn prepare(p: &Publication<'_>) -> std::result::Result<Prepared, PublicationError> {
++    let budget_bytes = p
++        .byte_budget
++        .unwrap_or(MAX_BATCH_BYTES)
++        .min(MAX_BATCH_BYTES);
++    let budget_ops = u64::from(p.ops_budget.unwrap_or(MAX_BATCH_OPS).min(MAX_BATCH_OPS));
++    let (chunk_map, size, rows) = plan(&p.group, p.chunks)?;
++    let segments = rows.len() as u32;
++    if p.resume_from > segments {
++        return Err(PublicationError::ResumePastPlan {
++            resume_from: p.resume_from,
++            segments,
++        });
++    }
++    let owned = Owned {
++        inode: inode_key(p.root.id()),
++        dirent: dirent_key(p.parent, p.name),
++        segments: seg_range_prefix(&p.group),
++    };
++    let track = fence_track(p, segments, &owned)?;
++    check_track(&track)?;
++    let batches = split_batches(p, &rows, budget_bytes, budget_ops)?;
++    for batch in &batches {
++        let phase = Phase::Segments {
++            first_index: batch.start as u32,
++        };
++        let (pin, left) = segment_step(&batch.contribution, phase, &owned, p.fence_key)?;
++        if *pin != track[batch.start] || *left != track[batch.end] {
++            return Err(PublicationError::FenceOffCursor { phase });
++        }
++    }
++    check_flip_fence(&p.flip_contribution, &owned, p.fence_key, &track)?;
++    let root = root_record(p, chunk_map, size)?;
++    let flip = flip_batch(p, &root, budget_bytes, budget_ops)?;
++    Ok(Prepared {
++        rows,
++        batches,
++        flip,
++    })
++}
++
++/// The root's chunk map, the object's size, and the segment records (none for a flat map).
++fn plan(
++    group: &SegmentGroup,
++    chunks: &[ChunkRef],
++) -> std::result::Result<(ChunkMap, u64, Vec<Row>), PublicationError> {
++    if chunks.len() <= MAX_MAP_CHUNKS as usize {
++        let size = chunks
++            .iter()
++            .try_fold(0u64, |total, chunk| total.checked_add(chunk.len))
++            .ok_or(PublicationError::Shape(
++                ChunkMapError::SegmentLengthOverflow {
++                    chunks: chunks.len(),
++                },
++            ))?;
++        return Ok((ChunkMap::Flat(chunks.to_vec()), size, Vec::new()));
++    }
++    let spans = split_segments(chunks)?;
++    let mut refs = Vec::with_capacity(spans.len());
++    let mut rows = Vec::with_capacity(spans.len());
++    let mut offset = 0u64;
++    for (index, span) in spans.into_iter().enumerate() {
++        // At most `MAX_ROOT_SEGMENTS` spans, so the index fits.
++        let index = index as u32;
++        let record = SegmentRecord::new(span.to_vec(), offset).map_err(PublicationError::Shape)?;
++        refs.push(SegmentRef {
++            index,
++            byte_offset: offset,
++            byte_len: record.byte_len(),
++        });
++        rows.push(Row {
++            key: seg_key(group, index).map_err(PublicationError::Shape)?,
++            value: encode(&record),
++        });
++        offset = offset
++            .checked_add(record.byte_len())
++            .ok_or(PublicationError::Shape(
++                ChunkMapError::SegmentSpanOverflow { index },
++            ))?;
++    }
++    let map = SegmentedMap::new(group.clone(), refs).map_err(PublicationError::Shape)?;
++    // The size is the table's own span, so the root meets its decode invariant by
++    // construction.
++    let size = map.span();
++    Ok((ChunkMap::Segmented(map), size, rows))
++}
++
++/// Split the chunk list into segments by **encoded bytes** against [`SEGMENT_VALUE_BUDGET`]
++/// and by count against [`MAX_SEG_CHUNKS`], whichever binds first: a segment closes at
++/// `MAX_SEG_CHUNKS` refs, or sooner when wider refs would overrun the value. So the plan has
++/// `⌈chunks / MAX_SEG_CHUNKS⌉` segments only while every ref is within the sizing scheme's
++/// width; [`planned_segments`] is the count either way.
++fn split_segments(chunks: &[ChunkRef]) -> std::result::Result<Vec<&[ChunkRef]>, PublicationError> {
++    let mut spans = Vec::new();
++    let mut start = 0usize;
++    let mut bytes = SEGMENT_ENVELOPE_BYTES;
++    for (position, chunk) in chunks.iter().enumerate() {
++        let encoded = encode(chunk).len();
++        // A separating comma per chunk (one too many, so the estimate is an upper bound).
++        let cost = encoded + 1;
++        if SEGMENT_ENVELOPE_BYTES + cost > SEGMENT_VALUE_BUDGET {
++            return Err(PublicationError::ChunkTooLarge {
++                position,
++                bytes: encoded,
++            });
++        }
++        let held = position - start;
++        if held > 0 && (held == MAX_SEG_CHUNKS as usize || bytes + cost > SEGMENT_VALUE_BUDGET) {
++            spans.push(&chunks[start..position]);
++            start = position;
++            bytes = SEGMENT_ENVELOPE_BYTES;
++        }
++        bytes += cost;
++    }
++    if start < chunks.len() {
++        spans.push(&chunks[start..]);
++    }
++    if spans.len() > MAX_ROOT_SEGMENTS {
++        return Err(PublicationError::TooManySegments {
++            segments: spans.len(),
++        });
++    }
++    Ok(spans)
++}
++
++/// What one row costs a batch in its **unwitnessed** shape — `require_absent(key)` plus
++/// `put(key, value)` — which is the larger of its two shapes (a witnessed row is
++/// `require(key, value)` alone), so the split never depends on what the store held.
++fn row_bytes(row: &Row) -> u64 {
++    (2 * row.key.len() + row.value.len()) as u64
++}
++
++/// Operations one row costs a batch: its precondition and, unwitnessed, its put.
++const ROW_OPS: u64 = 2;
++
++/// Split rows `resume_from..` into batches, each as many rows as fit the envelope **with
++/// that batch's own contribution** — measured in encoded bytes and in operations, never by
++/// a fixed row count. A batch that cannot fit even one row beside its contribution is
++/// refused.
++fn split_batches(
++    p: &Publication<'_>,
++    rows: &[Row],
++    budget_bytes: u64,
++    budget_ops: u64,
++) -> std::result::Result<Vec<SegmentBatch>, PublicationError> {
++    let mut batches = Vec::new();
++    let mut start = p.resume_from as usize;
++    while start < rows.len() {
++        // Rows `start..end` costing `rows_bytes`, measured with the contribution for exactly
++        // that batch: its total bytes, its total operations, and the contribution itself.
++        let measure = |end: usize, rows_bytes: u64| {
++            let contribution = (p.segment_contribution)(SegmentBatchInfo {
++                first_index: start as u32,
++                written: end as u32,
++            });
++            let bytes = rows_bytes + batch_bytes(&contribution);
++            let ops = ROW_OPS * (end - start) as u64 + batch_ops(&contribution);
++            (bytes, ops, contribution)
++        };
++        let phase = Phase::Segments {
++            first_index: start as u32,
++        };
++        let mut rows_bytes = row_bytes(&rows[start]);
++        let (bytes, ops, contribution) = measure(start + 1, rows_bytes);
++        if bytes > budget_bytes {
++            return Err(PublicationError::BatchOverBytes {
++                phase,
++                bytes,
++                budget: budget_bytes,
++            });
++        }
++        if ops > budget_ops {
++            return Err(PublicationError::BatchOverOps {
++                phase,
++                ops,
++                budget: budget_ops,
++            });
++        }
++        let (mut end, mut contribution) = (start + 1, contribution);
++        for next in start + 2..=rows.len() {
++            let candidate = rows_bytes + row_bytes(&rows[next - 1]);
++            let (bytes, ops, grown) = measure(next, candidate);
++            if bytes > budget_bytes || ops > budget_ops {
++                break;
++            }
++            (rows_bytes, end, contribution) = (candidate, next, grown);
++        }
++        batches.push(SegmentBatch {
++            start,
++            end,
++            contribution,
++        });
++        start = end;
++    }
++    Ok(batches)
++}
++
++/// The bytes a batch carries: every precondition's key and expected value, every put's key
++/// and value, every delete's key — the whole transaction, not just the caller's idea of its
++/// payload.
++fn batch_bytes(batch: &WriteBatch) -> u64 {
++    let preconditions: usize = batch
++        .preconditions
++        .iter()
++        .map(|p| p.key.len() + p.expected.as_ref().map_or(0, Bytes::len))
++        .sum();
++    let puts: usize = batch.puts.iter().map(|(k, v)| k.len() + v.len()).sum();
++    let deletes: usize = batch.deletes.iter().map(Vec::len).sum();
++    (preconditions + puts + deletes) as u64
++}
++
++/// The operations a batch carries: every precondition read and every mutation, each a
++/// sequential round trip inside the transaction (`0016:630-648`).
++fn batch_ops(batch: &WriteBatch) -> u64 {
++    (batch.preconditions.len() + batch.puts.len() + batch.deletes.len()) as u64
++}
++
++/// The keys the committer writes itself.
++struct Owned {
++    inode: Vec<u8>,
++    dirent: Vec<u8>,
++    segments: Vec<u8>,
++}
++
++impl Owned {
++    fn owns(&self, key: &[u8]) -> bool {
++        key == self.inode.as_slice()
++            || key == self.dirent.as_slice()
++            || key.starts_with(&self.segments)
++    }
++}
++
++/// The rules every contribution meets: no owned key in any of its three lists, no key
++/// mutated twice, no value over the ceiling. Returns the one value it pins the fence at.
++fn check_contribution<'a>(
++    contribution: &'a WriteBatch,
++    phase: Phase,
++    owned: &Owned,
++    fence_key: &[u8],
++) -> std::result::Result<&'a Bytes, PublicationError> {
++    let read = contribution.preconditions.iter().map(|p| p.key.as_slice());
++    let mut mutated = contribution
++        .puts
++        .iter()
++        .map(|(k, _)| k.as_slice())
++        .chain(contribution.deletes.iter().map(Vec::as_slice));
++    if let Some(key) = read.chain(mutated.clone()).find(|k| owned.owns(k)) {
++        return Err(PublicationError::OwnedKey {
++            phase,
++            key: rendered(key),
++        });
++    }
++    let mut seen = BTreeSet::new();
++    if let Some(key) = mutated.find(|k| !seen.insert(*k)) {
++        return Err(PublicationError::DuplicateMutation {
++            phase,
++            key: rendered(key),
++        });
++    }
++    if let Some((key, value)) = contribution
++        .puts
++        .iter()
++        .find(|(_, v)| v.len() > MAX_VALUE_BYTES)
++    {
++        return Err(PublicationError::ValueOverCeiling {
++            phase,
++            key: rendered(key),
++            bytes: value.len(),
++        });
++    }
++    let mut pins = contribution
++        .preconditions
++        .iter()
++        .filter(|p| p.key == fence_key);
++    match (pins.next().and_then(|p| p.expected.as_ref()), pins.next()) {
++        (Some(pin), None) => Ok(pin),
++        _ => Err(PublicationError::Unfenced { phase }),
++    }
++}
++
++/// A segment contribution checked, and the fence values it moves between: the one it
++/// requires, and the one it leaves (its put, or the required value when it writes none).
++fn segment_step<'a>(
++    contribution: &'a WriteBatch,
++    phase: Phase,
++    owned: &Owned,
++    fence_key: &[u8],
++) -> std::result::Result<(&'a Bytes, &'a Bytes), PublicationError> {
++    let pin = check_contribution(contribution, phase, owned, fence_key)?;
++    if contribution.deletes.iter().any(|k| k == fence_key) {
++        return Err(PublicationError::FenceDeleted { phase });
++    }
++    // One put at most: `check_contribution` refused two.
++    let left = fence_put(contribution, fence_key).unwrap_or(pin);
++    Ok((pin, left))
++}
++
++/// The fence value at every cursor position `0..=segments` — `track[k]` is what the batch
++/// starting at segment `k` requires, `track[k + 1]` what the batch ending there leaves —
++/// read off the hook's one-segment batches, each checked like a committed one. Empty for a
++/// flat publication. One batch leaving a value the next does not require is a hook that is
++/// not a function of the cursor.
++fn fence_track(
++    p: &Publication<'_>,
++    segments: u32,
++    owned: &Owned,
++) -> std::result::Result<Vec<Bytes>, PublicationError> {
++    let mut track: Vec<Bytes> = Vec::with_capacity(segments as usize + 1);
++    for first_index in 0..segments {
++        let phase = Phase::Segments { first_index };
++        let probe = (p.segment_contribution)(SegmentBatchInfo {
++            first_index,
++            written: first_index + 1,
++        });
++        let (pin, left) = segment_step(&probe, phase, owned, p.fence_key)?;
++        match track.last() {
++            None => track.push(pin.clone()),
++            Some(held) if held != pin => return Err(PublicationError::FenceOffCursor { phase }),
++            Some(_) => {}
++        }
++        track.push(left.clone());
++    }
++    Ok(track)
++}
++
++/// Refuse a track that returns to a value it already left. A repeat of the value just held
++/// is the same state (a batch that leaves the fence where it was); any other repeat is a
++/// cycle, and is one on some split, so it is refused whatever split this call uses.
++fn check_track(track: &[Bytes]) -> std::result::Result<(), PublicationError> {
++    let mut left: BTreeSet<&Bytes> = BTreeSet::new();
++    for (first_index, pair) in track.windows(2).enumerate() {
++        if pair[1] == pair[0] {
++            continue;
++        }
++        left.insert(&pair[0]);
++        if left.contains(&pair[1]) {
++            return Err(PublicationError::FenceCycled {
++                phase: Phase::Segments {
++                    first_index: first_index as u32,
++                },
++            });
++        }
++    }
++    Ok(())
++}
++
++/// The flip contribution checked, and its fence rules: it requires the value the segment
++/// phase leaves (any value, for a flat publication), and moves the fence — deletes it, or
++/// puts a value the fence never held at any cursor position.
++fn check_flip_fence(
++    flip: &WriteBatch,
++    owned: &Owned,
++    fence_key: &[u8],
++    track: &[Bytes],
++) -> std::result::Result<(), PublicationError> {
++    let pin = check_contribution(flip, Phase::Flip, owned, fence_key)?;
++    if track.last().is_some_and(|end| end != pin) {
++        return Err(PublicationError::FenceOffCursor { phase: Phase::Flip });
++    }
++    if flip.deletes.iter().any(|k| k == fence_key) {
++        return Ok(());
++    }
++    match fence_put(flip, fence_key) {
++        Some(value) if value != pin && track.contains(value) => {
++            Err(PublicationError::FenceCycled { phase: Phase::Flip })
++        }
++        Some(value) if value != pin => Ok(()),
++        _ => Err(PublicationError::FenceNotMoved),
++    }
++}
++
++/// The value a batch writes to the fence record, if it writes one.
++fn fence_put<'a>(batch: &'a WriteBatch, fence_key: &[u8]) -> Option<&'a Bytes> {
++    batch
++        .puts
++        .iter()
++        .find(|(k, _)| k == fence_key)
++        .map(|(_, v)| v)
++}
++
++/// The root the flip installs: version 1 or `prior.version + 1`, the caller's object
++/// metadata, and `modified` ordered after the prior's by [`overwrite_modified`].
++fn root_record(
++    p: &Publication<'_>,
++    chunk_map: ChunkMap,
++    size: u64,
++) -> std::result::Result<InodeRecord, PublicationError> {
++    let (version, prior_modified) = match p.root {
++        RootTarget::Fresh { .. } => (1, None),
++        RootTarget::Supersede { id, prior } => (
++            prior
++                .version
++                .checked_add(1)
++                .ok_or(PublicationError::VersionOverflow { inode: id })?,
++            prior.modified,
++        ),
++    };
++    let modified = overwrite_modified(p.root.id(), prior_modified, p.meta.modified)
++        .map_err(PublicationError::Unstamped)?;
++    Ok(InodeRecord {
++        size,
++        chunk_map,
++        state: InodeState::Committed,
++        version,
++        etag: p.meta.etag.clone(),
++        content_type: p.meta.content_type.clone(),
++        modified,
++    })
++}
++
++/// The flip: the dirent and inode pinned on both branches (`0016:663`), the root put, and
++/// the caller's whole contribution — one batch, checked against both envelopes.
++fn flip_batch(
++    p: &Publication<'_>,
++    root: &InodeRecord,
++    budget_bytes: u64,
++    budget_ops: u64,
++) -> std::result::Result<WriteBatch, PublicationError> {
++    let id = p.root.id();
++    let inode = inode_key(id);
++    let dirent = dirent_key(p.parent, p.name);
++    let encoded = encode(root);
++    if encoded.len() > MAX_VALUE_BYTES {
++        return Err(PublicationError::ValueOverCeiling {
++            phase: Phase::Flip,
++            key: rendered(&inode),
++            bytes: encoded.len(),
++        });
++    }
++    let mut flip = match p.root {
++        RootTarget::Fresh { .. } => WriteBatch::new()
++            .require_absent(inode.clone())
++            .require_absent(dirent.clone())
++            .put(inode, encoded)
++            .put(dirent, encode(&DirentRecord { inode: id })),
++        RootTarget::Supersede { prior, .. } => WriteBatch::new()
++            .require(dirent, encode(&DirentRecord { inode: id }))
++            .require(inode.clone(), encode(prior))
++            .put(inode, encoded),
++    };
++    merge(&mut flip, &p.flip_contribution);
++    let bytes = batch_bytes(&flip);
++    if bytes > budget_bytes {
++        return Err(PublicationError::BatchOverBytes {
++            phase: Phase::Flip,
++            bytes,
++            budget: budget_bytes,
++        });
++    }
++    let ops = batch_ops(&flip);
++    if ops > budget_ops {
++        return Err(PublicationError::BatchOverOps {
++            phase: Phase::Flip,
++            ops,
++            budget: budget_ops,
++        });
++    }
++    Ok(flip)
++}
++
++/// Append a contribution's preconditions and mutations to `batch`.
++fn merge(batch: &mut WriteBatch, contribution: &WriteBatch) {
++    batch
++        .preconditions
++        .extend(contribution.preconditions.iter().cloned());
++    batch.puts.extend(contribution.puts.iter().cloned());
++    batch.deletes.extend(contribution.deletes.iter().cloned());
++}
++
++/// One segment batch as it commits: each row created under `require_absent`, or pinned
++/// with `require` when the range read found it durable and identical, plus the caller's
++/// contribution.
++fn assemble_segments(
++    rows: &[Row],
++    batch: &SegmentBatch,
++    witnessed: &BTreeSet<usize>,
++) -> WriteBatch {
++    let mut assembled = WriteBatch::new();
++    for (index, row) in rows.iter().enumerate().take(batch.end).skip(batch.start) {
++        assembled = if witnessed.contains(&index) {
++            assembled.require(row.key.clone(), row.value.clone())
++        } else {
++            assembled
++                .require_absent(row.key.clone())
++                .put(row.key.clone(), row.value.clone())
++        };
++    }
++    merge(&mut assembled, &batch.contribution);
++    assembled
++}
++
++/// Read the group's whole `seg:<nonce>:<epoch>:` range in [`SEGMENT_PAGE_LIMIT`] pages,
++/// keyed by parsed index. Refuses a key that is not one of the group's segment keys and a
++/// row at or past `planned`, so at most `planned` rows are kept.
++async fn read_group(
++    store: &impl MetadataStore,
++    group: &SegmentGroup,
++    planned: usize,
++) -> Result<BTreeMap<u32, Bytes>> {
++    let prefix = seg_range_prefix(group);
++    let mut rows = BTreeMap::new();
++    let mut after: Option<Vec<u8>> = None;
++    loop {
++        let (page, next) = store
++            .scan_page(&prefix, after.as_deref(), SEGMENT_PAGE_LIMIT)
++            .await?;
++        for (key, value) in page {
++            // A key under the group's own prefix that parses names that nonce and epoch:
++            // the prefix spells both and ends in `:`.
++            let Ok((_, _, index)) = parse_seg_key(&key) else {
++                return Err(PublicationError::ForeignRow {
++                    key: rendered(&key),
++                }
++                .into());
++            };
++            if index as usize >= planned {
++                return Err(PublicationError::StrandedRow { index }.into());
++            }
++            rows.insert(index, value);
++        }
++        match next {
++            Some(cursor) => after = Some(cursor),
++            None => return Ok(rows),
++        }
++    }
++}
++
++/// Check the durable range against the plan: every row below `required` must be durable
++/// and identical, and no durable row may differ from the plan. Returns the rows found
++/// durable and identical.
++fn check_durable(
++    rows: &[Row],
++    durable: &BTreeMap<u32, Bytes>,
++    required: usize,
++) -> std::result::Result<BTreeSet<usize>, PublicationError> {
++    let mut witnessed = BTreeSet::new();
++    for (index, row) in rows.iter().enumerate() {
++        match durable.get(&(index as u32)) {
++            Some(value) if *value == row.value => {
++                witnessed.insert(index);
++            }
++            Some(_) => {
++                return Err(PublicationError::SegmentMismatch {
++                    index: index as u32,
++                })
++            }
++            None if index < required => {
++                return Err(PublicationError::SegmentNotDurable {
++                    index: index as u32,
++                })
++            }
++            None => {}
++        }
++    }
++    Ok(witnessed)
++}
++
++/// A key for an error message, cut to 64 bytes.
++fn rendered(key: &[u8]) -> String {
++    String::from_utf8_lossy(&key[..key.len().min(64)]).into_owned()
++}
+diff --git a/crates/core/tests/segmented_publication.rs b/crates/core/tests/segmented_publication.rs
+new file mode 100644
+index 0000000..54cba9c
+--- /dev/null
++++ b/crates/core/tests/segmented_publication.rs
+@@ -0,0 +1,1382 @@
++//! The staged-publication committer (issue #653, proposal 0016 decision 7(b)–(d)), driven
++//! for real over [`RedbMetadataStore::in_memory`] through [`Recorder`], a wrapper that logs
++//! every batch the committer hands the store and can answer one with `Conflict`, or run a
++//! rival's batch just before or just after it.
++//!
++//! The fence record is test-local (`FENCE`); the committer must not care what it is. Its
++//! values model the multipart session: `cursor:<n>` while `n` segments are durable,
++//! `published` after the flip, `aborting` after a rollback's fence move.
++//!
++//! One test per acceptance leg of the brief: (A) round trip, (B) bounded batches, (C)
++//! refusals before any commit, (D1)–(D3) the whole range verified, (E) the flip carries the
++//! caller's batch, (F) epoch disjointness, fence cycles and both rollback orders.
++
++#![forbid(unsafe_code)]
++
++use std::sync::Mutex;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_core::metadata::{
++    dirent_key, encode, inode_key, resolve_chunk_map, seg_key, seg_range_prefix, ChunkMap,
++    ChunkRef, DirentRecord, EcScheme, InodeRecord, ObjectMeta, SegmentGroup, MAX_ROOT_SEGMENTS,
++    MAX_ROOT_VALUE_BYTES, SEGMENT_PAGE_LIMIT,
++};
++use wyrd_core::multipart::{MAX_BATCH_OPS, MAX_MAP_CHUNKS, MAX_SEG_CHUNKS};
++use wyrd_core::staged_publication::{
++    planned_segments, publish, Phase, Publication, PublicationError, RootTarget, SegmentBatchInfo,
++};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_traits::{CommitOutcome, MetadataStore, Result, ScanPage, WriteBatch};
++
++const ROOT: u64 = 0;
++const NONCE: &str = "0123456789abcdef0123456789abcdef";
++const EPOCH: u64 = 4;
++/// The test-local fence record.
++const FENCE: &[u8] = b"test:fence";
++/// A key of the caller's own that its flip contribution writes (leg E).
++const FLIP_MARK: &[u8] = b"test:flip-mark";
++/// What [`BIG`] chunks plan to: four full segments and a short tail (checked by
++/// `the_fixture_plans_the_segment_count_the_legs_assume`).
++const SEGMENTS: u32 = 5;
++const BIG: usize = 4 * MAX_MAP_CHUNKS as usize + 10;
++
++// ---------------------------------------------------------------------------
++// The recording wrapper
++// ---------------------------------------------------------------------------
++
++/// A rival batch, built from the fence record's value as the inner store holds it at that
++/// instant, so a rival can require what it read.
++type Hook = Box<dyn Fn(Option<Bytes>) -> WriteBatch + Send + Sync>;
++
++/// What [`Recorder`] does to the one commit a [`Rule`] matches.
++enum Action {
++    /// Answer `Conflict` without forwarding the batch.
++    Conflict,
++    /// Read the fence, commit the hook's batch, then forward the matched batch.
++    Before(Hook),
++    /// Read the fence, forward the matched batch, then commit the hook's batch.
++    ReadBeforeCommitAfter(Hook),
++    /// Forward the matched batch, then read the fence and commit the hook's batch.
++    After(Hook),
++}
++
++/// A one-shot rule: the first commit `when` matches gets `action`.
++struct Rule {
++    when: Box<dyn Fn(&WriteBatch) -> bool + Send + Sync>,
++    action: Action,
++}
++
++#[derive(Default)]
++struct Log {
++    /// Every batch the committer handed `commit`, in order.
++    batches: Vec<WriteBatch>,
++    /// The outcome of every rival batch a hook committed.
++    rivals: Vec<CommitOutcome>,
++    rules: Vec<Rule>,
++}
++
++struct Recorder {
++    inner: RedbMetadataStore,
++    log: Mutex<Log>,
++}
++
++impl Recorder {
++    /// A fresh store whose fence reads `cursor:0`.
++    fn new() -> Self {
++        let recorder = Self {
++            inner: RedbMetadataStore::in_memory().unwrap(),
++            log: Mutex::new(Log::default()),
++        };
++        recorder.set_fence(cursor(0));
++        recorder
++    }
++
++    fn rule(&self, when: impl Fn(&WriteBatch) -> bool + Send + Sync + 'static, action: Action) {
++        self.log.lock().unwrap().rules.push(Rule {
++            when: Box::new(when),
++            action,
++        });
++    }
++
++    fn batches(&self) -> Vec<WriteBatch> {
++        self.log.lock().unwrap().batches.clone()
++    }
++
++    fn rivals(&self) -> Vec<CommitOutcome> {
++        self.log.lock().unwrap().rivals.clone()
++    }
++
++    fn clear_log(&self) {
++        let mut log = self.log.lock().unwrap();
++        log.batches.clear();
++        log.rivals.clear();
++    }
++
++    /// Commit straight to the inner store, unlogged: a fixture step or another writer.
++    fn direct(&self, batch: WriteBatch) {
++        let outcome = pollster::block_on(self.inner.commit(batch)).unwrap();
++        assert_eq!(outcome, CommitOutcome::Committed);
++    }
++
++    /// Set the fence directly, as a new attempt's own fence would leave it.
++    fn set_fence(&self, value: Bytes) {
++        self.direct(WriteBatch::new().put(FENCE, value));
++    }
++
++    fn get(&self, key: &[u8]) -> Option<Bytes> {
++        pollster::block_on(self.inner.get(key)).unwrap()
++    }
++
++    /// Every key and value in the store.
++    fn snapshot(&self) -> Vec<(Vec<u8>, Bytes)> {
++        pollster::block_on(self.inner.scan(b"")).unwrap()
++    }
++
++    fn keys_under(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
++        let rows = pollster::block_on(self.inner.scan(prefix)).unwrap();
++        rows.into_iter().map(|(key, _)| key).collect()
++    }
++
++    /// What a rollback's drain does once its fence move committed: delete the whole range.
++    fn drain(&self, group: &SegmentGroup) {
++        let mut batch = WriteBatch::new();
++        for key in self.keys_under(&seg_range_prefix(group)) {
++            batch = batch.delete(key);
++        }
++        self.direct(batch);
++    }
++
++    async fn rival(&self, hook: &Hook) -> Result<WriteBatch> {
++        Ok(hook(self.inner.get(FENCE).await?))
++    }
++
++    async fn commit_rival(&self, batch: WriteBatch) -> Result<()> {
++        let outcome = self.inner.commit(batch).await?;
++        self.log.lock().unwrap().rivals.push(outcome);
++        Ok(())
++    }
++}
++
++#[async_trait]
++impl MetadataStore for Recorder {
++    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> Result<ScanPage> {
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
++        let action = {
++            let mut log = self.log.lock().unwrap();
++            log.batches.push(batch.clone());
++            let matched = log.rules.iter().position(|rule| (rule.when)(&batch));
++            matched.map(|at| log.rules.remove(at).action)
++        };
++        match action {
++            None => self.inner.commit(batch).await,
++            Some(Action::Conflict) => Ok(CommitOutcome::Conflict),
++            Some(Action::Before(hook)) => {
++                let rival = self.rival(&hook).await?;
++                self.commit_rival(rival).await?;
++                self.inner.commit(batch).await
++            }
++            Some(Action::ReadBeforeCommitAfter(hook)) => {
++                let rival = self.rival(&hook).await?;
++                let outcome = self.inner.commit(batch).await?;
++                self.commit_rival(rival).await?;
++                Ok(outcome)
++            }
++            Some(Action::After(hook)) => {
++                let outcome = self.inner.commit(batch).await?;
++                let rival = self.rival(&hook).await?;
++                self.commit_rival(rival).await?;
++                Ok(outcome)
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Fixtures
++// ---------------------------------------------------------------------------
++
++fn cursor(n: u32) -> Bytes {
++    Bytes::from(format!("cursor:{n}"))
++}
++
++fn group(epoch: u64) -> SegmentGroup {
++    SegmentGroup::new(NONCE, epoch).unwrap()
++}
++
++/// `n` distinct one-fragment chunks, ids from `base`.
++fn chunks(n: usize, base: u128) -> Vec<ChunkRef> {
++    (0..n)
++        .map(|i| ChunkRef {
++            id: base + i as u128,
++            scheme: EcScheme::None,
++            len: 4096 + (i as u64 % 7),
++            placement: vec![(i % 3) as u64 + 1],
++        })
++        .collect()
++}
++
++fn meta(modified: u64) -> ObjectMeta {
++    ObjectMeta {
++        etag: Some("e".repeat(64)),
++        content_type: Some("application/octet-stream".into()),
++        modified: Some(modified),
++    }
++}
++
++/// The segment contribution #658 makes: require the cursor the batch starts at, move it to
++/// the one it leaves.
++fn cursor_move(info: SegmentBatchInfo) -> WriteBatch {
++    WriteBatch::new()
++        .require(FENCE, cursor(info.first_index))
++        .put(FENCE, cursor(info.written))
++}
++
++/// The flip contribution: require the fully written cursor, move the fence to `published`,
++/// and write a key of the caller's own in the same batch.
++fn flip_move(segments: u32) -> WriteBatch {
++    WriteBatch::new()
++        .require(FENCE, cursor(segments))
++        .put(FENCE, Bytes::from_static(b"published"))
++        .put(FLIP_MARK, Bytes::from_static(b"flipped"))
++}
++
++/// A rollback's fence move: require the value it read, move it to `aborting`.
++fn rollback() -> Hook {
++    Box::new(|read| {
++        WriteBatch::new()
++            .require(FENCE, read.expect("the fence record exists"))
++            .put(FENCE, Bytes::from_static(b"aborting"))
++    })
++}
++
++/// A fresh publication of `chunks` at inode `id`, named `name`, under the cursor fence, its
++/// flip requiring the cursor at the count the committer plans.
++fn fresh<'a>(
++    id: u64,
++    name: &'a str,
++    epoch: u64,
++    chunks: &'a [ChunkRef],
++    meta: &'a ObjectMeta,
++) -> Publication<'a> {
++    let segments = planned_segments(chunks).unwrap_or(0);
++    Publication {
++        parent: ROOT,
++        name,
++        root: RootTarget::Fresh { id },
++        group: group(epoch),
++        chunks,
++        meta,
++        fence_key: FENCE,
++        segment_contribution: &cursor_move,
++        resume_from: 0,
++        byte_budget: None,
++        ops_budget: None,
++        flip_contribution: flip_move(segments),
++    }
++}
++
++/// A byte budget one full segment row fits and two do not (a full row is about 8.5 KB),
++/// so the phase commits one batch per full segment.
++const ONE_FULL_ROW_PER_BATCH: u64 = 10_000;
++
++fn run(store: &Recorder, publication: &Publication<'_>) -> Result<CommitOutcome> {
++    pollster::block_on(publish(store, publication))
++}
++
++fn refusal(result: Result<CommitOutcome>) -> PublicationError {
++    match result {
++        Ok(outcome) => panic!("expected a refusal, got {outcome:?}"),
++        Err(err) => err
++            .downcast_ref::<PublicationError>()
++            .unwrap_or_else(|| panic!("expected a PublicationError, got {err}"))
++            .clone(),
++    }
++}
++
++/// Run `publication` and require a refusal that committed nothing and changed nothing.
++fn refused_before_any_commit(store: &Recorder, publication: &Publication<'_>) -> PublicationError {
++    let before = store.snapshot();
++    store.clear_log();
++    let err = refusal(run(store, publication));
++    assert!(
++        store.batches().is_empty(),
++        "{err}: a refusal committed a batch"
++    );
++    assert_eq!(
++        store.snapshot(),
++        before,
++        "{err}: a refusal changed the store"
++    );
++    err
++}
++
++fn root_of(store: &Recorder, id: u64) -> Option<InodeRecord> {
++    store
++        .get(&inode_key(id))
++        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
++}
++
++/// The chunk list the shared resolver answers for inode `id`.
++fn resolved(store: &Recorder, id: u64) -> Vec<ChunkRef> {
++    let record = root_of(store, id).expect("a root");
++    let key = inode_key(id);
++    let answer = pollster::block_on(resolve_chunk_map(store, &key, &record))
++        .unwrap()
++        .expect("a live generation");
++    answer.chunks.into_owned()
++}
++
++fn puts_key(batch: &WriteBatch, key: &[u8]) -> bool {
++    batch.puts.iter().any(|(k, _)| k == key)
++}
++
++fn touches_seg(batch: &WriteBatch) -> bool {
++    batch.puts.iter().any(|(k, _)| k.starts_with(b"seg:"))
++        || batch.deletes.iter().any(|k| k.starts_with(b"seg:"))
++        || batch
++            .preconditions
++            .iter()
++            .any(|p| p.key.starts_with(b"seg:"))
++}
++
++fn requires(batch: &WriteBatch, key: &[u8], value: &Bytes) -> bool {
++    batch
++        .preconditions
++        .iter()
++        .any(|p| p.key == key && p.expected.as_ref() == Some(value))
++}
++
++/// The encoded bytes of the **whole** transaction, measured here rather than asked of the
++/// committer: every precondition's key and expected value, every put's key and value, every
++/// delete's key. Its mutation bytes are the part of it without the preconditions.
++fn transaction_bytes(batch: &WriteBatch) -> usize {
++    let preconditions: usize = batch
++        .preconditions
++        .iter()
++        .map(|p| p.key.len() + p.expected.as_ref().map_or(0, Bytes::len))
++        .sum();
++    let puts: usize = batch.puts.iter().map(|(k, v)| k.len() + v.len()).sum();
++    preconditions + puts + batch.deletes.iter().map(Vec::len).sum::<usize>()
++}
++
++fn operations(batch: &WriteBatch) -> usize {
++    batch.preconditions.len() + batch.puts.len() + batch.deletes.len()
++}
++
++/// Leave `publication`'s segments durable up to where the fence reads `stop`: run it and
++/// answer the first batch that requires `stop` — a segment batch, or the flip — `Conflict`.
++fn plant(store: &Recorder, publication: &Publication<'_>, stop: Bytes) {
++    let at = stop.clone();
++    store.rule(move |b| requires(b, FENCE, &at), Action::Conflict);
++    assert_eq!(run(store, publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(store.get(FENCE), Some(stop));
++    store.clear_log();
++}
++
++/// [`plant`] for the cursor fence, one full row per batch: segments `0..n` durable and the
++/// fence at `cursor:n`.
++fn plant_cursor(store: &Recorder, epoch: u64, chunks: &[ChunkRef], meta: &ObjectMeta, n: u32) {
++    let mut publication = fresh(8, "planted", epoch, chunks, meta);
++    publication.byte_budget = Some(ONE_FULL_ROW_PER_BATCH);
++    plant(store, &publication, cursor(n));
++}
++
++// ---------------------------------------------------------------------------
++// (A) Round trip
++// ---------------------------------------------------------------------------
++
++#[test]
++fn a_segmented_and_flat_maps_round_trip_through_the_resolver() {
++    let store = Recorder::new();
++    let meta = meta(10_000);
++
++    // Fresh key, segmented: the resolver answers the identical ordered list.
++    let big = chunks(BIG, 1_000_000);
++    let publication = fresh(8, "big", EPOCH, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let root = root_of(&store, 8).unwrap();
++    let map = root.chunk_map.segmented().expect("a segmented root");
++    assert_eq!(
++        map.group(),
++        &group(EPOCH),
++        "the root names the group it was given"
++    );
++    assert_eq!(map.segment_count(), planned_segments(&big).unwrap());
++    assert_eq!(root.version, 1);
++    assert_eq!(resolved(&store, 8), big);
++
++    // At most MAX_MAP_CHUNKS: a flat root, and no `seg:` record written.
++    store.set_fence(cursor(0));
++    store.clear_log();
++    let before = store.keys_under(b"seg:");
++    let small = chunks(MAX_MAP_CHUNKS as usize, 2_000_000);
++    let publication = fresh(9, "small", EPOCH + 1, &small, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let root = root_of(&store, 9).unwrap();
++    assert_eq!(root.chunk_map, ChunkMap::Flat(small.clone()));
++    assert_eq!(root.version, 1);
++    assert!(!store.batches().iter().any(touches_seg));
++    assert_eq!(store.keys_under(b"seg:"), before);
++
++    // Superseding that flat generation with a segmented one: version prior + 1, and the
++    // stamp ordered after the prior's (#768) though the caller's clock reads earlier.
++    store.set_fence(cursor(0));
++    let prior = root_of(&store, 9).unwrap();
++    let late = chunks(BIG, 3_000_000);
++    let early = ObjectMeta {
++        modified: Some(5_000),
++        ..meta.clone()
++    };
++    let mut publication = fresh(9, "small", EPOCH + 2, &late, &early);
++    publication.root = RootTarget::Supersede {
++        id: 9,
++        prior: &prior,
++    };
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let root = root_of(&store, 9).unwrap();
++    assert_eq!(root.version, prior.version + 1);
++    assert_eq!(root.modified, Some(10_001));
++    assert_eq!(
++        root.chunk_map.segmented().map(|m| m.group().clone()),
++        Some(group(EPOCH + 2))
++    );
++    assert_eq!(resolved(&store, 9), late);
++}
++
++/// `planned_segments` is the count `publish` writes, also where the byte rule closes
++/// segments before the count rule does: wide refs (RS(10,4), twenty-digit placement ids)
++/// plan more than `⌈chunks / MAX_SEG_CHUNKS⌉` segments, and the flip built from it
++/// publishes.
++#[test]
++fn a_planned_segments_is_the_count_publish_writes_for_wide_refs_too() {
++    let wide: Vec<ChunkRef> = (0..2 * MAX_SEG_CHUNKS as usize)
++        .map(|i| ChunkRef {
++            id: u128::MAX - i as u128,
++            scheme: EcScheme::ReedSolomon { k: 10, m: 4 },
++            len: 1 << 20,
++            placement: vec![u64::MAX - i as u64; 14],
++        })
++        .collect();
++    let planned = planned_segments(&wide).unwrap();
++    assert!(
++        planned > wide.len().div_ceil(MAX_SEG_CHUNKS as usize) as u32,
++        "wide refs close segments early: {planned}"
++    );
++    let store = Recorder::new();
++    let meta = meta(1);
++    let publication = fresh(8, "wide", EPOCH, &wide, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let root = root_of(&store, 8).unwrap();
++    assert_eq!(root.chunk_map.segmented().unwrap().segment_count(), planned);
++    assert_eq!(resolved(&store, 8), wide);
++    // Every segment value written fits the `V/2` budget the byte rule closes segments
++    // against: wide refs fill a segment long before the count rule would close it.
++    let written: Vec<usize> = store
++        .batches()
++        .iter()
++        .flat_map(|batch| batch.puts.iter())
++        .filter(|(key, _)| key.starts_with(b"seg:"))
++        .map(|(_, value)| value.len())
++        .collect();
++    assert_eq!(written.len(), planned as usize);
++    for bytes in written {
++        assert!(
++            bytes <= MAX_ROOT_VALUE_BYTES,
++            "a segment value of {bytes} bytes, over {MAX_ROOT_VALUE_BYTES}"
++        );
++    }
++
++    // The bounds: flat up to MAX_MAP_CHUNKS, and exactly MAX_ROOT_SEGMENTS full segments
++    // is the largest plan.
++    assert_eq!(planned_segments(&chunks(MAX_MAP_CHUNKS as usize, 1)), Ok(0));
++    assert_eq!(
++        planned_segments(&chunks(MAX_MAP_CHUNKS as usize + 1, 1)),
++        Ok(2)
++    );
++    let most = MAX_ROOT_SEGMENTS * MAX_SEG_CHUNKS as usize;
++    assert_eq!(
++        planned_segments(&chunks(most, 1)),
++        Ok(MAX_ROOT_SEGMENTS as u32)
++    );
++    assert_eq!(
++        planned_segments(&chunks(most + 1, 1)),
++        Err(PublicationError::TooManySegments {
++            segments: MAX_ROOT_SEGMENTS + 1
++        })
++    );
++}
++
++/// The flip pins the target dirent on both branches (`0016:663`): a fresh key over a name
++/// already bound, and a supersede after a rename moved the name, each lose with `Conflict`
++/// and leave the dirent as it was.
++#[test]
++fn a_the_flip_pins_the_dirent_on_both_branches() {
++    let store = Recorder::new();
++    let meta = meta(1);
++    let taken = dirent_key(ROOT, "taken");
++    let small = chunks(10, 1);
++    assert_eq!(
++        run(&store, &fresh(8, "taken", EPOCH, &small, &meta)).unwrap(),
++        CommitOutcome::Committed
++    );
++    let bound = store.get(&taken);
++    assert!(bound.is_some());
++
++    // A fresh inode 9 for the name inode 8 holds.
++    store.set_fence(cursor(0));
++    let big = chunks(BIG, 1);
++    let publication = fresh(9, "taken", EPOCH, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(store.get(&taken), bound, "the name was rebound");
++    assert_eq!(root_of(&store, 9), None);
++
++    // A supersede of inode 8 at "taken" after a rename moved inode 8 to "moved".
++    store.set_fence(cursor(0));
++    let prior = root_of(&store, 8).unwrap();
++    let moved = dirent_key(ROOT, "moved");
++    store.direct(
++        WriteBatch::new()
++            .delete(taken.clone())
++            .put(moved.clone(), encode(&DirentRecord { inode: 8 })),
++    );
++    let mut publication = fresh(8, "taken", EPOCH + 1, &big, &meta);
++    publication.root = RootTarget::Supersede {
++        id: 8,
++        prior: &prior,
++    };
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(
++        root_of(&store, 8),
++        Some(prior),
++        "the inode now bound at another name was overwritten"
++    );
++    assert_eq!(store.get(&taken), None);
++    assert_eq!(store.get(&moved), Some(encode(&DirentRecord { inode: 8 })));
++}
++
++/// The flip pins the target inode on both branches (`0016:663`): a supersede whose prior a
++/// concurrent PUT already replaced, and a fresh key whose inode id already holds a record,
++/// each lose with `Conflict` and leave that record as it was. The dirent pin cannot catch
++/// either: the name still names inode 8 in the first, and the fresh name is unbound in the
++/// second.
++#[test]
++fn a_the_flip_pins_the_inode_on_both_branches() {
++    let store = Recorder::new();
++    let meta = meta(1);
++    let small = chunks(10, 1);
++    assert_eq!(
++        run(&store, &fresh(8, "obj", EPOCH, &small, &meta)).unwrap(),
++        CommitOutcome::Committed
++    );
++    let prior = root_of(&store, 8).unwrap();
++
++    // A concurrent PUT replaces the generation the supersede read, under the same name.
++    let put = InodeRecord {
++        version: prior.version + 1,
++        modified: Some(2),
++        ..prior.clone()
++    };
++    store.direct(
++        WriteBatch::new()
++            .require(inode_key(8), encode(&prior))
++            .put(inode_key(8), encode(&put)),
++    );
++    store.set_fence(cursor(0));
++    let big = chunks(BIG, 1);
++    let mut publication = fresh(8, "obj", EPOCH + 1, &big, &meta);
++    publication.root = RootTarget::Supersede {
++        id: 8,
++        prior: &prior,
++    };
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(
++        root_of(&store, 8),
++        Some(put.clone()),
++        "the concurrent PUT's generation was overwritten"
++    );
++
++    // A fresh key whose inode id already holds a record no dirent names.
++    store.direct(WriteBatch::new().put(inode_key(9), encode(&put)));
++    store.set_fence(cursor(0));
++    let publication = fresh(9, "unbound", EPOCH + 2, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(
++        root_of(&store, 9),
++        Some(put),
++        "an existing inode record was overwritten"
++    );
++    assert_eq!(store.get(&dirent_key(ROOT, "unbound")), None);
++}
++
++/// A map of more segments than one range-read page holds (`SEGMENT_PAGE_LIMIT`): the
++/// committer's verify read pages through all of them, and the root publishes and resolves.
++#[test]
++fn a_a_map_over_one_page_of_segments_publishes_and_resolves() {
++    let many = chunks((SEGMENT_PAGE_LIMIT + 2) * MAX_SEG_CHUNKS as usize, 1);
++    let planned = planned_segments(&many).unwrap();
++    assert!(
++        planned as usize > SEGMENT_PAGE_LIMIT,
++        "{planned} segments fit one page"
++    );
++    let store = Recorder::new();
++    let meta = meta(1);
++    let publication = fresh(8, "many", EPOCH, &many, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let root = root_of(&store, 8).unwrap();
++    assert_eq!(root.chunk_map.segmented().unwrap().segment_count(), planned);
++    assert_eq!(resolved(&store, 8), many);
++}
++
++// ---------------------------------------------------------------------------
++// (B) Bounded batches
++// ---------------------------------------------------------------------------
++
++/// Fence values 4,000 bytes wide, all the same width, so each batch's contribution carries
++/// about 8 KB — half of it a precondition's expected value — and costs the same in every
++/// batch.
++fn padded(n: u32) -> Bytes {
++    Bytes::from(format!("{n:0>4000}"))
++}
++
++fn padded_move(info: SegmentBatchInfo) -> WriteBatch {
++    WriteBatch::new()
++        .require(FENCE, padded(info.first_index))
++        .put(FENCE, padded(info.written))
++}
++
++/// Every batch fits the byte budget **as a whole transaction**, and no segment batch left
++/// room for the next row (the split fills each batch rather than under-packing it).
++///
++/// The budget is set where the precondition bytes decide the split. A full row costs about
++/// 8.6 KB and the contribution 8,020 bytes, so one row and the contribution are about
++/// 16.6 KB and two about 25.3 KB: 23,000 bytes fits one (the last batch also takes the
++/// 10-chunk tail). A committer that dropped the expected value from its count would see two
++/// rows at about 21.3 KB, pack them, and commit a 25 KB transaction.
++#[test]
++fn b_every_batch_fits_the_byte_envelope_counting_its_preconditions() {
++    const BUDGET: u64 = 23_000;
++    let within_budget = |batches: &[WriteBatch]| {
++        for (n, batch) in batches.iter().enumerate() {
++            let bytes = transaction_bytes(batch);
++            assert!(
++                bytes as u64 <= BUDGET,
++                "batch {n} carries {bytes} bytes, over {BUDGET}"
++            );
++            assert!(operations(batch) <= MAX_BATCH_OPS as usize);
++        }
++    };
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.segment_contribution = &padded_move;
++    publication.byte_budget = Some(BUDGET);
++    publication.flip_contribution = WriteBatch::new()
++        .require(FENCE, padded(SEGMENTS))
++        .put(FENCE, Bytes::from_static(b"published"));
++
++    // A fresh run, which writes every row.
++    let store = Recorder::new();
++    store.set_fence(padded(0));
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let batches = store.batches();
++    within_budget(&batches);
++    let segment_batches: Vec<&WriteBatch> = batches.iter().filter(|b| touches_seg(b)).collect();
++    assert!(
++        segment_batches.len() >= 3,
++        "the budget must force at least three segment batches, got {}",
++        segment_batches.len()
++    );
++    for pair in segment_batches.windows(2) {
++        let (key, value) = pair[1]
++            .puts
++            .iter()
++            .find(|(k, _)| k.starts_with(b"seg:"))
++            .unwrap();
++        // The next row in the shape the committer charges: `require_absent` + `put`.
++        let next_row = 2 * key.len() + value.len();
++        assert!(
++            (transaction_bytes(pair[0]) + next_row) as u64 > BUDGET,
++            "a segment batch left room for the next row"
++        );
++    }
++    let flips: Vec<usize> = (0..batches.len())
++        .filter(|&n| puts_key(&batches[n], &inode_key(8)))
++        .collect();
++    assert_eq!(
++        flips,
++        vec![batches.len() - 1],
++        "the root is written once, last"
++    );
++    assert_eq!(resolved(&store, 8), big);
++
++    // A recovery: rows 0..2 are durable, and the recovery from 0 pins them
++    // (`require(key, value)`, no put) instead of rewriting them.
++    let store = Recorder::new();
++    store.set_fence(padded(0));
++    plant(&store, &publication, padded(2));
++    store.set_fence(padded(0));
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let batches = store.batches();
++    assert!(
++        batches[0].puts.iter().all(|(k, _)| !k.starts_with(b"seg:")),
++        "the recovery's first batch pins the durable rows"
++    );
++    within_budget(&batches);
++}
++
++/// The operation envelope binds on its own: at seven operations a segment batch holds two
++/// rows (two operations each, plus the contribution's two) whatever the byte budget allows.
++#[test]
++fn b_the_operation_envelope_binds_where_bytes_do_not() {
++    const OPS: u32 = 7;
++    let store = Recorder::new();
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.ops_budget = Some(OPS);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++
++    let batches = store.batches();
++    for (n, batch) in batches.iter().enumerate() {
++        let ops = operations(batch);
++        assert!(
++            ops <= OPS as usize,
++            "batch {n} carries {ops} operations, over {OPS}"
++        );
++    }
++    let segment_batches: Vec<&WriteBatch> = batches.iter().filter(|b| touches_seg(b)).collect();
++    assert!(segment_batches.len() >= 3);
++    for batch in &segment_batches[..segment_batches.len() - 1] {
++        assert!(
++            operations(batch) + 2 > OPS as usize,
++            "a segment batch left room for the next row"
++        );
++    }
++    assert_eq!(
++        batches
++            .iter()
++            .filter(|b| puts_key(b, &inode_key(8)))
++            .count(),
++        1
++    );
++    assert!(puts_key(batches.last().unwrap(), &inode_key(8)));
++    assert_eq!(resolved(&store, 8), big);
++}
++
++// ---------------------------------------------------------------------------
++// (C) Refusals precede durability
++// ---------------------------------------------------------------------------
++
++#[test]
++fn c_every_deterministic_refusal_leaves_zero_commits() {
++    let big = chunks(BIG, 1);
++    let too_many = chunks(MAX_ROOT_SEGMENTS * MAX_MAP_CHUNKS as usize + 1, 1);
++    let meta = meta(1);
++    let seg0 = seg_key(&group(EPOCH), 0).unwrap();
++    let seg0_rendered = String::from_utf8(seg0.clone()).unwrap();
++    let at = |first_index| Phase::Segments { first_index };
++
++    fn unfenced(info: SegmentBatchInfo) -> WriteBatch {
++        WriteBatch::new().put(FENCE, cursor(info.written))
++    }
++    fn deletes_seg0(info: SegmentBatchInfo) -> WriteBatch {
++        let seg0 = seg_key(&group(EPOCH), 0).unwrap();
++        cursor_move(info).delete(seg0)
++    }
++    fn deletes_fence(info: SegmentBatchInfo) -> WriteBatch {
++        WriteBatch::new()
++            .require(FENCE, cursor(info.first_index))
++            .delete(FENCE)
++    }
++    /// Leaves a value the next one-segment batch does not require.
++    fn skips_a_cursor(info: SegmentBatchInfo) -> WriteBatch {
++        WriteBatch::new()
++            .require(FENCE, cursor(info.first_index))
++            .put(FENCE, cursor(info.written + 1))
++    }
++    /// One-segment batches agree with each other, a wider batch leaves something else.
++    fn wide_batches_disagree(info: SegmentBatchInfo) -> WriteBatch {
++        let left = if info.written == info.first_index + 1 {
++            cursor(info.written)
++        } else {
++            Bytes::from_static(b"skipped")
++        };
++        WriteBatch::new()
++            .require(FENCE, cursor(info.first_index))
++            .put(FENCE, left)
++    }
++
++    type Edit<'a> = Box<dyn Fn(&mut Publication<'a>) + 'a>;
++    let cases: Vec<(Edit<'_>, PublicationError)> = vec![
++        (
++            Box::new(|p| p.chunks = &too_many),
++            PublicationError::TooManySegments {
++                segments: MAX_ROOT_SEGMENTS + 1,
++            },
++        ),
++        (
++            Box::new(|p| p.resume_from = SEGMENTS + 1),
++            PublicationError::ResumePastPlan {
++                resume_from: SEGMENTS + 1,
++                segments: SEGMENTS,
++            },
++        ),
++        (
++            Box::new(|p| p.byte_budget = Some(5_000)),
++            PublicationError::BatchOverBytes {
++                phase: at(0),
++                bytes: 0,
++                budget: 5_000,
++            },
++        ),
++        (
++            Box::new(|p| p.ops_budget = Some(3)),
++            PublicationError::BatchOverOps {
++                phase: at(0),
++                ops: 4,
++                budget: 3,
++            },
++        ),
++        (
++            Box::new(|p| {
++                p.byte_budget = Some(60_000);
++                p.flip_contribution =
++                    flip_move(SEGMENTS).put(b"test:big".to_vec(), vec![0u8; 70_000]);
++            }),
++            PublicationError::BatchOverBytes {
++                phase: Phase::Flip,
++                bytes: 0,
++                budget: 60_000,
++            },
++        ),
++        (
++            Box::new(|p| {
++                let mut flip = flip_move(SEGMENTS);
++                for n in 0..600 {
++                    flip = flip.put(format!("test:op:{n}").into_bytes(), Bytes::new());
++                }
++                p.flip_contribution = flip;
++            }),
++            PublicationError::BatchOverOps {
++                phase: Phase::Flip,
++                ops: 607,
++                budget: 500,
++            },
++        ),
++        (
++            Box::new(|p| p.segment_contribution = &unfenced),
++            PublicationError::Unfenced { phase: at(0) },
++        ),
++        (
++            Box::new(|p| p.segment_contribution = &deletes_fence),
++            PublicationError::FenceDeleted { phase: at(0) },
++        ),
++        (
++            Box::new(|p| p.segment_contribution = &skips_a_cursor),
++            PublicationError::FenceOffCursor { phase: at(1) },
++        ),
++        (
++            Box::new(|p| p.segment_contribution = &wide_batches_disagree),
++            PublicationError::FenceOffCursor { phase: at(0) },
++        ),
++        (
++            Box::new(|p| p.flip_contribution = flip_move(SEGMENTS - 1)),
++            PublicationError::FenceOffCursor { phase: Phase::Flip },
++        ),
++        (
++            Box::new(|p| {
++                p.flip_contribution = WriteBatch::new()
++                    .require(FENCE, cursor(SEGMENTS))
++                    .put(FENCE, cursor(SEGMENTS));
++            }),
++            PublicationError::FenceNotMoved,
++        ),
++        (
++            // Deleting a key of the caller's own is not a move of the fence.
++            Box::new(|p| {
++                p.flip_contribution = WriteBatch::new()
++                    .require(FENCE, cursor(SEGMENTS))
++                    .delete(b"test:unrelated".to_vec());
++            }),
++            PublicationError::FenceNotMoved,
++        ),
++        (
++            // The flip's deletes count toward its bytes: about 51 KB without them, 63 KB
++            // with them.
++            Box::new(|p| {
++                p.byte_budget = Some(60_000);
++                p.flip_contribution = flip_move(SEGMENTS)
++                    .put(b"test:big".to_vec(), vec![0u8; 50_000])
++                    .delete(format!("test:del:{}", "a".repeat(6_000)).into_bytes())
++                    .delete(format!("test:del:{}", "b".repeat(6_000)).into_bytes());
++            }),
++            PublicationError::BatchOverBytes {
++                phase: Phase::Flip,
++                bytes: 0,
++                budget: 60_000,
++            },
++        ),
++        (
++            // ...and toward its operations: the root's four, `flip_move`'s three, four
++            // deletes.
++            Box::new(|p| {
++                p.ops_budget = Some(10);
++                let mut flip = flip_move(SEGMENTS);
++                for n in 0..4 {
++                    flip = flip.delete(format!("test:del:{n}").into_bytes());
++                }
++                p.flip_contribution = flip;
++            }),
++            PublicationError::BatchOverOps {
++                phase: Phase::Flip,
++                ops: 11,
++                budget: 10,
++            },
++        ),
++        (
++            Box::new(|p| p.segment_contribution = &deletes_seg0),
++            PublicationError::OwnedKey {
++                phase: at(0),
++                key: seg0_rendered.clone(),
++            },
++        ),
++        (
++            Box::new(|p| p.flip_contribution = flip_move(SEGMENTS).delete(seg0.clone())),
++            PublicationError::OwnedKey {
++                phase: Phase::Flip,
++                key: seg0_rendered.clone(),
++            },
++        ),
++        (
++            Box::new(|p| {
++                p.flip_contribution = flip_move(SEGMENTS).require_absent(dirent_key(ROOT, "big"));
++            }),
++            PublicationError::OwnedKey {
++                phase: Phase::Flip,
++                key: String::from_utf8_lossy(&dirent_key(ROOT, "big")).into_owned(),
++            },
++        ),
++        (
++            Box::new(|p| p.flip_contribution = flip_move(SEGMENTS).put(inode_key(8), Bytes::new())),
++            PublicationError::OwnedKey {
++                phase: Phase::Flip,
++                key: String::from_utf8_lossy(&inode_key(8)).into_owned(),
++            },
++        ),
++        (
++            Box::new(|p| {
++                p.flip_contribution = flip_move(SEGMENTS).put(FLIP_MARK, Bytes::new());
++            }),
++            PublicationError::DuplicateMutation {
++                phase: Phase::Flip,
++                key: String::from_utf8_lossy(FLIP_MARK).into_owned(),
++            },
++        ),
++        (
++            Box::new(|p| {
++                p.flip_contribution =
++                    flip_move(SEGMENTS).put(b"test:huge".to_vec(), vec![0u8; 100_001]);
++            }),
++            PublicationError::ValueOverCeiling {
++                phase: Phase::Flip,
++                key: "test:huge".into(),
++                bytes: 100_001,
++            },
++        ),
++    ];
++    for (edit, expected) in cases {
++        let store = Recorder::new();
++        let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++        edit(&mut publication);
++        let err = refused_before_any_commit(&store, &publication);
++        // A byte refusal is matched on where and against what; its size is the
++        // committer's own measure.
++        let err = match err {
++            PublicationError::BatchOverBytes { phase, budget, .. } => {
++                PublicationError::BatchOverBytes {
++                    phase,
++                    bytes: 0,
++                    budget,
++                }
++            }
++            other => other,
++        };
++        assert_eq!(err, expected);
++    }
++}
++
++/// A flip that deletes the fence record moves it as surely as one that puts a new value:
++/// no rollback can require a record that is gone. The publication commits.
++#[test]
++fn c_a_flip_that_deletes_the_fence_record_moves_it() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.flip_contribution = WriteBatch::new()
++        .require(FENCE, cursor(SEGMENTS))
++        .delete(FENCE);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    assert_eq!(store.get(FENCE), None);
++    assert_eq!(resolved(&store, 8), big);
++}
++
++// ---------------------------------------------------------------------------
++// (D) A resume verifies the whole range
++// ---------------------------------------------------------------------------
++
++/// Plant one row the plan does not have under the group's range, then publish: the range
++/// read refuses it before any commit, and no root is written.
++fn refused_over_planted_row(key: Vec<u8>) -> PublicationError {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    store.direct(WriteBatch::new().put(key, Bytes::from_static(b"{}")));
++    let err = refused_before_any_commit(&store, &fresh(8, "big", EPOCH, &big, &meta));
++    assert_eq!(root_of(&store, 8), None);
++    err
++}
++
++/// A durable segment record one past the plan's last index, as a longer plan at this epoch
++/// would leave: a root over the range would not resolve.
++#[test]
++fn d_a_durable_row_past_the_plan_refuses_the_publish() {
++    let stranded = seg_key(&group(EPOCH), SEGMENTS).unwrap();
++    assert_eq!(
++        refused_over_planted_row(stranded),
++        PublicationError::StrandedRow { index: SEGMENTS }
++    );
++}
++
++/// A key under the group's `seg:<nonce>:<epoch>:` prefix that is not a segment key.
++#[test]
++fn d_a_foreign_key_in_the_groups_range_refuses_the_publish() {
++    let mut foreign = seg_range_prefix(&group(EPOCH));
++    foreign.extend_from_slice(b"junk");
++    let key = String::from_utf8(foreign.clone()).unwrap();
++    assert_eq!(
++        refused_over_planted_row(foreign),
++        PublicationError::ForeignRow { key }
++    );
++}
++
++#[test]
++fn d1_a_record_below_the_cursor_missing_or_rewritten_refuses_the_publish() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let damage: [(u32, Option<Bytes>); 2] = [(1, None), (2, Some(Bytes::from_static(b"{}")))];
++    for (index, replacement) in damage {
++        let store = Recorder::new();
++        plant_cursor(&store, EPOCH, &big, &meta, 3);
++        let key = seg_key(&group(EPOCH), index).unwrap();
++        store.direct(match &replacement {
++            None => WriteBatch::new().delete(key),
++            Some(bytes) => WriteBatch::new().put(key, bytes.clone()),
++        });
++
++        let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++        publication.resume_from = 3;
++        let err = refusal(run(&store, &publication));
++        let expected = match replacement {
++            None => PublicationError::SegmentNotDurable { index },
++            Some(_) => PublicationError::SegmentMismatch { index },
++        };
++        assert_eq!(err, expected);
++        assert!(store.batches().is_empty(), "refused before any commit");
++        assert_eq!(root_of(&store, 8), None, "no root names the group");
++    }
++}
++
++/// With `resume_from = 2`, a record lost right after the LAST segment commit returns is
++/// caught by the check before the flip, at an index past the cursor (which a check of
++/// `0..resume_from` alone would pass) and at one below it (which a check of
++/// `resume_from..` alone would pass).
++#[test]
++fn d2_a_record_lost_after_the_last_segment_commit_refuses_the_flip() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    for lost in [3, 0] {
++        let store = Recorder::new();
++        plant_cursor(&store, EPOCH, &big, &meta, 2);
++        let last = seg_key(&group(EPOCH), SEGMENTS - 1).unwrap();
++        store.rule(
++            move |b| b.preconditions.iter().any(|p| p.key == last),
++            Action::After(Box::new(move |_| {
++                WriteBatch::new().delete(seg_key(&group(EPOCH), lost).unwrap())
++            })),
++        );
++        let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++        publication.resume_from = 2;
++        let err = refusal(run(&store, &publication));
++        assert_eq!(err, PublicationError::SegmentNotDurable { index: lost });
++        assert_eq!(store.rivals(), vec![CommitOutcome::Committed]);
++        assert!(
++            !store.batches().iter().any(|b| puts_key(b, &inode_key(8))),
++            "no flip commit was handed to the store"
++        );
++        assert_eq!(root_of(&store, 8), None, "no root names the group");
++    }
++}
++
++#[test]
++fn d3_a_fully_durable_range_publishes_without_rewriting_it() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    plant_cursor(&store, EPOCH, &big, &meta, SEGMENTS);
++    let durable = store.snapshot();
++
++    store.set_fence(cursor(0));
++    let publication = fresh(8, "big", EPOCH, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    for batch in store.batches() {
++        assert!(
++            !batch.puts.iter().any(|(k, _)| k.starts_with(b"seg:")),
++            "a durable, identical segment was rewritten"
++        );
++    }
++    let segs = |rows: &[(Vec<u8>, Bytes)]| -> Vec<(Vec<u8>, Bytes)> {
++        rows.iter()
++            .filter(|(k, _)| k.starts_with(b"seg:"))
++            .cloned()
++            .collect()
++    };
++    assert_eq!(segs(&store.snapshot()), segs(&durable));
++    assert_eq!(resolved(&store, 8), big);
++}
++
++// ---------------------------------------------------------------------------
++// (E) The flip carries the caller's batch atomically
++// ---------------------------------------------------------------------------
++
++#[test]
++fn e_the_flip_commits_the_callers_contribution_with_the_root_or_neither() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++
++    let store = Recorder::new();
++    let publication = fresh(8, "big", EPOCH, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let flip = store.batches().pop().unwrap();
++    assert!(puts_key(&flip, &inode_key(8)) && puts_key(&flip, FLIP_MARK));
++    assert!(store.get(FLIP_MARK).is_some());
++
++    let store = Recorder::new();
++    store.rule(|b| puts_key(b, &inode_key(8)), Action::Conflict);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Conflict);
++    assert_eq!(root_of(&store, 8), None);
++    assert_eq!(
++        store.get(FLIP_MARK),
++        None,
++        "the caller's put landed without the root"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// (F) Epoch disjointness, fence cycles, and the rollback race
++// ---------------------------------------------------------------------------
++
++#[test]
++fn f_a_drained_rolled_back_epoch_never_touches_the_published_one() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    // Epoch E writes its segments and loses its flip: a rolled-back attempt.
++    plant_cursor(&store, EPOCH, &big, &meta, SEGMENTS);
++    let rolled_back = store.keys_under(&seg_range_prefix(&group(EPOCH)));
++    assert_eq!(rolled_back.len(), SEGMENTS as usize);
++
++    // Epoch E' > E publishes, over a part set that changed meanwhile.
++    store.set_fence(cursor(0));
++    let changed = chunks(BIG, 7_000_000);
++    let publication = fresh(8, "big", EPOCH + 1, &changed, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    let live = store.keys_under(&seg_range_prefix(&group(EPOCH + 1)));
++    assert!(
++        live.iter().all(|k| !rolled_back.contains(k)),
++        "the ranges overlap"
++    );
++
++    // The stale epoch-E obligation drains AFTER the publication.
++    store.drain(&group(EPOCH));
++    assert!(store
++        .keys_under(&seg_range_prefix(&group(EPOCH)))
++        .is_empty());
++    assert_eq!(store.keys_under(&seg_range_prefix(&group(EPOCH + 1))), live);
++    assert_eq!(resolved(&store, 8), changed);
++}
++
++/// A fence that returns to a value it left is refused before any commit: across the
++/// segment phase and the flip (`A → B → A`), at a cursor position only a resumed attempt's
++/// durable prefix held, and at one this call's own split never stops at.
++#[test]
++fn f_a_fence_that_returns_to_a_value_it_left_is_refused() {
++    /// `A` before the first segment, `B` from then on.
++    fn a_to_b(info: SegmentBatchInfo) -> WriteBatch {
++        let at = |n| Bytes::from_static(if n == 0 { b"A" } else { b"B" });
++        WriteBatch::new()
++            .require(FENCE, at(info.first_index))
++            .put(FENCE, at(info.written))
++    }
++    /// The cursor fence reduced to its parity: `0 → 1 → 0 → …`.
++    fn parity(info: SegmentBatchInfo) -> WriteBatch {
++        WriteBatch::new()
++            .require(FENCE, cursor(info.first_index % 2))
++            .put(FENCE, cursor(info.written % 2))
++    }
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++
++    // A → B over the phase, then a flip B → A.
++    let store = Recorder::new();
++    store.set_fence(Bytes::from_static(b"A"));
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.segment_contribution = &a_to_b;
++    publication.flip_contribution = WriteBatch::new()
++        .require(FENCE, Bytes::from_static(b"B"))
++        .put(FENCE, Bytes::from_static(b"A"));
++    let err = refused_before_any_commit(&store, &publication);
++    assert_eq!(err, PublicationError::FenceCycled { phase: Phase::Flip });
++    assert_eq!(
++        err.to_string(),
++        "the root flip: the fence record returns to a value it already left"
++    );
++
++    // A resume from 3 whose flip moves the fence back to `cursor:1`, a value only the
++    // durable prefix held.
++    let store = Recorder::new();
++    plant_cursor(&store, EPOCH, &big, &meta, 3);
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.resume_from = 3;
++    publication.flip_contribution = WriteBatch::new()
++        .require(FENCE, cursor(SEGMENTS))
++        .put(FENCE, cursor(1));
++    let err = refused_before_any_commit(&store, &publication);
++    assert_eq!(err, PublicationError::FenceCycled { phase: Phase::Flip });
++
++    // One batch at the default budget holds the whole phase (`0 → 1`), but a one-row
++    // split would go `0 → 1 → 0`: refused whatever split this call happens to use.
++    let store = Recorder::new();
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.segment_contribution = &parity;
++    publication.flip_contribution = WriteBatch::new()
++        .require(FENCE, cursor(SEGMENTS % 2))
++        .put(FENCE, Bytes::from_static(b"published"));
++    let err = refused_before_any_commit(&store, &publication);
++    assert_eq!(
++        err,
++        PublicationError::FenceCycled {
++            phase: Phase::Segments { first_index: 1 }
++        }
++    );
++    assert_eq!(
++        err.to_string(),
++        "the segment batch starting at segment 1: the fence record returns to a value it already left"
++    );
++}
++
++/// The fence verdict depends on the hook, the plan and the flip, never on how far an earlier
++/// attempt got or how it split. With fence values `A C D E F B` at cursor positions `0..=5`:
++/// a flip `B → C` is refused on the **first** attempt, before anything is durable (not only
++/// on a recovery, after); a flip `B → G` publishes on a recovery whose earlier attempt
++/// committed the whole phase as one `A → B` batch.
++#[test]
++fn f_the_fence_verdict_is_the_same_on_every_attempt() {
++    fn letter(k: u32) -> Bytes {
++        Bytes::copy_from_slice(&b"ACDEFB"[k as usize..=k as usize])
++    }
++    fn lettered(info: SegmentBatchInfo) -> WriteBatch {
++        WriteBatch::new()
++            .require(FENCE, letter(info.first_index))
++            .put(FENCE, letter(info.written))
++    }
++    let flip_to = |to: &'static [u8]| {
++        WriteBatch::new()
++            .require(FENCE, Bytes::from_static(b"B"))
++            .put(FENCE, Bytes::from_static(to))
++    };
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++
++    let store = Recorder::new();
++    store.set_fence(Bytes::from_static(b"A"));
++    let mut publication = fresh(8, "big", EPOCH, &big, &meta);
++    publication.segment_contribution = &lettered;
++    publication.flip_contribution = flip_to(b"C");
++    let err = refused_before_any_commit(&store, &publication);
++    assert_eq!(err, PublicationError::FenceCycled { phase: Phase::Flip });
++
++    publication.flip_contribution = flip_to(b"G");
++    plant(&store, &publication, Bytes::from_static(b"B"));
++    publication.resume_from = SEGMENTS;
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    assert_eq!(store.get(FENCE), Some(Bytes::from_static(b"G")));
++    assert_eq!(resolved(&store, 8), big);
++}
++
++#[test]
++fn f_r_a_rollback_whose_fence_move_lands_first_loses_the_flip_and_drains_nothing_published() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    store.rule(|b| puts_key(b, &inode_key(8)), Action::Before(rollback()));
++    let publication = fresh(8, "big", EPOCH, &big, &meta);
++    let outcome = run(&store, &publication).unwrap();
++    assert_eq!(store.rivals(), vec![CommitOutcome::Committed]);
++
++    // The rollback's fence move committed, so its drain may now delete the range.
++    store.drain(&group(EPOCH));
++    assert_eq!(root_of(&store, 8), None, "a root names a drained range");
++    assert_eq!(outcome, CommitOutcome::Conflict);
++    assert_eq!(store.get(&dirent_key(ROOT, "big")), None);
++    assert_eq!(store.get(FENCE), Some(Bytes::from_static(b"aborting")));
++}
++
++#[test]
++fn f_p_a_flip_that_lands_first_makes_the_rollbacks_fence_move_lose() {
++    let big = chunks(BIG, 1);
++    let meta = meta(1);
++    let store = Recorder::new();
++    store.rule(
++        |b| puts_key(b, &inode_key(8)),
++        Action::ReadBeforeCommitAfter(rollback()),
++    );
++    let publication = fresh(8, "big", EPOCH, &big, &meta);
++    assert_eq!(run(&store, &publication).unwrap(), CommitOutcome::Committed);
++    assert_eq!(store.rivals(), vec![CommitOutcome::Conflict]);
++
++    // The rollback lost, so it deletes nothing; the published root resolves whole.
++    assert_eq!(store.get(FENCE), Some(Bytes::from_static(b"published")));
++    assert_eq!(
++        store.keys_under(&seg_range_prefix(&group(EPOCH))).len(),
++        SEGMENTS as usize
++    );
++    assert_eq!(resolved(&store, 8), big);
++}
++
++/// The fixture plans the segment count the legs assume, and its refs are narrow enough that
++/// the count rule, not the byte rule, closes each segment.
++#[test]
++fn the_fixture_plans_the_segment_count_the_legs_assume() {
++    let big = chunks(BIG, 1);
++    assert_eq!(planned_segments(&big), Ok(SEGMENTS));
++    assert_eq!(BIG.div_ceil(MAX_SEG_CHUNKS as usize), SEGMENTS as usize);
++    assert!(encode(&big[0]).len() * MAX_SEG_CHUNKS as usize <= 25_000);
++}
+diff --git a/crates/dst/tests/segmented_publication.rs b/crates/dst/tests/segmented_publication.rs
+new file mode 100644
+index 0000000..03f6c47
+--- /dev/null
++++ b/crates/dst/tests/segmented_publication.rs
+@@ -0,0 +1,380 @@
++//! **Seeded publication atomicity** for the staged-publication committer (issue #653,
++//! proposal 0016 decision 7(b)–(d)), on the simulated-FoundationDB store with the
++//! commit-ambiguity nemesis armed (`support/mod.rs`, `arm_mixed_commit_ambiguity`).
++//!
++//! Two tasks race on one segmented publication:
++//!
++//! * the **publisher** runs [`publish`] — one full segment per batch on odd seeds, the whole
++//!   phase in one batch on even ones — and on every
++//!   `CommitUnknownResult` or lost precondition recovers the way #658's Complete does —
++//!   re-reads its own fence record and publishes again **at the same epoch** from the
++//!   cursor it finds. Each attempt mints a fresh inode id, as a Complete that re-resolves
++//!   its target may, so a second root is representable: only the flip's pins on the fence
++//!   and the dirent keep one out;
++//! * the **rival rollback** has the target's shape
++//!   (`SessionRecord::completing_teardown`): it first wins a fence move off the publisher's
++//!   value, and only then deletes the epoch's `seg:` range.
++//!
++//! The seed also picks how many commits the nemesis strikes (1–7) and, for half the seeds,
++//! holds a timed-out batch in flight until the run settles.
++//!
++//! After every seed: at most one root exists, and the name binds it; a root that names the
++//! group resolves, through the shared resolver, to the plan with every segment present; and
++//! the fence agrees with whichever side won. The demonstrated red is a rival that drains on a
++//! fence value it only **read** — the caller obligation the committer's doc states — and the
++//! same invariant catches the root it leaves over a drained range.
++//!
++//! Requires `--cfg madsim` (set by `cargo xtask dst`); without it this file compiles to
++//! nothing.
++
++#![forbid(unsafe_code)]
++#![cfg(madsim)]
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use bytes::Bytes;
++use wyrd_core::metadata::{
++    decode, dirent_key, inode_key, resolve_chunk_map, seg_range_prefix, ChunkRef, DirentRecord,
++    EcScheme, InodeRecord, ObjectMeta, SegmentGroup,
++};
++use wyrd_core::multipart::MAX_MAP_CHUNKS;
++use wyrd_core::staged_publication::{
++    planned_segments, publish, Publication, PublicationError, RootTarget, SegmentBatchInfo,
++};
++use wyrd_traits::{BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, WriteBatch};
++
++#[path = "support/mod.rs"]
++mod support;
++use support::{FdbFidelity, FdbObservations, SimFdbMetadataStore};
++
++/// The inode id the publisher's first attempt mints; attempt `n` mints `FIRST_ID + n`.
++const FIRST_ID: u64 = 8;
++const NAME: &str = "big";
++const FENCE: &[u8] = b"test:fence";
++const NONCE: &str = "0123456789abcdef0123456789abcdef";
++const EPOCH: u64 = 4;
++/// Four full segments and a short tail.
++const CHUNKS: usize = 4 * MAX_MAP_CHUNKS as usize + 10;
++/// One full segment row per batch (a full row is about 8.5 KB), so the phase is four
++/// segment commits and the nemesis lands mid-phase. Even seeds use the default budget
++/// instead: the phase is one commit, and more strikes reach the flip.
++const ONE_FULL_ROW_PER_BATCH: u64 = 10_000;
++/// The most commits the nemesis strikes, starting with the publisher's first segment batch.
++/// A seed strikes `1 + seed % MAX_STRIKES` of them: few strikes land mid-phase, and the
++/// publication is four segment commits and a flip, so more of them reach the flip, where an
++/// ambiguous flip still in flight sends the publisher round again with a fresh inode id.
++const MAX_STRIKES: u64 = 7;
++/// How many times either side re-reads and tries again before it stops.
++const ATTEMPTS: usize = 16;
++/// Seeds the plain-`#[test]` sweeps drive.
++const SWEEP_SEEDS: u64 = 64;
++
++fn cursor(n: u32) -> Bytes {
++    Bytes::from(format!("cursor:{n}"))
++}
++
++fn group() -> SegmentGroup {
++    SegmentGroup::new(NONCE, EPOCH).unwrap()
++}
++
++fn chunks() -> Vec<ChunkRef> {
++    (0..CHUNKS)
++        .map(|i| ChunkRef {
++            id: 1 + i as u128,
++            scheme: EcScheme::None,
++            len: 4096,
++            placement: vec![(i % 3) as u64 + 1],
++        })
++        .collect()
++}
++
++fn cursor_move(info: SegmentBatchInfo) -> WriteBatch {
++    WriteBatch::new()
++        .require(FENCE, cursor(info.first_index))
++        .put(FENCE, cursor(info.written))
++}
++
++fn is_unknown(err: &BoxError) -> bool {
++    err.downcast_ref::<CommitUnknownResult>().is_some()
++}
++
++/// How the publisher's run ended.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Ended {
++    /// It read its own fence at `published`.
++    Published,
++    /// It read the fence at the rival's `aborting`.
++    RolledBack,
++    /// It ran out of attempts.
++    GaveUp,
++}
++
++/// The publisher and its same-epoch recovery: re-read the fence, publish from the cursor it
++/// names, repeat until the fence says the publication or the rollback won. Returns how it
++/// ended, how many of its publishes came back `CommitUnknownResult`, and how many attempts
++/// resumed mid-phase (from a cursor strictly between 0 and the segment count).
++async fn publisher(
++    meta: Arc<SimFdbMetadataStore>,
++    chunks: Arc<Vec<ChunkRef>>,
++    byte_budget: Option<u64>,
++) -> (Ended, usize, usize) {
++    let (mut unknowns, mut mid_phase) = (0, 0);
++    let object = ObjectMeta {
++        modified: Some(1),
++        ..ObjectMeta::default()
++    };
++    let segments = planned_segments(&chunks).unwrap();
++    for attempt in 0..ATTEMPTS as u64 {
++        let fence = meta.get(FENCE).await.unwrap().expect("the fence exists");
++        let resume_from = match fence.as_ref() {
++            b"published" => return (Ended::Published, unknowns, mid_phase),
++            b"aborting" => return (Ended::RolledBack, unknowns, mid_phase),
++            value => std::str::from_utf8(value)
++                .ok()
++                .and_then(|v| v.strip_prefix("cursor:"))
++                .and_then(|n| n.parse().ok())
++                .expect("a cursor value"),
++        };
++        if 0 < resume_from && resume_from < segments {
++            mid_phase += 1;
++        }
++        let publication = Publication {
++            parent: 0,
++            name: NAME,
++            root: RootTarget::Fresh {
++                id: FIRST_ID + attempt,
++            },
++            group: group(),
++            chunks: &chunks,
++            meta: &object,
++            fence_key: FENCE,
++            segment_contribution: &cursor_move,
++            resume_from,
++            byte_budget,
++            ops_budget: None,
++            flip_contribution: WriteBatch::new()
++                .require(FENCE, cursor(segments))
++                .put(FENCE, Bytes::from_static(b"published")),
++        };
++        match publish(&*meta, &publication).await {
++            // Committed or Conflict alike: the next read of the fence says which.
++            Ok(_) => {}
++            Err(err) if is_unknown(&err) => unknowns += 1,
++            // A rival drained under this attempt; its fence move is what the next read sees.
++            Err(err)
++                if matches!(
++                    err.downcast_ref::<PublicationError>(),
++                    Some(PublicationError::SegmentNotDurable { .. })
++                ) => {}
++            Err(err) => panic!("the publisher met an unexpected error: {err}"),
++        }
++    }
++    (Ended::GaveUp, unknowns, mid_phase)
++}
++
++/// Which rollback the rival runs.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Rival {
++    /// The target's shape: commit a fence move off the publisher's value, then drain.
++    FenceThenDrain,
++    /// Violating: drain on a publisher value it only read, without moving the fence.
++    DrainOnRead,
++}
++
++/// Delete the group's whole `seg:` range, page by page, until it reads empty.
++async fn drain(meta: &SimFdbMetadataStore) {
++    let prefix = seg_range_prefix(&group());
++    for _ in 0..ATTEMPTS {
++        let (page, _) = meta.scan_page(&prefix, None, 128).await.unwrap();
++        if page.is_empty() {
++            return;
++        }
++        let mut batch = WriteBatch::new();
++        for (key, _) in page {
++            batch = batch.delete(key);
++        }
++        match meta.commit(batch).await {
++            Ok(_) => {}
++            Err(err) if is_unknown(&err) => {}
++            Err(err) => panic!("the drain met an unexpected error: {err}"),
++        }
++    }
++}
++
++/// The rival rollback. Returns whether it drained.
++async fn rival(meta: Arc<SimFdbMetadataStore>, delay_ms: u64, shape: Rival) -> bool {
++    madsim::time::sleep(Duration::from_millis(delay_ms)).await;
++    for _ in 0..ATTEMPTS {
++        let read = meta.get(FENCE).await.unwrap().expect("the fence exists");
++        match read.as_ref() {
++            b"published" => return false,
++            // Only this rival writes `aborting`: an earlier ambiguous move of its own landed.
++            b"aborting" => {
++                drain(&meta).await;
++                return true;
++            }
++            _ => {}
++        }
++        if shape == Rival::DrainOnRead {
++            drain(&meta).await;
++            madsim::time::sleep(Duration::from_millis(1)).await;
++            continue;
++        }
++        let fence_move = WriteBatch::new()
++            .require(FENCE, read)
++            .put(FENCE, Bytes::from_static(b"aborting"));
++        match meta.commit(fence_move).await {
++            Ok(CommitOutcome::Committed) => {
++                drain(&meta).await;
++                return true;
++            }
++            // The publisher moved the fence first, or the move's outcome is unknown: the next
++            // read decides. (A 1031 move still in flight may land later, leaving the range
++            // undrained — reclaimable residue, never a published root over it.)
++            Ok(CommitOutcome::Conflict) => {}
++            Err(err) if is_unknown(&err) => {}
++            Err(err) => panic!("the rival met an unexpected error: {err}"),
++        }
++    }
++    false
++}
++
++/// What one seed produced.
++#[derive(Debug)]
++struct Report {
++    ended: Ended,
++    unknowns: usize,
++    mid_phase: usize,
++    published: bool,
++    obs: FdbObservations,
++}
++
++/// The invariant, on the store's settled state. Returns whether a root was published.
++async fn assert_atomic(meta: &SimFdbMetadataStore, chunks: &[ChunkRef]) -> bool {
++    meta.quiesce();
++    let mut roots = meta.scan(b"inode:").await.unwrap();
++    assert!(roots.len() <= 1, "more than one root: {}", roots.len());
++    let fence = meta.get(FENCE).await.unwrap();
++    let Some((key, bytes)) = roots.pop() else {
++        assert_ne!(
++            fence.as_deref(),
++            Some(&b"published"[..]),
++            "the fence says published but no root exists"
++        );
++        return false;
++    };
++    let name = meta.get(&dirent_key(0, NAME)).await.unwrap();
++    let dirent: DirentRecord = decode(&name.expect("a root no name binds")).unwrap();
++    assert_eq!(key, inode_key(dirent.inode), "the name binds another inode");
++    let root: InodeRecord = decode(&bytes).unwrap();
++    let map = root.chunk_map.segmented().expect("a segmented root");
++    assert_eq!(map.group(), &group(), "the root names another group");
++    let resolved = resolve_chunk_map(meta, &key, &root)
++        .await
++        .expect("a published root names a missing or different seg: record")
++        .expect("the published root is live");
++    assert_eq!(
++        resolved.chunks.as_ref(),
++        chunks,
++        "the root resolves to another map"
++    );
++    let rows = meta.scan(&seg_range_prefix(&group())).await.unwrap();
++    assert_eq!(rows.len(), map.segment_count() as usize);
++    assert_eq!(fence.as_deref(), Some(&b"published"[..]));
++    true
++}
++
++async fn scenario(seed: u64, shape: Rival) -> Report {
++    let meta = Arc::new(SimFdbMetadataStore::with_fidelity(
++        FdbFidelity::CommitUnknownResult,
++    ));
++    meta.commit(WriteBatch::new().put(FENCE, cursor(0)))
++        .await
++        .unwrap();
++    meta.arm_mixed_commit_ambiguity(1 + seed % MAX_STRIKES);
++    // Every other block of seeds holds a timed-out batch in flight until the run settles
++    // (the latest instant FDB allows), so an ambiguous flip can still land after the
++    // publisher has gone round again — the case only the flip's pins decide.
++    if (seed / 24) % 2 == 1 {
++        meta.defer_in_flight_landings();
++    }
++    let chunks = Arc::new(chunks());
++    // Each network hop is one millisecond and a clean publication takes about a dozen, so
++    // the seed spreads the rival from before the first segment to after the flip.
++    let delay_ms = seed % 24;
++    let byte_budget = (seed % 2 == 1).then_some(ONE_FULL_ROW_PER_BATCH);
++    let publishing = madsim::task::spawn(publisher(
++        Arc::clone(&meta),
++        Arc::clone(&chunks),
++        byte_budget,
++    ));
++    let rolling_back = madsim::task::spawn(rival(Arc::clone(&meta), delay_ms, shape));
++    let (ended, unknowns, mid_phase) = publishing.await.unwrap();
++    rolling_back.await.unwrap();
++    let published = assert_atomic(&meta, &chunks).await;
++    Report {
++        ended,
++        unknowns,
++        mid_phase,
++        published,
++        obs: meta.observations(),
++    }
++}
++
++fn run(seed: u64, shape: Rival) -> Report {
++    let rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
++    rt.block_on(scenario(seed, shape))
++}
++
++/// **The seed sweep `cargo xtask dst` drives**: at every seed the publication is atomic,
++/// and the nemesis struck at least once, so no seed passes on a fault-free run.
++#[madsim::test]
++async fn segmented_publication_is_atomic_under_ambiguity_and_a_rival_rollback() {
++    let seed = madsim::runtime::Handle::current().seed();
++    let report = scenario(seed, Rival::FenceThenDrain).await;
++    assert!(
++        report.obs.ambiguous_commits >= 1,
++        "the nemesis never struck: {report:?}"
++    );
++}
++
++/// The sweep explores both winners and the recovery it exists for: some seeds publish,
++/// some roll back, and some publish only after recovering at the same epoch from a
++/// `CommitUnknownResult`, resuming mid-phase.
++#[test]
++fn the_sweep_reaches_both_winners_and_a_mid_phase_recovery() {
++    let (mut published, mut rolled_back, mut recovered) = (0, 0, 0);
++    for seed in 0..SWEEP_SEEDS {
++        let report = run(seed, Rival::FenceThenDrain);
++        assert!(report.obs.ambiguous_commits >= 1, "seed {seed}: no strike");
++        assert_eq!(report.published, report.ended == Ended::Published);
++        match report.ended {
++            Ended::Published if report.unknowns >= 1 && report.mid_phase >= 1 => {
++                published += 1;
++                recovered += 1;
++            }
++            Ended::Published => published += 1,
++            Ended::RolledBack => rolled_back += 1,
++            Ended::GaveUp => panic!("seed {seed}: the publisher gave up: {report:?}"),
++        }
++    }
++    assert!(published >= 1, "no seed published");
++    assert!(rolled_back >= 1, "no seed rolled back");
++    assert!(
++        recovered >= 1,
++        "no seed published after a mid-phase recovery from an unknown commit result"
++    );
++}
++
++/// **Demonstrated red:** a rival that drains on a fence value it only read — no fence move
++/// first — leaves a published root over a drained range at some seed, and the invariant
++/// above catches it. Without such a seed this test fails, so it also guards the sweep
++/// against reaching that window by luck alone.
++#[test]
++#[should_panic(expected = "a published root names a missing or different seg: record")]
++fn a_rival_draining_on_a_read_value_is_caught() {
++    for seed in 0..SWEEP_SEEDS {
++        run(seed, Rival::DrainOnRead);
++    }
++}
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index 693db2a..cb190b3 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -88,6 +88,8 @@ A half-upgraded fleet is the normal state during a rolling upgrade (constraint 2
+ 
+ **The segmented shape has a write side too (proposal 0016 decision 7(f)).** A maintenance pass that moves one chunk's placement goes through one primitive (`repoint_chunk`), the write counterpart of the single resolver: it rewrites whichever record holds the chunk's reference — the flat inode record, or one `seg:` record, leaving the segmented root byte-identical — as a compare-and-swap on the root generation, on that record's bytes as the move itself re-reads them, and on the chunk's reference. The custodian's reconstruction pass repairs a chunk held in a `seg:` record this way (section 6.3), adding the obligation's delete and the orphan marks to the same batch. The re-encoded record is weighed against the backend value ceiling before anything is written, and a segment record the root still names but the move cannot read is the same typed, per-object error the read side raises: the pass contains it, and never rewrites it or reads it as a lost race.
+ 
++**A segmented map is published in stages (proposal 0016 decision 7(b)–(d)).** A map too large for one value is also too large for one transaction, so one committer (`wyrd_core::staged_publication::publish`) publishes it in two phases under a fence record the publisher holds: it writes the `seg:` records in batches bounded by encoded bytes and by operation count, each batch carrying the publisher's own fence update, then reads the group's whole range back and requires every planned record durable and byte-identical, and only then flips the root in **one** batch that also carries the publisher's own state change. A map of at most `MAX_MAP_CHUNKS` chunks is published flat, as the flip alone. Segment keys carry the attempt's fence epoch, so a rolled-back attempt's records never overlap a later attempt's and its pending cleanup can never delete them. Every batch must pin the fence; the fence value a batch requires and leaves must be a function of how many segments are durable, and the flip must require the value the last segment batch leaves and move it; the fence may never return to a value it already left, judged over every cursor position rather than only where one attempt's batches happen to stop, so a recovery gets the same verdict as the first attempt; the publisher's batches may not touch the target inode, its dirent or the group's `seg:` range; all of these are refused before anything is written. The segment count the flip must require is `planned_segments`, which can exceed `⌈chunks / MAX_SEG_CHUNKS⌉` when chunk references are wider than the sizing scheme assumes. The rest of the guarantee is the caller's: a rollback deletes a group's `seg:` records only after it has committed its own move of the fence away from every value the publisher's batches require, so the rollback and the flip cannot both land. A recovering publisher re-derives the same records at the same epoch and pins the ones already durable instead of rewriting them. The only producer is the multipart Complete (#658).
++
+ ## 8.8 Multi-tenancy
+ 
+ The primary deployment is a provider serving many tenants on shared infrastructure (section 1.4), so a **tenant** is a first-class unit — a namespace partition plus an identity domain, carrying its own policy (residency, replication factor, encryption, quotas, rate limits). See ADR-0022.

@@ -1,0 +1,11 @@
+Advisory findings grounded in the target source and frozen gate evidence; no gates were rerun.
+
+- NEEDS-HUMAN [impl] — **Reject non-HTTP whitespace in transfer coding.** `crates/validate/src/s3/response.rs:85` uses Unicode-aware `trim()`, so `Transfer-Encoding: chunked\u{00A0}` becomes `Framing::Chunked`. Hyper treats this value as close-delimited, allowing a GET cut off without a terminal chunk to finish successfully. This discrepancy is also recorded in `gate-logs/T4-batch-review.log`. Validate the original bytes using only HTTP space/tab trimming and add a malformed-coding GET regression.
+
+- NEEDS-HUMAN [impl] — **Account for bodyless statuses before accepting chunked GETs.** `crates/validate/src/s3/response.rs:198` admits every successful status into the streaming path. For `204 No Content` with `Transfer-Encoding: chunked`, hyper suppresses the body, while `crates/validate/src/s3.rs:198` accepts the framing with no length check. Consequently, even a response with no terminal chunk becomes a successful empty object. The frozen batch review confirms this case. Reject forbidden framing for bodyless statuses and add this GET regression.
+
+- NEEDS-HUMAN [impl] — **Reject nested elements in scalar error fields.** `crates/validate/src/s3/response.rs:328` concatenates all descendant text, turning `<Error><Code>Slow<Unexpected/>Down</Code></Error>` into a clean `Code("SlowDown")`. The same normalization affects `<Message>`. XML well-formedness does not establish that these fields contain scalar text. Validate their children before collecting text and exercise nested elements on GET, PUT, and DELETE; the frozen batch review identifies the same defect.
+
+- NEEDS-HUMAN [impl] — **Test acceptance at the buffered-body limit.** The budget cases at `crates/validate/tests/s3_client_nonconforming_responses.rs:1055` only demand rejection of oversized bodies. Frozen `C5-mutants.log` shows that changing `64 * 1024` to `64 + 1024` at `crates/validate/src/s3/response.rs:45` survives, as does changing the streaming comparison from `>` to `>=`. Thus the suite accepts a client that rejects valid error documents above 1,088 bytes or exactly at the documented limit. Add valid error-document cases just below and at 64 KiB, with declared-length and chunked framing on all three operations.
+
+No separate reuse, simplification, or efficiency finding.

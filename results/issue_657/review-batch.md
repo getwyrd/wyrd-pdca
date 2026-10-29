@@ -1,0 +1,8 @@
+# Batched review — 3 passes, union of findings
+
+- [ ] `crates/core/src/multipart/upload_part.rs:810` **BUG** (seen by 1 pass): Empty parts have no unique chunk IDs, so an unapplied commit with an unknown outcome can match a prior empty part with the same timestamp and epoch, falsely return Committed, and leave this attempt’s slot reserved.
+- [ ] `crates/core/src/multipart/upload_part.rs:810` **BUG** (seen by 1 pass): Empty parts have no unique chunk IDs, so a prior empty part with the same millisecond timestamp and epoch can falsely identify an unapplied ambiguous commit as successful, leaving this attempt’s slot reserved.
+- [ ] `crates/core/src/multipart/upload_part.rs:1139` **BUG** (seen by 1 pass): Because session and slot reads are separate, an Abort and teardown between them can remove the slot after an Open session was observed, causing an unapplied pending commit to be inferred as landed and answered Committed.
+- [ ] `crates/core/src/multipart/upload_part.rs:810` **BUG** (seen by 1 pass): An empty re-upload in the same millisecond and session epoch can produce bytes identical to the prior empty part, so an unapplied commit with an unknown outcome is falsely recognized as committed and leaves its reserved slot unreleased.
+
+Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale (a decision follows its finding to the nearest matching line when the line shifts) — not re-reviewed to silence. The gate blocks while any finding here is unchecked.

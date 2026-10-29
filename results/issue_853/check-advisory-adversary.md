@@ -1,23 +1,91 @@
-# Adversarial review — #853 validate-s3-client-nonconforming-responses
+# Adversarial review — issue #853, round 5 (trailer section dropped at the connector)
 
-**Method.** I re-read the red→green log and the C5 survivors. Then I ran 9 probe inputs and one budget mutation against the patched tree at `$PDCA_TARGET`, using a scratch copy, the production `S3Client`, and the patch's own scripted-endpoint helpers. 6 of the 9 probes broke the fix.
+I re-ran the suite on the patched tree: 28/28 green. Then I attacked this round's change
+(`crates/validate/src/s3/wire.rs:321-327`, where the trailer section is dropped and the body is
+polled on to its end) and the claims around it. I built everything in a scratch copy of
+`$PDCA_TARGET` with `cargo test --offline`, toolchain 1.96.0.
 
-**Evidence: holds.** The C4-verify red leg compiles against #852 and fails by assertion: 8 tests fail and 6 pass as guards. It drives the production client through `resolve_config` and `S3Client::with_deadlines` (`crates/validate/tests/s3_client_nonconforming_responses.rs:479-516`). It is not a parallel copy of the client. The gate's summary "14 test(s) ran red" is wrong (only 8 of 14 failed). That is a harness counting slip, not a patch defect.
+## This round's fix: attempted to refute, could not
+
+- **The new tests do guard this round's fix.** I tried two wrong versions of
+  `crates/validate/src/s3/wire.rs:325`. (a) Forward the section at once (the round-3 code).
+  This fails 3 tests: both checksum tests panic at `aws-smithy-checksums-0.65.0
+  validate.rs:57`, and three `chunked-trailer-then-*` GET cases are accepted as 3000-byte
+  objects. (b) Hold the section until after the connection check, then hand it over (the
+  round-4 code). This fails 2 tests, both with the same validator panic:
+  `a_chunked_get_with_a_trailer_section_is_checked_against_its_checksum_header`
+  (`crates/validate/tests/s3_client_nonconforming_responses.rs:1968`) and
+  `an_error_body_with_a_trailer_section_and_a_checksum_header_is_the_error_it_says` (`:1378`).
+  Both tests go through the public `S3Client` against the scripted loopback endpoint, so they
+  test the real production code, not a copy.
+- **The `continue` at `wire.rs:325` cannot hang or panic.** After the trailers frame, hyper's
+  `Incoming` polls a `futures_channel` oneshot that has already been used. That returns
+  `Err(Canceled)`, which becomes `Poll::Ready(None)` (`hyper-1.10.1 body/incoming.rs:229-233`).
+  The unit test at `wire.rs:437-454` shows the body ends cleanly.
+- **A checksum header plus junk after the trailer section.** I probed this. The result is
+  `Body(Overrun { after: 4 })` on a GET 200, both chunked and `Content-Length` framed, and
+  `Unreadable` with the overrun detail on a GET, PUT and DELETE 503. All correct.
+- **Dropping the section unread is bounded.** hyper caps the trailer section at 16 KiB
+  (`hyper-1.10.1 proto/h1/decode.rs:25`, `:181`).
+- **C5 survivors.** Replacing `wire.rs:237` (`Drop` → `()`) gives an equivalent mutant.
+  Dropping `ConnectionTask` also drops `stop`, so `stopped` resolves and `drive` returns
+  (`wire.rs:200`), so the task still ends. `response.rs:233` is only the interceptor's
+  name. `wire.rs:220` (guard → `true`) would need a peek error other than the three
+  listed, which a loopback test cannot stage on demand. I'm not raising any of these.
 
 ## Findings
 
-- NEEDS-HUMAN — [human] **A body longer than its declared `Content-Length` is never detected, on any operation.** `crates/validate/tests/s3_client_nonconforming_responses.rs:921-935` (`length-under-sent`) goes green only because the declared length ends inside `<Message>`, so the XML check catches it. No length check is involved. Move the declared end to the `</Error>` close tag and send more bytes after it (`Content-Length: doc.len()`, body `doc + "<html>proxy junk…</html>"`). Then GET, PUT and DELETE each report a clean `Service { 503, Code("SlowDown"), "Please reduce your request rate." }` (probe run). A GET 200 with `Content-Length: 2000` and 3000 bytes sent is accepted as a 2000-byte object (probe run). The brief makes both cases binding ("an error body whose received length differs from its declared `Content-Length` … → unreadable"; "a GET whose received length disagrees with its declared length → body error"). The patch's own comment admits the gap: the length checks "cannot fire on any framing a peer can send" (`crates/validate/src/s3/body.rs:223-229`). The GET test leaves this direction out entirely (`:1255-1290`). hyper stops reading at the declared length and never reports the extra bytes. Catching them needs a connector-level check, so this is a scope call: build that check, or narrow the brief and the test names to "declared more than sent".
+- NEEDS-HUMAN [human] — **The same 503 bytes classify differently on GET and on PUT/DELETE
+  when an `x-amz-checksum-*` header does not match the body.** Concrete case:
+  `503 Slow Down`, a complete `SlowDown` document, and `x-amz-checksum-sha256` set to the
+  digest of `"other"`. With `Content-Length` framing, a GET returns
+  `Unreadable { detail: "body checksum mismatch …" }`, while PUT and DELETE return
+  `Service { code: Code("SlowDown") }`. The chunked-with-trailer framing gives the same split.
+  The cause: the SDK wraps a GET body in its checksum validator whatever the status
+  (`aws-sdk-s3-1.152.0 http_response_checksum.rs:130-140`), and no validator runs for PUT or
+  DELETE. This breaks the brief's self-test ("the same bytes must classify the same way on
+  GET, PUT and DELETE") and the test file's own promise
+  (`s3_client_nonconforming_responses.rs:8-9`). This round's new 503 checksum case (`:1378-1407`)
+  sends only a *matching* checksum, so it cannot see the split. The inconsistency likely
+  predates this patch (#852's SDK path behaves the same), but this round's surface is
+  exactly this interaction. I tag it `[human]` because the fix needs a decision: check
+  checksum headers on error bodies on every operation (new checksum code or dependencies),
+  or ignore them on error responses. The checksum interceptor wraps the body before
+  `ResponseGuard` runs (`crates/validate/src/s3/response.rs:236-277`), so the guard cannot
+  just strip the header.
+- NEEDS-HUMAN [human] — **The 64 KiB budget counts decoded bytes, not wire bytes, so an
+  endpoint can make the client read any amount of chunk framing.** Concrete case: a 503,
+  chunked, with no `Content-Length`. The 134-byte `<Error><Code>SlowDown</Code><Message>x</Message>…`
+  document is sent as 1-byte chunks, and each chunk-size line carries 65,536 leading zeros
+  (`000…01`, valid `1*HEXDIG`). The endpoint wrote all 8,782,633 body bytes, 134 times the
+  budget, with no close from the client. The verdict was a clean
+  `Service { code: Code("SlowDown"), message: Some("x") }` on GET, PUT and DELETE, after about
+  4 s each. The padding size has no limit except the 15-minute operation deadline
+  (`crates/validate/src/s3.rs:102`). A second form, `1` plus 64 KiB of spaces before the CRLF,
+  is also accepted on all three operations. That one is not RFC 9112 §7.1.1 grammar
+  (whitespace is allowed only before `;`); hyper allows it (`hyper-1.10.1
+  proto/h1/decode.rs:414-429`). Memory stays bounded, so the Goal's "never buffers more"
+  holds. Two things do not hold: the doc claim that such a body "is cut off at the budget
+  rather than read whole" (`s3.rs:26-28`, the `05-building-block-view.md` paragraph), and the
+  rubric's "budgets sized for the worst-case **encoded** representation". The test oracle
+  cannot see it, because it counts only document bytes and skips chunk framing
+  (`s3_client_nonconforming_responses.rs:345-347`, `:564-588`). A fix means counting raw
+  socket bytes in the connector (`wire.rs`) for buffered responses. That is an
+  architecture and scope call, and the human froze the rest of the patch.
+- NEEDS-HUMAN [human] — **A GET answered with a non-200 2xx is accepted as the whole
+  object.** Concrete cases: `206 Partial Content`, `Content-Range: bytes 0-99/3000`,
+  `Content-Length: 100` returns `Ok`, a 100-byte "object". `203` with 100 bytes returns `Ok`.
+  `204` with `Content-Length: 0` returns `Ok`, an empty object. S3 sends none of these to a
+  plain GET, and the patch's invariant says "never … a shorter object" (`s3.rs:15-17`). The
+  guard streams any `is_success()` status (`response.rs:244-251`). The only 2xx check is for
+  framing on a `204` (`response.rs:108-112`). Not one of the brief's listed cases, and likely
+  inherited from #852, so this is a scope question: fix it here or in a follow-up issue.
+- **The gate summary overstates the red leg** (informational, not the builder's to fix). The
+  `C4-verify` row in `check-gates.json` says "28 test(s) ran red". `gate-logs/C4-verify.log`
+  shows 20 failed and 8 passed on the reverted base: `base64_matches_the_rfc_4648_vectors`,
+  the bodiless-404, non-XML, incomplete-chunked-error, close-delimited-GET, cut-short-GET,
+  other-coding-GET and larger-than-budget-GET tests. The brief allows green guards, and
+  every red is an assertion failure on a build that compiled, so the PASS verdict stands.
+  Only the count in the row is wrong.
 
-- NEEDS-HUMAN [impl] — **The test does not pin the 64 KiB budget; a budget 256 times larger passes all 14 tests.** I set `crates/validate/src/s3/response.rs:45` to `16 * 1024 * 1024` and ran the suite: 14/14 green. The endpoint wrote about 16.9 MB against a bound of 34,652,160. The bound (`s3_client_nonconforming_responses.rs:113-120`) is set almost entirely by `tcp_rmem[2]`, which is 32 MiB on this host. With the real budget the endpoint wrote only 135–229 KB. So the bytes-written oracle proves "some streaming limit under about 33 MiB", not 64 KiB. C5 agrees: mutants at `response.rs:45` (`*`→`+`, a 1088-byte budget that would refuse a legitimate ~20 KiB `SignatureDoesNotMatch`), `:215` and `:262` (`>`→`>=`) all survived. Fix: add an exact boundary pair. A chunked `<Error>` of exactly `BUDGET` bytes must be a clean `Service`, and one of `BUDGET + 1` bytes must be `Unreadable`. Optionally add a ~20 KiB legitimate error document, which the probe showed is read correctly today. This adds no new option or dev-dependency, and the `+1` case is red on #852.
-
-- NEEDS-HUMAN [impl] — **Three of the T4 blockers reproduce on the production path, so they are not reviewer noise.** (a) A GET 200 with `Transfer-Encoding: chunked\u{00A0}` that sends 1000 of 3000 bytes and closes is **accepted as a 1000-byte object**. The cause is the Unicode `trim()` at `crates/validate/src/s3/response.rs:85`. hyper's `HeaderValue::to_str()` refuses the value (`hyper-1.10.1/src/headers.rs:130-139`) and reads the body to EOF (`proto/h1/role.rs:1296-1298`). The surviving mutant at `response.rs:85` (guard → `true`) shows that no test sends any non-`chunked` coding on a GET. `Transfer-Encoding: gzip` is refused correctly today, but nothing checks it. (b) A GET `204` with `Transfer-Encoding: chunked` and `5\r\nhello\r\n` with no terminal chunk is **accepted as a 0-byte object**. hyper forces a zero-length body for 204 (`role.rs:1268`), but `response.rs:198` records `Chunked` for any 2xx. (c) `<Code>Slow<b/>Down</Code>` becomes a clean `Code("SlowDown")` on all three operations (`response.rs:327-331`). Each needs a production fix plus a test case.
-
-- NEEDS-HUMAN [impl] — **The "nothing after `</Error>` but whitespace or comments" rule is enforced but untested.** The mutant deleting `!` at `crates/validate/src/s3/response.rs:312` survived. That mutant would accept `<Error>…</Error><?pi x?>` as a clean error. The current code refuses it correctly (probe run). The `:345` mutant also survived, and `is_blank` (`:344-346`) looks unreachable because roxmltree keeps no whitespace text after the root. Add a case with a processing instruction after the root element.
-
-- NEEDS-HUMAN — [human] **An empty `<Code></Code>` is reported as a clean S3 error with code `""`.** On all three operations the result is `Service { 503, Code(""), Some("m") }` (probe run; `crates/validate/src/s3/response.rs:327-339`). The brief says "never a code the body did not carry", and an empty string is not an S3 code. Someone needs to decide whether an empty or whitespace-only `<Code>` should be `MissingInXml`, `Unreadable`, or stay as it is.
-
-- `crates/validate/src/s3/body.rs:223-229` claims the length checks "cannot fire on any framing a peer can send". A GET `204` with `Content-Length: 5` gets `Framing::Length(5)`, hyper delivers 0 bytes, and the end-of-body check does fire. The behaviour is right; the comment is not. Fix it together with the 204 work above.
-
-**Tried and could not refute.** HTML and plain-text 500s; chunked framing cut before the terminal chunk or the final CRLF; a 69 MB generated chunked error or PUT/DELETE success body (the endpoint writes only 135–229 KB before the client closes); a close-delimited GET; `Transfer-Encoding: gzip` on a GET; a GET error with a declared length over the budget (refused from the header before any read); and the claim that the SDK's success diagnostic is kept on PUT and DELETE.
-
-C4-diff-cov's "fail" means "not measured": the bundle does not apply on `origin/main` without #852. It is not evidence for or against the fix.
+<!-- pdca:leaf-complete -->

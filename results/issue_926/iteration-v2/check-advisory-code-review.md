@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/src/multipart/stage.rs:1334`: **A pending renewal defeats the fragment-write deadline.** `renewing` awaits `renew_if_due` before checking the deadline or polling its timer. If a fragment remains pending, renewal becomes due at time 50, and its metadata commit takes until time 70, a fragment deadline of 60 cannot end staging at 60. The backend's operation timeout does not enforce this earlier deadline. Keep the absolute fragment deadline active during renewal and its recovery reads, preserving an unknown outcome if a submitted renewal is abandoned. Add a test holding both a fragment put and a renewal commit, then advance to the fragment deadline and assert staging terminates before releasing the renewal. The existing timeout test explicitly excludes this overlap (`crates/core/tests/multipart_upload_part_stage.rs:1364`). This confirms the frozen T4 finding at its current target-source location.
+
+No additional correctness or reuse/simplification/efficiency findings. Reviewed the target read-only and used the frozen gate evidence; gates were not re-run.
+
+<!-- pdca:leaf-complete -->
