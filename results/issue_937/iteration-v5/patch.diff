@@ -1,0 +1,2877 @@
+diff --git a/crates/validate/src/lib.rs b/crates/validate/src/lib.rs
+index cef8337..c519f83 100644
+--- a/crates/validate/src/lib.rs
++++ b/crates/validate/src/lib.rs
+@@ -21,6 +21,7 @@
+ 
+ pub mod access_keys;
+ pub mod args;
++pub mod matrix;
+ pub mod payload;
+ pub mod s3;
+ pub mod sizes;
+diff --git a/crates/validate/src/matrix.rs b/crates/validate/src/matrix.rs
+new file mode 100644
+index 0000000..8080389
+--- /dev/null
++++ b/crates/validate/src/matrix.rs
+@@ -0,0 +1,1479 @@
++//! The capability matrix (proposal 0017 §3) and the failure taxonomy that judges it (§7).
++//!
++//! Pure: nothing here sends a request, opens a socket or reads a clock. A scenario exercises
++//! the operations, maps what came back onto this module's own observation type ([`Answer`],
++//! [`Exercise`]), and hands that to [`classify`] and [`verdict`]. The client's error types
++//! never reach this module, so it judges the same facts whichever client produced them.
++//!
++//! Three pieces:
++//!
++//! * **Profiles.** A [`Profile`] declares, per [`Operation`], one of three states
++//!   ([`Expected`]): `required` (must succeed, and the answer must show it was done),
++//!   `unsupported(#NNN)` (must be refused with an exact status and S3 error code), or
++//!   `supported, not checked (#NNN)` (the server should accept it and the tool cannot check it
++//!   yet). Profiles are constants: [`PRE_0_1`] describes today's gateway, row by row, each row
++//!   citing the gateway line that gives today's answer.
++//! * **Version keying.** [`parse_version`] reads the version a server reports, and
++//!   [`select`] picks the one profile whose range covers it. "Version unknown" (the gateway's
++//!   `unknown`, or a build whose identity is `+git.unknown[.dirty]`) is never read as a
++//!   release: it selects no profile.
++//! * **Judging.** [`classify`] turns one exercise of one row into a [`RowResult`]; [`verdict`]
++//!   folds a run's results into PASS, FAIL or INCONCLUSIVE.
++//!
++//! The invariant: **the verdict never claims more than the answers prove.** An `unsupported`
++//! operation that succeeds in any part is fatal (`unexpected-support`); a `required` operation
++//! passes only on an answer that shows the operation was done and ended whole; an answer that
++//! cannot settle a check (no response head, a body cut off in transport, a 5xx, a follow-up
++//! probe that got no answer) neither passes nor fails it, so a row with such a check and no
++//! fatal one is unproved; and a run with any row unproved is INCONCLUSIVE, never PASS.
++
++use std::cmp::Ordering;
++use std::fmt;
++
++use crate::s3::ErrorCode;
++
++// ---------------------------------------------------------------------------------------------
++// Operations and rows
++// ---------------------------------------------------------------------------------------------
++
++/// One row of the matrix: an S3 operation, or one form of it whose answer differs (a ranged
++/// or conditional `GetObject`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub enum Operation {
++    PutObject,
++    /// `GetObject` of the whole object.
++    GetObject,
++    /// `GetObject` with `Range: bytes=a-b`.
++    GetObjectRanged,
++    /// `GetObject` with an `If-None-Match` naming the object's current entity-tag.
++    GetObjectIfNoneMatchHit,
++    /// `GetObject` with an `If-None-Match` naming a valid strong tag the object does not have.
++    GetObjectIfNoneMatchMiss,
++    HeadObject,
++    DeleteObject,
++    /// Bulk `POST /bucket?delete`.
++    DeleteObjects,
++    ListObjectsV2,
++    /// The v1 listing (`GET /bucket` without `list-type=2`).
++    ListObjects,
++    CopyObject,
++    CreateMultipartUpload,
++    UploadPart,
++    CompleteMultipartUpload,
++    AbortMultipartUpload,
++    ListParts,
++    ListMultipartUploads,
++    CreateBucket,
++    DeleteBucket,
++    HeadBucket,
++    ListBuckets,
++    GetBucketLocation,
++}
++
++impl Operation {
++    /// The row's name as a report spells it.
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::PutObject => "PutObject",
++            Self::GetObject => "GetObject",
++            Self::GetObjectRanged => "GetObject (Range)",
++            Self::GetObjectIfNoneMatchHit => "GetObject (If-None-Match, matching)",
++            Self::GetObjectIfNoneMatchMiss => "GetObject (If-None-Match, not matching)",
++            Self::HeadObject => "HeadObject",
++            Self::DeleteObject => "DeleteObject",
++            Self::DeleteObjects => "DeleteObjects",
++            Self::ListObjectsV2 => "ListObjectsV2",
++            Self::ListObjects => "ListObjects",
++            Self::CopyObject => "CopyObject",
++            Self::CreateMultipartUpload => "CreateMultipartUpload",
++            Self::UploadPart => "UploadPart",
++            Self::CompleteMultipartUpload => "CompleteMultipartUpload",
++            Self::AbortMultipartUpload => "AbortMultipartUpload",
++            Self::ListParts => "ListParts",
++            Self::ListMultipartUploads => "ListMultipartUploads",
++            Self::CreateBucket => "CreateBucket",
++            Self::DeleteBucket => "DeleteBucket",
++            Self::HeadBucket => "HeadBucket",
++            Self::ListBuckets => "ListBuckets",
++            Self::GetBucketLocation => "GetBucketLocation",
++        }
++    }
++}
++
++impl fmt::Display for Operation {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.name())
++    }
++}
++
++/// The S3 error code an `unsupported` row declares.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DeclaredCode {
++    /// The `<Code>` of the error document.
++    Code(&'static str),
++    /// No body at all (a `HEAD` refusal cannot carry one).
++    NoBody,
++}
++
++impl DeclaredCode {
++    fn matches(self, observed: Option<&ErrorCode>) -> bool {
++        match (self, observed) {
++            (Self::Code(want), Some(ErrorCode::Code(got))) => want == got,
++            (Self::NoBody, Some(ErrorCode::NoBody)) => true,
++            _ => false,
++        }
++    }
++}
++
++impl fmt::Display for DeclaredCode {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Code(code) => f.write_str(code),
++            Self::NoBody => f.write_str("no body"),
++        }
++    }
++}
++
++/// A row's declared state (proposal 0017 §3).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Expected {
++    /// Must succeed, and the answer must show the operation was done.
++    Required,
++    /// Must be refused with exactly this status and code. `issue` is the issue that will build
++    /// the operation.
++    Unsupported {
++        issue: u32,
++        status: u16,
++        code: DeclaredCode,
++    },
++    /// The server is expected to accept the operation and the tool cannot check it yet;
++    /// `issue` is the issue that will add the check. Never counted as a pass.
++    SupportedNotChecked { issue: u32 },
++}
++
++/// One declared row: the operation, its state, and where today's answer comes from.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Row {
++    pub operation: Operation,
++    pub expected: Expected,
++    /// The source line that gives the answer this row expects.
++    pub cites: &'static str,
++}
++
++impl Row {
++    pub const fn required(operation: Operation, cites: &'static str) -> Self {
++        Self {
++            operation,
++            expected: Expected::Required,
++            cites,
++        }
++    }
++
++    pub const fn unsupported(
++        operation: Operation,
++        issue: u32,
++        status: u16,
++        code: DeclaredCode,
++        cites: &'static str,
++    ) -> Self {
++        Self {
++            operation,
++            expected: Expected::Unsupported {
++                issue,
++                status,
++                code,
++            },
++            cites,
++        }
++    }
++
++    pub const fn not_checked(operation: Operation, issue: u32, cites: &'static str) -> Self {
++        Self {
++            operation,
++            expected: Expected::SupportedNotChecked { issue },
++            cites,
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Profiles
++// ---------------------------------------------------------------------------------------------
++
++/// A release `MAJOR.MINOR.PATCH` with no pre-release: the edge of a profile's range.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Bound {
++    pub major: u64,
++    pub minor: u64,
++    pub patch: u64,
++}
++
++impl Bound {
++    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
++        Self {
++            major,
++            minor,
++            patch,
++        }
++    }
++}
++
++/// The releases a profile covers: at or above `from` (when set) and below `below` (when set),
++/// by semantic-version precedence, so `0.1.0-rc.1` is below `0.1.0`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct VersionRange {
++    pub from: Option<Bound>,
++    pub below: Option<Bound>,
++}
++
++impl VersionRange {
++    pub fn contains(&self, release: &Release) -> bool {
++        let at_or_above = self
++            .from
++            .is_none_or(|from| release.cmp_bound(from) != Ordering::Less);
++        let under = self
++            .below
++            .is_none_or(|below| release.cmp_bound(below) == Ordering::Less);
++        at_or_above && under
++    }
++}
++
++/// An immutable set of rows keyed by the release range it applies to.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Profile {
++    name: &'static str,
++    range: VersionRange,
++    rows: &'static [Row],
++}
++
++impl Profile {
++    pub const fn new(name: &'static str, range: VersionRange, rows: &'static [Row]) -> Self {
++        Self { name, range, rows }
++    }
++
++    pub fn name(&self) -> &'static str {
++        self.name
++    }
++
++    pub fn range(&self) -> VersionRange {
++        self.range
++    }
++
++    pub fn rows(&self) -> &'static [Row] {
++        self.rows
++    }
++
++    /// The row declared for `operation`, if the profile declares one.
++    pub fn row(&self, operation: Operation) -> Option<&'static Row> {
++        self.rows.iter().find(|row| row.operation == operation)
++    }
++}
++
++/// The rows of [`PRE_0_1`]. Each `cites` names the gateway line that gives today's answer.
++///
++/// Until the first tagged release this profile describes `main` and is edited in place when a
++/// feature lands (proposal 0017 §3): every untagged build reports `0.0.0+git.<sha>`, so a second
++/// pre-release profile could never be selected. When #508 lands, the six multipart rows move to
++/// `supported, not checked (#750)` — the `cp` upload leg that will check them.
++const PRE_0_1_ROWS: &[Row] = &[
++    Row::required(
++        Operation::PutObject,
++        "crates/gateway-s3/src/lib.rs:2008 (200 + ETag, put_object_response :3401)",
++    ),
++    Row::required(
++        Operation::GetObject,
++        "crates/gateway-s3/src/lib.rs:2017 (serve_get :2469)",
++    ),
++    Row::required(
++        Operation::GetObjectRanged,
++        "crates/gateway-s3/src/lib.rs:2713-2719 (206 + Content-Range)",
++    ),
++    Row::required(
++        Operation::GetObjectIfNoneMatchHit,
++        "crates/gateway-s3/src/lib.rs:2785-2803 (304, If-None-Match :2995)",
++    ),
++    Row::required(
++        Operation::GetObjectIfNoneMatchMiss,
++        "crates/gateway-s3/src/lib.rs:2995 (no tag matches: the whole object, :2017)",
++    ),
++    Row::required(
++        Operation::HeadObject,
++        "crates/gateway-s3/src/lib.rs:2025 (serve_head :2570)",
++    ),
++    Row::required(
++        Operation::DeleteObject,
++        "crates/gateway-s3/src/lib.rs:2026-2028 (204)",
++    ),
++    Row::required(
++        Operation::DeleteObjects,
++        "crates/gateway-s3/src/lib.rs:1766-1788 (POST ?delete; 200 even with errors :2293-2300)",
++    ),
++    Row::required(
++        Operation::ListObjectsV2,
++        "crates/gateway-s3/src/lib.rs:1806-1808 (list_objects :823, list-type=2 :868)",
++    ),
++    Row::required(
++        Operation::ListObjects,
++        "crates/gateway-s3/src/lib.rs:1806-1808 (list_objects :823, v1 shim :855)",
++    ),
++    Row::unsupported(
++        Operation::CopyObject,
++        766,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1865-1871 (x-amz-copy-source)",
++    ),
++    Row::unsupported(
++        Operation::CreateMultipartUpload,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1842-1849 (`uploads`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::UploadPart,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1842-1849 (`partNumber`/`uploadId`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::CompleteMultipartUpload,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1842-1849 (`uploadId`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::AbortMultipartUpload,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1842-1849 (`uploadId`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::ListParts,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1842-1849 (`uploadId`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::ListMultipartUploads,
++        508,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1797-1804 (bucket `?uploads`, denylist :410-422)",
++    ),
++    Row::unsupported(
++        Operation::GetBucketLocation,
++        511,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "crates/gateway-s3/src/lib.rs:1797-1804 (bucket `?location`, denylist :422)",
++    ),
++    Row::unsupported(
++        Operation::CreateBucket,
++        511,
++        400,
++        DeclaredCode::Code("InvalidRequest"),
++        "crates/gateway-s3/src/lib.rs:1809-1815 (bucket path, PUT)",
++    ),
++    Row::unsupported(
++        Operation::DeleteBucket,
++        511,
++        400,
++        DeclaredCode::Code("InvalidRequest"),
++        "crates/gateway-s3/src/lib.rs:1809-1815 (bucket path, DELETE)",
++    ),
++    Row::unsupported(
++        Operation::ListBuckets,
++        511,
++        400,
++        DeclaredCode::Code("InvalidRequest"),
++        "crates/gateway-s3/src/lib.rs:1819-1826 (root path `/`)",
++    ),
++    Row::unsupported(
++        Operation::HeadBucket,
++        511,
++        400,
++        DeclaredCode::NoBody,
++        "crates/gateway-s3/src/lib.rs:1809-1815 (bucket path, HEAD: the 400 carries no body)",
++    ),
++];
++
++/// Every Wyrd build below `0.1.0`: today's gateway.
++pub const PRE_0_1: Profile = Profile::new(
++    "pre-0.1",
++    VersionRange {
++        from: None,
++        below: Some(Bound::new(0, 1, 0)),
++    },
++    PRE_0_1_ROWS,
++);
++
++/// The profiles this tool ships, one per release range. The ranges do not overlap.
++pub const PROFILES: &[Profile] = &[PRE_0_1];
++
++// ---------------------------------------------------------------------------------------------
++// Versions
++// ---------------------------------------------------------------------------------------------
++
++/// One dot-separated pre-release identifier.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PreId {
++    Numeric(u64),
++    Alpha(String),
++}
++
++/// A release version: `MAJOR.MINOR.PATCH` with any pre-release. Build metadata is not part of
++/// it: it never changes which profile a version selects.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Release {
++    pub major: u64,
++    pub minor: u64,
++    pub patch: u64,
++    pub pre: Vec<PreId>,
++}
++
++impl Release {
++    /// SemVer precedence against a bound, which has no pre-release: on the same triple a
++    /// pre-release sorts before the release itself (SemVer 2.0.0 §11).
++    fn cmp_bound(&self, bound: Bound) -> Ordering {
++        (self.major, self.minor, self.patch)
++            .cmp(&(bound.major, bound.minor, bound.patch))
++            .then(if self.pre.is_empty() {
++                Ordering::Equal
++            } else {
++                Ordering::Less
++            })
++    }
++}
++
++impl fmt::Display for Release {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
++        for (i, id) in self.pre.iter().enumerate() {
++            f.write_str(if i == 0 { "-" } else { "." })?;
++            match id {
++                PreId::Numeric(n) => write!(f, "{n}")?,
++                PreId::Alpha(s) => f.write_str(s)?,
++            }
++        }
++        Ok(())
++    }
++}
++
++/// What a reported version says.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReportedVersion {
++    Release(Release),
++    /// The server does not know its own version: the gateway's default (`unknown`,
++    /// `crates/gateway-s3/src/lib.rs:121`), or a build whose identity is the "nothing was
++    /// known" fallback `+git.unknown[.dirty]` (`crates/server/src/version/derivation.rs:65`).
++    /// Never read as release `0.0.0`.
++    Unknown,
++}
++
++/// Why a reported version could not be read.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct VersionError {
++    pub input: String,
++    pub reason: &'static str,
++}
++
++impl fmt::Display for VersionError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "cannot read version {:?}: {}", self.input, self.reason)
++    }
++}
++
++impl std::error::Error for VersionError {}
++
++/// The gateway's "not told" version (`crates/gateway-s3/src/lib.rs:121`).
++const UNKNOWN: &str = "unknown";
++
++/// The build-metadata identities the version derivation gives when nothing was known
++/// (`crates/server/src/version/derivation.rs:65`, the `Fallback` rung at `:121`).
++const UNKNOWN_BUILDS: [&str; 2] = ["git.unknown", "git.unknown.dirty"];
++
++/// Read a reported version: `unknown`, or `MAJOR.MINOR.PATCH[-PRE][+BUILD]` by the SemVer 2.0.0
++/// grammar, every token checked (digits only, no leading zeros in numeric identifiers, no empty
++/// identifiers, identifier characters `[0-9A-Za-z-]`). The shapes the server's derivation emits
++/// (`normalize_describe`, `crates/server/src/version/derivation.rs:30-41`) are `0.0.0+git.<sha>
++/// [.dirty]`, `0.1.0`, and `0.1.0+git.3.<sha>[.dirty]`.
++pub fn parse_version(input: &str) -> Result<ReportedVersion, VersionError> {
++    let err = |reason| VersionError {
++        input: input.to_string(),
++        reason,
++    };
++    if input == UNKNOWN {
++        return Ok(ReportedVersion::Unknown);
++    }
++    let (release_part, build) = match input.split_once('+') {
++        Some((release, build)) => (release, Some(build)),
++        None => (input, None),
++    };
++    if let Some(build) = build {
++        let ok = build
++            .split('.')
++            .all(|id| !id.is_empty() && id.bytes().all(is_ident_byte));
++        if !ok {
++            return Err(err("malformed build metadata"));
++        }
++    }
++    let (core, pre) = match release_part.split_once('-') {
++        Some((core, pre)) => (core, Some(pre)),
++        None => (release_part, None),
++    };
++    let mut numbers = core.split('.');
++    let (Some(major), Some(minor), Some(patch), None) = (
++        numbers.next(),
++        numbers.next(),
++        numbers.next(),
++        numbers.next(),
++    ) else {
++        return Err(err("expected MAJOR.MINOR.PATCH"));
++    };
++    let number = |s: &str| parse_numeric(s).ok_or_else(|| err("malformed version number"));
++    let (major, minor, patch) = (number(major)?, number(minor)?, number(patch)?);
++    let mut pre_ids = Vec::new();
++    if let Some(pre) = pre {
++        for id in pre.split('.') {
++            if id.is_empty() || !id.bytes().all(is_ident_byte) {
++                return Err(err("malformed pre-release"));
++            }
++            if id.bytes().all(|b| b.is_ascii_digit()) {
++                pre_ids.push(PreId::Numeric(
++                    parse_numeric(id).ok_or_else(|| err("malformed pre-release"))?,
++                ));
++            } else {
++                pre_ids.push(PreId::Alpha(id.to_string()));
++            }
++        }
++    }
++    if build.is_some_and(|build| UNKNOWN_BUILDS.contains(&build)) {
++        return Ok(ReportedVersion::Unknown);
++    }
++    Ok(ReportedVersion::Release(Release {
++        major,
++        minor,
++        patch,
++        pre: pre_ids,
++    }))
++}
++
++fn is_ident_byte(b: u8) -> bool {
++    b.is_ascii_alphanumeric() || b == b'-'
++}
++
++/// A SemVer numeric identifier: ASCII digits, no leading zero unless it is `0`, fits a `u64`.
++/// The digit check refuses the `+` sign `u64::from_str` would take; `from_str` refuses the
++/// empty string and a value past `u64::MAX`.
++fn parse_numeric(s: &str) -> Option<u64> {
++    if !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
++        return None;
++    }
++    s.parse().ok()
++}
++
++/// Why no profile was selected.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum NoProfile {
++    /// The server does not know its version.
++    Unknown,
++    /// The version could not be read.
++    Unparsable(VersionError),
++    /// No profile covers this release.
++    NoMatch(Release),
++    /// More than one profile covers it: the table is wrong, and picking one would be a guess.
++    Ambiguous(Release),
++}
++
++impl fmt::Display for NoProfile {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Unknown => f.write_str("the server's version is unknown"),
++            Self::Unparsable(e) => write!(f, "{e}"),
++            Self::NoMatch(r) => write!(f, "no profile covers release {r}"),
++            Self::Ambiguous(r) => write!(f, "more than one profile covers release {r}"),
++        }
++    }
++}
++
++/// The one profile in `profiles` whose range covers `version`.
++pub fn select<'a>(
++    profiles: &'a [Profile],
++    version: &ReportedVersion,
++) -> Result<&'a Profile, NoProfile> {
++    let release = match version {
++        ReportedVersion::Unknown => return Err(NoProfile::Unknown),
++        ReportedVersion::Release(release) => release,
++    };
++    let mut covering = profiles.iter().filter(|p| p.range.contains(release));
++    match (covering.next(), covering.next()) {
++        (Some(profile), None) => Ok(profile),
++        (None, _) => Err(NoProfile::NoMatch(release.clone())),
++        (Some(_), Some(_)) => Err(NoProfile::Ambiguous(release.clone())),
++    }
++}
++
++/// [`parse_version`] then [`select`].
++pub fn select_reported<'a>(profiles: &'a [Profile], input: &str) -> Result<&'a Profile, NoProfile> {
++    let version = parse_version(input).map_err(NoProfile::Unparsable)?;
++    select(profiles, &version)
++}
++
++// ---------------------------------------------------------------------------------------------
++// Observations
++// ---------------------------------------------------------------------------------------------
++
++/// What came back for one request.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Answer {
++    /// No response head arrived: no connection, a reset, a timeout before the head.
++    NoAnswer {
++        why: String,
++    },
++    Response(Response),
++}
++
++/// A response head and what followed it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Response {
++    pub status: u16,
++    pub etag: Option<String>,
++    pub content_range: Option<String>,
++    pub content_length: Option<u64>,
++    /// The S3 error code of an error response, as the client read it; `None` on a success.
++    pub error_code: Option<ErrorCode>,
++    pub body: Body,
++}
++
++impl Response {
++    /// A response with `status`, no headers the checks read, no error code and no body.
++    pub fn new(status: u16) -> Self {
++        Self {
++            status,
++            etag: None,
++            content_range: None,
++            content_length: None,
++            error_code: None,
++            body: Body::Empty,
++        }
++    }
++
++    pub fn with_etag(mut self, etag: &str) -> Self {
++        self.etag = Some(etag.to_string());
++        self
++    }
++
++    pub fn with_content_range(mut self, content_range: &str) -> Self {
++        self.content_range = Some(content_range.to_string());
++        self
++    }
++
++    pub fn with_content_length(mut self, content_length: u64) -> Self {
++        self.content_length = Some(content_length);
++        self
++    }
++
++    pub fn with_error_code(mut self, code: ErrorCode) -> Self {
++        self.error_code = Some(code);
++        self
++    }
++
++    pub fn with_body(mut self, body: Body) -> Self {
++        self.body = body;
++        self
++    }
++
++    fn is_success(&self) -> bool {
++        (200..300).contains(&self.status)
++    }
++}
++
++/// The body of a response, as far as it arrived.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Body {
++    /// No body bytes.
++    Empty,
++    Bytes(Vec<u8>),
++    /// A listing document, every page together: each key with its size.
++    Listing(Vec<Listed>),
++    /// A `<DeleteResult>` document (requested without `Quiet`).
++    DeleteResult(DeleteResult),
++    /// The head arrived and the body then failed or timed out.
++    Failed {
++        why: String,
++    },
++}
++
++/// One `<Contents>` entry of a listing.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Listed {
++    pub key: String,
++    pub size: u64,
++}
++
++/// A bulk delete's `<DeleteResult>`: the keys under `<Deleted>`, and each `<Error>` row.
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct DeleteResult {
++    pub deleted: Vec<String>,
++    pub errors: Vec<DeleteFailure>,
++}
++
++/// One `<Error>` row of a `<DeleteResult>`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DeleteFailure {
++    pub key: String,
++    pub code: String,
++}
++
++/// One exercise of one row: what was asked, what the oracle expects, and every answer the
++/// check reads. A check that needs more than one request (a delete and its follow-up `HEAD`s)
++/// carries each follow-up as an answer of its own.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Exercise {
++    PutObject {
++        answer: Answer,
++        /// Whether the request body had ended when the response head arrived. A success
++        /// before that is not a receipt (the client's `BodyError::AcknowledgedEarly`).
++        request_body_ended: bool,
++    },
++    GetObject {
++        object: Vec<u8>,
++        answer: Answer,
++    },
++    /// `Range: bytes=first-last` of `object`.
++    GetObjectRanged {
++        object: Vec<u8>,
++        first: u64,
++        last: u64,
++        answer: Answer,
++    },
++    GetObjectIfNoneMatchHit {
++        answer: Answer,
++    },
++    GetObjectIfNoneMatchMiss {
++        object: Vec<u8>,
++        answer: Answer,
++    },
++    HeadObject {
++        size: u64,
++        /// The `ETag` the PUT answered.
++        etag: String,
++        answer: Answer,
++    },
++    DeleteObject {
++        answer: Answer,
++        /// The `HEAD` of the key sent after the delete answered.
++        follow_up: Answer,
++    },
++    DeleteObjects {
++        keys: Vec<String>,
++        answer: Answer,
++        /// The `HEAD`s sent after the delete answered, each with the key it asked about. A key
++        /// may be probed more than once (a retry); every entry is judged.
++        follow_ups: Vec<(String, Answer)>,
++    },
++    ListObjectsV2 {
++        /// Every key written under the listed prefix, with its size.
++        expected: Vec<Listed>,
++        answer: Answer,
++    },
++    ListObjects {
++        expected: Vec<Listed>,
++        answer: Answer,
++    },
++    /// An operation with no check of its own: one whose row is `unsupported`, where only the
++    /// refusal is judged.
++    Other {
++        operation: Operation,
++        answer: Answer,
++    },
++}
++
++impl Exercise {
++    pub fn operation(&self) -> Operation {
++        match self {
++            Self::PutObject { .. } => Operation::PutObject,
++            Self::GetObject { .. } => Operation::GetObject,
++            Self::GetObjectRanged { .. } => Operation::GetObjectRanged,
++            Self::GetObjectIfNoneMatchHit { .. } => Operation::GetObjectIfNoneMatchHit,
++            Self::GetObjectIfNoneMatchMiss { .. } => Operation::GetObjectIfNoneMatchMiss,
++            Self::HeadObject { .. } => Operation::HeadObject,
++            Self::DeleteObject { .. } => Operation::DeleteObject,
++            Self::DeleteObjects { .. } => Operation::DeleteObjects,
++            Self::ListObjectsV2 { .. } => Operation::ListObjectsV2,
++            Self::ListObjects { .. } => Operation::ListObjects,
++            Self::Other { operation, .. } => *operation,
++        }
++    }
++
++    /// The answer to the operation itself (not to a follow-up).
++    pub fn answer(&self) -> &Answer {
++        match self {
++            Self::PutObject { answer, .. }
++            | Self::GetObject { answer, .. }
++            | Self::GetObjectRanged { answer, .. }
++            | Self::GetObjectIfNoneMatchHit { answer }
++            | Self::GetObjectIfNoneMatchMiss { answer, .. }
++            | Self::HeadObject { answer, .. }
++            | Self::DeleteObject { answer, .. }
++            | Self::DeleteObjects { answer, .. }
++            | Self::ListObjectsV2 { answer, .. }
++            | Self::ListObjects { answer, .. }
++            | Self::Other { answer, .. } => answer,
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Classification
++// ---------------------------------------------------------------------------------------------
++
++/// The fatal classes of proposal 0017 §7. (`availability` is budgeted, not fatal; an answer
++/// of that shape leaves a row [`RowResult::Unsettled`] here.)
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FailureClass {
++    /// Bytes, digest or size differ.
++    Integrity,
++    /// The model and the server disagree (a deleted key readable, a listing mismatch).
++    Oracle,
++    /// An `unsupported` operation succeeded.
++    UnexpectedSupport,
++    /// Wrong status, error code, or document shape.
++    Protocol,
++}
++
++impl FailureClass {
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Integrity => "integrity",
++            Self::Oracle => "oracle",
++            Self::UnexpectedSupport => "unexpected-support",
++            Self::Protocol => "protocol",
++        }
++    }
++}
++
++impl fmt::Display for FailureClass {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.name())
++    }
++}
++
++/// The result of one exercise of one row.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum RowResult {
++    Pass,
++    Fatal {
++        class: FailureClass,
++        detail: String,
++    },
++    /// No response head arrived: nothing to judge.
++    NoAnswer {
++        why: String,
++    },
++    /// The row cannot be settled: a body cut off after its head, a 5xx, a follow-up probe that
++    /// got no answer, or an exercise that cannot show anything about the row.
++    Unsettled {
++        why: String,
++    },
++    /// The row is `supported, not checked (#issue)`: whatever came back, it is not a pass.
++    NotChecked {
++        issue: u32,
++    },
++}
++
++fn fatal(class: FailureClass, detail: impl Into<String>) -> RowResult {
++    RowResult::Fatal {
++        class,
++        detail: detail.into(),
++    }
++}
++
++fn protocol(detail: impl Into<String>) -> RowResult {
++    fatal(FailureClass::Protocol, detail)
++}
++
++fn unsettled(why: impl Into<String>) -> RowResult {
++    RowResult::Unsettled { why: why.into() }
++}
++
++/// Judge one exercise of `row`. The exercise must be of `row.operation`; one that is not is
++/// unsettled (it shows nothing about the row).
++pub fn classify(row: &Row, exercise: &Exercise) -> RowResult {
++    if exercise.operation() != row.operation {
++        return unsettled(format!(
++            "an exercise of {} cannot settle the {} row",
++            exercise.operation(),
++            row.operation
++        ));
++    }
++    match row.expected {
++        Expected::SupportedNotChecked { issue } => RowResult::NotChecked { issue },
++        Expected::Unsupported { status, code, .. } => {
++            classify_unsupported(status, code, exercise.answer())
++        }
++        Expected::Required => classify_required(exercise),
++    }
++}
++
++fn classify_unsupported(status: u16, code: DeclaredCode, answer: &Answer) -> RowResult {
++    let response = match answer {
++        Answer::NoAnswer { why } => return RowResult::NoAnswer { why: why.clone() },
++        Answer::Response(response) => response,
++    };
++    // Any 2xx is support, however the body then ended: the server started doing it.
++    if response.is_success() {
++        return fatal(
++            FailureClass::UnexpectedSupport,
++            format!("answered {}; declared {status} {code}", response.status),
++        );
++    }
++    if response.status != status {
++        return protocol(format!(
++            "answered {}; declared {status} {code}",
++            response.status
++        ));
++    }
++    if let Body::Failed { why } = &response.body {
++        return unsettled(format!(
++            "the {status} error body failed before its code could be read: {why}"
++        ));
++    }
++    if code.matches(response.error_code.as_ref()) {
++        RowResult::Pass
++    } else {
++        protocol(format!(
++            "answered {status} with {}; declared {status} {code}",
++            match &response.error_code {
++                Some(observed) => observed.to_string(),
++                None => "no error code".to_string(),
++            }
++        ))
++    }
++}
++
++/// The first steps of every required check: no head is no answer, and a 5xx other than
++/// `501 Not Implemented` is `availability` (budgeted, §7), which settles nothing here.
++fn required_response(answer: &Answer) -> Result<&Response, RowResult> {
++    match answer {
++        Answer::NoAnswer { why } => Err(RowResult::NoAnswer { why: why.clone() }),
++        Answer::Response(r) if (500..600).contains(&r.status) && r.status != 501 => {
++            Err(unsettled(format!("availability: answered {}", r.status)))
++        }
++        Answer::Response(r) => Ok(r),
++    }
++}
++
++fn expect_status(response: &Response, want: u16) -> Result<(), RowResult> {
++    if response.status == want {
++        Ok(())
++    } else {
++        Err(protocol(format!(
++            "answered {}; expected {want}",
++            response.status
++        )))
++    }
++}
++
++/// The body as bytes. A body cut off in transport settles nothing; a document where bytes were
++/// expected is the wrong shape.
++fn body_bytes(response: &Response) -> Result<&[u8], RowResult> {
++    match &response.body {
++        Body::Empty => Ok(&[]),
++        Body::Bytes(bytes) => Ok(bytes),
++        Body::Failed { why } => Err(unsettled(format!("the body failed: {why}"))),
++        Body::Listing(_) | Body::DeleteResult(_) => {
++            Err(protocol("a document where object bytes were expected"))
++        }
++    }
++}
++
++/// The body of an answer that carries none (a PUT's 200, a `HEAD`, a 204, a 304): nothing, or no
++/// bytes, passes. A body cut off in transport settles nothing (whether bytes arrived is not
++/// known); any bytes or document is the wrong shape.
++fn expect_no_body(response: &Response) -> Result<(), RowResult> {
++    match &response.body {
++        Body::Empty => Ok(()),
++        Body::Bytes(bytes) if bytes.is_empty() => Ok(()),
++        Body::Failed { why } => Err(unsettled(format!("the body failed: {why}"))),
++        Body::Bytes(_) | Body::Listing(_) | Body::DeleteResult(_) => Err(protocol(format!(
++            "answered {} with a body",
++            response.status
++        ))),
++    }
++}
++
++/// Fold a row's independent checks: a fatal result outranks one that cannot settle, which
++/// outranks a pass. Every check is judged; none is skipped because another already failed.
++fn worst(checks: impl IntoIterator<Item = Result<(), RowResult>>) -> Result<(), RowResult> {
++    let mut first_unsettled = None;
++    for check in checks {
++        match check {
++            Ok(()) => {}
++            Err(fatal @ RowResult::Fatal { .. }) => return Err(fatal),
++            Err(other) => {
++                first_unsettled.get_or_insert(other);
++            }
++        }
++    }
++    first_unsettled.map_or(Ok(()), Err)
++}
++
++fn expect_bytes(response: &Response, want: &[u8]) -> Result<(), RowResult> {
++    let got = body_bytes(response)?;
++    if got == want {
++        return Ok(());
++    }
++    let at = got
++        .iter()
++        .zip(want)
++        .position(|(a, b)| a != b)
++        .unwrap_or(got.len().min(want.len()));
++    Err(fatal(
++        FailureClass::Integrity,
++        format!(
++            "body of {} bytes differs from the expected {} bytes at offset {at}",
++            got.len(),
++            want.len()
++        ),
++    ))
++}
++
++fn classify_required(exercise: &Exercise) -> RowResult {
++    match check_required(exercise) {
++        Ok(()) => RowResult::Pass,
++        Err(result) => result,
++    }
++}
++
++fn check_required(exercise: &Exercise) -> Result<(), RowResult> {
++    match exercise {
++        Exercise::PutObject {
++            answer,
++            request_body_ended,
++        } => {
++            let r = required_response(answer)?;
++            expect_status(r, 200)?;
++            if !request_body_ended {
++                return Err(protocol(
++                    "answered 200 before the request body had ended: not a receipt",
++                ));
++            }
++            match r.etag.as_deref() {
++                Some(etag) if is_strong_etag(etag) => {}
++                Some(etag) => {
++                    return Err(protocol(format!(
++                        "ETag {etag:?} is not a strong entity-tag (RFC 9110 §8.8.3)"
++                    )))
++                }
++                None => return Err(protocol("answered 200 with no ETag")),
++            }
++            // The head is a receipt only if the answer ended whole.
++            expect_no_body(r)
++        }
++        Exercise::GetObject { object, answer } => {
++            let r = required_response(answer)?;
++            expect_status(r, 200)?;
++            expect_bytes(r, object)
++        }
++        Exercise::GetObjectRanged {
++            object,
++            first,
++            last,
++            answer,
++        } => {
++            let size = object.len() as u64;
++            if first > last || *last >= size {
++                return Err(unsettled(format!(
++                    "the exercise asked bytes={first}-{last} of a {size}-byte object"
++                )));
++            }
++            let r = required_response(answer)?;
++            expect_status(r, 206)?;
++            let want = (*first, *last, size);
++            match r.content_range.as_deref() {
++                Some(value) if parse_content_range(value) == Some(want) => {}
++                Some(value) => {
++                    return Err(protocol(format!(
++                        "Content-Range {value:?}; expected \"bytes {first}-{last}/{size}\""
++                    )))
++                }
++                None => return Err(protocol("answered 206 with no Content-Range")),
++            }
++            // In range by the guard above, so the slice cannot panic.
++            let wanted = &object[*first as usize..=*last as usize];
++            expect_bytes(r, wanted)
++        }
++        Exercise::GetObjectIfNoneMatchHit { answer } => {
++            let r = required_response(answer)?;
++            expect_status(r, 304)?;
++            expect_no_body(r)
++        }
++        Exercise::GetObjectIfNoneMatchMiss { object, answer } => {
++            let r = required_response(answer)?;
++            expect_status(r, 200)?;
++            expect_bytes(r, object)
++        }
++        Exercise::HeadObject { size, etag, answer } => {
++            let r = required_response(answer)?;
++            expect_status(r, 200)?;
++            if r.content_length != Some(*size) {
++                return Err(fatal(
++                    FailureClass::Oracle,
++                    format!(
++                        "Content-Length {:?}; the object holds {size} bytes",
++                        r.content_length
++                    ),
++                ));
++            }
++            if r.etag.as_deref() != Some(etag.as_str()) {
++                return Err(fatal(
++                    FailureClass::Oracle,
++                    format!("ETag {:?}; the PUT answered {etag:?}", r.etag),
++                ));
++            }
++            expect_no_body(r)
++        }
++        Exercise::DeleteObject { answer, follow_up } => {
++            let r = required_response(answer)?;
++            expect_status(r, 204)?;
++            worst([expect_no_body(r), probe_deleted("the key", follow_up)])
++        }
++        Exercise::DeleteObjects {
++            keys,
++            answer,
++            follow_ups,
++        } => check_delete_objects(keys, answer, follow_ups),
++        Exercise::ListObjectsV2 { expected, answer }
++        | Exercise::ListObjects { expected, answer } => {
++            let r = required_response(answer)?;
++            expect_status(r, 200)?;
++            let listed = match &r.body {
++                Body::Listing(listed) => listed,
++                Body::Failed { why } => return Err(unsettled(format!("the body failed: {why}"))),
++                _ => return Err(protocol("answered 200 without a listing document")),
++            };
++            let mut got = listed.clone();
++            let mut want = expected.clone();
++            got.sort();
++            want.sort();
++            if got != want {
++                Err(fatal(
++                    FailureClass::Oracle,
++                    format!("listed {got:?}; wrote {want:?}"),
++                ))
++            } else if want.is_empty() {
++                Err(unsettled(
++                    "a listing of a prefix with nothing written proves nothing",
++                ))
++            } else {
++                Ok(())
++            }
++        }
++        Exercise::Other { operation, .. } => Err(unsettled(format!(
++            "{operation} is required and this tool has no check for it"
++        ))),
++    }
++}
++
++/// The follow-up `HEAD` of a deleted key is a probe (proposal 0017 §7): a 404 that ended whole
++/// proves the delete; a 2xx is `oracle` (a deleted key is readable); no answer, a 5xx or a cut-off
++/// answer cannot settle it; any other status is `protocol`.
++fn probe_deleted(what: &str, follow_up: &Answer) -> Result<(), RowResult> {
++    match follow_up {
++        Answer::NoAnswer { why } => Err(unsettled(format!(
++            "the HEAD of {what} after its delete got no answer: {why}"
++        ))),
++        Answer::Response(r) => match r.status {
++            404 => expect_no_body(r),
++            200..=299 => Err(fatal(
++                FailureClass::Oracle,
++                format!("{what} answers {} to a HEAD after its delete", r.status),
++            )),
++            500..=599 => Err(unsettled(format!(
++                "the HEAD of {what} after its delete answered {}",
++                r.status
++            ))),
++            other => Err(protocol(format!(
++                "the HEAD of {what} after its delete answered {other}; expected 404"
++            ))),
++        },
++    }
++}
++
++/// The document and every follow-up `HEAD` are separate checks, folded by [`worst`]: a document
++/// cut off in transport never excuses a probe, since after a `200` a requested key that still
++/// reads is fatal whatever the lost document said. Without a `200` no delete was acknowledged,
++/// so a readable key disagrees with nothing and the probes are not judged.
++fn check_delete_objects(
++    keys: &[String],
++    answer: &Answer,
++    follow_ups: &[(String, Answer)],
++) -> Result<(), RowResult> {
++    if keys.is_empty() {
++        return Err(unsettled("a DeleteObjects of no keys proves nothing"));
++    }
++    let r = required_response(answer)?;
++    expect_status(r, 200)?;
++    let mut requested = keys.to_vec();
++    requested.sort();
++    let mut checks = vec![check_delete_result(&requested, &r.body)];
++    requested.dedup();
++    // The document alone never proves a delete: a key is proved gone by a HEAD of it that
++    // answered 404. Every follow-up is judged: one naming a key the delete did not request
++    // settles nothing, and any fatal probe of a key fails the row even when another probe of
++    // the same key answered 404.
++    checks.extend(
++        follow_ups
++            .iter()
++            .filter(|(key, _)| !requested.contains(key))
++            .map(|(key, _)| {
++                Err(unsettled(format!(
++                    "a HEAD of key {key:?}, which the delete did not request, settles nothing"
++                )))
++            }),
++    );
++    for key in &requested {
++        let what = format!("key {key:?}");
++        let probes: Vec<_> = follow_ups
++            .iter()
++            .filter(|(probed, _)| probed == key)
++            .map(|(_, follow_up)| probe_deleted(&what, follow_up))
++            .collect();
++        let proved = probes.iter().any(Result::is_ok);
++        match worst(probes) {
++            Err(fatal @ RowResult::Fatal { .. }) => checks.push(Err(fatal)),
++            _ if proved => {}
++            Err(other) => checks.push(Err(other)),
++            Ok(()) => checks.push(Err(unsettled(format!(
++                "{what} was not probed after its delete"
++            )))),
++        }
++    }
++    worst(checks)
++}
++
++/// The `<DeleteResult>` of a bulk delete of `requested` (sorted): every key under `<Deleted>`
++/// and no `<Error>` row.
++fn check_delete_result(requested: &[String], body: &Body) -> Result<(), RowResult> {
++    if let Some(twice) = requested.windows(2).find(|w| w[0] == w[1]) {
++        // The document could then not be matched key by key.
++        return Err(unsettled(format!(
++            "the exercise requested key {:?} twice",
++            twice[0]
++        )));
++    }
++    let result = match body {
++        Body::DeleteResult(result) => result,
++        Body::Failed { why } => return Err(unsettled(format!("the body failed: {why}"))),
++        _ => return Err(protocol("answered 200 without a <DeleteResult> document")),
++    };
++    // The gateway answers 200 even when keys failed (`crates/gateway-s3/src/lib.rs:2293-2300`),
++    // so the status says nothing about the keys.
++    if !result.errors.is_empty() {
++        let rows: Vec<String> = result
++            .errors
++            .iter()
++            .map(|e| format!("{} ({})", e.key, e.code))
++            .collect();
++        return Err(protocol(format!(
++            "<Error> rows in the DeleteResult: {}",
++            rows.join(", ")
++        )));
++    }
++    let mut deleted = result.deleted.clone();
++    deleted.sort();
++    if deleted != requested {
++        return Err(protocol(format!(
++            "<Deleted> names {deleted:?}; requested {requested:?}"
++        )));
++    }
++    Ok(())
++}
++
++/// A strong entity-tag (RFC 9110 §8.8.3): `"` etagc* `"`, etagc = `%x21 / %x23-7E / obs-text`.
++/// So `*`, an unquoted value, a weak `W/"…"` tag, an empty value and a quote inside the tag are
++/// each refused.
++pub fn is_strong_etag(value: &str) -> bool {
++    let bytes = value.as_bytes();
++    bytes.len() >= 2
++        && bytes[0] == b'"'
++        && bytes[bytes.len() - 1] == b'"'
++        && bytes[1..bytes.len() - 1]
++            .iter()
++            .all(|&b| b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80)
++}
++
++/// `bytes first-last/size` (RFC 9110 §14.4): the unit case-insensitive, every number ASCII
++/// digits only. Anything else (an unsatisfied `*/size`, a sign, a space) is `None`.
++fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
++    let (unit, rest) = value.split_once(' ')?;
++    if !unit.eq_ignore_ascii_case("bytes") {
++        return None;
++    }
++    let (range, size) = rest.split_once('/')?;
++    let (first, last) = range.split_once('-')?;
++    let digits = |s: &str| {
++        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
++            s.parse::<u64>().ok()
++        } else {
++            None
++        }
++    };
++    Some((digits(first)?, digits(last)?, digits(size)?))
++}
++
++// ---------------------------------------------------------------------------------------------
++// The run verdict
++// ---------------------------------------------------------------------------------------------
++
++/// The run's outcome.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Outcome {
++    Pass,
++    Fail,
++    Inconclusive,
++}
++
++impl fmt::Display for Outcome {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Pass => "PASS",
++            Self::Fail => "FAIL",
++            Self::Inconclusive => "INCONCLUSIVE",
++        })
++    }
++}
++
++/// A fatal row result.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Fatal {
++    pub operation: Operation,
++    pub class: FailureClass,
++    pub detail: String,
++}
++
++/// Why a `required` or `unsupported` row is not proved.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Unproved {
++    /// Never exercised.
++    NotExercised,
++    /// Exercised, and no response head came back.
++    NoAnswer { why: String },
++    /// Exercised, and the answer could not settle the row.
++    Unsettled { why: String },
++    /// Exercised, but the profile declares no row for it: nothing says what it should answer.
++    Undeclared,
++}
++
++/// A `supported, not checked` row, with the issue that will add its check.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct NotCovered {
++    pub operation: Operation,
++    pub issue: u32,
++}
++
++/// The folded verdict of one run against one profile.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RunVerdict {
++    pub outcome: Outcome,
++    /// Every fatal result, in exercise order.
++    pub fatal: Vec<Fatal>,
++    /// Every row not proved, with why (one entry per row: the first reason found).
++    pub unproved: Vec<(Operation, Unproved)>,
++    /// Every `supported, not checked` row: listed whether or not it was exercised.
++    pub not_covered: Vec<NotCovered>,
++}
++
++/// Fold a run: any fatal result ⇒ FAIL, naming every fatal row and its class; else any
++/// `required` or `unsupported` row that was not exercised, or that has an exercise with no
++/// answer or one that could not be settled ⇒ INCONCLUSIVE, naming those rows; else PASS. So a
++/// row is proved only when it was exercised and every exercise of it passed.
++pub fn verdict(profile: &Profile, exercises: &[Exercise]) -> RunVerdict {
++    let mut fatal = Vec::new();
++    let mut unproved: Vec<(Operation, Unproved)> = Vec::new();
++    let mut note = |operation: Operation, why: Unproved| {
++        if !unproved.iter().any(|(op, _)| *op == operation) {
++            unproved.push((operation, why));
++        }
++    };
++    for exercise in exercises {
++        let operation = exercise.operation();
++        let Some(row) = profile.row(operation) else {
++            note(operation, Unproved::Undeclared);
++            continue;
++        };
++        match classify(row, exercise) {
++            RowResult::Pass | RowResult::NotChecked { .. } => {}
++            RowResult::Fatal { class, detail } => fatal.push(Fatal {
++                operation,
++                class,
++                detail,
++            }),
++            RowResult::NoAnswer { why } => note(operation, Unproved::NoAnswer { why }),
++            RowResult::Unsettled { why } => note(operation, Unproved::Unsettled { why }),
++        }
++    }
++    let mut not_covered = Vec::new();
++    for row in profile.rows() {
++        match row.expected {
++            Expected::SupportedNotChecked { issue } => not_covered.push(NotCovered {
++                operation: row.operation,
++                issue,
++            }),
++            Expected::Required | Expected::Unsupported { .. } => {
++                if !exercises.iter().any(|e| e.operation() == row.operation) {
++                    note(row.operation, Unproved::NotExercised);
++                }
++            }
++        }
++    }
++    let outcome = if !fatal.is_empty() {
++        Outcome::Fail
++    } else if !unproved.is_empty() {
++        Outcome::Inconclusive
++    } else {
++        Outcome::Pass
++    };
++    RunVerdict {
++        outcome,
++        fatal,
++        unproved,
++        not_covered,
++    }
++}
++
++impl fmt::Display for RunVerdict {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        writeln!(f, "{}", self.outcome)?;
++        for fatal in &self.fatal {
++            writeln!(
++                f,
++                "  fatal: {}: {}: {}",
++                fatal.operation, fatal.class, fatal.detail
++            )?;
++        }
++        for (operation, why) in &self.unproved {
++            let why = match why {
++                Unproved::NotExercised => "not exercised".to_string(),
++                Unproved::NoAnswer { why } => format!("no answer: {why}"),
++                Unproved::Unsettled { why } => format!("not settled: {why}"),
++                Unproved::Undeclared => "no row declares it".to_string(),
++            };
++            writeln!(f, "  not proved: {operation}: {why}")?;
++        }
++        for row in &self.not_covered {
++            writeln!(
++                f,
++                "  not covered: {}: supported, not checked (#{})",
++                row.operation, row.issue
++            )?;
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/validate/tests/capability_matrix.rs b/crates/validate/tests/capability_matrix.rs
+new file mode 100644
+index 0000000..e9b0a89
+--- /dev/null
++++ b/crates/validate/tests/capability_matrix.rs
+@@ -0,0 +1,1307 @@
++//! The capability matrix (proposal 0017 §3, §7; #937): today's profile, the classification of
++//! every row state, version keying, and the run verdict. Pure: every leg calls the production
++//! `wyrd_validate::matrix` functions with a fixed input. No network, no second process.
++
++#![forbid(unsafe_code)]
++
++use wyrd_validate::matrix::{
++    classify, is_strong_etag, parse_version, select, select_reported, verdict, Answer, Body, Bound,
++    DeclaredCode, DeleteFailure, DeleteResult, Exercise, Expected, FailureClass, Listed, NoProfile,
++    Operation, Outcome, PreId, Profile, Release, ReportedVersion, Response, Row, RowResult,
++    Unproved, VersionRange, PRE_0_1, PROFILES,
++};
++use wyrd_validate::ErrorCode;
++
++// ---------------------------------------------------------------------------------------------
++// Fixtures
++// ---------------------------------------------------------------------------------------------
++
++const OBJECT: &[u8] = b"0123456789abcdef";
++const ETAG: &str = "\"d41d8cd98f00b204e9800998ecf8427e\"";
++
++fn resp(status: u16) -> Response {
++    Response::new(status)
++}
++
++fn ans(response: Response) -> Answer {
++    Answer::Response(response)
++}
++
++fn no_answer() -> Answer {
++    Answer::NoAnswer {
++        why: "timed out before a response head".to_string(),
++    }
++}
++
++fn code(c: &str) -> ErrorCode {
++    ErrorCode::Code(c.to_string())
++}
++
++fn refusal(status: u16, c: &str) -> Answer {
++    ans(resp(status).with_error_code(code(c)))
++}
++
++fn row(op: Operation) -> &'static Row {
++    PRE_0_1.row(op).expect("pre-0.1 declares the row")
++}
++
++fn class_of(result: &RowResult) -> Option<FailureClass> {
++    match result {
++        RowResult::Fatal { class, .. } => Some(*class),
++        _ => None,
++    }
++}
++
++fn put(answer: Answer, ended: bool) -> Exercise {
++    Exercise::PutObject {
++        answer,
++        request_body_ended: ended,
++    }
++}
++
++fn good_put() -> Exercise {
++    put(ans(resp(200).with_etag(ETAG)), true)
++}
++
++fn keys() -> Vec<String> {
++    vec!["p/a".to_string(), "p/b".to_string()]
++}
++
++fn listing() -> Vec<Listed> {
++    vec![
++        Listed {
++            key: "p/a".to_string(),
++            size: 16,
++        },
++        Listed {
++            key: "p/b".to_string(),
++            size: 3,
++        },
++    ]
++}
++
++fn delete_objects(answer: Answer, follow_ups: Vec<(String, Answer)>) -> Exercise {
++    Exercise::DeleteObjects {
++        keys: keys(),
++        answer,
++        follow_ups,
++    }
++}
++
++fn deleted_all() -> Answer {
++    ans(resp(200).with_body(Body::DeleteResult(DeleteResult {
++        deleted: keys(),
++        errors: vec![],
++    })))
++}
++
++fn heads(a: Answer, b: Answer) -> Vec<(String, Answer)> {
++    vec![("p/a".to_string(), a), ("p/b".to_string(), b)]
++}
++
++fn failed() -> Body {
++    Body::Failed {
++        why: "connection reset after the head".to_string(),
++    }
++}
++
++/// A `DeleteObjects` of `keys` whose document names every one under `<Deleted>`, then one
++/// follow-up `HEAD` per `(key, status)`, in that order.
++fn bulk(keys: &[&str], heads: &[(&str, u16)]) -> Exercise {
++    let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
++    Exercise::DeleteObjects {
++        answer: ans(resp(200).with_body(Body::DeleteResult(DeleteResult {
++            deleted: keys.clone(),
++            errors: vec![],
++        }))),
++        keys,
++        follow_ups: heads
++            .iter()
++            .map(|(k, s)| (k.to_string(), ans(resp(*s))))
++            .collect(),
++    }
++}
++
++/// One passing exercise for every row of `pre-0.1`, unsupported rows answering exactly as
++/// declared. Each test replaces one entry to isolate the leg it judges.
++fn passing_run() -> Vec<Exercise> {
++    let mut run = vec![
++        good_put(),
++        Exercise::GetObject {
++            object: OBJECT.to_vec(),
++            answer: ans(resp(200).with_body(Body::Bytes(OBJECT.to_vec()))),
++        },
++        Exercise::GetObjectRanged {
++            object: OBJECT.to_vec(),
++            first: 2,
++            last: 5,
++            answer: ans(resp(206)
++                .with_content_range("bytes 2-5/16")
++                .with_body(Body::Bytes(OBJECT[2..=5].to_vec()))),
++        },
++        Exercise::GetObjectIfNoneMatchHit {
++            answer: ans(resp(304)),
++        },
++        Exercise::GetObjectIfNoneMatchMiss {
++            object: OBJECT.to_vec(),
++            answer: ans(resp(200).with_body(Body::Bytes(OBJECT.to_vec()))),
++        },
++        Exercise::HeadObject {
++            size: 16,
++            etag: ETAG.to_string(),
++            answer: ans(resp(200).with_content_length(16).with_etag(ETAG)),
++        },
++        Exercise::DeleteObject {
++            answer: ans(resp(204)),
++            follow_up: ans(resp(404)),
++        },
++        delete_objects(deleted_all(), heads(ans(resp(404)), ans(resp(404)))),
++        Exercise::ListObjectsV2 {
++            expected: listing(),
++            answer: ans(resp(200).with_body(Body::Listing(listing()))),
++        },
++        Exercise::ListObjects {
++            expected: listing(),
++            answer: ans(resp(200).with_body(Body::Listing(listing()))),
++        },
++    ];
++    for r in PRE_0_1.rows() {
++        if let Expected::Unsupported { status, code, .. } = r.expected {
++            let response = match code {
++                DeclaredCode::Code(c) => resp(status).with_error_code(ErrorCode::Code(c.into())),
++                DeclaredCode::NoBody => resp(status).with_error_code(ErrorCode::NoBody),
++            };
++            run.push(Exercise::Other {
++                operation: r.operation,
++                answer: ans(response),
++            });
++        }
++    }
++    run
++}
++
++fn replace(run: &mut [Exercise], exercise: Exercise) {
++    let op = exercise.operation();
++    let slot = run
++        .iter_mut()
++        .find(|e| e.operation() == op)
++        .expect("the run exercises the row");
++    *slot = exercise;
++}
++
++/// The run verdict when exactly one exercise of the passing run is replaced.
++fn verdict_with(exercise: Exercise) -> wyrd_validate::matrix::RunVerdict {
++    let mut run = passing_run();
++    replace(&mut run, exercise);
++    verdict(&PRE_0_1, &run)
++}
++
++fn assert_fails_with(exercise: Exercise, class: FailureClass) {
++    let op = exercise.operation();
++    let v = verdict_with(exercise);
++    assert_eq!(v.outcome, Outcome::Fail, "{v}");
++    assert_eq!(v.fatal.len(), 1, "{v}");
++    assert_eq!(v.fatal[0].operation, op, "{v}");
++    assert_eq!(v.fatal[0].class, class, "{v}");
++}
++
++fn assert_inconclusive_on(exercise: Exercise) {
++    let op = exercise.operation();
++    let v = verdict_with(exercise);
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert!(v.fatal.is_empty(), "{v}");
++    assert_eq!(v.unproved.len(), 1, "{v}");
++    assert_eq!(v.unproved[0].0, op, "{v}");
++    assert!(matches!(v.unproved[0].1, Unproved::Unsettled { .. }), "{v}");
++}
++
++// ---------------------------------------------------------------------------------------------
++// (A) Today's profile
++// ---------------------------------------------------------------------------------------------
++
++#[test]
++fn pre_0_1_declares_exactly_todays_rows() {
++    use Operation::*;
++    let nimpl = DeclaredCode::Code("NotImplemented");
++    let invalid = DeclaredCode::Code("InvalidRequest");
++    let unsupported = |issue, status, code| Expected::Unsupported {
++        issue,
++        status,
++        code,
++    };
++    let want: Vec<(Operation, Expected)> = vec![
++        (PutObject, Expected::Required),
++        (GetObject, Expected::Required),
++        (GetObjectRanged, Expected::Required),
++        (GetObjectIfNoneMatchHit, Expected::Required),
++        (GetObjectIfNoneMatchMiss, Expected::Required),
++        (HeadObject, Expected::Required),
++        (DeleteObject, Expected::Required),
++        (DeleteObjects, Expected::Required),
++        (ListObjectsV2, Expected::Required),
++        (ListObjects, Expected::Required),
++        (CopyObject, unsupported(766, 501, nimpl)),
++        (CreateMultipartUpload, unsupported(508, 501, nimpl)),
++        (UploadPart, unsupported(508, 501, nimpl)),
++        (CompleteMultipartUpload, unsupported(508, 501, nimpl)),
++        (AbortMultipartUpload, unsupported(508, 501, nimpl)),
++        (ListParts, unsupported(508, 501, nimpl)),
++        (ListMultipartUploads, unsupported(508, 501, nimpl)),
++        (GetBucketLocation, unsupported(511, 501, nimpl)),
++        (CreateBucket, unsupported(511, 400, invalid)),
++        (DeleteBucket, unsupported(511, 400, invalid)),
++        (ListBuckets, unsupported(511, 400, invalid)),
++        (HeadBucket, unsupported(511, 400, DeclaredCode::NoBody)),
++    ];
++    let mut got: Vec<(Operation, Expected)> = PRE_0_1
++        .rows()
++        .iter()
++        .map(|r| (r.operation, r.expected))
++        .collect();
++    let mut want_sorted = want.clone();
++    got.sort_by_key(|(op, _)| *op);
++    want_sorted.sort_by_key(|(op, _)| *op);
++    assert_eq!(got, want_sorted, "pre-0.1 declares exactly today's rows");
++    assert_eq!(PRE_0_1.rows().len(), want.len(), "no row is declared twice");
++    assert!(
++        PRE_0_1
++            .rows()
++            .iter()
++            .all(|r| !matches!(r.expected, Expected::SupportedNotChecked { .. })),
++        "no row is `supported, not checked` today"
++    );
++    for r in PRE_0_1.rows() {
++        assert!(
++            r.cites.starts_with("crates/gateway-s3/src/lib.rs:"),
++            "{} cites the gateway line giving today's answer: {}",
++            r.operation,
++            r.cites
++        );
++    }
++    assert_eq!(PRE_0_1.name(), "pre-0.1");
++}
++
++#[test]
++fn pre_0_1_covers_every_version_below_0_1_0() {
++    for v in [
++        "0.0.0",
++        "0.0.0+git.abc1234",
++        "0.0.0+git.abc1234.dirty",
++        "0.0.9",
++        "0.0.99-alpha",
++        "0.1.0-rc.1",
++    ] {
++        assert_eq!(
++            select_reported(PROFILES, v).map(Profile::name),
++            Ok("pre-0.1"),
++            "{v}"
++        );
++    }
++    for v in ["0.1.0", "0.1.0+git.3.abc1234", "0.2.0", "1.0.0"] {
++        assert!(
++            matches!(select_reported(PROFILES, v), Err(NoProfile::NoMatch(_))),
++            "{v} is not covered by pre-0.1"
++        );
++    }
++}
++
++#[test]
++fn a_full_passing_run_against_pre_0_1_passes() {
++    let v = verdict(&PRE_0_1, &passing_run());
++    assert_eq!(v.outcome, Outcome::Pass, "{v}");
++    assert!(v.fatal.is_empty() && v.unproved.is_empty() && v.not_covered.is_empty());
++}
++
++// ---------------------------------------------------------------------------------------------
++// (B) Unsupported rows
++// ---------------------------------------------------------------------------------------------
++
++#[test]
++fn unsupported_row_passes_only_on_the_declared_status_and_code() {
++    let copy = row(Operation::CopyObject);
++    let ex = |answer| Exercise::Other {
++        operation: Operation::CopyObject,
++        answer,
++    };
++    assert_eq!(
++        classify(copy, &ex(refusal(501, "NotImplemented"))),
++        RowResult::Pass
++    );
++    for wrong in [
++        refusal(501, "InvalidRequest"),
++        refusal(400, "NotImplemented"),
++        refusal(500, "InternalError"),
++        refusal(503, "SlowDown"),
++        ans(resp(501)),
++        ans(resp(501).with_error_code(ErrorCode::NoBody)),
++        ans(resp(501).with_error_code(ErrorCode::MissingInXml)),
++    ] {
++        assert_eq!(
++            class_of(&classify(copy, &ex(wrong.clone()))),
++            Some(FailureClass::Protocol),
++            "{wrong:?}"
++        );
++    }
++    // The report says what came back and what the row declares.
++    assert_eq!(
++        classify(copy, &ex(refusal(500, "InternalError"))),
++        RowResult::Fatal {
++            class: FailureClass::Protocol,
++            detail: "answered 500; declared 501 NotImplemented".to_string(),
++        }
++    );
++}
++
++#[test]
++fn head_bucket_passes_on_a_400_with_no_body_only() {
++    let hb = row(Operation::HeadBucket);
++    let ex = |answer| Exercise::Other {
++        operation: Operation::HeadBucket,
++        answer,
++    };
++    let empty_400 = ans(resp(400).with_error_code(ErrorCode::NoBody));
++    assert_eq!(classify(hb, &ex(empty_400)), RowResult::Pass);
++    assert_eq!(
++        classify(hb, &ex(refusal(400, "InvalidRequest"))),
++        RowResult::Fatal {
++            class: FailureClass::Protocol,
++            detail: "answered 400 with code InvalidRequest; declared 400 no body".to_string(),
++        }
++    );
++    assert_eq!(
++        class_of(&classify(
++            hb,
++            &ex(ans(resp(404).with_error_code(ErrorCode::NoBody)))
++        )),
++        Some(FailureClass::Protocol)
++    );
++}
++
++#[test]
++fn any_2xx_to_an_unsupported_row_is_unexpected_support() {
++    for op in [
++        Operation::CopyObject,
++        Operation::UploadPart,
++        Operation::CreateBucket,
++        Operation::HeadBucket,
++    ] {
++        for answer in [
++            ans(resp(200)),
++            ans(resp(204)),
++            ans(resp(206)),
++            // A 2xx head whose body then failed or timed out is still support.
++            ans(resp(200).with_body(Body::Failed {
++                why: "connection reset mid-body".to_string(),
++            })),
++            ans(resp(200).with_body(Body::Failed {
++                why: "body deadline expired".to_string(),
++            })),
++        ] {
++            let result = classify(
++                row(op),
++                &Exercise::Other {
++                    operation: op,
++                    answer: answer.clone(),
++                },
++            );
++            assert_eq!(
++                class_of(&result),
++                Some(FailureClass::UnexpectedSupport),
++                "{op}: {answer:?}"
++            );
++        }
++    }
++}
++
++#[test]
++fn an_unsupported_row_with_no_response_head_has_no_verdict() {
++    let result = classify(
++        row(Operation::CopyObject),
++        &Exercise::Other {
++            operation: Operation::CopyObject,
++            answer: no_answer(),
++        },
++    );
++    assert!(matches!(result, RowResult::NoAnswer { .. }), "{result:?}");
++    let v = verdict_with(Exercise::Other {
++        operation: Operation::CopyObject,
++        answer: no_answer(),
++    });
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert_eq!(v.unproved[0].0, Operation::CopyObject);
++    assert!(matches!(v.unproved[0].1, Unproved::NoAnswer { .. }));
++}
++
++#[test]
++fn an_unexpected_success_fails_the_run() {
++    assert_fails_with(
++        Exercise::Other {
++            operation: Operation::CompleteMultipartUpload,
++            answer: ans(resp(200)),
++        },
++        FailureClass::UnexpectedSupport,
++    );
++}
++
++// ---------------------------------------------------------------------------------------------
++// (B′) Required rows
++// ---------------------------------------------------------------------------------------------
++
++#[test]
++fn strong_entity_tag_grammar() {
++    for ok in ["\"abc\"", "\"\"", "\"a-b_c.1!#~\"", ETAG] {
++        assert!(is_strong_etag(ok), "{ok}");
++    }
++    for bad in [
++        "*",
++        "abc",
++        "W/\"abc\"",
++        "",
++        "\"",
++        "\"a\"b\"",
++        "\"abc",
++        "abc\"",
++        " \"abc\"",
++        "\"a b\"",
++    ] {
++        assert!(!is_strong_etag(bad), "{bad:?}");
++    }
++}
++
++#[test]
++fn put_passes_on_200_with_a_strong_etag_after_the_body_ended() {
++    assert_eq!(
++        classify(row(Operation::PutObject), &good_put()),
++        RowResult::Pass
++    );
++}
++
++#[test]
++fn put_etag_that_is_not_a_strong_tag_is_protocol() {
++    for etag in ["*", "abc", "W/\"abc\"", ""] {
++        assert_fails_with(
++            put(ans(resp(200).with_etag(etag)), true),
++            FailureClass::Protocol,
++        );
++    }
++    assert_fails_with(put(ans(resp(200)), true), FailureClass::Protocol);
++}
++
++#[test]
++fn put_answered_before_its_body_ended_is_protocol_whatever_its_etag() {
++    assert_fails_with(
++        put(ans(resp(200).with_etag(ETAG)), false),
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn whole_get_one_byte_off_is_integrity() {
++    let get = |body: Vec<u8>| Exercise::GetObject {
++        object: OBJECT.to_vec(),
++        answer: ans(resp(200).with_body(Body::Bytes(body))),
++    };
++    let mut off = OBJECT.to_vec();
++    off[7] ^= 1;
++    // One byte off, and one byte short; the report names where the bytes part.
++    for (body, detail) in [
++        (
++            off,
++            "body of 16 bytes differs from the expected 16 bytes at offset 7",
++        ),
++        (
++            OBJECT[..15].to_vec(),
++            "body of 15 bytes differs from the expected 16 bytes at offset 15",
++        ),
++    ] {
++        assert_fails_with(get(body.clone()), FailureClass::Integrity);
++        assert_eq!(
++            classify(row(Operation::GetObject), &get(body)),
++            RowResult::Fatal {
++                class: FailureClass::Integrity,
++                detail: detail.to_string(),
++            }
++        );
++    }
++}
++
++fn ranged(answer: Answer) -> Exercise {
++    Exercise::GetObjectRanged {
++        object: OBJECT.to_vec(),
++        first: 2,
++        last: 5,
++        answer,
++    }
++}
++
++#[test]
++fn ranged_get_answered_200_with_the_whole_body_is_protocol() {
++    assert_fails_with(
++        ranged(ans(resp(200).with_body(Body::Bytes(OBJECT.to_vec())))),
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn ranged_get_with_the_wrong_content_range_is_protocol() {
++    for cr in [
++        "bytes 2-6/16",
++        "bytes 2-5/17",
++        "bytes 0-3/16",
++        "bytes */16",
++        "bytes 2-5",
++        // Signs are not digits, though `u64::from_str` takes a `+` (AGENTS.md grammar rule).
++        "bytes +2-+5/+16",
++        "bytes +2-5/16",
++        "bytes 2-+5/16",
++        "bytes 2-5/+16",
++    ] {
++        assert_fails_with(
++            ranged(ans(resp(206)
++                .with_content_range(cr)
++                .with_body(Body::Bytes(OBJECT[2..=5].to_vec())))),
++            FailureClass::Protocol,
++        );
++    }
++    // The unit is case-insensitive (RFC 9110 §14.1).
++    let ok = classify(
++        row(Operation::GetObjectRanged),
++        &ranged(ans(resp(206)
++            .with_content_range("Bytes 2-5/16")
++            .with_body(Body::Bytes(OBJECT[2..=5].to_vec())))),
++    );
++    assert_eq!(ok, RowResult::Pass);
++}
++
++#[test]
++fn ranged_get_with_the_wrong_bytes_is_integrity() {
++    assert_fails_with(
++        ranged(ans(resp(206)
++            .with_content_range("bytes 2-5/16")
++            .with_body(Body::Bytes(OBJECT[3..=6].to_vec())))),
++        FailureClass::Integrity,
++    );
++}
++
++#[test]
++fn matching_conditional_get_answered_200_is_protocol() {
++    assert_fails_with(
++        Exercise::GetObjectIfNoneMatchHit {
++            answer: ans(resp(200).with_body(Body::Bytes(OBJECT.to_vec()))),
++        },
++        FailureClass::Protocol,
++    );
++    assert_fails_with(
++        Exercise::GetObjectIfNoneMatchHit {
++            answer: ans(resp(304).with_body(Body::Bytes(b"x".to_vec()))),
++        },
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn non_matching_conditional_get_answered_304_is_protocol() {
++    assert_fails_with(
++        Exercise::GetObjectIfNoneMatchMiss {
++            object: OBJECT.to_vec(),
++            answer: ans(resp(304)),
++        },
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn head_with_the_wrong_size_or_etag_is_oracle() {
++    for answer in [
++        ans(resp(200).with_content_length(15).with_etag(ETAG)),
++        ans(resp(200).with_content_length(16).with_etag("\"other\"")),
++        ans(resp(200).with_etag(ETAG)),
++    ] {
++        assert_fails_with(
++            Exercise::HeadObject {
++                size: 16,
++                etag: ETAG.to_string(),
++                answer,
++            },
++            FailureClass::Oracle,
++        );
++    }
++}
++
++#[test]
++fn listing_that_is_not_exactly_the_written_keys_is_oracle() {
++    let mut missing = listing();
++    missing.pop();
++    let mut extra = listing();
++    extra.push(Listed {
++        key: "p/c".to_string(),
++        size: 1,
++    });
++    let mut wrong_size = listing();
++    wrong_size[1].size = 4;
++    for listed in [missing, extra, wrong_size] {
++        assert_fails_with(
++            Exercise::ListObjectsV2 {
++                expected: listing(),
++                answer: ans(resp(200).with_body(Body::Listing(listed.clone()))),
++            },
++            FailureClass::Oracle,
++        );
++        assert_fails_with(
++            Exercise::ListObjects {
++                expected: listing(),
++                answer: ans(resp(200).with_body(Body::Listing(listed))),
++            },
++            FailureClass::Oracle,
++        );
++    }
++}
++
++#[test]
++fn delete_object_followed_by_a_readable_head_is_oracle() {
++    assert_fails_with(
++        Exercise::DeleteObject {
++            answer: ans(resp(204)),
++            follow_up: ans(resp(200)),
++        },
++        FailureClass::Oracle,
++    );
++}
++
++#[test]
++fn delete_object_follow_up_with_another_status_is_protocol() {
++    assert_fails_with(
++        Exercise::DeleteObject {
++            answer: ans(resp(204)),
++            follow_up: ans(resp(403)),
++        },
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn delete_objects_with_one_error_row_is_protocol() {
++    let answer = ans(resp(200).with_body(Body::DeleteResult(DeleteResult {
++        deleted: vec!["p/a".to_string()],
++        errors: vec![DeleteFailure {
++            key: "p/b".to_string(),
++            code: "InternalError".to_string(),
++        }],
++    })));
++    assert_fails_with(
++        delete_objects(answer, heads(ans(resp(404)), ans(resp(404)))),
++        FailureClass::Protocol,
++    );
++}
++
++#[test]
++fn delete_objects_document_alone_never_proves_the_delete() {
++    // Every key under <Deleted>, and a HEAD that still reads one of them.
++    assert_fails_with(
++        delete_objects(deleted_all(), heads(ans(resp(404)), ans(resp(200)))),
++        FailureClass::Oracle,
++    );
++    // Every key under <Deleted>, and no HEAD sent at all: not proved.
++    assert_inconclusive_on(delete_objects(deleted_all(), vec![]));
++}
++
++#[test]
++fn delete_follow_up_with_no_answer_or_a_5xx_is_inconclusive_not_oracle() {
++    assert_inconclusive_on(Exercise::DeleteObject {
++        answer: ans(resp(204)),
++        follow_up: no_answer(),
++    });
++    assert_inconclusive_on(Exercise::DeleteObject {
++        answer: ans(resp(204)),
++        follow_up: ans(resp(503)),
++    });
++    assert_inconclusive_on(delete_objects(
++        deleted_all(),
++        heads(ans(resp(404)), no_answer()),
++    ));
++    // A fatal probe outranks an unsettled one.
++    assert_fails_with(
++        delete_objects(deleted_all(), heads(no_answer(), ans(resp(200)))),
++        FailureClass::Oracle,
++    );
++}
++
++#[test]
++fn required_row_with_a_cut_off_body_or_an_availability_5xx_is_not_proved() {
++    assert_inconclusive_on(Exercise::GetObject {
++        object: OBJECT.to_vec(),
++        answer: ans(resp(200).with_body(Body::Failed {
++            why: "reset".to_string(),
++        })),
++    });
++    assert_inconclusive_on(put(ans(resp(503)), true));
++    // But a 501 to a required row is a refusal, not unavailability.
++    assert_fails_with(
++        put(refusal(501, "NotImplemented"), true),
++        FailureClass::Protocol,
++    );
++    // A document or a range cut off after its head is not proved either.
++    let cut = || ans(resp(200).with_body(failed()));
++    assert_inconclusive_on(Exercise::ListObjectsV2 {
++        expected: listing(),
++        answer: cut(),
++    });
++    assert_inconclusive_on(Exercise::ListObjects {
++        expected: listing(),
++        answer: cut(),
++    });
++    assert_inconclusive_on(delete_objects(cut(), heads(ans(resp(404)), ans(resp(404)))));
++    assert_inconclusive_on(Exercise::GetObjectIfNoneMatchMiss {
++        object: OBJECT.to_vec(),
++        answer: cut(),
++    });
++    assert_inconclusive_on(ranged(ans(resp(206)
++        .with_content_range("bytes 2-5/16")
++        .with_body(failed()))));
++}
++
++fn head_of(answer: Response) -> Exercise {
++    Exercise::HeadObject {
++        size: 16,
++        etag: ETAG.to_string(),
++        answer: ans(answer.with_content_length(16).with_etag(ETAG)),
++    }
++}
++
++#[test]
++fn a_bodiless_answer_cut_off_after_its_head_is_not_proved() {
++    // A PUT's 200, a HEAD, a 304 and a 204 carry no body. A head and then a transport cut is not
++    // an answer that ended whole: neither a receipt nor a failure.
++    assert_inconclusive_on(put(
++        ans(resp(200).with_etag(ETAG).with_body(failed())),
++        true,
++    ));
++    assert_inconclusive_on(head_of(resp(200).with_body(failed())));
++    assert_inconclusive_on(Exercise::GetObjectIfNoneMatchHit {
++        answer: ans(resp(304).with_body(failed())),
++    });
++    assert_inconclusive_on(Exercise::DeleteObject {
++        answer: ans(resp(204).with_body(failed())),
++        follow_up: ans(resp(404)),
++    });
++    assert_inconclusive_on(Exercise::DeleteObject {
++        answer: ans(resp(204)),
++        follow_up: ans(resp(404).with_body(failed())),
++    });
++    // The cut never hides a fatal fact the head already showed.
++    assert_fails_with(
++        put(ans(resp(200).with_etag(ETAG).with_body(failed())), false),
++        FailureClass::Protocol,
++    );
++    assert_fails_with(
++        put(ans(resp(200).with_etag("*").with_body(failed())), true),
++        FailureClass::Protocol,
++    );
++    assert_fails_with(
++        Exercise::DeleteObject {
++            answer: ans(resp(204).with_body(failed())),
++            follow_up: ans(resp(200)),
++        },
++        FailureClass::Oracle,
++    );
++}
++
++#[test]
++fn a_bodiless_answer_that_carries_a_body_is_protocol() {
++    let x = || Body::Bytes(b"x".to_vec());
++    for exercise in [
++        put(ans(resp(200).with_etag(ETAG).with_body(x())), true),
++        head_of(resp(200).with_body(x())),
++        Exercise::GetObjectIfNoneMatchHit {
++            answer: ans(resp(304).with_body(Body::Listing(listing()))),
++        },
++        Exercise::DeleteObject {
++            answer: ans(resp(204).with_body(x())),
++            follow_up: ans(resp(404)),
++        },
++        Exercise::DeleteObject {
++            answer: ans(resp(204)),
++            follow_up: ans(resp(404).with_body(x())),
++        },
++    ] {
++        assert_fails_with(exercise, FailureClass::Protocol);
++    }
++    // No bytes is no body, however the client spelled it.
++    let none = || Body::Bytes(Vec::new());
++    for exercise in [
++        put(ans(resp(200).with_etag(ETAG).with_body(none())), true),
++        head_of(resp(200).with_body(none())),
++        Exercise::GetObjectIfNoneMatchHit {
++            answer: ans(resp(304).with_body(none())),
++        },
++    ] {
++        let op = exercise.operation();
++        assert_eq!(classify(row(op), &exercise), RowResult::Pass, "{op}");
++    }
++}
++
++#[test]
++fn every_follow_up_is_judged_against_the_key_it_asked_about() {
++    use FailureClass::Oracle;
++    // The readable key is the last: probes paired with the wrong keys would miss it.
++    let abc = ["p/a", "p/b", "p/c"];
++    assert_fails_with(
++        bulk(&abc, &[("p/a", 404), ("p/b", 404), ("p/c", 200)]),
++        Oracle,
++    );
++    // A key with no HEAD of its own is not proved by the HEADs of the others.
++    assert_inconclusive_on(bulk(&abc, &[("p/a", 404), ("p/b", 404)]));
++    // A later HEAD that reads a key is fatal, whatever an earlier HEAD of it said.
++    let ab = ["p/a", "p/b"];
++    assert_fails_with(
++        bulk(&ab, &[("p/a", 404), ("p/a", 200), ("p/b", 404)]),
++        Oracle,
++    );
++    // A retry that answers 404 proves what the first HEAD could not.
++    assert_eq!(
++        classify(
++            row(Operation::DeleteObjects),
++            &bulk(&ab, &[("p/a", 503), ("p/a", 404), ("p/b", 404)])
++        ),
++        RowResult::Pass
++    );
++    // A HEAD of a key the delete did not request settles nothing, alone or beside the others.
++    assert_inconclusive_on(bulk(&ab, &[("p/c", 404), ("p/c", 404)]));
++    assert_inconclusive_on(bulk(&ab, &[("p/a", 404), ("p/b", 404), ("p/c", 404)]));
++    // A key requested twice cannot be matched against the document key by key, but its probe
++    // is still judged.
++    assert_inconclusive_on(bulk(&["p/a", "p/a"], &[("p/a", 404)]));
++    assert_fails_with(bulk(&["p/a", "p/a"], &[("p/a", 200)]), Oracle);
++}
++
++#[test]
++fn a_cut_off_delete_result_never_hides_a_probe_that_reads_a_key() {
++    let cut = || ans(resp(200).with_body(failed()));
++    // After a 200, a requested key that still reads is fatal whatever the lost document said.
++    assert_fails_with(
++        delete_objects(cut(), heads(ans(resp(200)), ans(resp(404)))),
++        FailureClass::Oracle,
++    );
++    assert_fails_with(
++        delete_objects(cut(), heads(ans(resp(404)), ans(resp(200)))),
++        FailureClass::Oracle,
++    );
++    assert_fails_with(
++        delete_objects(cut(), heads(ans(resp(404)), ans(resp(403)))),
++        FailureClass::Protocol,
++    );
++    // Every key proved gone, and the document still lost: not proved, never passed.
++    assert_inconclusive_on(delete_objects(cut(), heads(ans(resp(404)), ans(resp(404)))));
++    assert_inconclusive_on(delete_objects(cut(), heads(ans(resp(404)), no_answer())));
++}
++
++#[test]
++fn probes_after_an_unacknowledged_bulk_delete_are_not_judged() {
++    // No 200, so no delete was acknowledged: a readable key is what an undone delete leaves.
++    let readable = || heads(ans(resp(200)), ans(resp(200)));
++    let v = verdict_with(delete_objects(no_answer(), readable()));
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert!(matches!(
++        v.unproved[..],
++        [(Operation::DeleteObjects, Unproved::NoAnswer { .. })]
++    ));
++    assert_inconclusive_on(delete_objects(ans(resp(503)), readable()));
++}
++
++#[test]
++fn a_listing_of_a_prefix_with_nothing_written_proves_nothing() {
++    let list = |listed| Exercise::ListObjects {
++        expected: vec![],
++        answer: ans(resp(200).with_body(Body::Listing(listed))),
++    };
++    assert_inconclusive_on(list(vec![]));
++    // A key listed where nothing was written is still a disagreement.
++    assert_fails_with(list(listing()), FailureClass::Oracle);
++}
++
++#[test]
++fn a_range_is_checked_at_its_edges_and_an_impossible_one_settles_nothing() {
++    for (first, last) in [(3, 3), (15, 15), (0, 15)] {
++        let exercise = Exercise::GetObjectRanged {
++            object: OBJECT.to_vec(),
++            first,
++            last,
++            answer: ans(resp(206)
++                .with_content_range(&format!("bytes {first}-{last}/16"))
++                .with_body(Body::Bytes(OBJECT[first as usize..=last as usize].to_vec()))),
++        };
++        let result = classify(row(Operation::GetObjectRanged), &exercise);
++        assert_eq!(result, RowResult::Pass, "bytes={first}-{last}");
++    }
++    for (first, last) in [(5, 4), (2, 16)] {
++        let exercise = Exercise::GetObjectRanged {
++            object: OBJECT.to_vec(),
++            first,
++            last,
++            answer: ans(resp(206).with_content_range(&format!("bytes {first}-{last}/16"))),
++        };
++        let result = classify(row(Operation::GetObjectRanged), &exercise);
++        assert!(matches!(result, RowResult::Unsettled { .. }), "{result:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// (C) Version keying
++// ---------------------------------------------------------------------------------------------
++
++fn release(major: u64, minor: u64, patch: u64, pre: Vec<PreId>) -> ReportedVersion {
++    ReportedVersion::Release(Release {
++        major,
++        minor,
++        patch,
++        pre,
++    })
++}
++
++#[test]
++fn parse_reads_releases_and_ignores_build_metadata() {
++    assert_eq!(parse_version("0.1.0"), Ok(release(0, 1, 0, vec![])));
++    assert_eq!(
++        parse_version("0.1.0+git.3.abc1234.dirty"),
++        Ok(release(0, 1, 0, vec![]))
++    );
++    assert_eq!(
++        parse_version("0.0.0+git.abc1234"),
++        Ok(release(0, 0, 0, vec![]))
++    );
++    assert_eq!(
++        parse_version("1.2.3-rc.1+build.5"),
++        Ok(release(
++            1,
++            2,
++            3,
++            vec![PreId::Alpha("rc".to_string()), PreId::Numeric(1)]
++        ))
++    );
++    assert_eq!(parse_version("10.20.30"), Ok(release(10, 20, 30, vec![])));
++    assert_eq!(
++        parse_version("18446744073709551615.0.0"),
++        Ok(release(u64::MAX, 0, 0, vec![]))
++    );
++}
++
++#[test]
++fn unknown_is_never_read_as_release_0_0_0() {
++    for v in ["unknown", "0.0.0+git.unknown", "0.0.0+git.unknown.dirty"] {
++        assert_eq!(parse_version(v), Ok(ReportedVersion::Unknown), "{v}");
++        assert_eq!(select_reported(PROFILES, v), Err(NoProfile::Unknown), "{v}");
++    }
++    // A sha that merely contains `unknown` is a real build.
++    assert_eq!(
++        parse_version("0.0.0+git.unknownx"),
++        Ok(release(0, 0, 0, vec![]))
++    );
++}
++
++#[test]
++fn parse_refuses_malformed_versions() {
++    for v in [
++        "",
++        "wyrd/0.1.0",
++        "v0.1.0",
++        "0.1",
++        "0.1.0.0",
++        "0..0",
++        ".0.0",
++        "0.0.",
++        "01.1.0",
++        "0.01.0",
++        "18446744073709551616.0.0",
++        "0.1.0-rc.18446744073709551616",
++        "+1.0.0",
++        "0.1.0-",
++        "0.1.0-rc..1",
++        "0.1.0-01",
++        "0.0.0-r_c",
++        "0.1.0+",
++        "0.1.0+git..x",
++        "0.1.0+git_x",
++        " 0.1.0",
++        "0.1.0 ",
++        "0.-1.0",
++        "Unknown",
++    ] {
++        assert!(parse_version(v).is_err(), "{v:?} must not parse");
++        assert!(
++            matches!(select_reported(PROFILES, v), Err(NoProfile::Unparsable(_))),
++            "{v:?}"
++        );
++    }
++}
++
++const OLD_ROWS: &[Row] = &[
++    Row::unsupported(
++        Operation::PutObject,
++        1,
++        501,
++        DeclaredCode::Code("NotImplemented"),
++        "test",
++    ),
++    Row::required(Operation::HeadObject, "test"),
++];
++const NEW_ROWS: &[Row] = &[
++    Row::required(Operation::PutObject, "test"),
++    Row::required(Operation::HeadObject, "test"),
++];
++const OLD: Profile = Profile::new(
++    "old",
++    VersionRange {
++        from: None,
++        below: Some(Bound::new(1, 0, 0)),
++    },
++    OLD_ROWS,
++);
++const NEW: Profile = Profile::new(
++    "new",
++    VersionRange {
++        from: Some(Bound::new(1, 0, 0)),
++        below: Some(Bound::new(2, 0, 0)),
++    },
++    NEW_ROWS,
++);
++const TABLE: &[Profile] = &[OLD, NEW];
++
++#[test]
++fn each_version_selects_its_own_profile_and_expectations() {
++    let old = select_reported(TABLE, "0.9.3+git.2.abc").expect("0.9.3 selects");
++    let new = select_reported(TABLE, "1.4.0").expect("1.4.0 selects");
++    assert_eq!(old.name(), "old");
++    assert_eq!(new.name(), "new");
++    assert_eq!(
++        select_reported(TABLE, "1.0.0-rc.1").map(Profile::name),
++        Ok("old")
++    );
++    assert_eq!(
++        select_reported(TABLE, "1.0.0").map(Profile::name),
++        Ok("new")
++    );
++    // The same answer flips: a receipt to PutObject passes where it is required and is
++    // unexpected support where it is unsupported.
++    let same = good_put();
++    assert_eq!(
++        classify(new.row(Operation::PutObject).unwrap(), &same),
++        RowResult::Pass
++    );
++    assert_eq!(
++        class_of(&classify(old.row(Operation::PutObject).unwrap(), &same)),
++        Some(FailureClass::UnexpectedSupport)
++    );
++    let head = Exercise::HeadObject {
++        size: 16,
++        etag: ETAG.to_string(),
++        answer: ans(resp(200).with_content_length(16).with_etag(ETAG)),
++    };
++    assert_eq!(
++        verdict(new, &[same.clone(), head.clone()]).outcome,
++        Outcome::Pass
++    );
++    assert_eq!(verdict(old, &[same, head]).outcome, Outcome::Fail);
++}
++
++#[test]
++fn a_version_no_profile_covers_selects_none() {
++    assert!(matches!(
++        select_reported(TABLE, "2.0.0"),
++        Err(NoProfile::NoMatch(_))
++    ));
++    assert_eq!(select_reported(TABLE, "unknown"), Err(NoProfile::Unknown));
++    assert!(matches!(
++        select_reported(TABLE, "two"),
++        Err(NoProfile::Unparsable(_))
++    ));
++    assert_eq!(
++        select(TABLE, &ReportedVersion::Unknown),
++        Err(NoProfile::Unknown)
++    );
++}
++
++#[test]
++fn overlapping_profiles_select_none() {
++    const BOTH: &[Profile] = &[
++        OLD,
++        Profile::new(
++            "overlap",
++            VersionRange {
++                from: Some(Bound::new(0, 5, 0)),
++                below: None,
++            },
++            NEW_ROWS,
++        ),
++    ];
++    assert!(matches!(
++        select_reported(BOTH, "0.6.0"),
++        Err(NoProfile::Ambiguous(_))
++    ));
++    assert_eq!(
++        select_reported(BOTH, "0.6.0").unwrap_err().to_string(),
++        "more than one profile covers release 0.6.0"
++    );
++}
++
++#[test]
++fn a_selection_that_finds_no_profile_says_why() {
++    let why = |v: &str| select_reported(TABLE, v).unwrap_err().to_string();
++    assert_eq!(why("unknown"), "the server's version is unknown");
++    assert_eq!(
++        why("2.1.0-rc.1.x+git.4.abc"),
++        "no profile covers release 2.1.0-rc.1.x"
++    );
++    assert_eq!(
++        why("0.1"),
++        "cannot read version \"0.1\": expected MAJOR.MINOR.PATCH"
++    );
++}
++
++// ---------------------------------------------------------------------------------------------
++// (D) Supported, not checked
++// ---------------------------------------------------------------------------------------------
++
++const UNCHECKED_ROWS: &[Row] = &[
++    Row::required(Operation::PutObject, "test"),
++    Row::not_checked(Operation::UploadPart, 750, "test"),
++];
++const UNCHECKED: Profile = Profile::new(
++    "unchecked",
++    VersionRange {
++        from: None,
++        below: None,
++    },
++    UNCHECKED_ROWS,
++);
++
++#[test]
++fn a_not_checked_row_need_not_be_exercised_and_is_listed_as_not_covered() {
++    let v = verdict(&UNCHECKED, &[good_put()]);
++    assert_eq!(v.outcome, Outcome::Pass, "{v}");
++    assert_eq!(v.not_covered.len(), 1);
++    assert_eq!(v.not_covered[0].operation, Operation::UploadPart);
++    assert_eq!(v.not_covered[0].issue, 750);
++    assert!(v
++        .to_string()
++        .contains("UploadPart: supported, not checked (#750)"));
++}
++
++#[test]
++fn an_answer_for_a_not_checked_row_is_never_a_pass() {
++    let row = UNCHECKED.row(Operation::UploadPart).unwrap();
++    for answer in [ans(resp(200)), refusal(501, "NotImplemented"), no_answer()] {
++        assert_eq!(
++            classify(
++                row,
++                &Exercise::Other {
++                    operation: Operation::UploadPart,
++                    answer
++                }
++            ),
++            RowResult::NotChecked { issue: 750 }
++        );
++    }
++    let v = verdict(
++        &UNCHECKED,
++        &[
++            good_put(),
++            Exercise::Other {
++                operation: Operation::UploadPart,
++                answer: ans(resp(200)),
++            },
++        ],
++    );
++    assert_eq!(v.not_covered.len(), 1, "still not covered: {v}");
++}
++
++// ---------------------------------------------------------------------------------------------
++// (E) The run verdict
++// ---------------------------------------------------------------------------------------------
++
++#[test]
++fn any_fatal_fails_the_run_naming_every_fatal_row() {
++    let mut run = passing_run();
++    replace(&mut run, put(ans(resp(200).with_etag("*")), true));
++    replace(
++        &mut run,
++        Exercise::Other {
++            operation: Operation::CopyObject,
++            answer: ans(resp(200)),
++        },
++    );
++    // An unproved row does not soften a fatal one.
++    replace(
++        &mut run,
++        Exercise::DeleteObject {
++            answer: ans(resp(204)),
++            follow_up: no_answer(),
++        },
++    );
++    let v = verdict(&PRE_0_1, &run);
++    assert_eq!(v.outcome, Outcome::Fail, "{v}");
++    let fatal: Vec<_> = v.fatal.iter().map(|f| (f.operation, f.class)).collect();
++    assert_eq!(
++        fatal,
++        vec![
++            (Operation::PutObject, FailureClass::Protocol),
++            (Operation::CopyObject, FailureClass::UnexpectedSupport),
++        ]
++    );
++    let text = v.to_string();
++    assert!(text.starts_with("FAIL"), "{text}");
++    assert!(text.contains("PutObject: protocol"), "{text}");
++    assert!(text.contains("CopyObject: unexpected-support"), "{text}");
++}
++
++#[test]
++fn an_unexercised_row_makes_the_run_inconclusive() {
++    let mut run = passing_run();
++    run.retain(|e| e.operation() != Operation::ListBuckets);
++    let v = verdict(&PRE_0_1, &run);
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert_eq!(
++        v.unproved,
++        vec![(Operation::ListBuckets, Unproved::NotExercised)]
++    );
++    assert!(v.to_string().contains("ListBuckets: not exercised"));
++}
++
++#[test]
++fn a_required_row_exercised_only_with_no_answer_is_inconclusive() {
++    let v = verdict_with(put(no_answer(), true));
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert_eq!(v.unproved.len(), 1);
++    assert_eq!(v.unproved[0].0, Operation::PutObject);
++    assert!(matches!(v.unproved[0].1, Unproved::NoAnswer { .. }));
++}
++
++#[test]
++fn an_unresolved_delete_names_the_delete_row() {
++    let v = verdict_with(Exercise::DeleteObject {
++        answer: ans(resp(204)),
++        follow_up: no_answer(),
++    });
++    assert_eq!(v.outcome, Outcome::Inconclusive);
++    assert!(v.to_string().contains("not proved: DeleteObject"), "{v}");
++    let v = verdict_with(delete_objects(
++        deleted_all(),
++        heads(ans(resp(404)), no_answer()),
++    ));
++    assert!(v.to_string().contains("not proved: DeleteObjects"), "{v}");
++}
++
++#[test]
++fn an_empty_run_proves_nothing() {
++    let v = verdict(&PRE_0_1, &[]);
++    assert_eq!(v.outcome, Outcome::Inconclusive);
++    assert_eq!(v.unproved.len(), PRE_0_1.rows().len());
++}
++
++#[test]
++fn a_row_passes_only_when_every_exercise_of_it_passed() {
++    let mut run = passing_run();
++    run.push(put(no_answer(), true));
++    let v = verdict(&PRE_0_1, &run);
++    assert_eq!(v.outcome, Outcome::Inconclusive, "{v}");
++    assert_eq!(v.unproved[0].0, Operation::PutObject);
++}
+diff --git a/docs/design/proposals/draft/0017-blackbox-validation-tool.md b/docs/design/proposals/draft/0017-blackbox-validation-tool.md
+index 85680f6..bd2f693 100644
+--- a/docs/design/proposals/draft/0017-blackbox-validation-tool.md
++++ b/docs/design/proposals/draft/0017-blackbox-validation-tool.md
+@@ -193,6 +193,10 @@ asserted — not just the success path.
+ - `required` — must succeed, and its result must satisfy the oracle.
+ - `unsupported(#NNN)` — must fail, **with the declared status and S3 error code**. Not a 500,
+   not a hang, and emphatically not a success.
++- `supported, not checked (#NNN)` — the server is expected to accept it and the tool cannot
++  check it yet; `#NNN` is the issue that adds the check. The verdict lists the row as not
++  covered, with its issue, and never counts an answer to it as a pass. A run can be `PASS`
++  without exercising it.
+ 
+ An `unsupported` operation that succeeds is a failure of class `unexpected-support`, and it is
+ fatal. That is [#504][i504] generalised: the day an unimplemented operation starts half-working
+@@ -256,9 +260,12 @@ reading as broken.
+ 
+ **The matrix must be keyed to the server version.** Expectations change as slices land, so a
+ tool validating an older release would otherwise fail on rows naming issues fixed after that
+-build. The gateway advertises no version today — no `Server:` header, nothing on the wire — so
+-this needs the version header of [#736][i736] (*Dependencies*). Until it lands, `--server-version` is an
+-operator-supplied parameter, with the honest weakness that a parameter can be silently wrong.
++build. Since #886 every response the gateway's handler returns carries `Server: wyrd/<version>`
++(`crates/gateway-s3/src/lib.rs:1693-1699`), the version header of [#736][i736]
++(*Dependencies*), so the version is read from the wire and `--server-version` is an override,
++with the honest weakness that an override can be silently wrong. A version the server does not
++know (`wyrd/unknown`, or a build identity ending `+git.unknown[.dirty]`) is never read as
++release `0.0.0`: it selects no profile.
+ 
+ **Profiles are versioned and retained — rows are never flipped in place.** An earlier revision
+ said "when #508 lands, the change is flipping six rows", which contradicts the version-keying
+@@ -274,6 +281,14 @@ version-keying mean anything rather than being a flag the tool accepts and ignor
+ Each profile is a reviewed constant with citations, and the retained ones are how a validator
+ shipped in an operator tarball stays useful against the release that operator actually runs.
+ 
++**Until the first tagged release, the `pre-0.1` profile describes `main` and is edited in
++place when a feature lands.** No release exists for a retained profile to protect, and every
++untagged build reports `0.0.0+git.<sha>`, so a second pre-release profile could never be
++selected. Retention starts at the first tag. A feature that lands before the tool can check it
++moves its rows to `supported, not checked (#NNN)`, naming the issue that adds the check (for
++multipart: the `cp` upload leg, #750). The profiles live in `crates/validate/src/matrix.rs`
++(#937).
++
+ ### 4. Size classes
+ 
+ Chosen to straddle boundaries on both sides of the wire — S3's, and Wyrd's own.
+@@ -855,12 +870,14 @@ Three product changes the tool's coverage wants. None blocks a first slice — d
+ today's values and the verdict records what was used — but each makes it accurate against a real
+ deployment rather than against the tree.
+ 
+-**The gateway advertises no version.** No `Server:` header, nothing on the wire
+-(`crates/gateway-s3/src/lib.rs`). A shipped tool cannot discover what it is validating, so the
+-capability matrix cannot key its expectations to a release. `Server: wyrd/<version>`, sourced
+-from the same `normalize_describe` over `git describe` that `cargo xtask dist` already uses
+-(`xtask/src/dist.rs:119,356`) rather than the `version = "0.0.0"` placeholder. Interim:
+-`--server-version`. Tracked as [#736][i736] (0.1 Alpha — a gateway change, not tooling).
++**The gateway advertises its version — landed.** [#736][i736] landed through #886: every
++response the gateway's handler returns carries `Server: wyrd/<version>`
++(`crates/gateway-s3/src/lib.rs:1693-1699`), the build identity baked by
++`crates/server/build.rs:117` from the same `normalize_describe` over `git describe` that
++`cargo xtask dist` uses (`crates/server/src/version/derivation.rs:41`, `xtask/src/dist.rs:546`)
++rather than the `version = "0.0.0"` placeholder. So a shipped tool reads what it is validating
++from the wire, the capability matrix keys its expectations to that release (§3), and
++`--server-version` is an override rather than the interim source.
+ 
+ **The `s3` role does not expose `--chunk-size`.** The seam exists —
+ `Gateway::with_chunk_size` (`crates/server/src/lib.rs:145`, doc-commented "mainly so tests can
