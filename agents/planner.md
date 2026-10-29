@@ -129,7 +129,11 @@ faster than Do could close them; it lifts by itself as sign-offs land.
   dependency discovered only at Do is a cycle burned — and the builder tends to *silently
   work around* an unmet one (a code-read instead of a compile, a curated fixture instead of
   the real environment), which fakes the evidence; catch it here. `none` when the base
-  toolchain suffices.
+  toolchain suffices. **Reuse an already-registered row's id; never mint a second id for the
+  same thing.** In particular, a base whose all-features advisory wall is red (the second
+  `cargo deny` step of `cargo xtask ci` fails before any patch) is the standing row
+  `cargo deny all-features advisories` — name that token, don't invent another (Act
+  2026-10-14: 666/686/767 each made up their own id for the same base failure).
 - **Assess `Difficulty:`** — `low` / `medium` / `high`, defined for its consumer as the
   fix's **blast-radius / cross-file reach**: how many files/call-sites it touches and how
   far its effects propagate — what a diff-reviewer must hold in view. A localized one-site
