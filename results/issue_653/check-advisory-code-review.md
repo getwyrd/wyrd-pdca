@@ -1,0 +1,5 @@
+- No introduced correctness findings: preflight and recovery (`crates/core/src/staged_publication.rs:445`), fence transitions (`crates/core/src/staged_publication.rs:790`), and the atomic root flip (`crates/core/src/staged_publication.rs:900`) are consistent with the documented caller obligations. The deterministic regressions and seeded scenario exercise the relevant failure paths (`crates/core/tests/segmented_publication.rs:788`, `crates/dst/tests/segmented_publication.rs:288`).
+- No actionable reuse, simplification, or efficiency findings. Planning uses the existing segment constructors and key helpers (`crates/core/src/staged_publication.rs:552`), and root stamping reuses `overwrite_modified` (`crates/core/src/staged_publication.rs:885`).
+
+Validation evidence was read from the frozen gate logs, not rerun: CI passed, including 21 core tests and three DST tests. The new-API red→green check remains explicitly unverifiable; mutation testing reports 18 survivors. Neither is treated here as proof of an introduced production defect.
+<!-- pdca:leaf-complete -->

@@ -1,6 +1,6 @@
 # Check gates — issue_853
 
-**Overall (gating): fail**
+**Overall (gating): pass**
 
 The Check 5/5/1: 5 correctness · 5 conformance · 1 validation.
 
@@ -12,9 +12,9 @@ The Check 5/5/1: 5 correctness · 5 conformance · 1 validation.
 | C2 Reproduction (red pre-fix) | none | (no gate configured) | — | — | no |
 | C3 Change | none | patch.diff | — | — | no |
 | C4 Wyrd gate: cargo xtask ci (fmt/clippy/build/test/deny/conformance) | pass | ./engine/xtask.sh ci | C4-ci | xtask ci: all checks passed | yes |
-| C4 per-fix red->green: this patch's test red pre-fix, green post-fix | pass | ./engine/scripts/run-verify.sh | C4-verify | run-verify.sh: PASS — red without the fix, green with it (14 test(s) ran red). | no |
+| C4 per-fix red->green: this patch's test red pre-fix, green post-fix | pass | ./engine/scripts/run-verify.sh | C4-verify | run-verify.sh: PASS — red without the fix, green with it (28 test(s) ran red). | no |
 | C4 diff coverage: changed lines executed by the patch's tests | fail | ./engine/scripts/run-diff-cov.sh | C4-diff-cov | diff coverage not measured — patch.diff does not apply on origin/main | no |
-| C5 surviving mutants on the bundle diff (cargo mutants --in-diff) | fail | scripts/mutants-in-diff | C5-mutants | 76 mutants tested in 3m: 17 missed, 15 caught, 44 unviable | no |
+| C5 surviving mutants on the bundle diff (cargo mutants --in-diff) | fail | scripts/mutants-in-diff | C5-mutants | 150 mutants tested in 12m: 4 missed, 90 caught, 51 unviable, 5 timeouts | no |
 
 ## Conformance (5)
 
@@ -23,9 +23,9 @@ The Check 5/5/1: 5 correctness · 5 conformance · 1 validation.
 | T1 Structure | none | (no gate configured) | — | — | no |
 | T2 Shape | none | (no gate configured) | — | — | no |
 | T3 Runtime | none | (no gate configured) | — | — | no |
-| T4 batched multi-pass rubric review (3x codex, union, triaged) | fail | scripts/review-branch --bundle | T4-batch-review | review-branch: 4 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_853/review-b | yes |
+| T4 batched multi-pass rubric review (3x codex, union, triaged) | pass | scripts/review-branch --bundle | T4-batch-review | review-branch: 0 blocking, 0 recorded-rejected, 0 noise-dropped -> /home/eddie/wyrd/wyrd-pdca/results/issue_853/review-b | yes |
 | T4 contribution artifacts complete (user-impact opener + tracker id in both) | deferred | scripts/pdca contribcheck | T4-contribution | pr-description.md not drafted yet — the substantive T4 audit of the contribution artifacts runs at publish | yes |
-| T4 tikv feature compiles (crate + server selection arms) | pass | WYRD_TIKV_TOOLCHAIN=1 sh -c 'cargo clippy -p wyrd-metadata-tikv --features tikv --tests && cargo clippy -p wyrd-server --features tikv,etcd --tests' | host-tikv |     Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.75s | yes |
+| T4 tikv feature compiles (crate + server selection arms) | pass | WYRD_TIKV_TOOLCHAIN=1 sh -c 'cargo clippy -p wyrd-metadata-tikv --features tikv --tests && cargo clippy -p wyrd-server --features tikv,etcd --tests' | host-tikv |     Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.42s | yes |
 | T5 Judgment | none | reviewer + human sign-off | — | — | no |
 
 ## Validation (1)

@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — **Check for extra bytes before forwarding trailers** (`crates/validate/src/s3/wire.rs:305`). `WholeResponse::poll_frame` forwards every frame immediately, but asks the connection for unread bytes only after a subsequent poll returns `None`. The SDK's body adapter treats a trailer frame as end-of-stream, so that subsequent poll need not happen. A chunked response ending in `0\r\nX-Test: value\r\n\r\njunk` can therefore be accepted without checking the trailing junk, bypassing the new overrun detection. The frozen `gate-logs/T4-batch-review.log` identifies this same failure; the added overrun tests use an empty trailer section. Hold trailers until the connection check succeeds, and add regression cases for GET success and error responses on all three operations, alongside valid-trailer acceptance guards.
+
+No additional actionable reuse, simplification, or efficiency findings. Reviewed target source and frozen gate evidence; tests were not rerun.
+
+<!-- pdca:leaf-complete -->

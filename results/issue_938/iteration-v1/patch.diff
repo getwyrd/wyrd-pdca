@@ -1,0 +1,3275 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b49c99d..1f89ebf 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5237,6 +5237,7 @@ dependencies = [
+  "wyrd-gateway-s3",
+  "wyrd-metadata-redb",
+  "wyrd-server",
++ "wyrd-traits",
+ ]
+ 
+ [[package]]
+diff --git a/crates/validate/Cargo.toml b/crates/validate/Cargo.toml
+index 6d224fc..37cb3b5 100644
+--- a/crates/validate/Cargo.toml
++++ b/crates/validate/Cargo.toml
+@@ -60,6 +60,9 @@ wyrd-core.workspace = true
+ wyrd-gateway-s3.workspace = true
+ wyrd-metadata-redb.workspace = true
+ wyrd-server = { path = "../server" }
++# The bucket marker a listing needs (ADR-0046 decision 1), seeded on the store before it goes
++# into the gateway, as `crates/server/tests/s3_list_objects.rs` seeds it.
++wyrd-traits.workspace = true
+ 
+ # Inherit the workspace lint policy (single source of truth).
+ [lints]
+diff --git a/crates/validate/src/s3.rs b/crates/validate/src/s3.rs
+index afede58..632fd3d 100644
+--- a/crates/validate/src/s3.rs
++++ b/crates/validate/src/s3.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! It is `aws-sdk-s3` pointed at an arbitrary `--endpoint`: path-style addressing, static
+ //! SigV4 credentials, and retries and stalled-stream protection **off**, so every request the
+-//! validator reports on is exactly one request on the wire. On top of the SDK it adds seven
++//! validator reports on is exactly one request on the wire. On top of the SDK it adds eight
+ //! things:
+ //!
+ //! * a plain-HTTP connector of its own (TLS is terminated in front of the gateway, proposal
+@@ -33,11 +33,22 @@
+ //!   budget: it streams, whether it is framed by a `Content-Length` or chunked;
+ //! * PUTs that end with their call ([`S3Client::put_object`]): a receipt only when the source
+ //!   had ended before the answer, and neither the source nor the connection left behind when
+-//!   the call returns.
++//!   the call returns;
++//! * answers kept whole for the verbs `smoke` sends beyond those three (`s3/verbs.rs`, #938):
++//!   HEAD, a ranged and a conditional GET, `ListObjectsV2` and `ListObjects` followed across
++//!   pages, bulk `DeleteObjects` row by row, and one [`Probe`] of each operation the capability
++//!   matrix may declare unsupported. Each reports the head as the server sent it, every header
++//!   field line included, and reads the body itself, under the budget and the body deadlines,
++//!   so a body that fails after a 2xx head is reported beside that 2xx, never in its place
++//!   ([`Answer`], `s3/answer.rs`). Listings and delete results are read by the same strict
++//!   rules as an error document (`s3/document.rs`).
+ 
++mod answer;
+ mod body;
++mod document;
+ mod error;
+ mod response;
++mod verbs;
+ mod wire;
+ 
+ use std::future::Future;
+@@ -56,9 +67,14 @@ use aws_sdk_s3::error::{BoxError, DisplayErrorContext, SdkError};
+ use aws_sdk_s3::primitives::ByteStream;
+ use futures_util::future::{self, Either};
+ 
++pub use answer::{Answer, BodyFailure, Fetched, Head, NoResult, Outcome};
+ pub use body::{ObjectBody, PutSource};
++pub use document::{
++    DeleteResult, DeleteRow, KeyError, ListEntry, Listing, ListingError, MAX_LISTING_PAGES,
++};
+ pub use error::{BodyError, ErrorCode, Phase, S3Error};
+ pub use response::BUFFERED_BODY_BUDGET;
++pub use verbs::Probe;
+ 
+ use body::Upload;
+ use response::{error_document, Framing, ResponseGuard};
+@@ -85,13 +101,14 @@ pub struct Deadlines {
+     /// covers the upload, so the default is sized for a large object rather than a small
+     /// one.
+     pub operation: Duration,
+-    /// The wait for each next piece of a GET body.
++    /// The wait for each next piece of a body the client reads itself: a GET object's, and the
++    /// body of every [`Answer`] (`s3/answer.rs`).
+     pub body_idle: Duration,
+-    /// A whole GET body, from the moment its response head is read to its end. The operation
+-    /// deadline ends with the response head, and the idle deadline restarts at every piece,
+-    /// so without this a peer that trickles a byte inside every idle window could hold a
+-    /// worker for as long as its declared length lasts. The default matches `operation`:
+-    /// the same object read back gets the budget its upload had.
++    /// A whole body the client reads itself, from the moment its response head is read to its
++    /// end. The operation deadline ends with the response head, and the idle deadline restarts
++    /// at every piece, so without this a peer that trickles a byte inside every idle window
++    /// could hold a worker for as long as its declared length lasts. The default matches
++    /// `operation`: the same object read back gets the budget its upload had.
+     pub body: Duration,
+ }
+ 
+@@ -296,23 +313,7 @@ impl S3Client {
+             .get()
+             .cloned()
+             .expect("the response guard records the framing of every GET success");
+-        let declared = match framing {
+-            Framing::Length(n) => Some(n),
+-            // Chunked framing marks its own end, so the body is accepted without a length.
+-            Framing::Chunked => None,
+-            // Without either a cut connection is indistinguishable from the end of the
+-            // object, so the body is refused rather than trusted.
+-            Framing::Undeclared => return Err(S3Error::Body(BodyError::LengthUndeclared)),
+-            Framing::Untrusted {
+-                transfer_encoding,
+-                content_length,
+-            } => {
+-                return Err(S3Error::Body(BodyError::Framing {
+-                    transfer_encoding,
+-                    content_length,
+-                }))
+-            }
+-        };
++        let declared = object_length(framing).map_err(S3Error::Body)?;
+         Ok(ObjectBody::new(
+             output.body,
+             declared,
+@@ -408,6 +409,27 @@ impl S3Client {
+     }
+ }
+ 
++/// The length a GET success's `framing` declares for the object it streams: its
++/// `Content-Length`, or `None` for chunked framing, which marks its own end; or why the body
++/// cannot be read as the object.
++fn object_length(framing: Framing) -> Result<Option<u64>, BodyError> {
++    match framing {
++        Framing::Length(n) => Ok(Some(n)),
++        // Chunked framing marks its own end, so the body is accepted without a length.
++        Framing::Chunked => Ok(None),
++        // Without either a cut connection is indistinguishable from the end of the object, so
++        // the body is refused rather than trusted.
++        Framing::Undeclared => Err(BodyError::LengthUndeclared),
++        Framing::Untrusted {
++            transfer_encoding,
++            content_length,
++        } => Err(BodyError::Framing {
++            transfer_encoding,
++            content_length,
++        }),
++    }
++}
++
+ /// The `x-amz-request-id` header, read directly.
+ fn request_id(raw: &HttpResponse) -> Option<String> {
+     raw.headers().get(REQUEST_ID_HEADER).map(str::to_owned)
+diff --git a/crates/validate/src/s3/answer.rs b/crates/validate/src/s3/answer.rs
+new file mode 100644
+index 0000000..02510bb
+--- /dev/null
++++ b/crates/validate/src/s3/answer.rs
+@@ -0,0 +1,522 @@
++//! Answers kept whole (#938): what the server sent in answer to one request, its head as it
++//! arrived and its body as far as it could be read (invariant: what the client reports is what
++//! the server sent; no answer is upgraded, none downgraded, nothing is filled in on the
++//! server's behalf, and a failure after a 2xx head never erases the 2xx).
++//!
++//! The verbs that report an [`Answer`] (`super::verbs`) do not let the SDK read the response.
++//! A [`Capture`] sits on the call, as the response guard does on the older verbs
++//! (`super::response`), at two hooks the SDK runs after the head arrives and before it
++//! touches the body:
++//!
++//! * `read_after_transmit`, which every interceptor runs in the poll that hands the response
++//!   over, before any of them runs the hook that may change it (`aws-smithy-runtime` 1.16.0
++//!   `client/orchestrator.rs:510-514`): the status, every header field line as sent, and the
++//!   framing as [`Framing::of`] reads it. Not later: the SDK's own interceptor for HEAD and
++//!   GET object drops an `Expires` header it cannot parse and adds an `ExpiresString` of its
++//!   own at the next hook (`aws-sdk-s3` 1.152.0 `s3_expires_interceptor.rs:30-56`);
++//! * `modify_before_deserialization`: the body itself, taken away and replaced with an empty
++//!   one for the SDK to deserialize. What the SDK makes of that empty body is never consulted.
++//!
++//! The client then reads the body itself ([`read_whole`]), under [`BUFFERED_BODY_BUDGET`] and
++//! the body-idle and body deadlines, so a body that stalls, is cut, overruns its framing or
++//! runs past the budget is a [`BodyFailure`] beside the head it came after, never a timeout or
++//! a transport error in its place. A 2xx GET body is not read here: it streams, as
++//! [`super::S3Client::get_object`]'s does ([`Fetched`]).
++//!
++//! A call whose response the SDK never saw (no connection, a deadline before the head, a
++//! request the SDK would not build) has no head to keep, and is the [`S3Error`] it always was.
++
++use std::fmt;
++use std::future::poll_fn;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex, PoisonError};
++use std::time::Duration;
++
++use aws_sdk_s3::config::http::HttpResponse;
++use aws_sdk_s3::config::interceptors::{
++    BeforeDeserializationInterceptorContextMut, BeforeDeserializationInterceptorContextRef,
++};
++use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
++use aws_sdk_s3::error::BoxError;
++use aws_sdk_s3::primitives::SdkBody;
++use bytes::Bytes;
++use http_body::Body as _;
++use tokio::time::Instant;
++
++use super::body::{error_chain, source_of, ObjectBody};
++use super::error::{BodyError, ErrorCode, Phase, S3Error};
++use super::response::{error_document, whole_document, Framing, BUFFERED_BODY_BUDGET};
++use super::wire::Overrun;
++use super::REQUEST_ID_HEADER;
++
++/// A response head as the server sent it: the status and every header field line.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Head {
++    /// The HTTP status.
++    pub status: u16,
++    /// Every header field line, in the order hyper keeps them (grouped by name, each name's
++    /// lines in the order sent): the name lowercased, the value's bytes as sent.
++    fields: Vec<(String, Vec<u8>)>,
++}
++
++impl Head {
++    /// The head of `response`, read from the raw header bytes: the SDK's UTF-8 view skips a
++    /// value it cannot decode.
++    fn of(response: &HttpResponse) -> Self {
++        Self {
++            status: response.status().as_u16(),
++            fields: response
++                .headers()
++                .iter_bytes()
++                .map(|(name, value)| (name.to_owned(), value.to_vec()))
++                .collect(),
++        }
++    }
++
++    /// Whether the status is a 2xx.
++    pub fn is_success(&self) -> bool {
++        (200..300).contains(&self.status)
++    }
++
++    /// The value of header `name` (any case) as text, when the head carries exactly one field
++    /// line of that name and its value is UTF-8. `None` when it carries none, more than one,
++    /// or one that is not text: a repeated header is never read as its first line.
++    /// [`Head::header_lines`] gives every line as sent.
++    pub fn header(&self, name: &str) -> Option<&str> {
++        let mut lines = self
++            .fields
++            .iter()
++            .filter(|(field, _)| field.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_slice());
++        let only = lines.next()?;
++        if lines.next().is_some() {
++            return None;
++        }
++        std::str::from_utf8(only).ok()
++    }
++
++    /// Every field line of header `name` (any case), its value as sent, in order.
++    pub fn header_lines<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
++        self.fields
++            .iter()
++            .filter(move |(field, _)| field.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_slice())
++    }
++
++    /// Every header field line: its name, lowercased, and its value as sent.
++    pub fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> {
++        self.fields
++            .iter()
++            .map(|(name, value)| (name.as_str(), value.as_slice()))
++    }
++
++    /// The `x-amz-request-id` header, read as [`Head::header`] reads one.
++    pub fn request_id(&self) -> Option<&str> {
++        self.header(REQUEST_ID_HEADER)
++    }
++}
++
++/// One answer, whole: its head as sent, and what its body turned out to be.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Answer {
++    pub head: Head,
++    pub outcome: Outcome,
++}
++
++/// What an answer's body turned out to be, read against its status.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Outcome {
++    /// A 2xx whose body is the one the operation's success carries: none at all, or one whole
++    /// document under the root S3 gives that success. The body as sent.
++    Success { body: Bytes },
++    /// A status other than 2xx whose body is empty ([`ErrorCode::NoBody`]) or one whole S3
++    /// `<Error>` document, read by the rules every error response is: its `<Code>` and
++    /// `<Message>`. A `304` to a conditional GET is one, with no body.
++    Error {
++        code: ErrorCode,
++        message: Option<String>,
++    },
++    /// The body was read whole and is not what its status calls for: for a 2xx, not the body
++    /// the operation's success carries (a body where that success has none; a document cut
++    /// short, followed by junk, or under another root); for any other status, not an S3 error
++    /// document. The body as sent, and why.
++    Unreadable { body: Bytes, detail: String },
++    /// The body could not be read whole.
++    BodyFailed(BodyFailure),
++}
++
++/// Why the body of an [`Answer`] could not be read whole. The head it came after stays in the
++/// answer.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum BodyFailure {
++    /// The head's framing cannot mark where the body ends (as [`super::S3Client::get_object`]
++    /// refuses it): a `Transfer-Encoding` together with a `Content-Length`, a coding other than
++    /// exactly `chunked`, a `Content-Length` that is not one decimal length, a `204` that frames
++    /// a body, a `Transfer-Encoding` on a `304` to anything but a GET or a HEAD. The header
++    /// values as sent, joined when repeated. The body is not read at all.
++    Framing {
++        transfer_encoding: Option<String>,
++        content_length: Option<String>,
++    },
++    /// A deadline expired after `received` bytes of the body: [`Phase::BodyIdle`] or
++    /// [`Phase::Body`].
++    Timeout {
++        phase: Phase,
++        limit: Duration,
++        received: u64,
++    },
++    /// Reading failed after `received` bytes: a connection cut mid-body, a body short of its
++    /// `Content-Length`, chunked framing that ends before its terminal chunk.
++    Transport { received: u64, detail: String },
++    /// The body ended where its framing says, after `received` bytes, and the endpoint had sent
++    /// at least `after` more bytes past that end.
++    Overrun { received: u64, after: u64 },
++    /// The body ran past [`BUFFERED_BODY_BUDGET`]: `received` counts the piece that crossed it,
++    /// and the client read nothing after that piece.
++    OverBudget { received: u64 },
++}
++
++impl fmt::Display for Outcome {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Success { body } => write!(f, "a success, with a {}-byte body", body.len()),
++            Self::Error { code, message } => {
++                write!(f, "an S3 error response, {code}")?;
++                match message {
++                    Some(message) => write!(f, ", message {message:?}"),
++                    None => Ok(()),
++                }
++            }
++            Self::Unreadable { body, detail } => {
++                write!(f, "an unreadable {}-byte body: {detail}", body.len())
++            }
++            Self::BodyFailed(failure) => write!(f, "a body that failed: {failure}"),
++        }
++    }
++}
++
++impl fmt::Display for BodyFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Framing {
++                transfer_encoding,
++                content_length,
++            } => write!(
++                f,
++                "the response's framing cannot mark where its body ends: Transfer-Encoding \
++                 {transfer_encoding:?}, Content-Length {content_length:?}"
++            ),
++            Self::Timeout {
++                phase,
++                limit,
++                received,
++            } => write!(
++                f,
++                "the {phase} deadline of {limit:?} expired after {received} bytes of the body"
++            ),
++            Self::Transport { received, detail } => {
++                write!(
++                    f,
++                    "reading the body failed after {received} bytes: {detail}"
++                )
++            }
++            Self::Overrun { received, after } => write!(
++                f,
++                "the body ended where its framing says, after {received} bytes, but the \
++                 endpoint sent at least {after} more bytes after that end"
++            ),
++            Self::OverBudget { received } => write!(
++                f,
++                "the body ran past the client's {BUFFERED_BODY_BUDGET}-byte budget for a body it \
++                 buffers ({received} bytes received when it stopped reading)"
++            ),
++        }
++    }
++}
++
++impl fmt::Display for Answer {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "HTTP {}", self.head.status)?;
++        match self.head.request_id() {
++            Some(id) => write!(f, ", x-amz-request-id {id}")?,
++            None => write!(f, ", no single x-amz-request-id")?,
++        }
++        write!(f, ": {}", self.outcome)
++    }
++}
++
++/// What a ranged or conditional GET returned.
++pub enum Fetched {
++    /// A 2xx: its head, and its body to read piece by piece with [`ObjectBody::next_piece`]
++    /// under the rules [`super::S3Client::get_object`]'s body is read by, or why that body
++    /// cannot be read (framing that cannot mark the object's end). Boxed, as the body is
++    /// several times the size of an answer.
++    Object {
++        head: Head,
++        body: Result<Box<ObjectBody>, BodyError>,
++    },
++    /// Any other status, a `304` included: the whole answer, its body read under the budget.
++    Other(Answer),
++}
++
++impl fmt::Debug for Fetched {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Object { head, body } => f
++                .debug_struct("Object")
++                .field("head", head)
++                .field(
++                    "body",
++                    &body
++                        .as_ref()
++                        .map(|body| ("streaming", body.content_length())),
++                )
++                .finish(),
++            Self::Other(answer) => f.debug_tuple("Other").field(answer).finish(),
++        }
++    }
++}
++
++/// Why a verb that reads a document from its answer (a listing page, a delete result) has no
++/// result.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum NoResult {
++    /// No answer arrived: the request was not built, no response head arrived, or a deadline
++    /// expired before one did.
++    NoAnswer(S3Error),
++    /// An answer arrived and holds no result: any status other than 2xx, or a 2xx whose body
++    /// failed or is not one whole document of the kind the verb reads. Kept whole; its
++    /// [`Outcome`] is never [`Outcome::Success`].
++    Answered(Answer),
++}
++
++impl fmt::Display for NoResult {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::NoAnswer(e) => write!(f, "no answer: {e}"),
++            Self::Answered(answer) => write!(f, "an answer with no result: {answer}"),
++        }
++    }
++}
++
++impl std::error::Error for NoResult {}
++
++/// What the body of a 2xx must be to be the operation's success.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum SuccessBody {
++    /// None at all: a HEAD's, and the success of an operation S3 answers with headers only.
++    Empty,
++    /// One whole document under this root.
++    Document(&'static str),
++}
++
++impl SuccessBody {
++    fn read(self, body: &Bytes) -> Result<(), String> {
++        match self {
++            Self::Empty if body.is_empty() => Ok(()),
++            Self::Empty => Err(format!(
++                "the success carries a {}-byte body, and this operation's S3 success has none",
++                body.len()
++            )),
++            Self::Document(root) => whole_document(body, root)
++                .map(drop)
++                .map_err(|fault| fault.describe("the success body", root)),
++        }
++    }
++}
++
++/// `body`, read against `head`'s status: for a 2xx, what `success` reads from it; otherwise,
++/// and when `success` refuses it or the body failed, the [`Outcome`] that stands in its place.
++pub(super) fn settle<T>(
++    head: &Head,
++    body: Result<Bytes, BodyFailure>,
++    success: impl FnOnce(&Bytes) -> Result<T, String>,
++) -> Result<T, Outcome> {
++    let body = body.map_err(Outcome::BodyFailed)?;
++    if head.is_success() {
++        return success(&body).map_err(|detail| Outcome::Unreadable { body, detail });
++    }
++    Err(match error_document(&body) {
++        Ok((code, message)) => Outcome::Error { code, message },
++        Err(detail) => Outcome::Unreadable { body, detail },
++    })
++}
++
++/// The answer of `head` and `body`, a 2xx read as `success` describes.
++pub(super) fn answer(head: Head, body: Result<Bytes, BodyFailure>, success: SuccessBody) -> Answer {
++    let outcome = match settle(&head, body, |body| {
++        success.read(body).map(|()| body.clone())
++    }) {
++        Ok(body) => Outcome::Success { body },
++        Err(outcome) => outcome,
++    };
++    Answer { head, outcome }
++}
++
++/// What a [`Capture`] took of one response.
++#[derive(Debug)]
++pub(super) struct Captured {
++    pub(super) head: Head,
++    pub(super) framing: Framing,
++    /// The body, or, when the SDK stopped between the two hooks and the body never reached
++    /// the client, what the SDK reported.
++    pub(super) body: Result<SdkBody, String>,
++}
++
++/// What a [`Capture`] has recorded so far.
++#[derive(Debug, Default)]
++struct Record {
++    head: Option<(Head, Framing)>,
++    body: Option<SdkBody>,
++}
++
++/// The per-call interceptor described in the module docs. One response per call (retries are
++/// off), so each hook runs at most once.
++#[derive(Debug)]
++pub(super) struct Capture {
++    record: Arc<Mutex<Record>>,
++    /// Whether the request is a GET or a HEAD, for [`Framing::of`].
++    get: bool,
++}
++
++/// A verb's handle on what its [`Capture`] recorded.
++#[derive(Debug)]
++pub(super) struct Taken(Arc<Mutex<Record>>);
++
++impl Capture {
++    /// A capture for a GET or HEAD request (`get`), or for any other, and the handle to take
++    /// what it records.
++    pub(super) fn new(get: bool) -> (Self, Taken) {
++        let record = Arc::new(Mutex::new(Record::default()));
++        (
++            Self {
++                record: Arc::clone(&record),
++                get,
++            },
++            Taken(record),
++        )
++    }
++
++    fn record(&self) -> std::sync::MutexGuard<'_, Record> {
++        // Nothing panics while holding the lock, so a poisoned one still holds a whole record.
++        self.record.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++}
++
++impl Taken {
++    /// The response's head, framing and body, or `None` if no response reached the hooks.
++    /// `sdk_detail` is what the SDK reported, kept for a body that never reached the client.
++    pub(super) fn take(&self, sdk_detail: impl FnOnce() -> String) -> Option<Captured> {
++        let mut record = self.0.lock().unwrap_or_else(PoisonError::into_inner);
++        let (head, framing) = record.head.take()?;
++        let body = record.body.take().ok_or_else(sdk_detail);
++        Some(Captured {
++            head,
++            framing,
++            body,
++        })
++    }
++}
++
++impl Intercept for Capture {
++    fn name(&self) -> &'static str {
++        "wyrd-validate answer capture"
++    }
++
++    fn read_after_transmit(
++        &self,
++        context: &BeforeDeserializationInterceptorContextRef<'_>,
++        _runtime_components: &RuntimeComponents,
++        _cfg: &mut ConfigBag,
++    ) -> Result<(), BoxError> {
++        let response = context.response();
++        self.record().head = Some((Head::of(response), Framing::of(response, self.get)));
++        Ok(())
++    }
++
++    fn modify_before_deserialization(
++        &self,
++        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
++        _runtime_components: &RuntimeComponents,
++        _cfg: &mut ConfigBag,
++    ) -> Result<(), BoxError> {
++        let body = std::mem::replace(context.response_mut().body_mut(), SdkBody::empty());
++        self.record().body = Some(body);
++        Ok(())
++    }
++}
++
++/// Read `body` whole, as the head's `framing` marks it, under [`BUFFERED_BODY_BUDGET`]: each
++/// wait for the next piece bounded by `idle`, the whole body by `limit` from now, and reported
++/// as whichever deadline comes first (on a tie, the whole-body one: waiting longer would not
++/// have helped). A body past the budget is not read further; dropping it closes the
++/// connection (`super::wire`).
++///
++/// The end is hyper's to find, as for a GET body (`super::body`): a `Content-Length` body is
++/// read to exactly that length, a chunked one to its terminal chunk, and a connection that
++/// closes short of either is a transport error; at that end the connector checks that nothing
++/// followed it. A body that declares neither ends where the connection does, so a cut cannot
++/// be told from its end, as for every error body the SDK buffers: a cut document is still
++/// refused by its reading.
++pub(super) async fn read_whole(
++    mut body: SdkBody,
++    framing: Framing,
++    idle: Duration,
++    limit: Duration,
++) -> Result<Bytes, BodyFailure> {
++    if let Framing::Untrusted {
++        transfer_encoding,
++        content_length,
++    } = framing
++    {
++        return Err(BodyFailure::Framing {
++            transfer_encoding,
++            content_length,
++        });
++    }
++    // Clock: tokio's runtime clock, the one the SDK's connect and operation deadlines and a GET
++    // body's own deadlines (`super::body`) sleep on, so every deadline of one request reads the
++    // same source.
++    let deadline = Instant::now().checked_add(limit);
++    let mut held = Vec::new();
++    loop {
++        let received = held.len() as u64;
++        let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
++        let (wait, phase, phase_limit) = match left {
++            Some(left) if left <= idle => (left, Phase::Body, limit),
++            _ => (idle, Phase::BodyIdle, idle),
++        };
++        let frame = tokio::time::timeout(wait, poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)))
++            .await
++            .map_err(|_| BodyFailure::Timeout {
++                phase,
++                limit: phase_limit,
++                received,
++            })?;
++        match frame {
++            None => return Ok(Bytes::from(held)),
++            Some(Err(e)) => {
++                return Err(match source_of::<Overrun>(e.as_ref()) {
++                    Some(overrun) => BodyFailure::Overrun {
++                        received,
++                        after: overrun.after,
++                    },
++                    None => BodyFailure::Transport {
++                        received,
++                        detail: error_chain(e.as_ref()),
++                    },
++                })
++            }
++            // A trailer section never gets here: the connector drops it (`super::wire`).
++            Some(Ok(frame)) => {
++                if let Ok(data) = frame.into_data() {
++                    let total = received.saturating_add(data.len() as u64);
++                    if total > BUFFERED_BODY_BUDGET {
++                        return Err(BodyFailure::OverBudget { received: total });
++                    }
++                    held.extend_from_slice(&data);
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/validate/src/s3/body.rs b/crates/validate/src/s3/body.rs
+index 002d019..fe6467d 100644
+--- a/crates/validate/src/s3/body.rs
++++ b/crates/validate/src/s3/body.rs
+@@ -351,7 +351,7 @@ impl http_body::Body for DeclaredLengthBody {
+ }
+ 
+ /// The first error of type `E` in `err`'s source chain, `err` included.
+-fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a E> {
++pub(super) fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a E> {
+     let mut next = Some(err);
+     while let Some(err) = next {
+         if let Some(found) = err.downcast_ref::<E>() {
+@@ -363,7 +363,7 @@ fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&
+ }
+ 
+ /// An error and its sources, joined with `": "`.
+-fn error_chain(err: &(dyn Error + 'static)) -> String {
++pub(super) fn error_chain(err: &(dyn Error + 'static)) -> String {
+     let mut text = err.to_string();
+     let mut source = err.source();
+     while let Some(e) = source {
+diff --git a/crates/validate/src/s3/document.rs b/crates/validate/src/s3/document.rs
+new file mode 100644
+index 0000000..8197e26
+--- /dev/null
++++ b/crates/validate/src/s3/document.rs
+@@ -0,0 +1,256 @@
++//! The documents the client reads from a 2xx itself (#938): a listing page, `ListObjectsV2`'s
++//! or `ListObjects`'s `<ListBucketResult>`, and a bulk delete's `<DeleteResult>`.
++//!
++//! Each is read by the rules every document the client reads is (UTF-8, one well-formed
++//! document under the expected root and nothing around it but whitespace and comments,
++//! bounded depth: `super::response::whole_document`), from a body read under
++//! [`super::BUFFERED_BODY_BUDGET`]. The fields read are text only and given at most once; a
++//! field given twice, holding markup, or missing where S3 always sends it is a refusal, never
++//! a guess. Elements the client does not read are passed over. Nothing here judges what the
++//! server answered (which keys, how many, whether a failure was due): that is the caller's.
++
++use std::fmt;
++
++use super::answer::{Head, NoResult};
++use super::error::ErrorCode;
++use super::response::{named_code, text_only, whole_document};
++
++/// The most pages one listing call reads. A listing still truncated after them is
++/// [`ListingError::TooManyPages`], so an endpoint that answers every page with another
++/// continuation cannot hold the call, or grow what it holds, without end: at most this many
++/// pages, each under [`super::BUFFERED_BODY_BUDGET`].
++pub const MAX_LISTING_PAGES: usize = 100;
++
++/// A whole listing: every page read, from the first to the one that ended it.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Listing {
++    /// Every `<Contents>` of every page, in the order the pages listed them.
++    pub entries: Vec<ListEntry>,
++    /// Each page's head, in order: as many as requests were sent.
++    pub pages: Vec<Head>,
++}
++
++/// One `<Contents>` of a listing.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ListEntry {
++    /// The `<Key>`, as sent.
++    pub key: String,
++    /// The `<Size>`, a decimal number of bytes.
++    pub size: u64,
++    /// The `<ETag>`, as sent (quotes included), when the entry has one.
++    pub etag: Option<String>,
++}
++
++/// Why a listing call has no listing. No entry of an earlier page is reported: a listing is
++/// reported whole or not at all.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ListingError {
++    /// Page `page` (the first is 1) holds no listing page: no answer, an answer other than a
++    /// 2xx, or a 2xx whose body failed or is not one whole listing page the client can
++    /// continue from.
++    Page { page: usize, cause: NoResult },
++    /// The listing was still truncated after `pages` pages ([`MAX_LISTING_PAGES`]).
++    TooManyPages { pages: usize },
++}
++
++impl fmt::Display for ListingError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Page { page, cause } => write!(f, "listing page {page}: {cause}"),
++            Self::TooManyPages { pages } => {
++                write!(f, "the listing was still truncated after {pages} pages")
++            }
++        }
++    }
++}
++
++impl std::error::Error for ListingError {}
++
++/// A whole `<DeleteResult>`: the answer's head, and every row in document order.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DeleteResult {
++    /// The head of the answer that carried it.
++    pub head: Head,
++    /// Every `<Deleted>` and `<Error>` row, in document order.
++    pub rows: Vec<DeleteRow>,
++}
++
++impl DeleteResult {
++    /// The key of every `<Deleted>` row, in document order.
++    pub fn deleted(&self) -> impl Iterator<Item = &str> {
++        self.rows.iter().filter_map(|row| match row {
++            DeleteRow::Deleted { key } => Some(key.as_str()),
++            DeleteRow::Error(_) => None,
++        })
++    }
++
++    /// Every `<Error>` row, in document order.
++    pub fn errors(&self) -> impl Iterator<Item = &KeyError> {
++        self.rows.iter().filter_map(|row| match row {
++            DeleteRow::Error(error) => Some(error),
++            DeleteRow::Deleted { .. } => None,
++        })
++    }
++}
++
++/// One row of a `<DeleteResult>`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum DeleteRow {
++    /// A `<Deleted>` row: the key the server reports deleted.
++    Deleted { key: String },
++    /// An `<Error>` row: a key the server reports it did not delete.
++    Error(KeyError),
++}
++
++/// An `<Error>` row of a `<DeleteResult>`, as sent.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct KeyError {
++    /// The row's `<Key>`.
++    pub key: String,
++    /// The row's `<Code>`, or [`ErrorCode::MissingInXml`] when it has none or an empty one
++    /// (never [`ErrorCode::NoBody`]).
++    pub code: ErrorCode,
++    /// The row's `<Message>`, when it has one.
++    pub message: Option<String>,
++}
++
++/// Which listing call a page answers: they continue differently.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum Version {
++    /// `ListObjectsV2`: from the page's `<NextContinuationToken>`.
++    V2,
++    /// `ListObjects`: from the page's `<NextMarker>`, or, when it gives none (S3 gives one only
++    /// with a delimiter), after the page's last key.
++    V1,
++}
++
++/// One page of a listing, read.
++#[derive(Debug)]
++pub(super) struct Page {
++    pub(super) entries: Vec<ListEntry>,
++    /// What the next request continues from, or `None` when this page ends the listing.
++    pub(super) next: Option<String>,
++}
++
++const LISTING: &str = "ListBucketResult";
++const DELETE_RESULT: &str = "DeleteResult";
++
++/// A `<ListBucketResult>` page for `version`. `<IsTruncated>` is required and is exactly
++/// `true` or `false`; every `<Contents>` has exactly one `<Key>` and one `<Size>` (decimal
++/// digits only) and at most one `<ETag>`. A truncated page must say what the next request
++/// continues from (see [`Version`]); a page that cannot is refused, since following it would
++/// either stop short or start over.
++pub(super) fn listing_page(body: &[u8], version: Version) -> Result<Page, String> {
++    let document = whole_document(body, LISTING)
++        .map_err(|fault| fault.describe("the listing body", LISTING))?;
++    let root = document.root_element();
++    let [truncated, token, marker] = fields(
++        root,
++        LISTING,
++        ["IsTruncated", "NextContinuationToken", "NextMarker"],
++    )?;
++    let truncated = match truncated.as_deref() {
++        Some("true") => true,
++        Some("false") => false,
++        Some(other) => {
++            return Err(format!(
++                "the listing's <IsTruncated> is {other:?}, not \"true\" or \"false\""
++            ))
++        }
++        None => return Err("the listing names no <IsTruncated>".to_string()),
++    };
++    let mut entries = Vec::new();
++    for contents in root
++        .children()
++        .filter(|node| node.is_element() && node.tag_name().name() == "Contents")
++    {
++        let [key, size, etag] = fields(contents, "Contents", ["Key", "Size", "ETag"])?;
++        let key = key.ok_or("a <Contents> of the listing names no <Key>")?;
++        let size = size.ok_or_else(|| format!("the <Contents> of {key:?} names no <Size>"))?;
++        let size = decimal(&size).ok_or_else(|| {
++            format!("the <Size> of {key:?} is {size:?}, not a decimal number of bytes")
++        })?;
++        entries.push(ListEntry { key, size, etag });
++    }
++    let next = match (truncated, version) {
++        (false, _) => None,
++        (true, Version::V2) => Some(token.filter(|token| !token.is_empty()).ok_or(
++            "the listing page is truncated and names no <NextContinuationToken> to continue from",
++        )?),
++        (true, Version::V1) => Some(
++            marker
++                .filter(|marker| !marker.is_empty())
++                .or_else(|| entries.last().map(|entry| entry.key.clone()))
++                .ok_or(
++                    "the listing page is truncated, names no <NextMarker> and lists no key to \
++                     continue after",
++                )?,
++        ),
++    };
++    Ok(Page { entries, next })
++}
++
++/// The rows of a `<DeleteResult>`, in document order: every `<Deleted>` with exactly one
++/// `<Key>`, every `<Error>` with exactly one `<Key>` and at most one `<Code>` and one
++/// `<Message>`.
++pub(super) fn delete_rows(body: &[u8]) -> Result<Vec<DeleteRow>, String> {
++    let document = whole_document(body, DELETE_RESULT)
++        .map_err(|fault| fault.describe("the delete result body", DELETE_RESULT))?;
++    let mut rows = Vec::new();
++    for row in document
++        .root_element()
++        .children()
++        .filter(|n| n.is_element())
++    {
++        match row.tag_name().name() {
++            "Deleted" => {
++                let [key] = fields(row, "Deleted", ["Key"])?;
++                let key = key.ok_or("a <Deleted> row names no <Key>")?;
++                rows.push(DeleteRow::Deleted { key });
++            }
++            "Error" => {
++                let [key, code, message] = fields(row, "Error", ["Key", "Code", "Message"])?;
++                let key = key.ok_or("an <Error> row names no <Key>")?;
++                rows.push(DeleteRow::Error(KeyError {
++                    key,
++                    code: named_code(code),
++                    message,
++                }));
++            }
++            _ => {}
++        }
++    }
++    Ok(rows)
++}
++
++/// The text of `parent`'s child elements named `names`, each at most once and holding text
++/// only; children of other names are passed over. `parent_name` names `parent` in a refusal.
++fn fields<const N: usize>(
++    parent: roxmltree::Node<'_, '_>,
++    parent_name: &str,
++    names: [&str; N],
++) -> Result<[Option<String>; N], String> {
++    let mut found: [Option<String>; N] = std::array::from_fn(|_| None);
++    for child in parent.children().filter(roxmltree::Node::is_element) {
++        let name = child.tag_name().name();
++        let Some(slot) = names.iter().position(|&wanted| wanted == name) else {
++            continue;
++        };
++        let text = text_only(child).ok_or_else(|| {
++            format!("the <{name}> of a <{parent_name}> holds markup, not only text")
++        })?;
++        if found[slot].replace(text).is_some() {
++            return Err(format!("a <{parent_name}> has more than one <{name}>"));
++        }
++    }
++    Ok(found)
++}
++
++/// `text` as a decimal number: ASCII digits only (no sign, no space, not empty), at most
++/// `u64::MAX`.
++fn decimal(text: &str) -> Option<u64> {
++    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    text.parse().ok()
++}
+diff --git a/crates/validate/src/s3/error.rs b/crates/validate/src/s3/error.rs
+index 1fbcbb0..07ea62f 100644
+--- a/crates/validate/src/s3/error.rs
++++ b/crates/validate/src/s3/error.rs
+@@ -83,9 +83,10 @@ pub enum Phase {
+     /// The whole request up to a deserialized response head: for a PUT, that includes the
+     /// upload.
+     Operation,
+-    /// Waiting for the next piece of a GET body.
++    /// Waiting for the next piece of a body the client reads itself: a GET object's, or an
++    /// answer's (`super::Answer`).
+     BodyIdle,
+-    /// Reading a whole GET body, from its response head to its end.
++    /// Reading a whole body the client reads itself, from its response head to its end.
+     Body,
+ }
+ 
+diff --git a/crates/validate/src/s3/response.rs b/crates/validate/src/s3/response.rs
+index 37710e7..c578939 100644
+--- a/crates/validate/src/s3/response.rs
++++ b/crates/validate/src/s3/response.rs
+@@ -15,7 +15,12 @@
+ //! * for a GET success, which streams, records the framing for the caller to enforce piece by
+ //!   piece ([`super::ObjectBody`]), and leaves the body uncapped.
+ //!
+-//! The buffered body of an error response is then read by [`error_document`], strictly.
++//! The buffered body of an error response is then read by [`error_document`], strictly, by the
++//! rules [`whole_document`] holds every document the client reads to.
++//!
++//! The verbs that report an answer whole (`super::answer`) take the body from the SDK at the
++//! same hook instead, and read it themselves; [`Framing`] and [`whole_document`] are shared
++//! with them.
+ 
+ use std::fmt;
+ use std::pin::Pin;
+@@ -35,7 +40,9 @@ use super::error::ErrorCode;
+ /// The most bytes of a response body the client buffers: 64 KiB.
+ ///
+ /// It applies to every body the SDK reads whole (every error response, and every PUT or
+-/// DELETE response) and to no successful GET body, which streams. A PUT or DELETE success
++/// DELETE response), to every body the client reads whole itself (the body of an
++/// [`super::Answer`]: a HEAD's, a probe's, a listing page's, a delete result's, and a ranged or
++/// conditional GET's that is not a 2xx), and to no successful GET body, which streams. A PUT or DELETE success
+ /// has no body at all, so one that sends a byte is refused at that byte, well inside the
+ /// budget. S3 error documents are small: a few hundred bytes, except
+ /// `SignatureDoesNotMatch`, which echoes the canonical request twice (as text, and as hex
+@@ -351,9 +358,9 @@ impl http_body::Body for Budgeted {
+ ///
+ /// An empty body is [`ErrorCode::NoBody`]. Otherwise the body must be one well-formed XML
+ /// document (UTF-8, every element closed, no DTD, elements nested at most
+-/// [`MAX_ERROR_DOCUMENT_DEPTH`] deep) whose root element is `<Error>`, with nothing but the
++/// [`MAX_DOCUMENT_DEPTH`] deep) whose root element is `<Error>`, with nothing but the
+ /// XML declaration, whitespace and comments before it and nothing but whitespace and
+-/// comments after it. `<Code>` and `<Message>` are the root's child elements of those names,
++/// comments after it ([`whole_document`]). `<Code>` and `<Message>` are the root's child elements of those names,
+ /// each at most once, each holding text only (character references and CDATA sections are
+ /// text; an element, a comment or a processing instruction is not); a document without a
+ /// `<Code>`, or whose `<Code>` holds only whitespace, is [`ErrorCode::MissingInXml`]. The
+@@ -364,41 +371,24 @@ pub(super) fn error_document(body: &[u8]) -> Result<(ErrorCode, Option<String>),
+     if body.is_empty() {
+         return Ok((ErrorCode::NoBody, None));
+     }
+-    let text = std::str::from_utf8(body)
+-        .map_err(|e| format!("the error response body is not UTF-8: {e}"))?;
+-    // Before the parser, which recurses once per level of nesting with no limit of its own
+-    // (`roxmltree` 0.21.1 `tokenizer.rs`, `parse_element` and `parse_content`): a body nested
+-    // a few thousand levels deep, well inside the budget, would overflow the stack, an abort
+-    // no caller can catch.
+-    if nests_deeper_than(body, MAX_ERROR_DOCUMENT_DEPTH) {
+-        return Err(format!(
+-            "the error response body nests elements more than {MAX_ERROR_DOCUMENT_DEPTH} \
+-             deep, and an S3 error document is two deep"
+-        ));
+-    }
+-    let document = roxmltree::Document::parse(text)
+-        .map_err(|e| format!("the error response body is not a well-formed XML document: {e}"))?;
+-    let root = document.root_element();
+-    if root.tag_name().name() != "Error" {
+-        return Err(format!(
+-            "the error response body is an XML document whose root is <{}>, not <Error>",
+-            root.tag_name().name()
+-        ));
+-    }
+-    // Outside the root the parser refuses text and elements and keeps no whitespace (the XML
+-    // declaration is not a node either), so what can sit there is comments and processing
+-    // instructions. A processing instruction is well-formed XML, but no part of an S3 error
+-    // document, before the root or after it.
+-    if document
+-        .root()
+-        .children()
+-        .any(|node| node != root && !node.is_comment())
+-    {
+-        return Err(
++    let document = whole_document(body, "Error").map_err(|fault| match fault {
++        NotADocument::NotUtf8(e) => format!("the error response body is not UTF-8: {e}"),
++        NotADocument::TooDeep => format!(
++            "the error response body nests elements more than {MAX_DOCUMENT_DEPTH} deep, and \
++             an S3 error document is two deep"
++        ),
++        NotADocument::Malformed(e) => {
++            format!("the error response body is not a well-formed XML document: {e}")
++        }
++        NotADocument::Root(name) => format!(
++            "the error response body is an XML document whose root is <{name}>, not <Error>"
++        ),
++        NotADocument::Around => {
+             "the <Error> document has something other than whitespace or comments around it"
+-                .to_string(),
+-        );
+-    }
++                .to_string()
++        }
++    })?;
++    let root = document.root_element();
+     let mut code = None;
+     let mut message = None;
+     for child in root.children().filter(roxmltree::Node::is_element) {
+@@ -408,38 +398,115 @@ pub(super) fn error_document(body: &[u8]) -> Result<(ErrorCode, Option<String>),
+             "Message" => &mut message,
+             _ => continue,
+         };
+-        let text = child
+-            .children()
+-            .map(|node| {
+-                node.is_text()
+-                    .then(|| node.text())
+-                    .flatten()
+-                    .ok_or_else(|| {
+-                        format!("the <{name}> of the <Error> document holds markup, not only text")
+-                    })
+-            })
+-            .collect::<Result<String, String>>()?;
++        let text = text_only(child).ok_or_else(|| {
++            format!("the <{name}> of the <Error> document holds markup, not only text")
++        })?;
+         if slot.replace(text).is_some() {
+             return Err(format!("the <Error> document has more than one <{name}>"));
+         }
+     }
+-    // An empty `<Code>` names no code, any more than an absent one does. XML's whitespace
+-    // (`S`, XML 1.0 §2.3) is the only kind trimmed: a code is never read as anything else.
+-    let code = code
+-        .filter(|code| {
+-            !code
+-                .trim_matches(['\x20', '\x09', '\x0D', '\x0A'])
+-                .is_empty()
+-        })
+-        .map_or(ErrorCode::MissingInXml, ErrorCode::Code);
+-    Ok((code, message))
++    Ok((named_code(code), message))
++}
++
++/// A `<Code>` as read: an absent one, or one that is empty, names no code. XML's whitespace
++/// (`S`, XML 1.0 §2.3) is the only kind trimmed: a code is never read as anything else.
++pub(super) fn named_code(code: Option<String>) -> ErrorCode {
++    code.filter(|code| {
++        !code
++            .trim_matches(['\x20', '\x09', '\x0D', '\x0A'])
++            .is_empty()
++    })
++    .map_or(ErrorCode::MissingInXml, ErrorCode::Code)
++}
++
++/// Why a body is not one whole XML document under the root it should have.
++#[derive(Debug)]
++pub(super) enum NotADocument {
++    /// The body is not UTF-8.
++    NotUtf8(std::str::Utf8Error),
++    /// An element is nested more than [`MAX_DOCUMENT_DEPTH`] deep.
++    TooDeep,
++    /// The body is not well-formed XML (a DTD included, which the parser refuses).
++    Malformed(roxmltree::Error),
++    /// The document's root element has this name instead.
++    Root(String),
++    /// Something other than whitespace and comments sits before or after the root.
++    Around,
++}
++
++impl NotADocument {
++    /// The fault in words, for a body described as `what` that should be one `<root>`
++    /// document.
++    pub(super) fn describe(&self, what: &str, root: &str) -> String {
++        match self {
++            Self::NotUtf8(e) => format!("{what} is not UTF-8: {e}"),
++            Self::TooDeep => {
++                format!("{what} nests elements more than {MAX_DOCUMENT_DEPTH} deep")
++            }
++            Self::Malformed(e) => format!("{what} is not a well-formed XML document: {e}"),
++            Self::Root(name) => {
++                format!("{what} is an XML document whose root is <{name}>, not <{root}>")
++            }
++            Self::Around => format!(
++                "the <{root}> document has something other than whitespace or comments around it"
++            ),
++        }
++    }
++}
++
++/// `body` read strictly as one whole XML document whose root element is `<root>`: UTF-8,
++/// every element closed, no DTD, elements nested at most [`MAX_DOCUMENT_DEPTH`] deep, and
++/// nothing but the XML declaration, whitespace and comments before the root and nothing but
++/// whitespace and comments after it. The one reading every document the client reads itself
++/// goes through: the error document here, and the listing and delete-result documents and a
++/// probe's success body (`super::document`, `super::answer`).
++pub(super) fn whole_document<'a>(
++    body: &'a [u8],
++    root: &str,
++) -> Result<roxmltree::Document<'a>, NotADocument> {
++    let text = std::str::from_utf8(body).map_err(NotADocument::NotUtf8)?;
++    // Before the parser, which recurses once per level of nesting with no limit of its own
++    // (`roxmltree` 0.21.1 `tokenizer.rs`, `parse_element` and `parse_content`): a body nested
++    // a few thousand levels deep, well inside the budget, would overflow the stack, an abort
++    // no caller can catch.
++    if nests_deeper_than(body, MAX_DOCUMENT_DEPTH) {
++        return Err(NotADocument::TooDeep);
++    }
++    let document = roxmltree::Document::parse(text).map_err(NotADocument::Malformed)?;
++    let found = document.root_element();
++    if found.tag_name().name() != root {
++        return Err(NotADocument::Root(found.tag_name().name().to_string()));
++    }
++    // Outside the root the parser refuses text and elements and keeps no whitespace (the XML
++    // declaration is not a node either), so what can sit there is comments and processing
++    // instructions. A processing instruction is well-formed XML, but no part of an S3
++    // document, before the root or after it.
++    if document
++        .root()
++        .children()
++        .any(|node| node != found && !node.is_comment())
++    {
++        return Err(NotADocument::Around);
++    }
++    Ok(document)
++}
++
++/// The text `element` holds, when it holds text only: character references and CDATA
++/// sections are text; an element, a comment or a processing instruction is not. An empty
++/// element holds the empty text.
++pub(super) fn text_only(element: roxmltree::Node<'_, '_>) -> Option<String> {
++    element
++        .children()
++        .map(|node| node.is_text().then(|| node.text()).flatten())
++        .collect()
+ }
+ 
+-/// The deepest element nesting [`error_document`] parses, the root being level one. An S3
+-/// error document is two levels deep (`<Error>` and its fields); this leaves room for an
+-/// extension element nested inside a field, and keeps the parser's recursion to a few
+-/// kilobytes of stack per level.
+-const MAX_ERROR_DOCUMENT_DEPTH: usize = 16;
++/// The deepest element nesting [`whole_document`] parses, the root being level one. An S3
++/// error document is two levels deep (`<Error>` and its fields), a listing or a delete result
++/// three (`<Contents>` or `<Deleted>`, and their fields); this leaves room for an extension
++/// element nested inside a field, and keeps the parser's recursion to a few kilobytes of stack
++/// per level.
++const MAX_DOCUMENT_DEPTH: usize = 16;
+ 
+ /// Whether `xml` has an element more than `limit` levels deep (the root is level one) before
+ /// anything the parser would stop at. Never less deep than the parser goes: comments, CDATA
+diff --git a/crates/validate/src/s3/verbs.rs b/crates/validate/src/s3/verbs.rs
+new file mode 100644
+index 0000000..c9c617a
+--- /dev/null
++++ b/crates/validate/src/s3/verbs.rs
+@@ -0,0 +1,487 @@
++//! The verbs `smoke` sends beyond PUT, GET and DELETE of one object (#938): HEAD, a ranged
++//! GET, a conditional GET, both listings, bulk delete, and one probe of each operation the
++//! capability matrix may declare unsupported ([`Probe`]).
++//!
++//! Every one reports what the server sent, read as `super::answer` describes: the head as it
++//! arrived, and the body read by the client itself under [`super::BUFFERED_BODY_BUDGET`] and
++//! the body deadlines, beside that head. None decides whether an answer is right; that is the
++//! matrix's (743.1). A request the SDK never got an answer to is the [`S3Error`] the older
++//! verbs report it as, through [`S3Client::classify`].
++
++use aws_sdk_s3::config::http::HttpResponse;
++use aws_sdk_s3::error::{BuildError, DisplayErrorContext, SdkError};
++use aws_sdk_s3::primitives::ByteStream;
++use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
++use bytes::Bytes;
++
++use super::answer::{
++    answer, read_whole, settle, Answer, BodyFailure, Capture, Captured, Fetched, Head, NoResult,
++    SuccessBody, Taken,
++};
++use super::document::{
++    delete_rows, listing_page, DeleteResult, Listing, ListingError, Version, MAX_LISTING_PAGES,
++};
++use super::error::{BodyError, S3Error};
++use super::{object_length, ObjectBody, S3Client};
++
++/// The `ETag` S3 gives an empty part, the part a [`Probe::UploadPart`] sends; the one part a
++/// [`Probe::CompleteMultipartUpload`] names.
++const EMPTY_PART_ETAG: &str = "\"d41d8cd98f00b204e9800998ecf8427e\"";
++
++/// One request for an operation the capability matrix may declare unsupported, sent as the
++/// SDK sends that operation. Object and multipart probes name a key in the client's bucket;
++/// the multipart ones after the first name an upload id the caller chooses, since none can be
++/// created where `CreateMultipartUpload` is unsupported. [`Probe::CreateBucket`] and
++/// [`Probe::DeleteBucket`] name their bucket, and send whatever name they are given: the
++/// client checks no bucket name against S3's naming rules, so a name those rules forbid
++/// reaches the endpoint as given (743.3 probes with one, so no bucket it does not own can be
++/// created or deleted).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Probe {
++    /// `PUT /{bucket}/{key}` with `x-amz-copy-source: {bucket}/{source_key}`, the source key
++    /// as given (a key that needs percent-encoding must come encoded).
++    CopyObject { key: String, source_key: String },
++    /// `POST /{bucket}/{key}?uploads`.
++    CreateMultipartUpload { key: String },
++    /// `PUT /{bucket}/{key}?partNumber=1&uploadId={upload_id}`, with an empty part.
++    UploadPart { key: String, upload_id: String },
++    /// `POST /{bucket}/{key}?uploadId={upload_id}`, completing with the one empty part
++    /// [`Probe::UploadPart`] sends.
++    CompleteMultipartUpload { key: String, upload_id: String },
++    /// `DELETE /{bucket}/{key}?uploadId={upload_id}`.
++    AbortMultipartUpload { key: String, upload_id: String },
++    /// `GET /{bucket}/{key}?uploadId={upload_id}`.
++    ListParts { key: String, upload_id: String },
++    /// `GET /{bucket}?uploads`.
++    ListMultipartUploads,
++    /// `GET /{bucket}?location`.
++    GetBucketLocation,
++    /// `PUT /{bucket}`, with no `<CreateBucketConfiguration>`.
++    CreateBucket { bucket: String },
++    /// `DELETE /{bucket}`.
++    DeleteBucket { bucket: String },
++    /// `GET /`.
++    ListBuckets,
++    /// `HEAD /{bucket}`, the client's bucket.
++    HeadBucket,
++}
++
++impl Probe {
++    /// The S3 operation's name.
++    pub fn operation(&self) -> &'static str {
++        match self {
++            Self::CopyObject { .. } => "CopyObject",
++            Self::CreateMultipartUpload { .. } => "CreateMultipartUpload",
++            Self::UploadPart { .. } => "UploadPart",
++            Self::CompleteMultipartUpload { .. } => "CompleteMultipartUpload",
++            Self::AbortMultipartUpload { .. } => "AbortMultipartUpload",
++            Self::ListParts { .. } => "ListParts",
++            Self::ListMultipartUploads => "ListMultipartUploads",
++            Self::GetBucketLocation => "GetBucketLocation",
++            Self::CreateBucket { .. } => "CreateBucket",
++            Self::DeleteBucket { .. } => "DeleteBucket",
++            Self::ListBuckets => "ListBuckets",
++            Self::HeadBucket => "HeadBucket",
++        }
++    }
++
++    /// Whether the request is a GET or a HEAD.
++    fn reads(&self) -> bool {
++        matches!(
++            self,
++            Self::ListParts { .. }
++                | Self::ListMultipartUploads
++                | Self::GetBucketLocation
++                | Self::ListBuckets
++                | Self::HeadBucket
++        )
++    }
++
++    /// What the body of the operation's S3 success is: a document under the root the S3 API
++    /// gives it, or none.
++    fn success_body(&self) -> SuccessBody {
++        match self {
++            Self::CopyObject { .. } => SuccessBody::Document("CopyObjectResult"),
++            Self::CreateMultipartUpload { .. } => {
++                SuccessBody::Document("InitiateMultipartUploadResult")
++            }
++            Self::CompleteMultipartUpload { .. } => {
++                SuccessBody::Document("CompleteMultipartUploadResult")
++            }
++            Self::ListParts { .. } => SuccessBody::Document("ListPartsResult"),
++            Self::ListMultipartUploads => SuccessBody::Document("ListMultipartUploadsResult"),
++            Self::GetBucketLocation => SuccessBody::Document("LocationConstraint"),
++            Self::ListBuckets => SuccessBody::Document("ListAllMyBucketsResult"),
++            Self::UploadPart { .. }
++            | Self::AbortMultipartUpload { .. }
++            | Self::CreateBucket { .. }
++            | Self::DeleteBucket { .. }
++            | Self::HeadBucket => SuccessBody::Empty,
++        }
++    }
++}
++
++impl S3Client {
++    /// HEAD `key`. A `200` carries the object's size in its `Content-Length` and its `ETag`
++    /// ([`Head::header`]); an error has no body, so its code is [`super::ErrorCode::NoBody`].
++    pub async fn head_object(&self, key: &str) -> Result<Answer, S3Error> {
++        let (capture, taken) = Capture::new(true);
++        let sent = self
++            .sdk
++            .head_object()
++            .bucket(&self.bucket)
++            .key(key)
++            .customize()
++            .interceptor(capture)
++            .send()
++            .await;
++        let captured = self.captured(sent, &taken)?;
++        Ok(self.answer(captured, SuccessBody::Empty).await)
++    }
++
++    /// GET bytes `first` to `last` (inclusive) of `key`: `Range: bytes={first}-{last}`, as
++    /// given. A `206` streams exactly the bytes its `Content-Length` declares; its
++    /// `Content-Range` is in the head as sent.
++    pub async fn get_object_range(
++        &self,
++        key: &str,
++        first: u64,
++        last: u64,
++    ) -> Result<Fetched, S3Error> {
++        let (capture, taken) = Capture::new(true);
++        let sent = self
++            .sdk
++            .get_object()
++            .bucket(&self.bucket)
++            .key(key)
++            .range(format!("bytes={first}-{last}"))
++            .customize()
++            .interceptor(capture)
++            .send()
++            .await;
++        let captured = self.captured(sent, &taken)?;
++        Ok(self.fetched(captured).await)
++    }
++
++    /// GET `key` with `If-None-Match: {etag}`, the tag as given. A `304` is
++    /// [`Fetched::Other`], with no body; a `200` streams the whole object.
++    pub async fn get_object_if_none_match(
++        &self,
++        key: &str,
++        etag: &str,
++    ) -> Result<Fetched, S3Error> {
++        let (capture, taken) = Capture::new(true);
++        let sent = self
++            .sdk
++            .get_object()
++            .bucket(&self.bucket)
++            .key(key)
++            .if_none_match(etag)
++            .customize()
++            .interceptor(capture)
++            .send()
++            .await;
++        let captured = self.captured(sent, &taken)?;
++        Ok(self.fetched(captured).await)
++    }
++
++    /// `ListObjectsV2` of the keys under `prefix`, `page_size` keys a page (`max-keys`), every
++    /// page followed from its `<NextContinuationToken>` to the one that is not truncated.
++    ///
++    /// Each page is read whole under [`super::BUFFERED_BODY_BUDGET`], so `page_size` must leave
++    /// a page room to fit: S3 spends a few hundred bytes of markup on an entry besides its key,
++    /// so a page holds a couple of hundred entries with short keys, and far fewer with keys
++    /// near S3's 1024-byte limit. A page past the budget is refused
++    /// ([`super::BodyFailure::OverBudget`]), never read in part.
++    pub async fn list_objects_v2(
++        &self,
++        prefix: &str,
++        page_size: u16,
++    ) -> Result<Listing, ListingError> {
++        let mut listing = Listing::default();
++        let mut token = None;
++        for page in 1..=MAX_LISTING_PAGES {
++            let (capture, taken) = Capture::new(true);
++            let sent = self
++                .sdk
++                .list_objects_v2()
++                .bucket(&self.bucket)
++                .prefix(prefix)
++                .max_keys(i32::from(page_size))
++                .set_continuation_token(token.take())
++                .customize()
++                .interceptor(capture)
++                .send()
++                .await;
++            match self.page(sent, &taken, Version::V2, &mut listing).await {
++                Ok(None) => return Ok(listing),
++                Ok(next) => token = next,
++                Err(cause) => return Err(ListingError::Page { page, cause }),
++            }
++        }
++        Err(ListingError::TooManyPages {
++            pages: MAX_LISTING_PAGES,
++        })
++    }
++
++    /// `ListObjects` (version 1) of the keys under `prefix`, `page_size` keys a page
++    /// (`max-keys`), every page followed with a `marker` to the one that is not truncated. Each
++    /// page is read under the budget as [`S3Client::list_objects_v2`]'s is.
++    pub async fn list_objects_v1(
++        &self,
++        prefix: &str,
++        page_size: u16,
++    ) -> Result<Listing, ListingError> {
++        let mut listing = Listing::default();
++        let mut marker = None;
++        for page in 1..=MAX_LISTING_PAGES {
++            let (capture, taken) = Capture::new(true);
++            let sent = self
++                .sdk
++                .list_objects()
++                .bucket(&self.bucket)
++                .prefix(prefix)
++                .max_keys(i32::from(page_size))
++                .set_marker(marker.take())
++                .customize()
++                .interceptor(capture)
++                .send()
++                .await;
++            match self.page(sent, &taken, Version::V1, &mut listing).await {
++                Ok(None) => return Ok(listing),
++                Ok(next) => marker = next,
++                Err(cause) => return Err(ListingError::Page { page, cause }),
++            }
++        }
++        Err(ListingError::TooManyPages {
++            pages: MAX_LISTING_PAGES,
++        })
++    }
++
++    /// `DeleteObjects` of `keys` in one request, not quiet, so the result names every key
++    /// deleted as well as every key not. S3 answers `200` whether or not every key was
++    /// deleted: a key that was not is only an `<Error>` row ([`DeleteResult::errors`]).
++    ///
++    /// The result is read whole under [`super::BUFFERED_BODY_BUDGET`]: a row is a few dozen
++    /// bytes of markup besides its key, so a request of many long keys can draw a result
++    /// past the budget, which is refused ([`super::BodyFailure::OverBudget`]), never read in
++    /// part.
++    pub async fn delete_objects<K: AsRef<str>>(
++        &self,
++        keys: &[K],
++    ) -> Result<DeleteResult, NoResult> {
++        let objects = keys
++            .iter()
++            .map(|key| ObjectIdentifier::builder().key(key.as_ref()).build())
++            .collect::<Result<Vec<_>, _>>()
++            .map_err(not_built)?;
++        let delete = Delete::builder()
++            .set_objects(Some(objects))
++            .build()
++            .map_err(not_built)?;
++        let (capture, taken) = Capture::new(false);
++        let sent = self
++            .sdk
++            .delete_objects()
++            .bucket(&self.bucket)
++            .delete(delete)
++            .customize()
++            .interceptor(capture)
++            .send()
++            .await;
++        let captured = self.captured(sent, &taken).map_err(NoResult::NoAnswer)?;
++        let (head, body) = self.read(captured).await;
++        match settle(&head, body, |body| delete_rows(body)) {
++            Ok(rows) => Ok(DeleteResult { head, rows }),
++            Err(outcome) => Err(NoResult::Answered(Answer { head, outcome })),
++        }
++    }
++
++    /// Send `probe` and report its answer whole. A 2xx is [`super::Outcome::Success`] only
++    /// when its body is the one the operation's S3 success carries; one that stalls, is cut, or
++    /// is not that body keeps its status beside the failure.
++    pub async fn probe(&self, probe: &Probe) -> Result<Answer, S3Error> {
++        let (capture, taken) = Capture::new(probe.reads());
++        let bucket = self.bucket.as_str();
++        // Each arm builds one operation and sends it with the capture on.
++        macro_rules! send {
++            ($request:expr) => {
++                self.captured(
++                    $request.customize().interceptor(capture).send().await,
++                    &taken,
++                )
++            };
++        }
++        let captured = match probe {
++            Probe::CopyObject { key, source_key } => send!(self
++                .sdk
++                .copy_object()
++                .bucket(bucket)
++                .key(key)
++                .copy_source(format!("{bucket}/{source_key}"))),
++            Probe::CreateMultipartUpload { key } => {
++                send!(self.sdk.create_multipart_upload().bucket(bucket).key(key))
++            }
++            Probe::UploadPart { key, upload_id } => send!(self
++                .sdk
++                .upload_part()
++                .bucket(bucket)
++                .key(key)
++                .upload_id(upload_id)
++                .part_number(1)
++                .content_length(0)
++                .body(ByteStream::from_static(b""))),
++            Probe::CompleteMultipartUpload { key, upload_id } => send!(self
++                .sdk
++                .complete_multipart_upload()
++                .bucket(bucket)
++                .key(key)
++                .upload_id(upload_id)
++                .multipart_upload(
++                    CompletedMultipartUpload::builder()
++                        .parts(
++                            CompletedPart::builder()
++                                .part_number(1)
++                                .e_tag(EMPTY_PART_ETAG)
++                                .build()
++                        )
++                        .build()
++                )),
++            Probe::AbortMultipartUpload { key, upload_id } => send!(self
++                .sdk
++                .abort_multipart_upload()
++                .bucket(bucket)
++                .key(key)
++                .upload_id(upload_id)),
++            Probe::ListParts { key, upload_id } => send!(self
++                .sdk
++                .list_parts()
++                .bucket(bucket)
++                .key(key)
++                .upload_id(upload_id)),
++            Probe::ListMultipartUploads => {
++                send!(self.sdk.list_multipart_uploads().bucket(bucket))
++            }
++            Probe::GetBucketLocation => send!(self.sdk.get_bucket_location().bucket(bucket)),
++            Probe::CreateBucket { bucket } => send!(self.sdk.create_bucket().bucket(bucket)),
++            Probe::DeleteBucket { bucket } => send!(self.sdk.delete_bucket().bucket(bucket)),
++            Probe::ListBuckets => send!(self.sdk.list_buckets()),
++            Probe::HeadBucket => send!(self.sdk.head_bucket().bucket(bucket)),
++        }?;
++        Ok(self.answer(captured, probe.success_body()).await)
++    }
++
++    /// What the capture of one call took, or, when no response reached it, the SDK's failure
++    /// classified as the older verbs classify it.
++    fn captured<O, E>(
++        &self,
++        sent: Result<O, SdkError<E, HttpResponse>>,
++        taken: &Taken,
++    ) -> Result<Captured, S3Error>
++    where
++        E: std::error::Error + 'static,
++    {
++        let sdk_detail = || match &sent {
++            Err(e) => format!(
++                "the SDK stopped before the client could take the body: {}",
++                DisplayErrorContext(e)
++            ),
++            Ok(_) => "the SDK finished the call without handing the body over".to_string(),
++        };
++        if let Some(captured) = taken.take(sdk_detail) {
++            return Ok(captured);
++        }
++        match sent {
++            Err(e) => Err(self.classify(e)),
++            // An output is deserialized from a response, and the SDK runs `read_after_transmit`
++            // on every response before it deserializes it (`aws-smithy-runtime` 1.16.0
++            // `client/orchestrator.rs:507-514`).
++            Ok(_) => unreachable!("the capture records every response the SDK deserializes"),
++        }
++    }
++
++    /// The head of `captured`, and its body read whole.
++    async fn read(&self, captured: Captured) -> (Head, Result<Bytes, BodyFailure>) {
++        let Captured {
++            head,
++            framing,
++            body,
++        } = captured;
++        let body = match body {
++            Ok(body) => {
++                read_whole(body, framing, self.deadlines.body_idle, self.deadlines.body).await
++            }
++            Err(detail) => Err(BodyFailure::Transport {
++                received: 0,
++                detail,
++            }),
++        };
++        (head, body)
++    }
++
++    /// `captured` as a whole answer, a 2xx read as `success` describes.
++    async fn answer(&self, captured: Captured, success: SuccessBody) -> Answer {
++        let (head, body) = self.read(captured).await;
++        answer(head, body, success)
++    }
++
++    /// `captured`, answering a GET: a 2xx streams its body, anything else is read whole.
++    async fn fetched(&self, captured: Captured) -> Fetched {
++        if !captured.head.is_success() {
++            return Fetched::Other(self.answer(captured, SuccessBody::Empty).await);
++        }
++        let Captured {
++            head,
++            framing,
++            body,
++        } = captured;
++        let body = body
++            .map_err(|detail| BodyError::Transport {
++                declared: None,
++                received: 0,
++                detail,
++            })
++            .and_then(|body| {
++                let declared = object_length(framing)?;
++                // The whole-body deadline starts here, as the response head has just been read.
++                Ok(Box::new(ObjectBody::new(
++                    ByteStream::new(body),
++                    declared,
++                    self.deadlines.body_idle,
++                    self.deadlines.body,
++                )))
++            });
++        Fetched::Object { head, body }
++    }
++
++    /// One listing page: its entries added to `listing` and what the next page continues from,
++    /// or why it holds no page. `listing` is untouched by a page that holds none.
++    async fn page<O, E>(
++        &self,
++        sent: Result<O, SdkError<E, HttpResponse>>,
++        taken: &Taken,
++        version: Version,
++        listing: &mut Listing,
++    ) -> Result<Option<String>, NoResult>
++    where
++        E: std::error::Error + 'static,
++    {
++        let captured = self.captured(sent, taken).map_err(NoResult::NoAnswer)?;
++        let (head, body) = self.read(captured).await;
++        match settle(&head, body, |body| listing_page(body, version)) {
++            Ok(page) => {
++                listing.entries.extend(page.entries);
++                listing.pages.push(head);
++                Ok(page.next)
++            }
++            Err(outcome) => Err(NoResult::Answered(Answer { head, outcome })),
++        }
++    }
++}
++
++/// A request the SDK's builders refused, before anything was sent.
++fn not_built(e: BuildError) -> NoResult {
++    NoResult::NoAnswer(S3Error::RequestNotBuilt {
++        detail: DisplayErrorContext(&e).to_string(),
++    })
++}
+diff --git a/crates/validate/tests/s3_client_smoke_verbs.rs b/crates/validate/tests/s3_client_smoke_verbs.rs
+new file mode 100644
+index 0000000..19feeec
+--- /dev/null
++++ b/crates/validate/tests/s3_client_smoke_verbs.rs
+@@ -0,0 +1,1553 @@
++//! Issue #938 (743.2): the S3 client verbs `smoke` sends beyond PUT, GET and DELETE of one
++//! object — HEAD, a ranged and a conditional GET, `ListObjectsV2` and `ListObjects`, bulk
++//! `DeleteObjects`, and one probe of each operation the capability matrix may declare
++//! unsupported — each reporting what the server sent: status, headers, S3 code, body.
++//!
++//! The production [`S3Client`] runs against two kinds of endpoint, both on loopback:
++//!
++//! * a **real Wyrd S3 gateway** served in-process (redb + `MemCoordination` + a local
++//!   `FsChunkStore`, the composition `s3_client_roundtrip.rs` uses), with the bucket's marker
++//!   seeded on the store first so listings answer (ADR-0046 decision 1). Where a case must
++//!   show what reached the gateway, a **relay** in front of it records every request line;
++//! * a **scripted endpoint** that reads one whole request and answers with exact bytes, for
++//!   the answers no conforming gateway sends (the pattern of
++//!   `s3_client_nonconforming_responses.rs`).
++//!
++//! The legs, as the brief names them:
++//!
++//! * **(A)** against the gateway: HEAD of a written key is `200` with its size and `ETag`, of
++//!   a missing key `404` with no body; a ranged GET is `206` with the `Content-Range` as sent
++//!   and exactly those bytes; a GET with `If-None-Match` of its `ETag` is `304` with no body,
++//!   with another tag `200` and the whole object; both listings return every key under a
++//!   prefix with its size across three pages; `DeleteObjects` of four keys reports each under
++//!   `<Deleted>` and no `<Error>`, and the keys are then gone.
++//! * **(B)** every probe reaches the gateway, as the operation it names, and comes back with
++//!   the gateway's status and S3 code; `CreateBucket` and `DeleteBucket` naming buckets S3's
++//!   naming rules forbid reach it with the name exactly as given.
++//! * **(C)** a probe answered `200` whose body then stalls past the body-idle deadline,
++//!   trickles past the whole-body deadline, is cut mid-body, or is not the operation's success
++//!   body, is reported with the `200` and the body's failure beside it.
++//! * **(D)** a listing page or `<DeleteResult>` that is cut short, followed by junk or a second
++//!   document, followed by bytes past its `Content-Length`, or past the buffered budget (with a
++//!   `Content-Length` and chunked) is a typed refusal that keeps the `200`, never a partial
++//!   listing or a short delete result; a page that fails after a good one discards the good
++//!   one; a document of exactly the budget is read.
++//! * **(F)** a mixed `<DeleteResult>` (two `<Deleted>`, one `<Error>`) comes back row by row,
++//!   the error row's key, code and message as sent, in document order.
++//!
++//! (E) is the three existing client tests, run unmodified beside this one.
++//!
++//! RED before #938: none of these verbs exist, so the file does not compile.
++
++#![forbid(unsafe_code)]
++
++use std::ffi::OsString;
++use std::fmt::Write as _;
++use std::net::SocketAddr;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use bytes::Bytes;
++use futures_util::stream;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use tokio::task::JoinSet;
++use tokio::time::timeout;
++use wyrd_chunkstore_fs::FsChunkStore;
++use wyrd_coordination_mem::MemCoordination;
++use wyrd_gateway_s3::sigv4::Credentials as GatewayCredentials;
++use wyrd_gateway_s3::{S3Config, S3Gateway};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_server::Gateway;
++use wyrd_traits::{MetadataStore, WriteBatch};
++use wyrd_validate::s3::{
++    Answer, BodyFailure, DeleteRow, Fetched, KeyError, ListEntry, Listing, ListingError, NoResult,
++    Outcome, Probe, BUFFERED_BODY_BUDGET,
++};
++use wyrd_validate::{
++    resolve_config, Deadlines, ErrorCode, ObjectBody, Phase, PutSource, ResolvedConfig, S3Client,
++};
++
++const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
++const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
++const REGION: &str = "us-east-1";
++const BUCKET: &str = "validate";
++
++/// The gateway's chunk size: small, so a range and an object span several chunks.
++const GATEWAY_CHUNK: usize = 1024;
++/// The length of the object the HEAD and GET cases write: five chunks.
++const OBJECT_LEN: usize = 5000;
++
++/// A bucket name S3's naming rules forbid (it ends in `-`); the one 743.3 probes with.
++const FORBIDDEN_BUCKET: &str = "wyrd-validate-probe-";
++/// More names those rules forbid: upper case and an underscore, too short, an IP address,
++/// adjacent dots, a leading hyphen.
++const MORE_FORBIDDEN_BUCKETS: [&str; 5] = [
++    "Wyrd_Validate_Probe",
++    "ab",
++    "192.168.5.4",
++    "wyrd..validate",
++    "-wyrd-validate",
++];
++
++/// The test's own bound on any one call. Longer than every client deadline, so a production
++/// deadline fires first where one applies.
++const STALL: Duration = Duration::from_secs(30);
++/// How long the scripted endpoint holds a connection open waiting for the client to close it.
++const HOLD: Duration = Duration::from_secs(10);
++
++/// Deadlines for the gateway cases: generous, so only a hang trips them.
++fn deadlines() -> Deadlines {
++    Deadlines {
++        connect: Duration::from_secs(5),
++        operation: Duration::from_secs(60),
++        body_idle: Duration::from_secs(10),
++        body: Duration::from_secs(60),
++    }
++}
++
++/// The body deadlines the 2xx-head cases (C) expire: short, and the idle one shorter. The
++/// trickle's gap ([`TRICKLE_EVERY`]) is a tenth of the idle deadline, so a loaded runner does
++/// not turn the whole-body expiry into an idle one.
++const SHORT_IDLE: Duration = Duration::from_millis(500);
++const SHORT_BODY: Duration = Duration::from_millis(1500);
++/// The gap between two trickled bytes.
++const TRICKLE_EVERY: Duration = Duration::from_millis(50);
++
++fn short_deadlines() -> Deadlines {
++    Deadlines {
++        connect: Duration::from_secs(5),
++        operation: Duration::from_secs(30),
++        body_idle: SHORT_IDLE,
++        body: SHORT_BODY,
++    }
++}
++
++// --- the in-process gateway ----------------------------------------------------------------
++
++/// A Wyrd S3 gateway on an ephemeral loopback port. Field order is drop order: the serving
++/// task is aborted before its chunk store's directory is removed.
++struct GatewayFixture {
++    _tasks: JoinSet<()>,
++    addr: SocketAddr,
++    _dir: tempfile::TempDir,
++}
++
++/// Seed a `bucket:{name}` existence marker directly on the store, as
++/// `crates/server/tests/s3_list_objects.rs` does: a listing reads the marker for presence only.
++async fn seed_bucket(meta: &RedbMetadataStore, name: &str) {
++    let key = format!("bucket:{name}").into_bytes();
++    let value = format!("{{\"name\":\"{name}\",\"created_millis\":0}}").into_bytes();
++    meta.commit(WriteBatch::new().put(key, value))
++        .await
++        .expect("commit bucket marker");
++}
++
++/// As `s3_client_roundtrip.rs`'s `start_gateway_with_chunk`, with [`BUCKET`]'s marker seeded
++/// before the store goes into the gateway.
++async fn start_gateway() -> GatewayFixture {
++    let dir = tempfile::tempdir().expect("temp dir");
++    let meta = RedbMetadataStore::in_memory().expect("redb");
++    seed_bucket(&meta, BUCKET).await;
++    let gateway = Arc::new(
++        Gateway::new(
++            meta,
++            FsChunkStore::open(dir.path()).expect("fs store"),
++            MemCoordination::new(),
++        )
++        .with_chunk_size(GATEWAY_CHUNK),
++    );
++    let config = S3Config::new(vec![GatewayCredentials {
++        access_key_id: ACCESS_KEY.to_string(),
++        secret_access_key: SECRET_KEY.to_string(),
++    }]);
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let server = S3Gateway::new(gateway, config);
++    let mut tasks = JoinSet::new();
++    tasks.spawn(async move {
++        server.serve(listener).await.expect("serve");
++    });
++    GatewayFixture {
++        _tasks: tasks,
++        addr,
++        _dir: dir,
++    }
++}
++
++// --- the client, built the way the binary builds it ----------------------------------------
++
++/// A resolved configuration for `endpoint`, through the production argument parser and
++/// credential resolution.
++fn resolved(endpoint: SocketAddr) -> ResolvedConfig {
++    let endpoint = format!("http://{endpoint}");
++    let pairs = [
++        ("--endpoint", endpoint.as_str()),
++        ("--region", REGION),
++        ("--bucket", BUCKET),
++        ("--scenario", "smoke"),
++        ("--duration", "1m"),
++        ("--workers", "1"),
++        ("--seed", "938"),
++        ("--out", "unused"),
++        ("--run-id", "s3-client-smoke-verbs"),
++        ("--driver-placement", "loopback"),
++    ];
++    let args: Vec<String> = pairs
++        .iter()
++        .flat_map(|(flag, value)| [flag.to_string(), value.to_string()])
++        .collect();
++    let lookup = |name: &str| -> Option<OsString> {
++        match name {
++            "AWS_ACCESS_KEY_ID" => Some(ACCESS_KEY.into()),
++            "AWS_SECRET_ACCESS_KEY" => Some(SECRET_KEY.into()),
++            _ => None,
++        }
++    };
++    resolve_config(&args, &lookup).expect("the configuration resolves")
++}
++
++fn client(endpoint: SocketAddr, deadlines: Deadlines) -> S3Client {
++    S3Client::with_deadlines(&resolved(endpoint), deadlines)
++}
++
++/// `f`, bounded by [`STALL`].
++async fn bounded<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
++    timeout(STALL, f)
++        .await
++        .unwrap_or_else(|_| panic!("{what}: no outcome within {STALL:?}"))
++}
++
++/// The bytes of a test object of `len` bytes, distinct per offset.
++fn object(len: usize) -> Vec<u8> {
++    (0..len).map(|i| (i % 251) as u8).collect()
++}
++
++/// PUT `body` at `key`, returning the `ETag` the gateway gave it.
++async fn put(client: &S3Client, key: &str, body: &[u8]) -> String {
++    let piece = Bytes::copy_from_slice(body);
++    let source = PutSource::new(
++        body.len() as u64,
++        stream::iter([Ok::<_, std::io::Error>(piece)]),
++    );
++    bounded(key, client.put_object(key, source))
++        .await
++        .unwrap_or_else(|e| panic!("PUT {key}: {e}"))
++        .etag
++        .unwrap_or_else(|| panic!("PUT {key}: the gateway returned no ETag"))
++}
++
++/// Every byte of a streamed body.
++async fn read_all(body: &mut ObjectBody) -> Vec<u8> {
++    let mut held = Vec::new();
++    while let Some(piece) = bounded("a GET body", body.next_piece())
++        .await
++        .unwrap_or_else(|e| panic!("the GET body failed: {e}"))
++    {
++        held.extend_from_slice(&piece);
++    }
++    held
++}
++
++/// The id is the gateway's: 32 hex digits, the form it stamps on every response.
++fn assert_gateway_answered(answer: &Answer, case: &str) {
++    let id = answer
++        .head
++        .request_id()
++        .unwrap_or_else(|| panic!("{case}: the answer carries no x-amz-request-id: {answer:?}"));
++    assert!(
++        id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
++        "{case}: the gateway's request-id form (32 hex digits): {id:?}"
++    );
++}
++
++// --- (A) the verbs against the real gateway ------------------------------------------------
++
++#[tokio::test]
++async fn head_reports_a_written_keys_size_and_etag_and_a_missing_keys_bare_404() {
++    let gateway = start_gateway().await;
++    let client = client(gateway.addr, deadlines());
++    let etag = put(&client, "head/written", &object(OBJECT_LEN)).await;
++
++    let written = bounded("HEAD written", client.head_object("head/written"))
++        .await
++        .unwrap_or_else(|e| panic!("HEAD written: no answer: {e}"));
++    assert_eq!(written.head.status, 200, "{written:?}");
++    let size = OBJECT_LEN.to_string();
++    assert_eq!(
++        written.head.header("content-length"),
++        Some(size.as_str()),
++        "the size: {written:?}"
++    );
++    assert_eq!(
++        written.head.header("etag"),
++        Some(etag.as_str()),
++        "the ETag the PUT returned: {written:?}"
++    );
++    assert_eq!(
++        written.outcome,
++        Outcome::Success { body: Bytes::new() },
++        "a HEAD success has no body"
++    );
++    assert_gateway_answered(&written, "HEAD written");
++
++    let missing = bounded("HEAD missing", client.head_object("head/missing"))
++        .await
++        .unwrap_or_else(|e| panic!("HEAD missing: no answer: {e}"));
++    assert_eq!(missing.head.status, 404, "{missing:?}");
++    assert_eq!(
++        missing.outcome,
++        Outcome::Error {
++            code: ErrorCode::NoBody,
++            message: None
++        },
++        "a HEAD error has no body, so no code: the SDK's made-up NotFound is not reported"
++    );
++    assert_gateway_answered(&missing, "HEAD missing");
++}
++
++#[tokio::test]
++async fn a_ranged_get_is_206_with_its_content_range_and_exactly_those_bytes() {
++    let gateway = start_gateway().await;
++    let client = client(gateway.addr, deadlines());
++    let body = object(OBJECT_LEN);
++    put(&client, "range/object", &body).await;
++    // Across two chunk boundaries (1024 and 2048).
++    let (first, last) = (1000u64, 2099u64);
++
++    let fetched = bounded(
++        "ranged GET",
++        client.get_object_range("range/object", first, last),
++    )
++    .await
++    .unwrap_or_else(|e| panic!("ranged GET: no answer: {e}"));
++    let Fetched::Object { head, body: got } = fetched else {
++        panic!("ranged GET: not a 2xx: {fetched:?}");
++    };
++    assert_eq!(head.status, 206, "{head:?}");
++    let range = format!("bytes {first}-{last}/{OBJECT_LEN}");
++    assert_eq!(
++        head.header("content-range"),
++        Some(range.as_str()),
++        "the Content-Range as sent: {head:?}"
++    );
++    let mut got = got.unwrap_or_else(|e| panic!("ranged GET: the body cannot be read: {e}"));
++    assert_eq!(got.content_length(), Some(last - first + 1));
++    assert!(
++        read_all(&mut got).await == body[first as usize..=last as usize],
++        "the ranged GET handed over exactly bytes {first}-{last}"
++    );
++}
++
++#[tokio::test]
++async fn a_conditional_get_is_304_on_its_etag_and_the_whole_object_on_another() {
++    let gateway = start_gateway().await;
++    let client = client(gateway.addr, deadlines());
++    let body = object(OBJECT_LEN);
++    let etag = put(&client, "conditional/object", &body).await;
++
++    let matched = bounded(
++        "GET If-None-Match its ETag",
++        client.get_object_if_none_match("conditional/object", &etag),
++    )
++    .await
++    .unwrap_or_else(|e| panic!("GET If-None-Match its ETag: no answer: {e}"));
++    let Fetched::Other(not_modified) = matched else {
++        panic!("GET If-None-Match its ETag: a 2xx: {matched:?}");
++    };
++    assert_eq!(not_modified.head.status, 304, "{not_modified:?}");
++    assert_eq!(
++        not_modified.outcome,
++        Outcome::Error {
++            code: ErrorCode::NoBody,
++            message: None
++        },
++        "a 304 has no body"
++    );
++    assert_gateway_answered(&not_modified, "GET If-None-Match its ETag");
++
++    // A valid tag, but not this object's.
++    let other = "\"0123456789abcdef0123456789abcdef\"";
++    assert_ne!(etag, other);
++    let fetched = bounded(
++        "GET If-None-Match another ETag",
++        client.get_object_if_none_match("conditional/object", other),
++    )
++    .await
++    .unwrap_or_else(|e| panic!("GET If-None-Match another ETag: no answer: {e}"));
++    let Fetched::Object { head, body: got } = fetched else {
++        panic!("GET If-None-Match another ETag: not a 2xx: {fetched:?}");
++    };
++    assert_eq!(head.status, 200, "{head:?}");
++    let mut got = got.unwrap_or_else(|e| panic!("the body cannot be read: {e}"));
++    assert!(
++        read_all(&mut got).await == body,
++        "a GET that matched no tag handed over the whole object"
++    );
++}
++
++/// The keys the listing cases write under `list/`, with their sizes, in the order S3 lists
++/// them; and one outside the prefix.
++const LISTED: [(&str, usize); 5] = [
++    ("list/a", 0),
++    ("list/b", 1),
++    ("list/c", 10),
++    ("list/d", 100),
++    ("list/e", 3000),
++];
++
++fn expected_entries() -> Vec<(String, u64)> {
++    LISTED
++        .iter()
++        .map(|&(key, size)| (key.to_string(), size as u64))
++        .collect()
++}
++
++fn keys_and_sizes(listing: &Listing) -> Vec<(String, u64)> {
++    listing
++        .entries
++        .iter()
++        .map(|entry| (entry.key.clone(), entry.size))
++        .collect()
++}
++
++#[tokio::test]
++async fn both_listings_return_every_key_under_a_prefix_with_its_size_across_pages() {
++    let gateway = start_gateway().await;
++    let client = client(gateway.addr, deadlines());
++    for (key, size) in LISTED {
++        put(&client, key, &object(size)).await;
++    }
++    put(&client, "listless/outside", b"not under the prefix").await;
++
++    // Two keys a page: three pages, the client following each continuation.
++    let v2 = bounded("ListObjectsV2", client.list_objects_v2("list/", 2))
++        .await
++        .unwrap_or_else(|e| panic!("ListObjectsV2: {e}"));
++    assert_eq!(keys_and_sizes(&v2), expected_entries(), "ListObjectsV2");
++    assert_eq!(v2.pages.len(), 3, "ListObjectsV2 read three pages");
++    assert!(v2.pages.iter().all(|head| head.status == 200));
++
++    let v1 = bounded("ListObjects", client.list_objects_v1("list/", 2))
++        .await
++        .unwrap_or_else(|e| panic!("ListObjects: {e}"));
++    assert_eq!(keys_and_sizes(&v1), expected_entries(), "ListObjects");
++    assert_eq!(v1.pages.len(), 3, "ListObjects read three pages");
++    assert!(v1.pages.iter().all(|head| head.status == 200));
++}
++
++#[tokio::test]
++async fn delete_objects_reports_every_key_deleted_and_the_keys_are_gone() {
++    let gateway = start_gateway().await;
++    let client = client(gateway.addr, deadlines());
++    let keys = ["bulk/0", "bulk/1", "bulk/2", "bulk/3"];
++    for key in keys {
++        put(&client, key, key.as_bytes()).await;
++    }
++
++    let result = bounded("DeleteObjects", client.delete_objects(&keys))
++        .await
++        .unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
++    assert_eq!(result.head.status, 200, "{result:?}");
++    let mut deleted: Vec<&str> = result.deleted().collect();
++    deleted.sort_unstable();
++    assert_eq!(deleted, keys, "every key under <Deleted>: {result:?}");
++    assert_eq!(result.errors().count(), 0, "no <Error> row: {result:?}");
++
++    for key in keys {
++        let head = bounded(key, client.head_object(key))
++            .await
++            .unwrap_or_else(|e| panic!("HEAD {key}: no answer: {e}"));
++        assert_eq!(head.head.status, 404, "{key} is gone: {head:?}");
++    }
++}
++
++// --- the relay -----------------------------------------------------------------------------
++
++/// A loopback forwarder in front of the gateway that records the head of every request it
++/// forwards (the client opens one connection per request).
++struct Relay {
++    addr: SocketAddr,
++    heads: Arc<Mutex<Vec<String>>>,
++    _task: JoinSet<()>,
++}
++
++impl Relay {
++    async fn start(upstream: SocketAddr) -> Self {
++        let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay bind");
++        let addr = listener.local_addr().expect("relay addr");
++        let heads = Arc::new(Mutex::new(Vec::new()));
++        let recorded = Arc::clone(&heads);
++        let mut task = JoinSet::new();
++        task.spawn(async move {
++            // Owned by the accept loop, so every connection's task goes with the relay.
++            let mut connections = JoinSet::new();
++            while let Ok((client, _)) = listener.accept().await {
++                connections.spawn(forward(client, upstream, Arc::clone(&recorded)));
++            }
++        });
++        Self {
++            addr,
++            heads,
++            _task: task,
++        }
++    }
++
++    /// The heads recorded since the last call.
++    fn take(&self) -> Vec<String> {
++        std::mem::take(&mut *self.heads.lock().expect("relay lock"))
++    }
++}
++
++/// Forward one connection, recording its request head before any of it reaches the gateway.
++async fn forward(mut client: TcpStream, upstream: SocketAddr, heads: Arc<Mutex<Vec<String>>>) {
++    let Ok(mut server) = TcpStream::connect(upstream).await else {
++        return;
++    };
++    let mut buf = Vec::new();
++    let head_end = loop {
++        if let Some(i) = find(&buf, b"\r\n\r\n") {
++            break i;
++        }
++        if read_more(&mut client, &mut buf).await.is_err() {
++            return;
++        }
++    };
++    heads
++        .lock()
++        .expect("relay lock")
++        .push(String::from_utf8_lossy(&buf[..head_end]).into_owned());
++    if server.write_all(&buf).await.is_err() {
++        return;
++    }
++    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
++}
++
++/// A request head's method, path and query.
++fn request_line(head: &str) -> (&str, &str, &str) {
++    let line = head.split("\r\n").next().unwrap_or_default();
++    let mut parts = line.split(' ');
++    let method = parts.next().unwrap_or_default();
++    let target = parts.next().unwrap_or_default();
++    let (path, query) = target.split_once('?').unwrap_or((target, ""));
++    (method, path, query)
++}
++
++/// Whether a query names `name`, bare or with a value.
++fn query_has(query: &str, name: &str) -> bool {
++    query
++        .split('&')
++        .any(|pair| pair == name || pair.starts_with(&format!("{name}=")))
++}
++
++/// A request header's value, by name, from a recorded head.
++fn request_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
++    head.split("\r\n").skip(1).find_map(|line| {
++        let (field, value) = line.split_once(':')?;
++        field
++            .trim()
++            .eq_ignore_ascii_case(name)
++            .then(|| value.trim())
++    })
++}
++
++// --- (B) every unsupported operation reaches the gateway -----------------------------------
++
++/// How a probe must reach the gateway and what the gateway answers it.
++struct ProbeCase {
++    probe: Probe,
++    method: &'static str,
++    path: String,
++    /// A query parameter that names the operation, or `None` for an operation the path and
++    /// method name alone.
++    query: Option<&'static str>,
++    status: u16,
++    code: ErrorCode,
++}
++
++fn not_implemented() -> ErrorCode {
++    ErrorCode::Code("NotImplemented".to_string())
++}
++
++fn invalid_request() -> ErrorCode {
++    ErrorCode::Code("InvalidRequest".to_string())
++}
++
++fn probe_cases() -> Vec<ProbeCase> {
++    let key = "probe/object".to_string();
++    let upload_id = "wyrd-validate-probe-upload".to_string();
++    let object_path = format!("/{BUCKET}/probe/object");
++    // Path-style, a bucket-level request's path is the bucket and a slash.
++    let bucket_path = format!("/{BUCKET}/");
++    let case = |probe, method, path: &str, query, status, code| ProbeCase {
++        probe,
++        method,
++        path: path.to_string(),
++        query,
++        status,
++        code,
++    };
++    vec![
++        case(
++            Probe::CopyObject {
++                key: key.clone(),
++                source_key: "probe/source".to_string(),
++            },
++            "PUT",
++            &object_path,
++            None,
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::CreateMultipartUpload { key: key.clone() },
++            "POST",
++            &object_path,
++            Some("uploads"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::UploadPart {
++                key: key.clone(),
++                upload_id: upload_id.clone(),
++            },
++            "PUT",
++            &object_path,
++            Some("partNumber"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::CompleteMultipartUpload {
++                key: key.clone(),
++                upload_id: upload_id.clone(),
++            },
++            "POST",
++            &object_path,
++            Some("uploadId"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::AbortMultipartUpload {
++                key: key.clone(),
++                upload_id: upload_id.clone(),
++            },
++            "DELETE",
++            &object_path,
++            Some("uploadId"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::ListParts {
++                key,
++                upload_id: upload_id.clone(),
++            },
++            "GET",
++            &object_path,
++            Some("uploadId"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::ListMultipartUploads,
++            "GET",
++            &bucket_path,
++            Some("uploads"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::GetBucketLocation,
++            "GET",
++            &bucket_path,
++            Some("location"),
++            501,
++            not_implemented(),
++        ),
++        case(
++            Probe::CreateBucket {
++                bucket: FORBIDDEN_BUCKET.to_string(),
++            },
++            "PUT",
++            &format!("/{FORBIDDEN_BUCKET}/"),
++            None,
++            400,
++            invalid_request(),
++        ),
++        case(
++            Probe::DeleteBucket {
++                bucket: FORBIDDEN_BUCKET.to_string(),
++            },
++            "DELETE",
++            &format!("/{FORBIDDEN_BUCKET}/"),
++            None,
++            400,
++            invalid_request(),
++        ),
++        case(Probe::ListBuckets, "GET", "/", None, 400, invalid_request()),
++        case(
++            Probe::HeadBucket,
++            "HEAD",
++            &bucket_path,
++            None,
++            400,
++            ErrorCode::NoBody,
++        ),
++    ]
++}
++
++#[tokio::test]
++async fn every_unsupported_operation_reaches_the_gateway_and_comes_back_with_its_status_and_code() {
++    let gateway = start_gateway().await;
++    let relay = Relay::start(gateway.addr).await;
++    let client = client(relay.addr, deadlines());
++    for case in probe_cases() {
++        let name = case.probe.operation();
++        let answer = bounded(name, client.probe(&case.probe))
++            .await
++            .unwrap_or_else(|e| panic!("{name}: no answer: {e}"));
++
++        let heads = relay.take();
++        let [head] = heads.as_slice() else {
++            panic!("{name}: one request reached the gateway, not {heads:?}");
++        };
++        let (method, path, query) = request_line(head);
++        assert_eq!(
++            (method, path),
++            (case.method, case.path.as_str()),
++            "{name}: the request reached the gateway as the operation: {head}"
++        );
++        if let Some(param) = case.query {
++            assert!(
++                query_has(query, param),
++                "{name}: the query names {param}: {head}"
++            );
++        }
++        if let Probe::CopyObject { .. } = case.probe {
++            assert_eq!(
++                request_header(head, "x-amz-copy-source"),
++                Some("validate/probe/source"),
++                "CopyObject names its source: {head}"
++            );
++        }
++
++        assert_eq!(answer.head.status, case.status, "{name}: {answer:?}");
++        let message = match &answer.outcome {
++            Outcome::Error { code, message } => {
++                assert_eq!(code, &case.code, "{name}: the S3 code: {answer:?}");
++                message.clone()
++            }
++            other => panic!("{name}: not an S3 error response: {other:?}"),
++        };
++        if case.code == ErrorCode::NoBody {
++            assert_eq!(message, None, "{name}: no body, so no message");
++        }
++        assert_gateway_answered(&answer, name);
++    }
++}
++
++#[tokio::test]
++async fn bucket_probes_send_a_name_s3_forbids_exactly_as_given() {
++    let gateway = start_gateway().await;
++    let relay = Relay::start(gateway.addr).await;
++    let client = client(relay.addr, deadlines());
++    for bucket in std::iter::once(FORBIDDEN_BUCKET).chain(MORE_FORBIDDEN_BUCKETS) {
++        for (probe, method) in [
++            (
++                Probe::CreateBucket {
++                    bucket: bucket.to_string(),
++                },
++                "PUT",
++            ),
++            (
++                Probe::DeleteBucket {
++                    bucket: bucket.to_string(),
++                },
++                "DELETE",
++            ),
++        ] {
++            let case = format!("{} {bucket:?}", probe.operation());
++            let answer = bounded(&case, client.probe(&probe))
++                .await
++                .unwrap_or_else(|e| panic!("{case}: refused or unanswered: {e}"));
++            let heads = relay.take();
++            let [head] = heads.as_slice() else {
++                panic!("{case}: one request reached the gateway, not {heads:?}");
++            };
++            let (sent_method, path, _) = request_line(head);
++            assert_eq!(
++                (sent_method, path),
++                (method, format!("/{bucket}/").as_str()),
++                "{case}: the name reached the gateway exactly as given: {head}"
++            );
++            assert_eq!(answer.head.status, 400, "{case}: {answer:?}");
++            assert_eq!(
++                answer.outcome,
++                Outcome::Error {
++                    code: invalid_request(),
++                    message: answer_message(&answer),
++                },
++                "{case}: the gateway's own refusal"
++            );
++            assert_gateway_answered(&answer, &case);
++        }
++    }
++}
++
++fn answer_message(answer: &Answer) -> Option<String> {
++    match &answer.outcome {
++        Outcome::Error { message, .. } => message.clone(),
++        _ => None,
++    }
++}
++
++// --- the scripted endpoint -----------------------------------------------------------------
++
++/// What the endpoint does once it has written a response's bytes.
++#[derive(Clone)]
++enum Then {
++    /// Close its side, then wait for the client to close its own.
++    End,
++    /// Write nothing more and keep the connection open until the client closes it.
++    Hold,
++    /// Close the connection at once.
++    Cut,
++    /// Write these bytes one at a time, `every` apart, then hold.
++    Trickle { bytes: Vec<u8>, every: Duration },
++}
++
++#[derive(Clone)]
++struct Script {
++    response: Vec<u8>,
++    then: Then,
++}
++
++impl Script {
++    fn ended(response: Vec<u8>) -> Self {
++        Self {
++            response,
++            then: Then::End,
++        }
++    }
++}
++
++/// A loopback endpoint that answers one connection per script, in order, each after reading
++/// one whole request, and records each request's head. Owned and aborted on drop.
++struct Endpoint {
++    addr: SocketAddr,
++    task: JoinSet<std::io::Result<Vec<String>>>,
++}
++
++impl Endpoint {
++    async fn start(scripts: Vec<Script>) -> Self {
++        let listener = TcpListener::bind("127.0.0.1:0")
++            .await
++            .expect("endpoint bind");
++        let addr = listener.local_addr().expect("endpoint addr");
++        let mut task = JoinSet::new();
++        task.spawn(async move {
++            let mut heads = Vec::new();
++            for script in scripts {
++                let (mut stream, _) = listener.accept().await?;
++                heads.push(read_request(&mut stream).await?);
++                serve(&mut stream, script).await;
++            }
++            Ok(heads)
++        });
++        Self { addr, task }
++    }
++
++    /// The request heads the endpoint read, once it has served every script.
++    async fn heads(&mut self) -> Vec<String> {
++        timeout(2 * HOLD, self.task.join_next())
++            .await
++            .expect("the endpoint finished")
++            .expect("the endpoint ran")
++            .expect("the endpoint task did not panic")
++            .expect("the endpoint read every request")
++    }
++}
++
++async fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
++    if stream.read_buf(buf).await? == 0 {
++        return Err(std::io::ErrorKind::UnexpectedEof.into());
++    }
++    Ok(())
++}
++
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    haystack.windows(needle.len()).position(|w| w == needle)
++}
++
++/// The index of the next CRLF at or after `from`, reading more as needed.
++async fn line_end(
++    stream: &mut TcpStream,
++    buf: &mut Vec<u8>,
++    from: usize,
++) -> std::io::Result<usize> {
++    loop {
++        if let Some(i) = find(&buf[from..], b"\r\n") {
++            return Ok(from + i);
++        }
++        read_more(stream, buf).await?;
++    }
++}
++
++/// Read one whole request, head and body, so the response is never written over unread
++/// request bytes (`s3_client_nonconforming_responses.rs`'s `read_request`). Returns its head.
++async fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
++    let mut buf = Vec::with_capacity(8192);
++    let head_end = loop {
++        if let Some(i) = find(&buf, b"\r\n\r\n") {
++            break i + 4;
++        }
++        read_more(stream, &mut buf).await?;
++    };
++    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
++    if let Some(len) = request_header(&head, "content-length") {
++        let len: usize = len.parse().expect("a numeric request Content-Length");
++        while buf.len() < head_end + len {
++            read_more(stream, &mut buf).await?;
++        }
++    } else if request_header(&head, "transfer-encoding")
++        .is_some_and(|te| te.eq_ignore_ascii_case("chunked"))
++    {
++        let mut pos = head_end;
++        loop {
++            let end = line_end(stream, &mut buf, pos).await?;
++            let size_text = String::from_utf8_lossy(&buf[pos..end]).into_owned();
++            let size_text = size_text.split(';').next().unwrap_or_default().trim();
++            let size = usize::from_str_radix(size_text, 16).expect("a hex chunk size");
++            if size == 0 {
++                let mut line = end + 2;
++                loop {
++                    let end = line_end(stream, &mut buf, line).await?;
++                    if end == line {
++                        return Ok(head);
++                    }
++                    line = end + 2;
++                }
++            }
++            let next = end + 2 + size + 2;
++            while buf.len() < next {
++                read_more(stream, &mut buf).await?;
++            }
++            pos = next;
++        }
++    }
++    Ok(head)
++}
++
++/// Write the script's response, then do what it says. A client that has closed the
++/// connection ends the exchange: every case here has said what it is by then.
++async fn serve(stream: &mut TcpStream, script: Script) {
++    if stream.write_all(&script.response).await.is_err() {
++        return;
++    }
++    match script.then {
++        Then::End => {
++            let _ = stream.shutdown().await;
++            hold(stream).await;
++        }
++        Then::Hold => hold(stream).await,
++        Then::Cut => {}
++        Then::Trickle { bytes, every } => {
++            for byte in bytes {
++                tokio::time::sleep(every).await;
++                if stream.write_all(&[byte]).await.is_err() {
++                    return;
++                }
++            }
++            hold(stream).await;
++        }
++    }
++}
++
++/// Wait, at most [`HOLD`], for the client to close the connection, reading whatever it sends.
++async fn hold(stream: &mut TcpStream) {
++    let mut sink = [0u8; 1024];
++    let _ = timeout(HOLD, async {
++        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
++    })
++    .await;
++}
++
++const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
++const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
++
++/// A response head: the status line, the `x-amz-request-id`, then `headers`.
++fn head(status: &str, request_id: &str, headers: &[(&str, String)]) -> Vec<u8> {
++    let mut text = format!("HTTP/1.1 {status}\r\nx-amz-request-id: {request_id}\r\n");
++    for (name, value) in headers {
++        let _ = write!(text, "{name}: {value}\r\n");
++    }
++    text.push_str("\r\n");
++    text.into_bytes()
++}
++
++/// A `200` carrying exactly `body`, with a `Content-Length` of `declared`.
++fn ok_with_length(request_id: &str, declared: usize, body: &[u8]) -> Vec<u8> {
++    let mut response = head(
++        "200 OK",
++        request_id,
++        &[
++            ("Content-Type", "application/xml".to_string()),
++            ("Content-Length", declared.to_string()),
++        ],
++    );
++    response.extend_from_slice(body);
++    response
++}
++
++/// A `200` carrying `body` chunked, in one chunk, with no `Content-Length`.
++fn ok_chunked(request_id: &str, body: &[u8]) -> Vec<u8> {
++    let mut response = head(
++        "200 OK",
++        request_id,
++        &[
++            ("Content-Type", "application/xml".to_string()),
++            ("Transfer-Encoding", "chunked".to_string()),
++        ],
++    );
++    response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
++    response.extend_from_slice(body);
++    response.extend_from_slice(b"\r\n0\r\n\r\n");
++    response
++}
++
++// --- (C) a 2xx head survives its body ------------------------------------------------------
++
++/// A body that starts like the operation's success document and is cut short: not a readable
++/// document, nor the empty body a headers-only success has.
++fn cut_document(probe: &Probe) -> Vec<u8> {
++    format!(
++        "{XML_DECL}<{}Result><ETag>&quot;0123&quot;</ETag>",
++        probe.operation()
++    )
++    .into_bytes()
++}
++
++/// The ways a `200` head's body fails, and the endpoint script for each.
++#[derive(Clone, Copy, Debug)]
++enum BodyFault {
++    /// Part of the body, then nothing, with the connection held open.
++    Stall,
++    /// One byte at a time, each inside the idle deadline, until the whole-body one.
++    Trickle,
++    /// Part of the body, then the connection closed.
++    Cut,
++    /// The whole declared body, which is not the operation's success body.
++    NotADocument,
++}
++
++const BODY_FAULTS: [BodyFault; 4] = [
++    BodyFault::Stall,
++    BodyFault::Trickle,
++    BodyFault::Cut,
++    BodyFault::NotADocument,
++];
++
++/// How much of the body a stalled or cut response sends before it stops.
++const SENT_BEFORE_FAULT: usize = 10;
++
++fn fault_script(probe: &Probe, fault: BodyFault, request_id: &str) -> Script {
++    let document = cut_document(probe);
++    // Room for more than the deadlines let through: a trickle of it takes several seconds.
++    let declared = document.len() + 64;
++    match fault {
++        BodyFault::Stall => Script {
++            response: ok_with_length(request_id, declared, &document[..SENT_BEFORE_FAULT]),
++            then: Then::Hold,
++        },
++        BodyFault::Trickle => Script {
++            response: ok_with_length(request_id, declared, b""),
++            then: Then::Trickle {
++                bytes: [document.clone(), vec![b' '; 64]].concat(),
++                every: TRICKLE_EVERY,
++            },
++        },
++        BodyFault::Cut => Script {
++            response: ok_with_length(request_id, declared, &document[..SENT_BEFORE_FAULT]),
++            then: Then::Cut,
++        },
++        BodyFault::NotADocument => {
++            Script::ended(ok_with_length(request_id, document.len(), &document))
++        }
++    }
++}
++
++/// Every probe whose answer can carry a body: a HEAD's never does.
++fn bodied_probes() -> Vec<Probe> {
++    probe_cases()
++        .into_iter()
++        .map(|case| case.probe)
++        .filter(|probe| *probe != Probe::HeadBucket)
++        .collect()
++}
++
++#[tokio::test]
++async fn a_probe_answered_200_keeps_its_200_when_the_body_stalls_trickles_is_cut_or_is_unreadable()
++{
++    let mut cases = JoinSet::new();
++    for probe in bodied_probes() {
++        for fault in BODY_FAULTS {
++            let probe = probe.clone();
++            cases.spawn(async move {
++                let request_id = format!("{}-{fault:?}", probe.operation());
++                let mut endpoint =
++                    Endpoint::start(vec![fault_script(&probe, fault, &request_id)]).await;
++                let client = client(endpoint.addr, short_deadlines());
++                let outcome = timeout(STALL, client.probe(&probe)).await;
++                drop(client);
++                let _ = endpoint.heads().await;
++                (probe, fault, request_id, outcome)
++            });
++        }
++    }
++    let mut failures = Vec::new();
++    while let Some(joined) = cases.join_next().await {
++        let (probe, fault, request_id, outcome) = joined.expect("a case task");
++        let case = format!("{} {fault:?}", probe.operation());
++        let answer = match outcome {
++            Err(_) => {
++                failures.push(format!("{case}: no outcome within {STALL:?}"));
++                continue;
++            }
++            Ok(Err(e)) => {
++                failures.push(format!("{case}: the 200 head was lost: {e:?}"));
++                continue;
++            }
++            Ok(Ok(answer)) => answer,
++        };
++        if answer.head.status != 200 || answer.head.request_id() != Some(request_id.as_str()) {
++            failures.push(format!("{case}: not the 200 the endpoint sent: {answer:?}"));
++            continue;
++        }
++        let sent = SENT_BEFORE_FAULT as u64;
++        let fits = match (&answer.outcome, fault) {
++            (
++                Outcome::BodyFailed(BodyFailure::Timeout {
++                    phase: Phase::BodyIdle,
++                    limit,
++                    received,
++                }),
++                BodyFault::Stall,
++            ) => *limit == SHORT_IDLE && *received == sent,
++            (
++                Outcome::BodyFailed(BodyFailure::Timeout {
++                    phase: Phase::Body,
++                    limit,
++                    received,
++                }),
++                BodyFault::Trickle,
++            ) => *limit == SHORT_BODY && *received > 0,
++            (Outcome::BodyFailed(BodyFailure::Transport { received, detail }), BodyFault::Cut) => {
++                *received <= sent && !detail.is_empty()
++            }
++            (Outcome::Unreadable { body, detail }, BodyFault::NotADocument) => {
++                body[..] == cut_document(&probe)[..] && !detail.is_empty()
++            }
++            _ => false,
++        };
++        if fits {
++            eprintln!("GREEN {case}: {answer}");
++        } else {
++            failures.push(format!(
++                "{case}: the wrong failure beside the 200: {answer:?}"
++            ));
++        }
++    }
++    assert!(
++        failures.is_empty(),
++        "{} case(s) lost or misreported the 200:\n{}",
++        failures.len(),
++        failures.join("\n")
++    );
++}
++
++// --- (D) unreadable listings and delete results are refused --------------------------------
++
++fn contents(key: &str, size: u64) -> String {
++    format!(
++        "<Contents><Key>{key}</Key><LastModified>2026-10-22T00:00:00.000Z</LastModified>\
++         <ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag><Size>{size}</Size>\
++         <StorageClass>STANDARD</StorageClass></Contents>"
++    )
++}
++
++/// A whole `ListObjectsV2` page of `keys`; truncated, with `token`, when `token` is given.
++fn listing_v2(keys: &[&str], token: Option<&str>) -> String {
++    let entries: String = keys.iter().map(|key| contents(key, 7)).collect();
++    let next = token.map_or(String::new(), |token| {
++        format!("<NextContinuationToken>{token}</NextContinuationToken>")
++    });
++    format!(
++        "{XML_DECL}<ListBucketResult xmlns=\"{S3_NS}\"><Name>{BUCKET}</Name>\
++         <Prefix>list/</Prefix><KeyCount>{}</KeyCount><MaxKeys>2</MaxKeys>\
++         <IsTruncated>{}</IsTruncated>{entries}{next}</ListBucketResult>",
++        keys.len(),
++        token.is_some()
++    )
++}
++
++/// A whole `ListObjects` (version 1) page of `keys`, not truncated.
++fn listing_v1(keys: &[&str]) -> String {
++    let entries: String = keys.iter().map(|key| contents(key, 7)).collect();
++    format!(
++        "{XML_DECL}<ListBucketResult xmlns=\"{S3_NS}\"><Name>{BUCKET}</Name>\
++         <Prefix>list/</Prefix><Marker></Marker><MaxKeys>2</MaxKeys>\
++         <IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
++    )
++}
++
++/// A whole `<DeleteResult>` reporting `keys` deleted.
++fn delete_result(keys: &[&str]) -> String {
++    let rows: String = keys
++        .iter()
++        .map(|key| format!("<Deleted><Key>{key}</Key></Deleted>"))
++        .collect();
++    format!("{XML_DECL}<DeleteResult xmlns=\"{S3_NS}\">{rows}</DeleteResult>")
++}
++
++/// `document` with a comment after its root that brings it to exactly `len` bytes.
++fn padded(document: &str, len: usize) -> String {
++    let fill = len
++        .checked_sub(document.len() + "<!---->".len())
++        .expect("room for the padding");
++    let padded = format!("{document}<!--{}-->", "a".repeat(fill));
++    assert_eq!(padded.len(), len);
++    padded
++}
++
++/// Which verb a (D) case calls.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum DocumentVerb {
++    ListV2,
++    ListV1,
++    Delete,
++}
++
++const DOCUMENT_VERBS: [DocumentVerb; 3] = [
++    DocumentVerb::ListV2,
++    DocumentVerb::ListV1,
++    DocumentVerb::Delete,
++];
++
++impl DocumentVerb {
++    /// A whole, readable document of this verb's result.
++    fn document(self) -> String {
++        match self {
++            Self::ListV2 => listing_v2(&["list/a", "list/b"], None),
++            Self::ListV1 => listing_v1(&["list/a", "list/b"]),
++            Self::Delete => delete_result(&["list/a", "list/b"]),
++        }
++    }
++
++    /// The method and a query parameter of the request this verb sends.
++    fn request(self) -> (&'static str, &'static str) {
++        match self {
++            Self::ListV2 => ("GET", "list-type"),
++            Self::ListV1 => ("GET", "prefix"),
++            Self::Delete => ("POST", "delete"),
++        }
++    }
++}
++
++/// What a (D) verb returned: the entries or rows it read, or why it read none.
++#[derive(Debug)]
++enum Read {
++    Listed(Vec<ListEntry>),
++    Deleted(Vec<DeleteRow>),
++    Listing(ListingError),
++    Delete(NoResult),
++}
++
++async fn call_document_verb(verb: DocumentVerb, client: &S3Client) -> Read {
++    match verb {
++        DocumentVerb::ListV2 => match client.list_objects_v2("list/", 2).await {
++            Ok(listing) => Read::Listed(listing.entries),
++            Err(e) => Read::Listing(e),
++        },
++        DocumentVerb::ListV1 => match client.list_objects_v1("list/", 2).await {
++            Ok(listing) => Read::Listed(listing.entries),
++            Err(e) => Read::Listing(e),
++        },
++        DocumentVerb::Delete => match client.delete_objects(&["list/a", "list/b"]).await {
++            Ok(result) => Read::Deleted(result.rows),
++            Err(e) => Read::Delete(e),
++        },
++    }
++}
++
++/// The answer a (D) refusal kept, when it is one of page `page` (listings) or of the one
++/// request (delete).
++fn refused_answer(read: &Read, page: usize) -> Option<&Answer> {
++    match read {
++        Read::Listing(ListingError::Page {
++            page: failed,
++            cause: NoResult::Answered(answer),
++        }) if *failed == page => Some(answer),
++        Read::Delete(NoResult::Answered(answer)) => Some(answer),
++        _ => None,
++    }
++}
++
++/// How a (D) case's body must be refused.
++#[derive(Clone, Copy, Debug)]
++enum Refused {
++    /// Read whole, and not one whole document of the verb's result.
++    Unreadable,
++    /// Bytes past the end the framing marks.
++    Overrun,
++    /// Past the buffered budget.
++    OverBudget,
++}
++
++fn refused_as(answer: &Answer, how: Refused) -> bool {
++    match (&answer.outcome, how) {
++        (Outcome::Unreadable { detail, .. }, Refused::Unreadable) => !detail.is_empty(),
++        (Outcome::BodyFailed(BodyFailure::Overrun { after, .. }), Refused::Overrun) => *after > 0,
++        (Outcome::BodyFailed(BodyFailure::OverBudget { received }), Refused::OverBudget) => {
++            *received > BUFFERED_BODY_BUDGET
++        }
++        _ => false,
++    }
++}
++
++#[tokio::test]
++async fn listing_and_delete_result_documents_that_are_not_whole_are_refused_never_partial() {
++    let budget = usize::try_from(BUFFERED_BODY_BUDGET).expect("the budget fits usize");
++    let mut failures = Vec::new();
++    for verb in DOCUMENT_VERBS {
++        let doc = verb.document();
++        let id = |case: &str| format!("{verb:?}-{case}");
++        let over = padded(&doc, budget + 1);
++        let cut = &doc[..doc.len() - 20];
++        let junk = format!("{doc}junk");
++        let twice = format!("{doc}{doc}");
++        let cases: Vec<(&str, Vec<u8>, Refused)> = vec![
++            (
++                "cut-short",
++                ok_with_length(&id("cut-short"), cut.len(), cut.as_bytes()),
++                Refused::Unreadable,
++            ),
++            (
++                "followed-by-junk",
++                ok_with_length(&id("followed-by-junk"), junk.len(), junk.as_bytes()),
++                Refused::Unreadable,
++            ),
++            (
++                "a-second-document",
++                ok_with_length(&id("a-second-document"), twice.len(), twice.as_bytes()),
++                Refused::Unreadable,
++            ),
++            (
++                "bytes-after-content-length",
++                ok_with_length(
++                    &id("bytes-after-content-length"),
++                    doc.len(),
++                    junk.as_bytes(),
++                ),
++                Refused::Overrun,
++            ),
++            (
++                "over-budget-with-length",
++                ok_with_length(&id("over-budget-with-length"), over.len(), over.as_bytes()),
++                Refused::OverBudget,
++            ),
++            (
++                "over-budget-chunked",
++                ok_chunked(&id("over-budget-chunked"), over.as_bytes()),
++                Refused::OverBudget,
++            ),
++        ];
++        for (case, response, how) in cases {
++            let name = format!("{verb:?} {case}");
++            let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
++            let client = client(endpoint.addr, deadlines());
++            let read = bounded(&name, call_document_verb(verb, &client)).await;
++            drop(client);
++            let heads = endpoint.heads().await;
++            let (method, query_param) = verb.request();
++            let [request] = heads.as_slice() else {
++                failures.push(format!("{name}: expected one request, saw {heads:?}"));
++                continue;
++            };
++            let (sent_method, _, query) = request_line(request);
++            if sent_method != method || !query_has(query, query_param) {
++                failures.push(format!("{name}: not the verb's request: {request}"));
++                continue;
++            }
++            match refused_answer(&read, 1) {
++                Some(answer)
++                    if answer.head.status == 200
++                        && answer.head.request_id() == Some(id(case).as_str())
++                        && refused_as(answer, how) =>
++                {
++                    eprintln!("GREEN {name}: {answer}");
++                }
++                _ => failures.push(format!("{name}: not refused as {how:?}: {read:?}")),
++            }
++        }
++
++        // A document of exactly the budget is read.
++        let exact = padded(&doc, budget);
++        let mut endpoint = Endpoint::start(vec![Script::ended(ok_with_length(
++            &id("exactly-the-budget"),
++            exact.len(),
++            exact.as_bytes(),
++        ))])
++        .await;
++        let client = client(endpoint.addr, deadlines());
++        let read = bounded("exactly the budget", call_document_verb(verb, &client)).await;
++        drop(client);
++        let _ = endpoint.heads().await;
++        match read {
++            Read::Listed(entries) if entries.len() == 2 => {}
++            Read::Deleted(rows) if rows.len() == 2 => {}
++            other => failures.push(format!(
++                "{verb:?} exactly the budget: not read whole: {other:?}"
++            )),
++        }
++    }
++    assert!(
++        failures.is_empty(),
++        "{} case(s) not refused as they must be:\n{}",
++        failures.len(),
++        failures.join("\n")
++    );
++}
++
++#[tokio::test]
++async fn a_listing_whose_later_page_is_unreadable_reports_no_listing_at_all() {
++    let first = listing_v2(&["list/a", "list/b"], Some("page-two"));
++    let second = listing_v2(&["list/c"], None);
++    let cut = &second[..second.len() - 20];
++    let mut endpoint = Endpoint::start(vec![
++        Script::ended(ok_with_length("page-1", first.len(), first.as_bytes())),
++        Script::ended(ok_with_length("page-2", cut.len(), cut.as_bytes())),
++    ])
++    .await;
++    let client = client(endpoint.addr, deadlines());
++    let listed = bounded("ListObjectsV2", client.list_objects_v2("list/", 2)).await;
++    drop(client);
++    let heads = endpoint.heads().await;
++    assert_eq!(
++        heads.len(),
++        2,
++        "the client asked for the second page: {heads:?}"
++    );
++    let (_, _, query) = request_line(&heads[1]);
++    assert!(
++        query_has(query, "continuation-token"),
++        "the second request continues from the first page's token: {}",
++        heads[1]
++    );
++    match listed {
++        Err(ListingError::Page {
++            page: 2,
++            cause: NoResult::Answered(answer),
++        }) => {
++            assert_eq!(answer.head.status, 200, "{answer:?}");
++            assert_eq!(answer.head.request_id(), Some("page-2"));
++            assert!(
++                matches!(answer.outcome, Outcome::Unreadable { .. }),
++                "{answer:?}"
++            );
++        }
++        other => panic!("a cut second page must fail the whole listing: {other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn a_truncated_listing_page_that_names_nothing_to_continue_from_is_refused() {
++    // Truncated, with keys, and no <NextContinuationToken>: V2 cannot continue.
++    let page = listing_v2(&["list/a", "list/b"], Some("x"))
++        .replace("<NextContinuationToken>x</NextContinuationToken>", "");
++    let mut endpoint = Endpoint::start(vec![Script::ended(ok_with_length(
++        "truncated",
++        page.len(),
++        page.as_bytes(),
++    ))])
++    .await;
++    let client = client(endpoint.addr, deadlines());
++    let listed = bounded("ListObjectsV2", client.list_objects_v2("list/", 2)).await;
++    drop(client);
++    let _ = endpoint.heads().await;
++    match listed {
++        Err(ListingError::Page {
++            page: 1,
++            cause: NoResult::Answered(answer),
++        }) if answer.head.status == 200 => {
++            assert!(
++                matches!(&answer.outcome, Outcome::Unreadable { detail, .. }
++                    if detail.contains("NextContinuationToken")),
++                "{answer:?}"
++            );
++        }
++        other => panic!("a truncated page with no continuation must be refused: {other:?}"),
++    }
++}
++
++// --- (F) a mixed <DeleteResult> is reported row by row -------------------------------------
++
++#[tokio::test]
++async fn a_mixed_delete_result_is_reported_row_by_row_in_document_order() {
++    let document = format!(
++        "{XML_DECL}<DeleteResult xmlns=\"{S3_NS}\">\
++         <Deleted><Key>mixed/a</Key></Deleted>\
++         <Error><Key>mixed/b</Key><Code>AccessDenied</Code><Message>Access Denied</Message>\
++         </Error>\
++         <Deleted><Key>mixed/c</Key></Deleted>\
++         </DeleteResult>"
++    );
++    let mut endpoint = Endpoint::start(vec![Script::ended(ok_with_length(
++        "mixed",
++        document.len(),
++        document.as_bytes(),
++    ))])
++    .await;
++    let client = client(endpoint.addr, deadlines());
++    let keys = ["mixed/a", "mixed/b", "mixed/c"];
++    let result = bounded("DeleteObjects", client.delete_objects(&keys)).await;
++    drop(client);
++    let heads = endpoint.heads().await;
++    let (method, path, query) = request_line(&heads[0]);
++    assert_eq!((method, path), ("POST", format!("/{BUCKET}/").as_str()));
++    assert!(query_has(query, "delete"), "{}", heads[0]);
++
++    let result = result.unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
++    assert_eq!(result.head.status, 200);
++    assert_eq!(result.head.request_id(), Some("mixed"));
++    let denied = KeyError {
++        key: "mixed/b".to_string(),
++        code: ErrorCode::Code("AccessDenied".to_string()),
++        message: Some("Access Denied".to_string()),
++    };
++    assert_eq!(
++        result.rows,
++        [
++            DeleteRow::Deleted {
++                key: "mixed/a".to_string()
++            },
++            DeleteRow::Error(denied.clone()),
++            DeleteRow::Deleted {
++                key: "mixed/c".to_string()
++            },
++        ],
++        "every row, as sent, in document order"
++    );
++    assert_eq!(
++        result.deleted().collect::<Vec<_>>(),
++        ["mixed/a", "mixed/c"],
++        "exactly the two deleted keys"
++    );
++    assert_eq!(
++        result.errors().cloned().collect::<Vec<_>>(),
++        [denied],
++        "exactly the one error row, its key, code and message as sent"
++    );
++}
