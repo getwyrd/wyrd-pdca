@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/src/multipart/commit.rs:666`: `judge_session` treats every decodable non-`Open` record as an irreversible fence without checking its epoch. Legal transitions must increase the epoch (`crates/core/src/multipart.rs:2582`). With a commit held at `Open@E`, a damaged `Aborting@E` (or older) makes `Doubt::session_seen` mark it unable to land; the following held-slot read clears the doubt and the call returns `NoSuchUpload`. Restoring the required `Open@E` bytes then lets that held commit land. The same helper affects compensation. Check epoch monotonicity for every changed session state, preserve doubt on invalid transitions, and extend the damage regressions to non-`Open` records at equal/lower epochs, including repair between reads. This confirms the finding recorded in the frozen T4 gate log.
+
+No additional correctness findings or actionable reuse, simplification, or efficiency changes found. Reviewed target source and frozen gate evidence; no builds were rerun.
+
+<!-- pdca:leaf-complete -->

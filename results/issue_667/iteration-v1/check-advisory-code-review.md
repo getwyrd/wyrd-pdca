@@ -1,0 +1,8 @@
+- NEEDS-HUMAN [impl] — `crates/server/tests/s3_multipart_routing.rs:434`: `decode_chunked` returns success immediately after the zero-size chunk line. A response with the expected body followed by `0\r\n` and EOF therefore passes despite missing the terminal CRLF; incomplete trailers are likewise ignored. Validate the trailer section and its terminating empty line before returning. The existing decoder at `crates/server/tests/multipart_gateway_seam.rs:575` already handles this and could be factored into shared test support.
+
+- NEEDS-HUMAN [impl] — `crates/server/tests/s3_multipart_routing.rs:130`: the server's `JoinHandle` is discarded, so dropping `Served` removes its chunk-store directory without cancelling the server that owns that store and listener. Cancellation is left to runtime teardown, contrary to the rubric's abort-on-drop requirement. Retain the handle in `Served` and abort it in `Drop`, following `crates/server/tests/s3_key_length_limit.rs:118`.
+
+- NEEDS-HUMAN [impl] — `crates/gateway-s3/src/lib.rs:619`: optional efficiency/simplification: classification scans the decoded parameters separately for each multipart key, collects all matching values into temporary vectors, then builds another vector of present keys. Only presence, the first value, and duplicate counts are needed. Fixed slots populated in one pass would avoid these intermediate collections; build the key-name list only for the malformed-shape error. This is a cleanup opportunity, not a routing correctness defect.
+
+No production routing correctness regression found. Assessment used the target source and frozen gate evidence; gates were not rerun.
+<!-- pdca:leaf-complete -->
