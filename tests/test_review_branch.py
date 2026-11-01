@@ -53,6 +53,44 @@ def _f(loc, cls, why, votes=1):
     return {"loc": loc, "cls": cls, "why": why, "votes": votes}
 
 
+def _rec(idx, ok, note, settings="confirmed", applied=(("gpt-6.1-sol", "high"),)):
+    """A run_pass evidence record, as a scripted pass returns it."""
+    return {"pass": idx, "requested": {"model": "gpt-6.1-sol", "effort": "high"},
+            "applied": [{"model": m, "effort": e} for m, e in applied],
+            "settings": settings, "session_id": f"s{idx}", "duration_secs": 1.0,
+            "input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 2,
+            "reasoning_output_tokens": 3, "commands": 1, "answer": note,
+            "usable": ok, "note": note}
+
+
+def _events(answer, session="sess-1", commands=1):
+    """`codex exec --json` stdout for one run that answers ``answer``."""
+    import json
+    lines = [{"type": "thread.started", "thread_id": session}, {"type": "turn.started"}]
+    lines += [{"type": "item.completed", "item": {"id": f"c{n}", "type": "command_execution",
+                                                  "command": "ls", "exit_code": 0}}
+              for n in range(commands)]
+    lines += [{"type": "item.completed", "item": {"id": "m", "type": "agent_message",
+                                                  "text": "Looking at the diff.\n"}},
+              {"type": "item.completed", "item": {"id": "m2", "type": "agent_message",
+                                                  "text": answer}},
+              {"type": "turn.completed", "usage": {
+                  "input_tokens": 1200, "cached_input_tokens": 1000,
+                  "output_tokens": 40, "reasoning_output_tokens": 3400}}]
+    return "".join(json.dumps(x) + "\n" for x in lines)
+
+
+def _session_log(codex_home, session, model="gpt-6.1-sol", effort="high"):
+    """Write the session log codex leaves for ``session``, with one turn_context."""
+    import json
+    d = Path(codex_home) / "sessions" / "2026" / "11" / "01"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"rollout-2026-11-01T02-16-07-{session}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": session}}) + "\n"
+        + json.dumps({"type": "turn_context", "payload": {"model": model, "effort": effort}})
+        + "\n", encoding="utf-8")
+
+
 class ParseFindings(unittest.TestCase):
     def test_parses_a_finding_line(self):
         out = rb.parse_findings("crates/x.rs:12 | BUG | off-by-one in the loop")
@@ -180,44 +218,62 @@ class Rejections(unittest.TestCase):
 
 
 class RunPassUsability(unittest.TestCase):
-    """A pass is usable only with a parseable finding or the sentinel; it runs
-    in the target checkout."""
+    """A pass is usable only with a parseable finding or the sentinel, read from
+    the final message of the `--json` stream, and only when its session log
+    confirms the requested model and effort; it runs in the target checkout."""
 
-    def _proc(self, stdout="", returncode=0, raises=None):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        _session_log(self.home, "sess-1")
+        self._env = mock.patch.dict(os.environ, {"CODEX_HOME": self.home})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _proc(self, answer="", returncode=0, raises=None, stdout=None):
         def fake(*a, **k):
-            self._kwargs = k
+            self._argv, self._kwargs = a[0], k
             if raises:
                 raise raises
-            return subprocess.CompletedProcess(a, returncode, stdout=stdout, stderr="err")
+            out = _events(answer) if stdout is None else stdout
+            return subprocess.CompletedProcess(a, returncode, stdout=out, stderr="err")
         return fake
 
     def test_findings_make_a_pass_usable(self):
         with mock.patch("subprocess.run", self._proc("f:1 | BUG | boom")):
-            idx, ok, findings, note = rb.run_pass(1, "p", 60, Path("/tgt"))
+            idx, ok, findings, note, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
         self.assertTrue(ok)
         self.assertEqual(findings[0]["cls"], "BUG")
+        self.assertEqual(rec["settings"], "confirmed")
 
     def test_no_findings_sentinel_is_usable_and_clean(self):
         with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
-            _, ok, findings, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
+            _, ok, findings, _, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
         self.assertTrue(ok)
         self.assertEqual(findings, [])
 
     def test_malformed_nonempty_output_is_unusable(self):
         with mock.patch("subprocess.run", self._proc('{"json": true} explanatory prose')):
-            _, ok, _, note = rb.run_pass(1, "p", 60, Path("/tgt"))
+            _, ok, _, note, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
         self.assertFalse(ok)
         self.assertIn("unusable", note)
 
+    def test_raw_non_json_stdout_is_not_read_as_an_answer(self):
+        # Plain `codex exec` output (no event stream) must not certify: the
+        # answer comes only from the --json events.
+        with mock.patch("subprocess.run", self._proc(stdout="NO FINDINGS\n")):
+            _, ok, _, _, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
+        self.assertFalse(ok)
+
     def test_nonzero_exit_is_unusable(self):
         with mock.patch("subprocess.run", self._proc("", returncode=1)):
-            _, ok, _, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
+            _, ok, _, _, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
         self.assertFalse(ok)
+        self.assertIsNone(rec["settings"])       # a crash is not a settings problem
 
     def test_timeout_is_unusable(self):
         with mock.patch("subprocess.run",
                         self._proc(raises=subprocess.TimeoutExpired("codex", 60))):
-            _, ok, _, note = rb.run_pass(1, "p", 60, Path("/tgt"))
+            _, ok, _, note, _ = rb.run_pass(1, "p", 60, Path("/tgt"))
         self.assertFalse(ok)
         self.assertIn("timed out", note)
 
@@ -225,6 +281,80 @@ class RunPassUsability(unittest.TestCase):
         with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
             rb.run_pass(1, "p", 60, Path("/some/target"))
         self.assertEqual(self._kwargs.get("cwd"), "/some/target")
+
+    def test_command_pins_the_default_model_and_effort(self):
+        with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
+            rb.run_pass(1, "p", 60, Path("/tgt"))
+        argv = self._argv
+        self.assertEqual(argv[argv.index("-m") + 1], rb.DEFAULT_MODEL)
+        self.assertIn(f'model_reasoning_effort="{rb.DEFAULT_EFFORT}"', argv)
+        self.assertEqual(argv[argv.index("-c") - 2], "-m")
+        self.assertIn("--json", argv)
+        self.assertEqual(argv[-1], "-")
+        self.assertEqual((rb.DEFAULT_MODEL, rb.DEFAULT_EFFORT), ("gpt-6.1-sol", "high"))
+
+    def test_command_carries_an_override(self):
+        _session_log(self.home, "sess-1", model="m-test", effort="low")
+        with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
+            _, ok, _, _, rec = rb.run_pass(1, "p", 60, Path("/tgt"), model="m-test",
+                                           effort="low")
+        self.assertTrue(ok)
+        self.assertEqual(self._argv[self._argv.index("-m") + 1], "m-test")
+        self.assertIn('model_reasoning_effort="low"', self._argv)
+        self.assertEqual(rec["requested"], {"model": "m-test", "effort": "low"})
+
+    def test_an_effort_mismatch_is_not_usable(self):
+        # The unpinned failure mode: codex ran the model with effort None.
+        _session_log(self.home, "sess-1", effort=None)
+        with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
+            _, ok, _, note, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
+        self.assertFalse(ok)
+        self.assertEqual(rec["settings"], "mismatch")
+        self.assertIn("ran with gpt-6.1-sol/None", note)
+
+    def test_a_model_mismatch_is_not_usable(self):
+        _session_log(self.home, "sess-1", model="gpt-6-astra")
+        with mock.patch("subprocess.run", self._proc("f:1 | BUG | boom")):
+            _, ok, findings, _, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
+        self.assertFalse(ok)
+        self.assertEqual(findings, [])
+        self.assertEqual(rec["settings"], "mismatch")
+
+    def test_a_missing_session_log_leaves_the_settings_unconfirmed(self):
+        with mock.patch("subprocess.run", self._proc("NO FINDINGS", stdout=_events(
+                "NO FINDINGS", session="no-such-session"))):
+            _, ok, _, note, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
+        self.assertFalse(ok)
+        self.assertEqual(rec["settings"], "unconfirmed")
+        self.assertIn("unconfirmed", note)
+
+    def test_evidence_record_carries_usage_and_the_final_answer(self):
+        with mock.patch("subprocess.run", self._proc("NO FINDINGS")):
+            _, _, _, _, rec = rb.run_pass(1, "p", 60, Path("/tgt"))
+        self.assertEqual(rec["session_id"], "sess-1")
+        self.assertEqual(rec["applied"], [{"model": "gpt-6.1-sol", "effort": "high"}])
+        self.assertEqual((rec["input_tokens"], rec["reasoning_output_tokens"]), (1200, 3400))
+        self.assertEqual(rec["commands"], 1)
+        self.assertEqual(rec["answer"], "NO FINDINGS")    # the LAST message, not the first
+        self.assertIsNotNone(rec["duration_secs"])
+
+
+class ParseEvents(unittest.TestCase):
+    """The --json stream parser feeds the same finding parser plain stdout did."""
+
+    def test_final_message_findings_parse(self):
+        ev = rb.parse_events(_events("a.rs:3 | BUG | x\nb.rs:4 | TEST-GAP | y", commands=3))
+        self.assertEqual([f["loc"] for f in rb.parse_findings(ev["answer"])], ["a.rs:3", "b.rs:4"])
+        self.assertEqual(ev["commands"], 3)
+
+    def test_garbage_lines_are_ignored(self):
+        ev = rb.parse_events("not json\n[1,2]\n" + _events("NO FINDINGS"))
+        self.assertEqual(ev["answer"], "NO FINDINGS")
+        self.assertEqual(ev["session_id"], "sess-1")
+
+    def test_error_events_are_kept_for_the_note(self):
+        ev = rb.parse_events('{"type": "error", "message": "input_too_large"}\n')
+        self.assertEqual(ev["errors"], ["input_too_large"])
 
 
 class GateIntegration(unittest.TestCase):
@@ -254,9 +384,9 @@ class GateIntegration(unittest.TestCase):
 
     def _run(self, scripted):
         """scripted(idx) -> (usable, findings, note). Returns (rc, stdout, report)."""
-        def fake_run_pass(idx, prompt, timeout, target):
+        def fake_run_pass(idx, prompt, timeout, target, **pin):
             ok, findings, note = scripted(idx)
-            return idx, ok, findings, note
+            return idx, ok, findings, note, _rec(idx, ok, note)
         buf = io.StringIO()
         with mock.patch.object(rb, "run_pass", fake_run_pass), \
                 contextlib.redirect_stdout(buf), \
@@ -339,6 +469,94 @@ class GateIntegration(unittest.TestCase):
             lambda i: (True, [_f("x.rs:1", "BUG", "Add the required DCO sign-off")], "1"))
         self.assertEqual(rc, 0)
         self.assertIn("Auto-dropped", report)
+
+
+class GatePin(GateIntegration):
+    """#276 gate layer: every pass AND retry carries the pin, a pass on other
+    settings never yields a pass verdict, and review-passes.json records it all."""
+
+    def _run_recs(self, scripted, argv=("review-branch", "--bundle")):
+        """scripted(idx, call_no, pin) -> (ok, findings, note, rec). Returns
+        (rc, stdout, passes-json-or-None) and records every call's pin."""
+        import json
+        self.pins, calls = [], {}
+
+        def fake_run_pass(idx, prompt, timeout, target, **pin):
+            calls[idx] = calls.get(idx, 0) + 1
+            self.pins.append((idx, calls[idx], pin))
+            ok, findings, note, rec = scripted(idx, calls[idx], pin)
+            return idx, ok, findings, note, rec
+        buf = io.StringIO()
+        with mock.patch.object(rb, "run_pass", fake_run_pass), \
+                mock.patch.object(sys, "argv", list(argv)), \
+                contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = rb.main()
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+        passes = Path(self.bundle) / "review-passes.json"
+        return rc, buf.getvalue(), (json.loads(passes.read_text()) if passes.is_file() else None)
+
+    def test_every_pass_and_retry_carries_the_configured_pin(self):
+        def scripted(i, n, pin):
+            ok = not (i == 2 and n == 1)           # pass 2 fails once, then recovers
+            return ok, [], "clean" if ok else "transient", _rec(i, ok, "x")
+        rc, _, passes = self._run_recs(scripted, argv=(
+            "review-branch", "--bundle", "--model", "m-x", "--effort", "medium"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.pins), 4)        # 3 passes + 1 retry
+        self.assertTrue(all(p == {"model": "m-x", "effort": "medium"} for _, _, p in self.pins))
+        self.assertIn((2, 2, {"model": "m-x", "effort": "medium"}), self.pins)
+        self.assertEqual(passes["requested"], {"model": "m-x", "effort": "medium"})
+        self.assertEqual([a["attempt"] for a in passes["attempts"] if a["pass"] == 2], [1, 2])
+
+    def test_default_pin_reaches_the_passes(self):
+        rc, _, _ = self._run_recs(lambda i, n, pin: (True, [], "clean", _rec(i, True, "c")))
+        self.assertEqual(rc, 0)
+        self.assertTrue(all(p == {"model": rb.DEFAULT_MODEL, "effort": rb.DEFAULT_EFFORT}
+                            for _, _, p in self.pins))
+
+    def test_a_settings_mismatch_is_unverifiable_never_a_pass(self):
+        # Pass 3 runs on effort None on both attempts, and its answer is clean.
+        def scripted(i, n, pin):
+            if i == 3:
+                return False, [], "pass 3: unusable — requested gpt-6.1-sol/high, ran with " \
+                    "gpt-6.1-sol/None", _rec(i, False, "m", settings="mismatch",
+                                              applied=(("gpt-6.1-sol", None),))
+            return True, [], "clean", _rec(i, True, "c")
+        rc, out, passes = self._run_recs(scripted)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)
+        last = [ln for ln in out.splitlines() if ln.strip()][-1]
+        self.assertTrue(last.startswith(rb.UNVERIFIABLE_MARKER), last)
+        self.assertIn("gpt-6.1-sol/None", last)
+        self.assertEqual(len(passes["attempts"]), 4)  # the retry is on record too
+
+    def test_an_unconfirmed_pass_is_unverifiable_too(self):
+        def scripted(i, n, pin):
+            if i == 1:
+                return False, [], "pass 1: unusable — settings unconfirmed", \
+                    _rec(i, False, "u", settings="unconfirmed", applied=())
+            return True, [], "clean", _rec(i, True, "c")
+        rc, _, _ = self._run_recs(scripted)
+        self.assertEqual(rc, rb.UNVERIFIABLE_RC)
+
+    def test_a_crashed_pass_stays_a_thin_union_failure(self):
+        # A pass that never ran (settings None) is the old thin-union red, not §6.
+        def scripted(i, n, pin):
+            ok = i != 2
+            return ok, [], "x", _rec(i, ok, "x", settings="confirmed" if ok else None)
+        rc, _, passes = self._run_recs(scripted)
+        self.assertNotIn(rc, (0, rb.UNVERIFIABLE_RC))
+        self.assertIsNotNone(passes)               # evidence survives the refusal
+
+    def test_report_names_the_pin_and_the_patch_hash(self):
+        import hashlib
+        self._run_recs(lambda i, n, pin: (True, [], "clean", _rec(i, True, "c")))
+        report = (Path(self.bundle) / "review-batch.md").read_text()
+        self.assertIn("`gpt-6.1-sol` / effort `high`", report)
+        self.assertIn(hashlib.sha256("diff --git a b\n+x".encode()).hexdigest(), report)
+        self.assertEqual(report.count("| gpt-6.1-sol/high |"), 3)
 
 
 class InputCeiling(unittest.TestCase):
@@ -427,10 +645,10 @@ class CeilingIntegration(unittest.TestCase):
         overhead = rb.prompt_bytes(rb.PROMPT_TEMPLATE.format(n=3, rubric="RUBRIC", diff=""))
         self.prompts_seen = []
 
-        def fake_run_pass(idx, prompt, timeout, target):
+        def fake_run_pass(idx, prompt, timeout, target, **pin):
             self.prompts_seen.append(prompt)
             ok, findings, note = scripted(idx)
-            return idx, ok, findings, note
+            return idx, ok, findings, note, _rec(idx, ok, note)
         buf = io.StringIO()
         with mock.patch.object(rb, "CODEX_INPUT_CEILING", overhead + budget), \
                 mock.patch.object(rb, "collect_diff", lambda a, t: diff), \
