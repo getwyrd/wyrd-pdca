@@ -29,6 +29,13 @@ retry each), and treats a pass whose output is neither a parseable finding nor
 the explicit `NO FINDINGS` sentinel as a failed pass, so a garbled or partial
 review is never read as clean.
 
+Every pass runs on a pinned model and reasoning effort (DEFAULT_MODEL /
+DEFAULT_EFFORT, #276), and the gate checks the codex session log to confirm the
+pass actually ran on them: a pass on other settings is not usable, and if that
+survives the retry the row is `unverifiable`, never a pass. Each attempt's
+session id, applied settings, wall time, token usage, command count and answer
+go to `review-passes.json` beside the report.
+
 A diff past the reviewer's input ceiling is handled BEFORE any pass runs (#209
 — issue_635's ~1 MB diff burned three passes plus retries on identical
 `input_too_large` errors, and the gate went red with what read like a review
@@ -57,13 +64,28 @@ instance-owned wrapper is the stopgap until those land (scripts/flow precedent).
 
 import argparse
 import concurrent.futures
+import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
+
+# The passes' model and reasoning effort (#276). Unpinned, `codex exec` ran at whatever
+# Codex defaulted to: the session logs show `effort: None`, and the model changed over
+# time with no trace in the gate's evidence. Calibration 2026-10-31 on issue_927's
+# iteration-v3 patch (a known bug at crates/core/src/multipart/commit.rs:878): default
+# effort caught it in 0 of 3 passes (18-26 s, ~300-390 reasoning tokens); `high` caught it
+# in 2 of 3 (133-191 s, ~3,400-4,200 reasoning tokens). A small sample, but the default
+# was doing almost no reasoning. This is the gate's settings home, next to --passes and
+# --timeout; `--model` / `--effort` override it for a test run. Passed with `-c` on every
+# pass, never by editing ~/.codex/config.toml, which would change every Codex use here.
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_EFFORT = "high"
 
 # Findings whose text matches a rubric-rejected class are dropped from the union
 # (AGENTS.md § Reviewer protocol). These patterns are deliberately NARROW: they
@@ -264,37 +286,147 @@ def segment_file(segment: str) -> str:
     return (first[0][:80] if first else "(empty segment)")
 
 
-def run_pass(idx: int, prompt: str, timeout: int, target) -> tuple[int, bool, list, str]:
-    """One codex review pass -> (idx, usable, findings, note). Prompt goes over
-    stdin (`codex exec -`) so a large diff never hits the argv size limit
+def codex_argv(model: str, effort: str) -> list[str]:
+    """The pass command. `--json` makes stdout a JSONL event stream, so the answer
+    is read from it by :func:`parse_events`, not taken as raw stdout."""
+    return ["codex", "exec", "--json", "-m", model,
+            "-c", f'model_reasoning_effort="{effort}"',
+            "--sandbox", "read-only", "--skip-git-repo-check", "-"]
+
+
+def parse_events(stdout: str) -> dict:
+    """What a `codex exec --json` run reports: the session id, the final answer
+    (the last `agent_message`, which is what plain `codex exec` printed), the
+    commands it ran, token usage summed over its turns, and any error messages.
+    Lines that are not JSON events are ignored."""
+    ev = {"session_id": None, "answer": "", "commands": 0, "errors": [],
+          "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+          "reasoning_output_tokens": 0}
+    for line in stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        kind = e.get("type")
+        if kind == "thread.started":
+            ev["session_id"] = e.get("thread_id")
+        elif kind == "item.completed":
+            item = e.get("item") or {}
+            if item.get("type") == "agent_message":
+                ev["answer"] = item.get("text") or ""
+            elif item.get("type") == "command_execution":
+                ev["commands"] += 1
+        elif kind == "turn.completed":
+            usage = e.get("usage") or {}
+            for k in ("input_tokens", "cached_input_tokens", "output_tokens",
+                      "reasoning_output_tokens"):
+                ev[k] += int(usage.get(k) or 0)
+        elif kind in ("error", "turn.failed"):
+            msg = e.get("message") or (e.get("error") or {}).get("message")
+            if msg:
+                ev["errors"].append(str(msg))
+    return ev
+
+
+def find_session_log(session_id: str | None) -> Path | None:
+    """The session log codex wrote for this run: `$CODEX_HOME/sessions/<y>/<m>/<d>/
+    rollout-<time>-<session id>.jsonl` (codex-cli 0.163.0)."""
+    if not session_id:
+        return None
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    hits = sorted((home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl"))
+    return hits[-1] if hits else None
+
+
+def applied_settings(log: Path) -> list[tuple]:
+    """Every distinct (model, effort) the session's turns actually ran with, from the
+    log's `turn_context` records. An unpinned run shows effort None here."""
+    seen: list[tuple] = []
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") == "turn_context":
+            p = e.get("payload") or {}
+            pair = (p.get("model"), p.get("effort"))
+            if pair not in seen:
+                seen.append(pair)
+    return seen
+
+
+def run_pass(idx: int, prompt: str, timeout: int, target, *, model: str = DEFAULT_MODEL,
+             effort: str = DEFAULT_EFFORT) -> tuple[int, bool, list, str, dict]:
+    """One codex review pass -> (idx, usable, findings, note, record). Prompt goes
+    over stdin (`codex exec -`) so a large diff never hits the argv size limit
     (pdca-harness#313).
 
     Runs with `cwd=target` so a pass grounds on the code under review — the
     diff is in the prompt, but a reviewer that inspects unchanged callsites,
     tests, or repo state must read the TARGET checkout, not this harness root.
 
-    USABLE means the pass produced a format-conforming result: at least one
-    parseable finding, OR the explicit `NO FINDINGS` sentinel. A subprocess
-    error, a timeout, or nonempty output with neither (prose, JSON, a mangled
-    location) is NOT usable — it is never counted toward the promised N and
-    never read as clean."""
+    USABLE means the pass ran with the requested model and effort AND produced
+    a format-conforming result: at least one parseable finding, OR the explicit
+    `NO FINDINGS` sentinel. A subprocess error, a timeout, nonempty output with
+    neither (prose, JSON, a mangled location), or a run whose session log does
+    not confirm the requested model and effort (#276) is NOT usable — it is never
+    counted toward the promised N and never read as clean.
+
+    `record` is this attempt's evidence for review-passes.json: the requested and
+    applied settings, session id, wall time, token usage, command count, answer."""
+    rec = {"pass": idx, "requested": {"model": model, "effort": effort},
+           "applied": None, "settings": None, "session_id": None,
+           "duration_secs": None, "input_tokens": None, "cached_input_tokens": None,
+           "output_tokens": None, "reasoning_output_tokens": None, "commands": None,
+           "answer": None, "usable": False, "note": ""}
+
+    def done(ok, findings, note):
+        rec["usable"], rec["note"] = ok, note
+        return idx, ok, findings, note, rec
+
+    start = time.monotonic()
     try:
         proc = subprocess.run(
-            ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"],
+            codex_argv(model, effort),
             input=prompt, capture_output=True, text=True, timeout=timeout,
             cwd=str(target),
         )
     except subprocess.TimeoutExpired:
-        return idx, False, [], f"pass {idx}: timed out after {timeout}s"
+        rec["duration_secs"] = round(time.monotonic() - start, 1)
+        return done(False, [], f"pass {idx}: timed out after {timeout}s")
+    rec["duration_secs"] = round(time.monotonic() - start, 1)
+    ev = parse_events(proc.stdout)
+    rec.update({k: ev[k] for k in ("session_id", "input_tokens", "cached_input_tokens",
+                                   "output_tokens", "reasoning_output_tokens", "commands",
+                                   "answer")})
     if proc.returncode != 0:
-        return idx, False, [], f"pass {idx}: exit {proc.returncode} — {proc.stderr.strip()[-300:]}"
-    findings = parse_findings(proc.stdout)
+        why = "; ".join(ev["errors"]) or proc.stderr.strip()
+        return done(False, [], f"pass {idx}: exit {proc.returncode} — {why[-300:]}")
+
+    log = find_session_log(ev["session_id"])
+    if log is None:
+        rec["settings"] = "unconfirmed"
+        return done(False, [], f"pass {idx}: unusable — no codex session log for session "
+                               f"{ev['session_id']}, so the model/effort it ran with is "
+                               f"unconfirmed")
+    applied = applied_settings(log)
+    rec["applied"] = [{"model": m, "effort": e} for m, e in applied]
+    if applied != [(model, effort)]:
+        rec["settings"] = "mismatch"
+        got = ", ".join(f"{m}/{e}" for m, e in applied) or "no turn recorded"
+        return done(False, [], f"pass {idx}: unusable — requested {model}/{effort}, "
+                               f"ran with {got}")
+    rec["settings"] = "confirmed"
+
+    findings = parse_findings(ev["answer"])
     if findings:
-        return idx, True, findings, f"pass {idx}: {len(findings)} finding(s)"
-    if NO_FINDINGS_RE.search(proc.stdout):
-        return idx, True, [], f"pass {idx}: clean (NO FINDINGS)"
-    return idx, False, [], (f"pass {idx}: unusable — nonempty output with no parseable "
-                            f"finding and no NO-FINDINGS sentinel")
+        return done(True, findings, f"pass {idx}: {len(findings)} finding(s)")
+    if NO_FINDINGS_RE.search(ev["answer"]):
+        return done(True, [], f"pass {idx}: clean (NO FINDINGS)")
+    return done(False, [], f"pass {idx}: unusable — nonempty output with no parseable "
+                           f"finding and no NO-FINDINGS sentinel")
 
 
 def parse_findings(output: str) -> list[dict]:
@@ -419,6 +551,10 @@ def main() -> int:
                     help="parallel review passes (default 3)")
     ap.add_argument("--timeout", type=int, default=1800,
                     help="per-pass timeout in seconds (default 1800)")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"codex model for every pass (default {DEFAULT_MODEL})")
+    ap.add_argument("--effort", default=DEFAULT_EFFORT,
+                    help=f"codex reasoning effort for every pass (default {DEFAULT_EFFORT})")
     ap.add_argument("--out", help="findings report path "
                     "(default: $PDCA_BUNDLE/review-batch.md or ./review-batch.md)")
     ap.add_argument("--rejected", help="decisions file of "
@@ -465,16 +601,29 @@ def main() -> int:
                for cd in chunk_diffs]
     jobs = [(c, i) for c in range(len(prompts)) for i in range(1, args.passes + 1)]
 
-    def run(pairs):
+    out_path = Path(args.out) if args.out else (
+        Path(os.environ["PDCA_BUNDLE"]) / "review-batch.md"
+        if args.bundle and os.environ.get("PDCA_BUNDLE") else Path("review-batch.md"))
+    passes_path = out_path.with_name("review-passes.json")
+    records: list[dict] = []
+
+    def run(pairs, attempt):
         # Concurrency stays at N (today's level) regardless of chunk count: a
         # chunked run queues chunks behind the same worker pool rather than
         # multiplying parallel codex processes.
         def one(job):
             c, i = job
-            idx, ok, findings, note = run_pass(i, prompts[c], args.timeout, target)
+            idx, ok, findings, note, rec = run_pass(i, prompts[c], args.timeout, target,
+                                                    model=args.model, effort=args.effort)
             if len(prompts) > 1:
                 note = f"chunk {c + 1}/{len(prompts)} {note}"
-            return job, ok, findings, note
+            rec = {**rec, "chunk": c + 1, "attempt": attempt, "note": note}
+            # Every attempt, clean ones included, goes to the gate log (#276).
+            print(f"review-branch: {'retry ' if attempt > 1 else ''}{note} "
+                  f"[{rec['applied'] or 'applied unconfirmed'}; "
+                  f"{rec['duration_secs']}s; reasoning {rec['reasoning_output_tokens']} tok; "
+                  f"session {rec['session_id']}]", file=sys.stderr)
+            return job, ok, findings, rec
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, min(len(pairs), args.passes))) as pool:
             return list(pool.map(one, pairs))
@@ -483,17 +632,42 @@ def main() -> int:
     # result — a gating review must not silently certify a thinner union than
     # requested when the reviewer is transiently failing.
     usable: dict[tuple, list] = {}
-    for job, ok, findings, note in run(jobs):
-        (usable.__setitem__(job, findings) if ok
-         else print(f"review-branch: {note}", file=sys.stderr))
+    last_rec: dict[tuple, dict] = {}
+    for job, ok, findings, rec in run(jobs, 1):
+        records.append(rec)
+        last_rec[job] = rec
+        if ok:
+            usable[job] = findings
     missing = [j for j in jobs if j not in usable]
     if missing:
         print(f"review-branch: retrying {len(missing)} pass(es) once", file=sys.stderr)
-        for job, ok, findings, note in run(missing):
+        for job, ok, findings, rec in run(missing, 2):
+            records.append(rec)
+            last_rec[job] = rec
             if ok:
                 usable[job] = findings
-            else:
-                print(f"review-branch: retry {note}", file=sys.stderr)
+
+    # The per-pass evidence (#276), written before any verdict so a refused or
+    # unverifiable run keeps it too.
+    patch_sha256 = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+    records.sort(key=lambda r: (r["chunk"], r["pass"], r["attempt"]))
+    passes_path.write_text(json.dumps({
+        "requested": {"model": args.model, "effort": args.effort},
+        "patch_sha256": patch_sha256, "chunks": len(prompts), "passes": args.passes,
+        "attempts": records,
+    }, indent=2) + "\n", encoding="utf-8")
+
+    # A pass that ran on other settings than requested is not a weaker review of
+    # this diff, it is a different review: the row must not pass on it, and a
+    # re-run will not fix it, so it is `unverifiable` (§6), not a plain red (#276).
+    wrong = [last_rec[j] for j in jobs if j not in usable
+             and last_rec[j]["settings"] in ("mismatch", "unconfirmed")]
+    if wrong:
+        print(f"{UNVERIFIABLE_MARKER} {len(wrong)} pass(es) did not run with the requested "
+              f"{args.model}/{args.effort} after one retry ("
+              + "; ".join(r["note"] for r in wrong)
+              + f") — no verdict from this review; evidence in {passes_path}")
+        return UNVERIFIABLE_RC
     if len(usable) < len(jobs):
         thin = (f"review-branch: only {len(usable)}/{len(jobs)} passes produced a "
                 f"usable result after one retry — refusing to certify a thinner union. "
@@ -545,13 +719,22 @@ def main() -> int:
     order = {"BUG": 0, "TEST-GAP": 1, "CONVENTION": 2}
     blocking.sort(key=lambda f: (order.get(f["cls"], 3), -f["votes"]))
 
-    out_path = Path(args.out) if args.out else (
-        Path(os.environ["PDCA_BUNDLE"]) / "review-batch.md"
-        if args.bundle and os.environ.get("PDCA_BUNDLE") else Path("review-batch.md"))
     head = (f"# Batched review — {args.passes} passes × {len(prompts)} chunks, "
             "union of findings" if chunked else
             f"# Batched review — {len(usable)} passes, union of findings")
-    lines = [head, ""]
+    lines = [head, "",
+             f"Requested `{args.model}` / effort `{args.effort}`; patch sha256 "
+             f"`{patch_sha256}`; per-pass evidence in `{passes_path.name}`.", "",
+             "| chunk | pass | attempt | applied | secs | input tok | reasoning tok "
+             "| commands | result |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for r in records:
+        applied = ", ".join(f"{a['model']}/{a['effort']}" for a in r["applied"] or []) or "?"
+        lines.append(f"| {r['chunk']} | {r['pass']} | {r['attempt']} | {applied} "
+                     f"| {r['duration_secs']} | {r['input_tokens']} "
+                     f"| {r['reasoning_output_tokens']} | {r['commands']} "
+                     f"| {r['note'].split(': ', 1)[-1]} |")
+    lines.append("")
     if chunked:
         # A chunked run is a degradation, not an equivalent review — each pass saw
         # one chunk, so a defect visible only across two files' changes is lost.
