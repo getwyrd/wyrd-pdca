@@ -1,0 +1,30 @@
+# Adversarial review: #1029 (657.2c), settling a part commit answered unknown
+
+**Bottom line.** I could not refute the core of the fix. Once a commit round is answered unknown, the patch sends nothing more. It answers `Committed` only when a lap finds the slot gone and the session read after that still holds the exact `Open@E` bytes. I could not build a history that gives a false `Committed`. The red→green evidence is real: putting back iteration 2's resend or compensation turns (X) and (X2) red on the C-1 property itself, not just on a count. Two findings remain. Both are about the `may_still_commit` flag, not about safety. The first one is the same issue the gating T4 batch review flagged, and I reproduced it.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **A read fault throws away a lap's earlier evidence, so `may_still_commit` says `true` for a batch that can no longer land.** `read_lap` (`crates/core/src/multipart/commit.rs:848-857`) returns early on the first failed `get`, and `settle` maps that error straight to `doubt.end(...)` (`commit.rs:905-907`). The part read and first session read that already came back are never folded into the doubt (the folds at `commit.rs:915-925` only run on a full lap). Concrete failing case, run as a probe test on the patched tree: a held commit (`may_still_commit: true`); at gap 1 (after the part read) the session rolls back to a newer `Open` epoch, then reads of the slot key fault. The answer is `InDoubt { may_still_commit: true, cause: Store("scripted read fault") }`, and releasing the held batch afterwards answers `Conflict`, so it could never land. A second case gives the same result: a first upload (part key required absent), a rival's part lands before the part read, then the first session read faults. This breaks the field's own contract at `commit.rs:398-401` ("no read since showed it unable to land") and the doc line "says whether the commit may still land" (`docs/design/architecture/05-building-block-view.md:250`). The error points the safe way for C-1 today, so this is not a safety bug. But it is the T4-batch-review gating red (`commit.rs:907/911/927` in its log), and #1030 will build on this flag. Fix: fold each read into `Doubt` as it is made, or return the reads made before the fault. Then add the moved-session-then-fault and rival-then-fault cases next to `c_a_read_fault_at_each_read_under_a_held_commit_keeps_the_doubt` (`crates/core/tests/multipart_upload_part_commit.rs:5147`).
+
+- NEEDS-HUMAN [impl] — **No test covers the first session read's effect on the flag.** Deleting `doubt.seen_session(&judge_session(lap.first.as_ref(), session));` (`commit.rs:922`) leaves all 75 tests green. It changes the answer on a reachable (damage) history. Probe: a held commit; rollback at gap 1; session record erased at gap 3. As shipped this answers `may_still_commit: false, cause: Record(SessionRecordMissing)`; with line 922 removed it answers `true`, and nothing notices. Low severity on its own. Once the first finding's fix folds reads as they are made, though, this line decides the flag on a fault after a moved first read, so the test written for that fix should pin it too.
+
+## Refutation attempts that failed (evidence for the fix)
+
+- **The red→green proof.** C4-verify is only `PASS (green-only)`, so I ran the reds myself on a scratch copy of `$PDCA_TARGET`. Patched tree: 75/75 green. Then one deliberate breakage at a time to `commit.rs`:
+  - The same batch resent after an `OutcomeUnknown` doubt (iteration 2's `Judged::Again`): 17 red. Both `x2_a_*` and `x2_b_*` fail on "at most one of A's commit batches lands" (test `:4864`), so they fail on the double landing, not on a batch count.
+  - A compensation after an `OutcomeUnknown` doubt: (X) and 7 more red.
+  - A compensation after any doubt: the `h_*` legs and the moved-session leg red.
+  - The proof read from the first session read: C2 and the read-gap rollback leg red.
+  - Slot "gone" taken as absent-only: C3′ red.
+  - `Rewritten` taken as gone: the slot-rewritten leg red.
+  - "A changed part is there" taken as `Committed`: 10 red.
+  - `SETTLE_LAPS = 1`: 7 red, including the read-gap landed-then-rival leg, which needs lap 2 to answer `Committed`.
+  - The damage check moved before the proof, or the `PartRecordMissing` arm dropped: (R) red.
+  - The rival-part `cannot_land` dropped: 4 red.
+  - `gone_in_doubt` keeping the flag: `r_a_missing_session_*` red.
+- **Production path, not a mirror.** The legs drive `commit_part` against a real redb store. A held batch is re-checked against that store when it is released (`multipart_upload_part_commit.rs:520-533`), so a held commit's preconditions are judged at landing time, not at send time.
+- **A false `Committed`.** The proof needs nothing but this attempt's own batch to delete its slot under `Open@E`. Only `commit_batch` (`commit.rs:1083`) and `compensation_batch` (`commit.rs:1106`) delete a `slot:` key. Nothing in `stage.rs`, `abort.rs`, `complete.rs` or the custodian does. No compensation comes before the unknown round, because `settle` is only reached from `commit_rounds` (`commit.rs:1357-1366`) before any `refuse`/`unexplained_stop`. A Complete release goes to `Open@E+2` (`complete.rs:650-651`), so the `Open@E` bytes never come back. Another attempt can only put its id at the slot key under `require_absent`, which needs this attempt's slot gone first. I could not build a history where a lap sees slot-gone plus `Open@E` without this attempt's own commit having landed.
+- **A false "cannot land".** I checked each place that lowers the flag: the store said false; the session at a higher epoch (an epoch only rises); a part record where the commit required absence (`0016:351`); session gone with the slot key absent. Each one removes a precondition of the single batch for good, short of damage being repaired. I found no case that reports `false` for a batch that can still land.
+- **C5 timeouts** (`commit.rs:904`, `:955`): all three mutants turn `settle` into an endless loop. The 20 s mutant timeout kills them, so they count as caught, not as survivors.
+
+<!-- pdca:leaf-complete -->
