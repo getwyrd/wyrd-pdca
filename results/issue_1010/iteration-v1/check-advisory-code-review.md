@@ -1,0 +1,7 @@
+- NEEDS-HUMAN [impl] — `crates/core/tests/multipart_complete.rs:5878`: G6 keeps validation successful while the initial fence is held, so it does not verify that recovery skips pre-fence validation. The frozen `gate-logs/C5-mutants.log` confirms that replacing `Doubt::holds` with `false` at `crates/core/src/multipart/complete.rs:1834` survives. Add a held initial fence whose scripted step deletes the bucket, followed by conflicting retries. Assert `InDoubt` and show the held fence can still land afterward. Otherwise this regression can return definitive `NoSuchBucket` while leaving a fence able to land after the response.
+
+- NEEDS-HUMAN [impl] — `crates/core/tests/multipart_complete.rs:5632`: G4 ends in a definite successful publication, which bypasses the doubt bookkeeping; it therefore does not verify that a successful reread clears an out-of-flight unknown outcome. The frozen mutation log confirms that removing `Doubt::settle` at `crates/core/src/multipart/complete.rs:1841` survives. Add an unapplied unknown flip with `may_still_commit: false`, a successful reread, conflicting remaining publication rounds, and a successful release. Assert `Refused(OperationAborted)` and an `Open` session; the surviving regression instead returns `InDoubt` and strands the fence until the reaper.
+
+No introduced production logic defect or actionable reuse, simplification, or efficiency issue identified. Findings are advisory regression-test gaps, based on target-source inspection and frozen gate evidence; gates were not rerun.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/core/tests/multipart_upload_part_commit.rs:6939`: Add a damaged-record case for the new second part read. The frozen C5 log reports that replacing the decode guard at `crates/core/src/multipart/commit.rs:1025` with `true` survives. This changes observable behavior: hold a first-upload commit, erase its slot, plant undecodable part bytes before the second part read, then fault the final session read. The mutant incorrectly clears `may_still_commit`; removing the damaged part bytes and restoring the required slot lets the held commit land. Assert that this history preserves the flag and that the repaired batch lands. Existing held-commit part-damage tests keep the slot held, while the new fault cases read valid part bytes, so neither protects this distinction.
+
+No introduced implementation defect or actionable reuse, simplification, or efficiency issue found. Review used the target source and frozen gate evidence; no builds were rerun.
+
+<!-- pdca:leaf-complete -->
