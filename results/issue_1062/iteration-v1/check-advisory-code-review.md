@@ -1,0 +1,7 @@
+- NEEDS-HUMAN [impl] — `crates/custodian/src/retirement/marks.rs:590` and `crates/custodian/src/retirement/marks.rs:839`: Preserve the obligation when an empty page loses a partially marked record. If a previous step stored `cursor.item > 0` and that last part or segment subsequently disappears, the loop never executes its missing-record check. Both walkers return `Tail::Ended`; `Walk::finish` then deletes the obligation at `crates/custodian/src/retirement/marks.rs:470`, silently abandoning the remaining unmarked positions. Return the existing `RecordUnreadable` hold for this case and add regressions for both range walkers. This confirms the frozen batch-review finding; its three entries describe the same defect.
+
+- NEEDS-HUMAN [impl] — `crates/dst/tests/custodian.rs:6721` and `crates/dst/tests/custodian.rs:6793`: The race test does not require competing commits against the same stale mark. Its winner XOR and campaign flags also pass when one run lets the drain finish before GC reads, and another lets GC swap before the drain first reads `reclaiming`. Neither requires a failed conditional commit or the conflict-triggered re-read the scenario is meant to test. Use the existing `RaceEvent::Commit` outcomes to require a witnessed race with both stale-value attempts, exactly one `Committed` and one `Conflict`; for the GC-wins case, assert the drain's subsequent re-read observes `reclaiming` before GC deletes its key.
+
+No additional actionable reuse, simplification, or efficiency findings.
+
+<!-- pdca:leaf-complete -->
