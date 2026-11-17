@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — `crates/custodian/src/retirement/sessions.rs:673`: An earlier held entry monopolizes `first_left`, discarding a later entry's resumable progress. For example, put an unreadable mark at the first position of the first owned entry, followed by a valid RS(128,128) entry with 256 positions. The first pass marks only 232 positions of the later entry; the bookmark remains absent because the earlier entry's coverage is zero. Every subsequent pass spends its 233 reads on that same unreadable mark and those same 232 positions, so the healthy entry never finishes marking or retires while the unrelated hold persists. Preserve resumable progress for later actionable entries and add a repeated-`reconcile_step` regression combining a held first entry with a wide later entry; the existing wide-entry test at `crates/custodian/tests/multipart_session_terminal.rs:1813` has no preceding hold.
+
+No separate reuse, simplification, or efficiency findings. Reviewed target source and frozen gate evidence; tests were not rerun.
+
+<!-- pdca:leaf-complete -->
