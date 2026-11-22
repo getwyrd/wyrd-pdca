@@ -1,0 +1,48 @@
+# Adversarial review — issue #1014 (orphan-identity gate + retirement routing)
+
+Scope: `patch.diff` against `$PDCA_TARGET` (patch applied in the working tree). Inputs used:
+`brief.md`, `check-gates.json`, `gate-logs/`. I re-ran nothing from the gate set; I built a scratch
+copy of the patched tree and added one test to check finding 1 (shown below).
+
+**Overall verdict: refuted on liveness, not on safety.** I did not find an input that makes GC
+reclaim a fragment too early. I did find an ordinary production interleaving where the cleanup
+never writes its marker. While the marker is missing, GC reclaims nothing at all.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **A delete or overwrite that lands during a cleanup pass discards the whole lap. On a store with steady deletes, the marker is never written.** `crates/custodian/src/orphan_identity.rs:251` reads the reference picture (`Index::read`) once, before the ledger pages at `:854`. Suppose an object the index saw as committed is deleted or overwritten inline (the gate is closed, so this is the normal path) before the page holding its new marks is read. Then `judge` (`:948-951`) picks `Drop` against the stale `Committed` namer. `verified` (`:966-990`) finds the inode gone or no longer naming the slot and returns `None`. `visit` (`:902-907`) then reports the mark `namer-moved` → unsettled. The lap ends with no marker (`:266`, `:287-289`), and the next pass starts a new lap from the head of the ledger. The drop was moot: under a closed gate, every inline writer (`metadata.rs` `with_retirement` inline arm, the superseding commits) rewrites the mark in the same commit that removes the reference. That is exactly the brief's "re-read and found moot" case (brief, Design → Completion), but the code never checks it. **Reproduced:** in a scratch copy of the patched tree, I added a `scan_page(ORPHAN_PREFIX, after=None)` hook to the test file's own `Store` wrapper. The hook runs one production `md::unlink` of a 1-chunk RS(2,1) object per repair pass. Over 10 passes `reconcile_step` returned `Partial` every time, `status()` stayed `Walking { unsettled: true }`, and `migration:orphan-identity` was never written. GC passes at `+100×GRACE` reclaimed **none** of the 30 deleted fragments. Once the deletes stopped, one more pass wrote the marker. Rough rate: each lap expects about (fragments per delete) × (index-relevant deletes per pass, counted between the index read and the page read) unsettled marks, regardless of ledger size. So one 1-chunk RS(6,3) delete per pass gives a lap roughly an e⁻⁹ chance of completing. The pass outcome is `Partial`, not `Blocked`, so nothing escalates. Suggested fix: on `namer-moved`, stop the window *before* that key (`return Ok((lap, false))` without advancing). The next pass then judges it against a fresh index and the lap survives. Or settle as moot when, under the closed gate, the namer was removed by a commit that also wrote the mark. Either way, add a test that lands an inline unlink/overwrite between the index read and the page read and asserts that the marker is still written within a bounded number of passes. The F5 test (`crates/custodian/tests/retirement_routing.rs:1139-1195`) only shows that one race costs one lap, so it passes either way.
+
+- NEEDS-HUMAN [human] — **"Only delays reclamation" is not true as built. The closed gate stops all GC reclamation, and several ordinary states keep it closed with no bound.** `crates/custodian/src/gc.rs:691-695` holds every `Stamped` or `Reclaiming` mark while the gate is closed. On the base, GC reclaimed inline-unlink marks once their grace passed. The new runtime doc says the closed gate "only delays reclamation" (`docs/design/architecture/06-runtime-view.md`, added paragraph). In fact the delay has no bound in each of these cases:
+  - Finding 1 on any busy store.
+  - Any damaged `retire:bytes:` value, or any `Completed` session's `retire:records:` value (`orphan_identity.rs:619-626`, `:781-786`). These block the cleanup, yet the base GC never reads them, so they never stopped reclamation before.
+  - After every metadata restore, until a new lap completes.
+
+  While the gate is closed the `orphan:` ledger only grows, so each lap gets longer. The brief does ask for "GC treats every mark as protecting" (Design, Scope), so this is a fitness question for sign-off, not a code slip. Options: the closed gate could switch off only the keyed lookup and the routing (keep the base's stamp-only reclaim for inline marks); or a cleanup stuck past N laps could surface as `Blocked` or an alert rather than `Partial`.
+
+- NEEDS-HUMAN [impl] — **Confirming T4: the per-mark read reservation is one short, and the shortfall underflows.** `READS_PER_MARK = 1 + ATTEMPTS_PER_DROP * 3 = 7` (`orphan_identity.rs:142`). But the retirement-token lookup at `:937-938` runs on **each** attempt, using an unchecked `-=`, and so does the conflict re-read at `:920`. Trace with `reads_left == 7` at the guard (`:863`): attempt 1 is token (6), `verified` 2 reads (4, via `saturating_sub` at `:1081`), conflict (3). Attempt 2 is token (2), `verified` (0), conflict: `0 - 1`. That panics under overflow checks (tests/debug). In release it wraps to `usize::MAX` (no `[profile]` override in `Cargo.toml`), which disables the per-pass read bound for the rest of the pass. Reaching it needs a structured mark whose obligation is gone, judged `Drop`, and losing both commits. Fix: reserve 8 (`ATTEMPTS_PER_DROP * 4`) or move the token lookup out of the retry loop, and use `saturating_sub` or `checked_sub` at `:920` and `:938`.
+
+- NEEDS-HUMAN [impl] — **Confirming T4: an undecodable session record is treated as live, and that throws away the trap's evidence.** `orphan_identity.rs:540-541` maps a session that will not decode to `Phase::Unknown`. `:563` classes its parts as `Staged`, and `:1053-1054` treats `Unknown` as live, so a mark on such a part is **dropped**. Failing case: a `Completed` session publishes part 1. The inline `unlink` writes the trap mark (F3's fixture). Then the `mpu:` value is damaged. The cleanup drops the trap mark, pinned on the damaged bytes. A human repairs the record back to `Completed`, the records drain deletes `part:` without marking, and the fragments end with no mark and no reference, which GC keeps forever (`gc.rs:761`). That breaks the brief's F3 rule "No fragment is left with no mark and no reference". `Unknown` should be `Leave` (no write) or a blocker, not a drop.
+
+- NEEDS-HUMAN [impl] — **Surviving mutants show the new test file never exercises paths that decide drop vs keep. Broken code there leaves a stale mark on a live fragment, which is the exact hazard the gate exists to prevent.** These mutants were run against the custodian test suite, `retirement_routing.rs` included (`gate-logs/C5-mutants.log`):
+  - `Index::read_segments -> Ok(())` (`orphan_identity.rs:744`) and deleting the `(ChunkMap::Segmented, Some(seg))` arm of `verified` (`:981`) both survive. No test puts a stale mark on a **committed segmented** object's fragment, although routing a segmented `unlink` is new in this diff (A3).
+  - Flipping the class ranking (`<` → `>`/`<=`/`==` at `:469`, `:505`, `:517`) survives. No test has one position named by two classes. The normal state right after a Complete is such a case: the inode and the published `part:` records name the same chunks, and the ranking alone decides `Drop` (committed) versus `Keep` (published).
+  - The resume guard `walk.is_current(..) && !walk.is_ended()` → `false` (`:245`) and `CleanupWalk::is_current -> true` (`crates/core/src/orphan_identity.rs:167`, core-side) both survive. No test has a lap that spans more than one pass (every fixture is under `MARKS_PER_PASS`), and no test lands a restore **mid-lap**. F7 (`retirement_routing.rs:1291`) only restores after the marker exists.
+  - Every pagination "next page" arm survives (`:552`, `:601`, `:629`, `:670`, `:760`, `:819`).
+
+  The production code looks right in each spot. The finding is that the tests cannot catch it going wrong.
+
+- NEEDS-HUMAN [impl] — **The green results are on a stale base.** `C4-diff-cov` reports "patch.diff does not apply on origin/main" (`gate-logs/C4-diff-cov.log`). The brief lists a conflict with #1013 on the drain dispatch in `reconcile_step`. The cleanup leg sits right after that dispatch and depends on its order ("after the drain", `crates/custodian/src/reconciliation.rs` cleanup leg). Rebase, then re-run CI and the new test file, before treating `C4-ci: pass` as evidence for main.
+
+## Things I tried that did not break it
+
+- **Gate pinning.** Routed batches `require` the marker and `mpufence` bytes (`crates/core/src/orphan_identity.rs:333-339`), so a restore between the gate read and the commit fails the commit.
+- **Marker/generation soundness.** A marker's generation is never above its own image's fence, so a post-restore `next()` always invalidates it.
+- **The 502-op boundary.** `fits_one_batch` counts preconditions (`metadata.rs:2214`).
+- **Obligation-row drops against child-1's drain.** The drain re-stamps legacy marks (arm b) and leaves its own marks alone (arm a). A cleanup drop ahead of the drain's cursor is re-marked, and its own marks are left alone while the obligation exists.
+- **F5 race safety.** The drop requires the inode bytes.
+
+I could not find a premature reclaim in any of these.
+
+The withheld build notes carry the brief's required "demonstrated reds". `C4-verify` is UNVERIFIABLE (the test file does not compile on the base), so the frozen gate evidence holds no red→green for this slice. Sign-off has to take those reds from build-notes on trust.
+
+<!-- pdca:leaf-complete -->
