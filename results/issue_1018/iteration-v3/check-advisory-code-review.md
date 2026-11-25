@@ -1,0 +1,10 @@
+- NEEDS-HUMAN [impl] — `crates/server/src/cli.rs:3276`: The FoundationDB hint silently falls back to the original cluster-file path when absolute-path conversion fails. A relative UTF-8 filename can open successfully from a working directory containing non-UTF-8 bytes, yet replaying this hint elsewhere can select a different cluster. Propagate resolution/encoding errors before opening the store, following the existing `absolute_data_dir` approach.
+
+- NEEDS-HUMAN [impl] — `crates/server/src/cli.rs:3277`: The generated FoundationDB commands preserve only `WYRD_FDB_CLUSTER_FILE`. An abort using command-scoped `WYRD_FDB_EXTERNAL_CLIENT_DIR` can connect successfully during a version transition, while both printed follow-up commands fail without that setting (`crates/metadata-fdb/src/lib.rs:1096`). Preserve the effective external-client directory too, made absolute and shell-quoted.
+
+- NEEDS-HUMAN [impl] — `crates/dst/tests/custodian.rs:9307`: The completed-race oracle accepts `Stop::RoundsSpent`, and the coverage assertion at `crates/dst/tests/custodian.rs:9427` checks only `Completed` durable state plus a lost commit. It can therefore credit “lost to the flip, then refused the Completed upload” even when abort never returns that refusal. Retain the actual abort outcome and require `OperatorAbortOutcome::Completed` for this coverage row; keep exhaustion coverage separate.
+
+- NEEDS-HUMAN [impl] — `crates/server/tests/multipart_operator_abort.rs:986`: The printed-command test runs `sh -c`, but the timeout guard at `crates/server/tests/multipart_operator_abort.rs:278` kills only its immediate child. If `wyrd` hangs, killing the shell can leave `wyrd` and the stderr reader alive after the test fails. This shell/child behavior was reproduced locally. Use shell `exec` for these commands or terminate and reap the process group, and bound stderr draining too.
+
+No additional reuse/simplification or efficiency findings. Review used the target source and frozen gate evidence; target builds were not rerun.
+<!-- pdca:leaf-complete -->

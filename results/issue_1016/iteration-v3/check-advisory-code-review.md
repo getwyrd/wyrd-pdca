@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — **Register Ctrl-C handling before the first reaper pass.** At `crates/server/src/custodian.rs:715`, the first interval skips polling `shutdown` and starts the new no-fleet reaper pass at `crates/server/src/custodian.rs:732`. The CLI puts `tokio::signal::ctrl_c()` inside that lazy future (`crates/server/src/cli.rs:1145`), so its signal handler is not registered yet. A SIGINT during a slow first pass can terminate the newly added no-endpoints role immediately, interrupting its destructive work instead of finishing the pass and exiting cleanly as promised. Register the listener before starting the pass while keeping shutdown between passes. Add a regression that interrupts the first pass; the current test waits until five passes have emitted (`crates/server/tests/multipart_reaper_deployed.rs:661`), after registration has already happened.
+
+No additional actionable reuse, simplification, or efficiency findings. Reviewed the target source and frozen gate evidence; no builds or tests were rerun.
+
+<!-- pdca:leaf-complete -->

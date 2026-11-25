@@ -1,0 +1,7 @@
+# Batched review — 3 passes, union of findings
+
+- [ ] `crates/core/src/multipart/commit.rs:834` **BUG** (seen by 1 pass): If quiesce renewal adopts changed Open bytes at the same or a lower epoch and then exhausts its rounds or returns CoverShort, this early return bypasses the epoch validation and lets renewal_stopped commit compensation under the damaged session instead of returning SessionEpochNotRisen.
+- [ ] `crates/core/src/multipart/commit.rs:810` **BUG** (seen by 1 pass): The renewal error branch calls `renewal_stopped` before validating the adopted session epoch, so a renewal that adopts changed same-or-lower-epoch Open bytes and then exhausts its rounds can compensate under that damaged record instead of returning `SessionEpochNotRisen`.
+- [ ] `crates/core/src/multipart/commit.rs:834` **BUG** (seen by 1 pass): A renewal that adopts changed session bytes at the same or a lower epoch and then exhausts its rounds reaches compensation before the epoch validation at line 846, allowing it to delete staging records and install retirement obligations under a session this function should reject as damaged.
+
+Triage rule: every finding above must be fixed (it then leaves the next run) or recorded-rejected in the decisions file ($PDCA_BUNDLE/review-rejected.md) as `<file:line> | <CLASS> | <MATCH> | <reason>`, where MATCH is a phrase from the finding's rationale (a decision follows its finding to the nearest matching line when the line shifts) — not re-reviewed to silence. The gate blocks while any finding here is unchecked.

@@ -1,0 +1,6 @@
+- NEEDS-HUMAN [impl] — `crates/server/src/cli.rs:2127`: `open_existing_local_meta_redb` checks existence but then calls `RedbMetadataStore::open`, which uses `Database::create` (`crates/metadata-redb/src/lib.rs:67`). If the file disappears between those calls, the one-shot creates a fresh store and reports “satisfied — nothing to reap or drain”; an existing zero-length file also reaches the create-capable opener. Use an open-existing database operation and cover the empty-file case, so this maintenance command cannot initialize the store it certifies.
+
+- NEEDS-HUMAN [impl] — `crates/server/src/cli.rs:1722`: The new outcome-line store identifier is only `tikv` or `fdb` for network backends. Pointing `WYRD_TIKV_PD_ENDPOINTS` or `WYRD_FDB_CLUSTER_FILE` at another cluster therefore produces an indistinguishable successful “nothing to reap” report, defeating the operator safeguard this identifier supplies for redb. Carry the resolved connection identity into the outcome line and test that different configured stores produce different identifiers.
+
+No additional reuse, simplification, or efficiency findings. Reviewed the target source and frozen gate evidence; tests were not rerun. The brief's accepted deferrals are not reopened.
+<!-- pdca:leaf-complete -->

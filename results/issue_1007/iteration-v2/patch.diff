@@ -1,0 +1,3277 @@
+diff --git a/crates/core/src/multipart.rs b/crates/core/src/multipart.rs
+index 66aeba0..c1dda2f 100644
+--- a/crates/core/src/multipart.rs
++++ b/crates/core/src/multipart.rs
+@@ -7,8 +7,10 @@
+ //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
+ //! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
+ //! (#894), [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
+-//! fence's batch (#895), and [`stage`], `UploadPart`'s staging half: the slot reserve and the
+-//! owned intent per chunk (#932). After this file a reader can name every key the protocol
++//! fence's batch (#895), [`complete`], the fence phase of `CompleteMultipartUpload`: the fence,
++//! the validation against the frozen part set, and the release of a rejected request's fence
++//! (#1007), and [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
++//! per chunk (#932). After this file a reader can name every key the protocol
+ //! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
+ //! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
+ //! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
+@@ -105,8 +107,11 @@
+ //! `retire:bytes:` through the one fence batch builder the restore fence also commits
+ //! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
+ //! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and has no
+-//! production caller until the S3 `UploadPart` verb is wired (#669). Every other first writer
+-//! is a store round trip still to land: the part commit (#927), then #658–#659.
++//! production caller until the S3 `UploadPart` verb is wired (#669). The Complete fence
++//! ([`complete::fence_complete`], #1007) writes `mpu:` only: the fence and, for a rejected
++//! request, its release; it publishes nothing and has no production caller until the S3 verb
++//! is wired (#670). Every other first writer is a store round trip still to land: the part
++//! commit (#927), publication (#1008–#1011), then #659.
+ //! An earlier revision of this header deferred the living-architecture update to "the slice
+ //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
+ //! the convention ended up saying. The living architecture doc describes the system **as it
+@@ -151,6 +156,7 @@ use crate::metadata::{
+ };
+ 
+ pub mod abort;
++pub mod complete;
+ pub mod create;
+ pub mod stage;
+ 
+@@ -2349,8 +2355,10 @@ struct SessionRecordWire {
+ /// the identity [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
+ /// [`Budget`] omit one too. The writer-side routes are the one creation route Create uses
+ /// (`SessionRecord::open`, crate-private, #894), which can only mint an `Open` session, and the
+-/// transitions of a record that already decoded ([`Self::open_teardown`],
+-/// [`Self::completing_teardown`]), which change only `epoch` and `state`.
++/// transitions of a record that already decoded: the teardowns ([`Self::open_teardown`],
++/// [`Self::completing_teardown`]), which change only `epoch` and `state`, and the Complete fence
++/// and its release (`SessionRecord::complete_fence` and `SessionRecord::fence_released`,
++/// crate-private, #1007), which also move `attempts`.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(try_from = "SessionRecordWire")]
+ pub struct SessionRecord {
+@@ -2602,6 +2610,59 @@ impl SessionRecord {
+             records: RetireObligation::attempt_segments(upload_id, group),
+         })
+     }
++
++    /// The **Complete fence of an `Open@E` session** (`0016:661`): this session at
++    /// `Completing@E+1`, stamped `fenced_at_millis`, with no segment written yet, its publish
++    /// target its own `parent` and `object` at the new epoch, and one more Complete fence spent
++    /// (`attempts + 1`). The `W_completing` rollback is measured from that stamp (`0016:1005-1009`),
++    /// so it must be a reading of the clock this session's [`clock_source`](Self::clock_source)
++    /// names; [`complete::fence_complete`] checks that before it builds one.
++    ///
++    /// It holds the identity [`decode_session_record`] enforces: the publish target agrees with
++    /// the session's own target and epoch, and the cursor starts at 0. `None` unless the session
++    /// is `Open` below `u64::MAX`, or when `attempts` is at `u32::MAX`. The cap
++    /// [`MAX_COMPLETE_ATTEMPTS`] is not checked here: it is a knob, enforced where a fence is
++    /// admitted (see [`Self::attempts`]).
++    pub(crate) fn complete_fence(&self, fenced_at_millis: u64) -> Option<Self> {
++        if !matches!(self.state, SessionState::Open {}) {
++            return None;
++        }
++        let epoch = self.epoch.checked_add(1)?;
++        Some(Self {
++            epoch,
++            attempts: self.attempts.checked_add(1)?,
++            state: SessionState::Completing {
++                fenced_at_millis,
++                segments_written: 0,
++                publish_target: PublishTarget {
++                    parent: self.parent,
++                    name: self.object.clone(),
++                    epoch,
++                },
++            },
++            ..self.clone()
++        })
++    }
++
++    /// The **release of a Complete fence** (`0016:664`): this `Completing@E` session back at
++    /// `Open@E+1`, with its fence stamps dropped and `attempts` set to the value given. For a
++    /// fence that wrote no segment that value is the one read before the fence: such a fence
++    /// minted no `seg:` epoch, which is all the cap bounds (`0016:661`), so a rejected request
++    /// spends nothing (#1007). The charging rule for a fence that did write segments is #1009's.
++    ///
++    /// The segment-group nonce stays, for the next attempt (`0016:538-552`). `None` unless the
++    /// session is `Completing` below `u64::MAX`.
++    pub(crate) fn fence_released(&self, attempts: u32) -> Option<Self> {
++        if !matches!(self.state, SessionState::Completing { .. }) {
++            return None;
++        }
++        Some(Self {
++            epoch: self.epoch.checked_add(1)?,
++            attempts,
++            state: SessionState::Open {},
++            ..self.clone()
++        })
++    }
+ }
+ 
+ /// What [`SessionRecord::completing_teardown`] mints, committed together or not at all.
+diff --git a/crates/core/src/multipart/abort.rs b/crates/core/src/multipart/abort.rs
+index 6d27299..7f68c55 100644
+--- a/crates/core/src/multipart/abort.rs
++++ b/crates/core/src/multipart/abort.rs
+@@ -47,14 +47,16 @@ use crate::metadata;
+ 
+ /// How many fence commits one [`abort_session`] makes at most: [`MAX_COMPLETE_ATTEMPTS`] `+ 1`.
+ ///
+-/// A session goes back to `Open` only when a Complete fence is released, and it spends at most
+-/// [`MAX_COMPLETE_ATTEMPTS`] Complete fences, so a session that keeps moving to a later `Open@E'`
+-/// under the Abort can cost it at most that many rounds. The one more is the round that fences.
+-/// A round is also spent by a conflict no re-read explains (on TiKV, a lock another writer held,
+-/// with nothing moved) and by a commit whose outcome the store could not report; those share
+-/// the same budget. It is sized from the shipped value of that knob, and it bounds the work one
+-/// Abort does, not its correctness: an Abort that spends it ends with an error that says whether
+-/// a fence of it may still land, never with a wrong answer.
++/// A session goes back to `Open` only when a Complete fence is released, and it can spend at
++/// most [`MAX_COMPLETE_ATTEMPTS`] charged Complete fences, so that many rounds cover a session
++/// moved to a later `Open@E'` by each of them. The one more is the round that fences. A rejected
++/// Complete gives its attempt back when it releases its fence (#1007), so a client that keeps
++/// sending invalid Completes can move the session under the Abort more often than that; each
++/// such move spends a round too. A round is also spent by a conflict no re-read explains (on
++/// TiKV, a lock another writer held, with nothing moved) and by a commit whose outcome the store
++/// could not report; those share the same budget. It is sized from the shipped value of that
++/// knob, and it bounds the work one Abort does, not its correctness: an Abort that spends it
++/// ends with an error that says whether a fence of it may still land, never with a wrong answer.
+ pub const ABORT_ROUNDS: u32 = MAX_COMPLETE_ATTEMPTS + 1;
+ 
+ /// **The teardown fence's batch** (`0016:665`), the one builder of it: given the session's
+diff --git a/crates/core/src/multipart/complete.rs b/crates/core/src/multipart/complete.rs
+new file mode 100644
+index 0000000..db01e7e
+--- /dev/null
++++ b/crates/core/src/multipart/complete.rs
+@@ -0,0 +1,951 @@
++//! `CompleteMultipartUpload`'s **fence phase** (#1007, slice 1 of 5 of #658): the fence, the
++//! validation of the named parts against the part set the fence froze, and the release of a
++//! rejected request's fence. Nothing here publishes; the slices after it consume the
++//! [`HeldFence`] this one hands back (#1008 publishes flat objects, #1009 segmented ones).
++//!
++//! [`fence_complete`] reads the session and answers every state but `Open` as decision 3's table
++//! does (`0016:976`, [`super::complete_answer`]). An `Open@E` session is fenced to
++//! `Completing@E+1` (proposal 0016's *Complete fence* row, `0016:661`), and the request is
++//! validated against what the fence froze. A rejection releases the fence again (the *Fence
++//! release* row, `0016:664`) before it is answered:
++//!
++//! | Found | Answer | Written |
++//! |---|---|---|
++//! | `Open@E`, a valid list | [`FenceOutcome::Held`] | the fence: `require(mpu:<id> == bytes read)`; put the session at `Completing@E+1`, with `fenced_at_millis`, `segments_written: 0`, `publish_target {parent, name, epoch: E+1}` and `attempts + 1` |
++//! | `Open@E`, a list rejected against the frozen set or the bucket | [`Refusal::InvalidPart`] or [`Refusal::NoSuchBucket`] | the fence, then its release: `require(mpu:<id> == the fence's bytes)`; put the session at `Open@E+2` with `attempts` as read |
++//! | `Open@E`, a list already invalid before the fence | the same refusals | nothing |
++//! | `Open@E`, `attempts` at [`MAX_COMPLETE_ATTEMPTS`] | [`Refusal::CompleteAttemptsExhausted`] | nothing |
++//! | `Completing` (another publisher's fence) | [`Refusal::OperationAborted`] | nothing |
++//! | `Completed`, the same list | [`CompleteOutcome::AlreadyCompleted`], the **recorded** publication | nothing |
++//! | `Completed` (another list), `Aborting`, no record, or a session for another target | [`Refusal::NoSuchUpload`] | nothing |
++//!
++//! # The budget, and what a rejection costs (`0016:994-1000`)
++//!
++//! `attempts` bounds how many `seg:` epochs one session can mint (`0016:661`, `:1477`). A fence
++//! that is released before it wrote a segment minted none, so the release puts `attempts` back
++//! to the value read before the fence. A client error therefore never spends the budget, and an
++//! `Open` session can always be fenced again: three typos do not leave a correct fourth request
++//! answering [`Refusal::CompleteAttemptsExhausted`], which is the wedge #636's patch had.
++//!
++//! The list is checked before the fence too, against the part set and bucket as they are then,
++//! so a request that is already invalid is answered without fencing (no commit, and no in-flight
++//! `UploadPart` loses the session bytes it is fenced on). That check is only an optimization.
++//! The check that decides is the one against the set the fence froze: a part can be replaced
++//! between the two reads, and that request is still released with its attempt given back.
++//!
++//! What the fence freezes is the session's `psum:` range. A part summary is written in the same
++//! batch as the `part:` record it summarizes (`0016:660`) and carries what validation needs,
++//! the part's digest, plus its chunk count and length, so the next slices can size an assembly
++//! before they read a chunk list. The `part:` records themselves are not read here: their chunk
++//! lists can total tens of megabytes for one session, and only publication needs them.
++//!
++//! # Ownership, and the two errors
++//!
++//! A fence is this Complete's only once a fence commit of its own answered `Committed`. From
++//! then on, every answer this function returns has taken it down again or handed it over in the
++//! [`HeldFence`]; only an error may leave it standing (**C-1**, `docs/principles.md` §5):
++//!
++//! * [`CompleteError::InDoubt`]: a fence or release commit of this Complete came back with an
++//!   unknown outcome ([`CommitUnknownResult`]). It is returned at once, with nothing sent after
++//!   it; settling such an outcome by reading the session again is #1010's.
++//! * [`CompleteError::Stopped`]: nothing is in doubt, and the error says what became of this
++//!   Complete's fence ([`FenceState`]). The release is the one way this slice takes its own
++//!   fence down; when its rounds run out ([`RELEASE_ROUNDS`]) or the store refuses it for good,
++//!   the fence stands and the reaper's `W_completing` rollback is what clears it (#625).
++//!
++//! A Complete that meets **another** publisher's `Completing` fence leaves it untouched: it
++//! answers [`Refusal::OperationAborted`] and writes nothing (`0016:953-958`).
++//!
++//! A store fault while validating behind the fence is not a rejection, so it has no answer: it is
++//! an error whatever happens next. The Complete still tries to take its fence down, because a
++//! fence that wrote no segment minted nothing the cap bounds, and left standing it would cost the
++//! client a wait and an attempt for a fault of the store's. It tries with **one** release commit,
++//! the same exact-bytes check and the same record as a rejection's release:
++//!
++//! | The release | The error |
++//! |---|---|
++//! | lands | [`FenceState::Released`]: the session is `Open@E+2` with `attempts` as read before the fence |
++//! | fails for good, or answers `Conflict` with the session still the fence's bytes | [`FenceState::Stands`] |
++//! | comes back with an unknown outcome | [`CompleteError::InDoubt`], about the release |
++//! | answers `Conflict` and the session moved | answered from its new state, as a rejection's release is; an `Open` session has no rejection to answer, so that is [`FenceState::Gone`] |
++//! | answers `Conflict` and the session cannot be read | [`FenceState::Unknown`] |
++//!
++//! Each of those errors keeps the fault that stopped validation as its cause. A completer that
++//! crashes behind its fence, or whose one release does not land, still costs the wait 0016 accepts
++//! for that case, up to `W_completing` (`0016:956-962`).
++//!
++//! # Runtime-free (ADR-0009), and one clock per session
++//!
++//! Core reads no clock, draws no randomness and never sleeps here. The fence stamp
++//! `fenced_at_millis` arrives in the [`CompleteRequest`], with the `clock_source` that names its
++//! clock. That stamp belongs to the session's residency lifecycle: the reaper measures
++//! `W_completing` from it (`0016:1005-1009`) under the clock the session record names, so a
++//! request whose clock source is not the session's is stopped before anything is written
++//! ([`Stop::ForeignClock`], `0016:1966-1976`). A lost round is retried at once, with no backoff.
++//!
++//! Production calls nothing here yet: the S3 verb that will is #670, after #1008–#1011 compose
++//! publication onto it.
++
++use std::collections::BTreeMap;
++use std::fmt;
++
++use bytes::Bytes;
++use wyrd_traits::{BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, WriteBatch};
++
++use super::abort::ABORT_ROUNDS;
++use super::{
++    complete_answer, complete_fingerprint, decode_part_summary, decode_session_record, mpu_key,
++    parse_psum_key, psum_range, CompleteAnswer, CompleteOutcome, Digest, InvalidPart, PartNumber,
++    PartSummary, RecordError, Refusal, SessionRecord, UploadId, MAX_COMPLETE_ATTEMPTS,
++};
++use crate::metadata::{self, InodeId};
++
++/// How many fence commits one [`fence_complete`] makes at most before it stops with no fence
++/// placed: [`ABORT_ROUNDS`].
++///
++/// A fence round is spent by a commit that answered `Conflict` while the session is still `Open`:
++/// unchanged (on TiKV, a lock another writer of `mpu:<id>` held while nothing moved,
++/// `abort.rs:247-249`), or at a later epoch after another request's fence was released. Any other
++/// state found is answered at once. It is the budget an Abort spends against the same key and the
++/// same writers, and it bounds the work one Complete does, not its correctness: one that spends
++/// it ends with [`Stop::FenceRoundsSpent`], never with a wrong answer.
++pub const FENCE_ROUNDS: u32 = ABORT_ROUNDS;
++
++/// How many release commits one [`fence_complete`] makes at most before it stops with its fence
++/// standing: [`ABORT_ROUNDS`].
++///
++/// A release round is spent only by a commit that answered `Conflict` while the session is still
++/// exactly the fence's bytes, a conflict nothing a read can see explains (on TiKV, a lock another
++/// writer held): a session moved off the fence ends the release and is answered from its new
++/// state. Bounded so a Complete terminates with no
++/// reaper running, at the same budget an Abort spends against the same key. A Complete that
++/// spends it ends with [`Stop::ReleaseRoundsSpent`] and its fence standing.
++pub const RELEASE_ROUNDS: u32 = ABORT_ROUNDS;
++
++/// How many `psum:` records one page of the frozen-set read asks for. At the value ceiling a
++/// page is at most `128 ×` [`crate::metadata::MAX_VALUE_BYTES`] (12.8 MB), the bound
++/// [`crate::metadata::SEGMENT_PAGE_LIMIT`] keeps for a `seg:` page; a well-formed summary is
++/// tens of bytes, so [`super::MAX_PARTS_PER_SESSION`] parts take 79 pages.
++const PART_PAGE_LIMIT: usize = metadata::SEGMENT_PAGE_LIMIT;
++
++/// The `(part number, digest)` list a Complete names, in the client's order. Never empty.
++///
++/// Order is **not** checked here. A list out of order, or naming a part twice, is a well-formed
++/// request that the protocol answers ([`InvalidPart::OutOfOrder`]); an empty list is not a request
++/// at all (S3 refuses it as malformed XML before it reaches a store), so it has no value of this
++/// type.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct NamedParts(Vec<(PartNumber, Digest)>);
++
++impl NamedParts {
++    /// The list, refusing an empty one ([`RecordError::NoPartsNamed`]).
++    pub fn new(parts: Vec<(PartNumber, Digest)>) -> Result<Self, RecordError> {
++        if parts.is_empty() {
++            return Err(RecordError::NoPartsNamed);
++        }
++        Ok(Self(parts))
++    }
++
++    /// The pairs, in the order the client named them.
++    pub fn as_slice(&self) -> &[(PartNumber, Digest)] {
++        &self.0
++    }
++}
++
++/// What one `CompleteMultipartUpload` asks for. Every field is the caller's: core composes no
++/// name and reads no clock.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct CompleteRequest<'a> {
++    /// The bucket whose `bucket:<name>` marker must exist for the request to be valid
++    /// (ADR-0046 §4, `0016:1035`). The marker's bytes are handed on in the [`HeldFence`], for the
++    /// publication's precondition.
++    pub bucket: &'a str,
++    /// The dirent parent the request names. It must be the session's own target
++    /// ([`SessionRecord::parent`]), spelled as Create was given it ([`super::create::CreateRequest`]).
++    pub parent: InodeId,
++    /// The dirent name the request names. It must be the session's own ([`SessionRecord::object`]).
++    pub object: &'a str,
++    /// The parts to assemble.
++    pub parts: &'a NamedParts,
++    /// The fence stamp, in milliseconds of the clock [`Self::clock_source`] names.
++    pub fenced_at_millis: u64,
++    /// The clock that read [`Self::fenced_at_millis`]. It must be the session's own
++    /// ([`SessionRecord::clock_source`]).
++    pub clock_source: &'a str,
++}
++
++/// What [`fence_complete`] returns when nothing is in doubt and nothing stopped it.
++#[derive(Debug)]
++pub enum FenceOutcome {
++    /// The request is valid against the part set its fence froze and the bucket, and this call
++    /// holds that fence. Nothing is published.
++    Held(Box<HeldFence>),
++    /// The answer, and no fence of this call stands: decision 3's answer for the state found, or
++    /// a rejection whose fence this call released. Never [`CompleteOutcome::Published`]: nothing
++    /// here publishes.
++    Answered(CompleteOutcome),
++}
++
++/// **A fence this Complete owns**: the session at `Completing@E+1` under a fence commit of its
++/// own that answered `Committed`, with the request validated against the part set that fence
++/// froze. Only [`fence_complete`] makes one; it is the value the publication slices consume.
++///
++/// It is neither `Clone` nor constructible elsewhere: one fence, one holder. Dropping it leaves
++/// the fence standing until the reaper's `W_completing` rollback (#625).
++#[derive(Debug)]
++pub struct HeldFence {
++    upload_id: UploadId,
++    session: SessionRecord,
++    bytes: Bytes,
++    attempts_before: u32,
++    named: NamedParts,
++    frozen: BTreeMap<PartNumber, PartSummary>,
++    bucket_marker: Bytes,
++}
++
++impl HeldFence {
++    /// The upload the fence is on.
++    pub const fn upload_id(&self) -> &UploadId {
++        &self.upload_id
++    }
++
++    /// The fence epoch `E+1`: the session's epoch and its `publish_target.epoch`.
++    pub const fn epoch(&self) -> u64 {
++        self.session.epoch()
++    }
++
++    /// The session as the fence left it, at `Completing@E+1`.
++    pub const fn session(&self) -> &SessionRecord {
++        &self.session
++    }
++
++    /// The exact bytes the fence put at `mpu:<id>`: what every later batch of this attempt
++    /// requires there.
++    pub const fn session_bytes(&self) -> &Bytes {
++        &self.bytes
++    }
++
++    /// `attempts` as read before the fence: the value a release of a fence that wrote no
++    /// segment puts back.
++    pub const fn attempts_before(&self) -> u32 {
++        self.attempts_before
++    }
++
++    /// The validated list: every part present in [`Self::frozen_parts`] with the named digest, in
++    /// strictly ascending order.
++    pub fn named_parts(&self) -> &[(PartNumber, Digest)] {
++        self.named.as_slice()
++    }
++
++    /// The frozen part set: every `psum:<id>:` record the fence froze, by part number, named or
++    /// not.
++    pub const fn frozen_parts(&self) -> &BTreeMap<PartNumber, PartSummary> {
++        &self.frozen
++    }
++
++    /// The `bucket:<name>` marker bytes read behind the fence, for the publication's ADR-0046 §4
++    /// precondition.
++    pub const fn bucket_marker(&self) -> &Bytes {
++        &self.bucket_marker
++    }
++}
++
++/// A Complete that ended with neither an answer nor a held fence.
++///
++/// # Error class
++///
++/// [`wyrd_traits::classify`] reads [`Self::InDoubt`] as
++/// [`ErrorClass::Indeterminate`](wyrd_traits::ErrorClass::Indeterminate): its
++/// [`source`](std::error::Error::source) is the store's own [`CommitUnknownResult`].
++/// [`Self::Stopped`] keeps its cause's class: a [`Stop::Store`] wrapping a
++/// [`TransientFault`](wyrd_traits::TransientFault) is transient, because nothing is in doubt.
++#[derive(Debug)]
++pub enum CompleteError {
++    /// A fence or release commit of this Complete may have landed, or may still land. Never
++    /// "nothing was written".
++    InDoubt(Box<InDoubt>),
++    /// The Complete stopped, and no commit of it is in doubt.
++    Stopped(Box<Stopped>),
++}
++
++/// What a [`CompleteError::InDoubt`] reports.
++#[derive(Debug)]
++pub struct InDoubt {
++    /// The upload whose session is in doubt.
++    pub upload_id: UploadId,
++    /// Which commit's outcome the store could not report.
++    pub commit: DoubtfulCommit,
++    /// Whether that commit may still be applied **after** this Complete returned
++    /// ([`CommitUnknownResult::may_still_commit`]).
++    pub may_still_commit: bool,
++    /// The store's report of the unknown outcome. It is the error's
++    /// [`source`](std::error::Error::source).
++    pub outcome: CommitUnknownResult,
++}
++
++/// The commit a [`CompleteError::InDoubt`] is about.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DoubtfulCommit {
++    /// The fence `Open@E → Completing@epoch`: the session is still `Open@E`, or fenced by this
++    /// Complete.
++    Fence {
++        /// The fence epoch, `E+1`.
++        epoch: u64,
++    },
++    /// The release `Completing@epoch → Open@epoch+1` of a fence this Complete owns: the fence
++    /// still stands, or is released.
++    Release {
++        /// The epoch of the fence being released.
++        epoch: u64,
++    },
++}
++
++/// What a [`CompleteError::Stopped`] reports.
++#[derive(Debug)]
++pub struct Stopped {
++    /// The upload the Complete was for.
++    pub upload_id: UploadId,
++    /// What became of this Complete's own fence.
++    pub fence: FenceState,
++    /// What stopped it.
++    pub cause: Stop,
++}
++
++/// What became of a stopped Complete's own fence ([`Stopped::fence`]).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum FenceState {
++    /// No fence commit of this Complete landed.
++    NotPlaced,
++    /// This Complete's fence landed at `Completing@epoch` (a commit of it answered `Committed`),
++    /// and no read since found the session moved off it: it still stands.
++    Stands {
++        /// The fence epoch, `E+1`.
++        epoch: u64,
++    },
++    /// This Complete's fence landed at `Completing@epoch`, and a release commit of its own then
++    /// answered `Committed`: the fence is down.
++    Released {
++        /// The fence epoch, `E+1`.
++        epoch: u64,
++    },
++    /// This Complete's fence landed at `Completing@epoch`, and a later read found the session
++    /// moved off it by another writer: it no longer stands, and this Complete did not release it.
++    Gone {
++        /// The fence epoch, `E+1`.
++        epoch: u64,
++    },
++    /// This Complete's fence landed at `Completing@epoch`, a release of it answered `Conflict`, and
++    /// the read that would say why failed. The release did not apply, but the conflict may mean
++    /// another writer moved the session, so whether the fence stands is not known. It is safe to
++    /// not know: every later batch of an attempt requires the fence's exact bytes.
++    Unknown {
++        /// The fence epoch, `E+1`.
++        epoch: u64,
++    },
++}
++
++/// What stopped a Complete ([`Stopped::cause`]).
++#[derive(Debug)]
++pub enum Stop {
++    /// All [`FENCE_ROUNDS`] fence commits answered `Conflict` and the session was still `Open`.
++    FenceRoundsSpent {
++        /// Fence commits made.
++        rounds: u32,
++    },
++    /// All [`RELEASE_ROUNDS`] release commits answered `Conflict` with the session still exactly
++    /// the fence's bytes.
++    ReleaseRoundsSpent {
++        /// Release commits made.
++        rounds: u32,
++    },
++    /// The session is `Open` at an epoch too high for a fence and its release both to be
++    /// written (`0016:704-708`).
++    EpochExhausted,
++    /// The request's clock is not the one the session's timestamps are read under, so its stamp
++    /// may not be written into the session (`0016:1966-1976`).
++    ForeignClock {
++        /// The session's `clock_source`.
++        session: String,
++        /// The request's `clock_source`.
++        request: String,
++    },
++    /// A stored `mpu:` or `psum:` value is not a valid record (ADR-0045), or a key under the
++    /// session's `psum:` range does not parse.
++    Record(RecordError),
++    /// A store operation failed, or a page of the `psum:` range broke the paging contract (a key
++    /// at or below the last one read, or outside the range asked for).
++    Store(BoxError),
++}
++
++impl fmt::Display for CompleteError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::InDoubt(doubt) => write!(
++                f,
++                "multipart complete: upload {} is in doubt: {} {}; re-read the session to learn \
++                 whether it landed",
++                doubt.upload_id,
++                doubt.commit,
++                if doubt.may_still_commit {
++                    "may still be applied"
++                } else {
++                    "may have been applied"
++                },
++            ),
++            Self::Stopped(stopped) => write!(
++                f,
++                "multipart complete: upload {}: {}; {}; no commit of this complete is in doubt",
++                stopped.upload_id, stopped.cause, stopped.fence,
++            ),
++        }
++    }
++}
++
++impl fmt::Display for DoubtfulCommit {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Fence { epoch } => write!(f, "its fence at Completing@{epoch}"),
++            Self::Release { epoch } => write!(f, "the release of its fence at Completing@{epoch}"),
++        }
++    }
++}
++
++impl fmt::Display for FenceState {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::NotPlaced => f.write_str("no fence of this complete landed"),
++            Self::Stands { epoch } => write!(
++                f,
++                "this complete's fence at Completing@{epoch} still stands"
++            ),
++            Self::Released { epoch } => write!(
++                f,
++                "this complete's fence at Completing@{epoch} was taken down: its release landed"
++            ),
++            Self::Gone { epoch } => write!(
++                f,
++                "this complete's fence at Completing@{epoch} no longer stands: another writer \
++                 moved the session off it"
++            ),
++            Self::Unknown { epoch } => write!(
++                f,
++                "this complete's fence at Completing@{epoch} may or may not stand: a release \
++                 answered Conflict and the session could not be read again"
++            ),
++        }
++    }
++}
++
++impl fmt::Display for Stop {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::FenceRoundsSpent { rounds } => write!(
++                f,
++                "all {rounds} fence rounds were spent and the session is still Open"
++            ),
++            Self::ReleaseRoundsSpent { rounds } => write!(
++                f,
++                "all {rounds} release rounds were spent and the session is still at the fence"
++            ),
++            Self::EpochExhausted => {
++                f.write_str("the session is Open at an epoch too high for a fence and its release")
++            }
++            Self::ForeignClock { session, request } => write!(
++                f,
++                "the request's clock source {request:?} is not the session's {session:?}, so the \
++                 fence may not be stamped"
++            ),
++            Self::Record(torn) => write!(f, "a stored record is invalid: {torn}"),
++            Self::Store(fault) => write!(f, "store fault: {fault}"),
++        }
++    }
++}
++
++impl std::error::Error for CompleteError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::InDoubt(doubt) => Some(&doubt.outcome),
++            Self::Stopped(stopped) => match &stopped.cause {
++                Stop::Record(torn) => Some(torn),
++                Stop::Store(fault) => Some(fault.as_ref()),
++                Stop::FenceRoundsSpent { .. }
++                | Stop::ReleaseRoundsSpent { .. }
++                | Stop::EpochExhausted
++                | Stop::ForeignClock { .. } => None,
++            },
++        }
++    }
++}
++
++// deferred: #660. Seeded Tier-0 DST coverage of this fence racing an Abort, a rival Complete and
++// the reaper's rollback is #660's (out of #1007's scope). Meanwhile the integration test
++// `crates/core/tests/multipart_complete.rs` lands a rival fence, a teardown and a rollback at the
++// fence's and the release's commit points through a store wrapper.
++
++/// **`CompleteMultipartUpload`'s fence phase**: fence the session `upload_id` names
++/// (`0016:661`), validate `request` against the part set the fence froze, and either hand the
++/// fence back held ([`FenceOutcome::Held`]) or release it and answer
++/// ([`FenceOutcome::Answered`]), in the landed vocabulary ([`CompleteOutcome`], [`Refusal`]). No
++/// production path calls this yet (#670 will, through #1008–#1011).
++///
++/// # Before the fence
++///
++/// Read `mpu:<id>`. A failed read is an error, never an answer. A session for another target
++/// than `request`'s answers [`Refusal::NoSuchUpload`]; every state but `Open` is answered from
++/// [`complete_answer`] with the request's [`complete_fingerprint`]; a list not strictly ascending
++/// answers [`InvalidPart::OutOfOrder`] at the first part out of place. Then, on `Open@E`: a
++/// request whose clock source is not the session's stops ([`Stop::ForeignClock`]); a session at
++/// [`MAX_COMPLETE_ATTEMPTS`] answers [`Refusal::CompleteAttemptsExhausted`]; and the list is
++/// checked against the bucket and the part set as they are now (the module doc's optimization).
++/// None of that writes anything.
++///
++/// # The fence
++///
++/// One commit: `require(mpu:<id> == the bytes read)` and the session put at `Completing@E+1`
++/// (`SessionRecord::complete_fence`). A `Conflict` reads the session again and answers from what
++/// is there, so a rival Complete that fenced first answers [`Refusal::OperationAborted`] and an
++/// Abort that did answers [`Refusal::NoSuchUpload`]; a session still `Open` spends one of
++/// [`FENCE_ROUNDS`]. A [`CommitUnknownResult`] is [`CompleteError::InDoubt`] at once.
++///
++/// # Behind the fence
++///
++/// Read the bucket marker and the `psum:<id>:` range in bounded pages, and require every named
++/// part to be present with the named digest. A valid request returns the [`HeldFence`]; a
++/// rejected one is released: `require(mpu:<id> == the fence's bytes)` and the session put at
++/// `Open@E+2` with `attempts` as read before the fence (`SessionRecord::fence_released`). Then
++/// it is answered with the rejection. A release that answers `Conflict` reads the session again:
++/// still the fence's bytes, it spends one of [`RELEASE_ROUNDS`]; moved, it is answered from the
++/// new state (the rejection, if that state is `Open` again). A release the store refuses for good
++/// or that spends its rounds is [`CompleteError::Stopped`] with [`FenceState::Stands`]; one whose
++/// outcome is unknown is [`CompleteError::InDoubt`]; a `Conflict` whose read then fails is
++/// [`CompleteError::Stopped`] with [`FenceState::Unknown`].
++///
++/// A store fault during that validation is an error whatever happens next, and it tries one
++/// release before it is returned (the module doc's table).
++///
++/// # Termination
++///
++/// At most [`FENCE_ROUNDS`] fence commits and [`RELEASE_ROUNDS`] release commits, each followed
++/// by at most one read of `mpu:<id>`; one validation before each fence commit and one behind the
++/// fence, each one read of the bucket marker and a walk of the `psum:` range that ends because
++/// every page must name part numbers strictly above the last one seen, and there are
++/// [`super::MAX_PART_NUMBER`] of them. Each store call is
++/// bounded by the store's own contract (every operation terminates, `crates/traits/src/lib.rs`,
++/// "Operational envelope").
++///
++/// **Not cancel-safe once a commit is sent.** Dropping the future after that can leave a fence
++/// standing that no answer or error names; the reaper's `W_completing` rollback is then what
++/// takes it down (#625). Bound a Complete through the store's own deadlines, never by dropping
++/// the future: a commit the store abandons at its deadline comes back as a
++/// [`CommitUnknownResult`], which this function reports.
++pub async fn fence_complete(
++    store: &impl MetadataStore,
++    upload_id: &UploadId,
++    request: &CompleteRequest<'_>,
++) -> Result<FenceOutcome, CompleteError> {
++    let session_key = mpu_key(upload_id);
++    let bucket_key = metadata::bucket_key(request.bucket);
++    let named = request.parts.as_slice();
++    // `Err` for a list that is not strictly ascending: no recorded fingerprint can match it, and
++    // an `Open` session refuses it at the part it names.
++    let fingerprint = complete_fingerprint(named);
++    let not_placed = |cause| stopped(upload_id, FenceState::NotPlaced, cause);
++    let mut rounds = 0u32;
++    let mut found = store
++        .get(&session_key)
++        .await
++        .map_err(|fault| not_placed(Stop::Store(fault)))?;
++    let (opened, fenced, released) = loop {
++        // `found` is always the result of a read that succeeded.
++        let Some(read) = found else {
++            return Ok(refused(Refusal::NoSuchUpload));
++        };
++        let opened = decode_session_record(&read).map_err(|torn| not_placed(Stop::Record(torn)))?;
++        let answer = answer_without_fence(&opened, request, &fingerprint)
++            .map_err(|torn| not_placed(Stop::Record(torn)))?;
++        if let Some(answer) = answer {
++            return Ok(answered(answer));
++        }
++        if opened.clock_source() != request.clock_source {
++            return Err(not_placed(Stop::ForeignClock {
++                session: opened.clock_source().to_owned(),
++                request: request.clock_source.to_owned(),
++            }));
++        }
++        if opened.attempts() >= MAX_COMPLETE_ATTEMPTS {
++            return Ok(refused(Refusal::CompleteAttemptsExhausted));
++        }
++        // The release is minted with the fence, so no fence is placed that could not be taken
++        // down again.
++        let Some((fenced, released)) =
++            opened
++                .complete_fence(request.fenced_at_millis)
++                .and_then(|fenced| {
++                    let released = fenced.fence_released(opened.attempts())?;
++                    Some((fenced, released))
++                })
++        else {
++            return Err(not_placed(Stop::EpochExhausted));
++        };
++        // The optimization: a request already invalid is answered without a fence.
++        match validate(store, upload_id, &bucket_key, named).await {
++            Ok(Validation::Valid { .. }) => {}
++            Ok(Validation::Rejected(refusal)) => return Ok(refused(refusal)),
++            Err(cause) => return Err(not_placed(cause)),
++        }
++        if rounds == FENCE_ROUNDS {
++            return Err(not_placed(Stop::FenceRoundsSpent { rounds }));
++        }
++        rounds += 1;
++        let batch = WriteBatch::new()
++            .require(session_key.clone(), read)
++            .put(session_key.clone(), metadata::encode(&fenced));
++        match store.commit(batch).await {
++            Ok(CommitOutcome::Committed) => break (opened, fenced, released),
++            // Answered from what the store holds now: moved, from its new state; still the
++            // bytes read, the round is spent and the fence tried again.
++            Ok(CommitOutcome::Conflict) => {
++                found = store
++                    .get(&session_key)
++                    .await
++                    .map_err(|fault| not_placed(Stop::Store(fault)))?;
++            }
++            Err(fault) => {
++                return Err(match fault.downcast_ref::<CommitUnknownResult>() {
++                    Some(unknown) => in_doubt(
++                        upload_id,
++                        DoubtfulCommit::Fence {
++                            epoch: fenced.epoch(),
++                        },
++                        unknown,
++                    ),
++                    None => not_placed(Stop::Store(fault)),
++                });
++            }
++        }
++    };
++
++    // The fence is this Complete's: its commit answered `Committed`.
++    let own = OwnFence {
++        upload_id,
++        session_key: &session_key,
++        epoch: fenced.epoch(),
++        bytes: metadata::encode(&fenced),
++        released: metadata::encode(&released),
++    };
++    match validate(store, upload_id, &bucket_key, named).await {
++        Ok(Validation::Valid { frozen, marker }) => Ok(FenceOutcome::Held(Box::new(HeldFence {
++            upload_id: upload_id.clone(),
++            attempts_before: opened.attempts(),
++            session: fenced,
++            bytes: own.bytes,
++            named: request.parts.clone(),
++            frozen,
++            bucket_marker: marker,
++        }))),
++        Ok(Validation::Rejected(rejection)) => {
++            release(
++                store,
++                &own,
++                ReleaseFor::Rejection(rejection),
++                fingerprint.as_ref().ok(),
++            )
++            .await
++        }
++        // An error whatever the release does; see the module doc.
++        Err(cause) => {
++            release(
++                store,
++                &own,
++                ReleaseFor::Fault(cause),
++                fingerprint.as_ref().ok(),
++            )
++            .await
++        }
++    }
++}
++
++/// Decision 3's answer for a session a Complete found (`0016:976`), or `None` when it may fence:
++/// a session for another target is no upload this request can complete, and an `Open` one still
++/// refuses a list [`complete_fingerprint`] refused. The state answers first, so a list out of order
++/// against a `Completing` session is still `OperationAborted`.
++fn answer_without_fence(
++    session: &SessionRecord,
++    request: &CompleteRequest<'_>,
++    fingerprint: &Result<Digest, RecordError>,
++) -> Result<Option<CompleteOutcome>, RecordError> {
++    if session.parent() != request.parent || session.object() != request.object {
++        return Ok(Some(CompleteOutcome::Refused(Refusal::NoSuchUpload)));
++    }
++    Ok(
++        match complete_answer(Some(session.state()), fingerprint.as_ref().ok()) {
++            CompleteAnswer::Fences => match fingerprint {
++                Ok(_) => None,
++                Err(invalid) => Some(CompleteOutcome::Refused(order_refusal(invalid)?)),
++            },
++            CompleteAnswer::AlreadyCompleted(publication) => {
++                Some(CompleteOutcome::AlreadyCompleted(publication))
++            }
++            CompleteAnswer::Refused(refusal) => Some(CompleteOutcome::Refused(refusal)),
++        },
++    )
++}
++
++/// The protocol's answer to the ordering error [`complete_fingerprint`] returned (`0016:707`, the
++/// mapping [`InvalidPart::OutOfOrder`] documents), at the part it names. Any other error is handed
++/// back: [`NamedParts`] cannot hold the one other list the fingerprint refuses, an empty one.
++fn order_refusal(invalid: &RecordError) -> Result<Refusal, RecordError> {
++    let (RecordError::DuplicatePart { part_number }
++    | RecordError::PartsOutOfOrder { part_number, .. }) = invalid
++    else {
++        return Err(invalid.clone());
++    };
++    Ok(Refusal::InvalidPart {
++        part_number: PartNumber::new(*part_number)?,
++        reason: InvalidPart::OutOfOrder,
++    })
++}
++
++/// What a validation found.
++enum Validation {
++    /// Every named part is present with the named digest, and the bucket marker is present.
++    Valid {
++        /// The part set read.
++        frozen: BTreeMap<PartNumber, PartSummary>,
++        /// The bucket marker bytes read.
++        marker: Bytes,
++    },
++    /// The request is rejected with this refusal.
++    Rejected(Refusal),
++}
++
++/// Validate `named` against the bucket and the session's part set as the store holds them now
++/// (`0016:994-1000`): the bucket marker first, which is one read; then every `psum:` record of
++/// the session; then each named part, in order, which must be present with the named digest.
++/// The first part that is not answers [`Refusal::InvalidPart`].
++async fn validate(
++    store: &impl MetadataStore,
++    upload_id: &UploadId,
++    bucket_key: &[u8],
++    named: &[(PartNumber, Digest)],
++) -> Result<Validation, Stop> {
++    let Some(marker) = store.get(bucket_key).await.map_err(Stop::Store)? else {
++        return Ok(Validation::Rejected(Refusal::NoSuchBucket));
++    };
++    let frozen = read_part_set(store, upload_id).await?;
++    for (part_number, digest) in named {
++        let reason = match frozen.get(part_number) {
++            None => InvalidPart::Absent,
++            Some(summary) if summary.digest != *digest => InvalidPart::DigestMismatch,
++            Some(_) => continue,
++        };
++        return Ok(Validation::Rejected(Refusal::InvalidPart {
++            part_number: *part_number,
++            reason,
++        }));
++    }
++    Ok(Validation::Valid { frozen, marker })
++}
++
++/// Every `psum:<id>:` record, by part number, read in pages of [`PART_PAGE_LIMIT`] with
++/// [`MetadataStore::scan_page`]. Each key must parse back to this upload, and each value must
++/// decode ([`Stop::Record`]). Each part number must be strictly above the last one read, as the
++/// paging contract's order and exclusive cursor make it (`crates/traits/src/lib.rs`, `scan_page`
++/// clauses 1 and 2); one that is not is a store fault, and it is also what makes the walk end:
++/// there are [`super::MAX_PART_NUMBER`] part numbers.
++async fn read_part_set(
++    store: &impl MetadataStore,
++    upload_id: &UploadId,
++) -> Result<BTreeMap<PartNumber, PartSummary>, Stop> {
++    let prefix = psum_range(upload_id);
++    let mut parts: BTreeMap<PartNumber, PartSummary> = BTreeMap::new();
++    let mut after: Option<Vec<u8>> = None;
++    loop {
++        let (page, next) = store
++            .scan_page(&prefix, after.as_deref(), PART_PAGE_LIMIT)
++            .await
++            .map_err(Stop::Store)?;
++        // An empty page is terminal (clause 3).
++        let Some((last, _)) = page.last() else {
++            return Ok(parts);
++        };
++        let last = last.clone();
++        for (key, value) in page {
++            let (owner, part_number) = parse_psum_key(&key).map_err(Stop::Record)?;
++            let ascending = parts
++                .last_key_value()
++                .is_none_or(|(previous, _)| part_number > *previous);
++            if owner != *upload_id || !ascending {
++                return Err(Stop::Store(BoxError::from(format!(
++                    "scan_page over {} answered {} out of order or outside the range",
++                    String::from_utf8_lossy(&prefix),
++                    String::from_utf8_lossy(&key),
++                ))));
++            }
++            parts.insert(
++                part_number,
++                decode_part_summary(&value).map_err(Stop::Record)?,
++            );
++        }
++        if next.is_none() {
++            return Ok(parts);
++        }
++        after = Some(last);
++    }
++}
++
++/// The fence this Complete owns, and the release that takes it down.
++struct OwnFence<'a> {
++    upload_id: &'a UploadId,
++    session_key: &'a [u8],
++    /// The fence epoch, `E+1`.
++    epoch: u64,
++    /// The bytes the fence put: `Completing@E+1`.
++    bytes: Bytes,
++    /// The bytes the release puts: `Open@E+2`, `attempts` as read before the fence.
++    released: Bytes,
++}
++
++/// Why a Complete is taking its own fence down.
++enum ReleaseFor {
++    /// The request was rejected. The release is what lets it be answered.
++    Rejection(Refusal),
++    /// Validation behind the fence could not finish. The request ends in an error with this cause
++    /// whatever the release does, so the release is best effort.
++    Fault(Stop),
++}
++
++impl ReleaseFor {
++    /// How many commits the release may make.
++    const fn rounds(&self) -> u32 {
++        match self {
++            Self::Rejection(_) => RELEASE_ROUNDS,
++            Self::Fault(_) => 1,
++        }
++    }
++
++    /// The cause a stopped error reports when the release itself went wrong with `failure`. A fault
++    /// keeps its own: it is what stopped the request, and the release was only an attempt to clean
++    /// up after it.
++    fn cause(self, failure: Stop) -> Stop {
++        match self {
++            Self::Rejection(_) => failure,
++            Self::Fault(cause) => cause,
++        }
++    }
++
++    /// How the request ends once the session is `Open` again, its fence down as `fence` says.
++    fn end(self, own: &OwnFence<'_>, fence: FenceState) -> Result<FenceOutcome, CompleteError> {
++        match self {
++            Self::Rejection(refusal) => Ok(refused(refusal)),
++            Self::Fault(cause) => Err(stopped(own.upload_id, fence, cause)),
++        }
++    }
++}
++
++/// Release `own` (`0016:664`, `:994-1000`) in at most [`ReleaseFor::rounds`] commits, and end the
++/// request as `why` says.
++async fn release(
++    store: &impl MetadataStore,
++    own: &OwnFence<'_>,
++    why: ReleaseFor,
++    fingerprint: Option<&Digest>,
++) -> Result<FenceOutcome, CompleteError> {
++    let epoch = own.epoch;
++    let stands = |cause| stopped(own.upload_id, FenceState::Stands { epoch }, cause);
++    let mut rounds = 0u32;
++    loop {
++        rounds += 1;
++        let batch = WriteBatch::new()
++            .require(own.session_key.to_vec(), own.bytes.clone())
++            .put(own.session_key.to_vec(), own.released.clone());
++        match store.commit(batch).await {
++            Ok(CommitOutcome::Committed) => return why.end(own, FenceState::Released { epoch }),
++            Ok(CommitOutcome::Conflict) => {
++                let now = match store.get(own.session_key).await {
++                    Ok(now) => now,
++                    // The conflict may mean another writer moved the session; no read says so.
++                    Err(fault) => {
++                        let cause = why.cause(Stop::Store(fault));
++                        return Err(stopped(own.upload_id, FenceState::Unknown { epoch }, cause));
++                    }
++                };
++                if now.as_ref() != Some(&own.bytes) {
++                    return moved(own, now, why, fingerprint);
++                }
++                // Nothing a read can see explains the conflict (on TiKV, a lock): spend the round.
++                if rounds == why.rounds() {
++                    return Err(stands(why.cause(Stop::ReleaseRoundsSpent { rounds })));
++                }
++            }
++            Err(fault) => {
++                return Err(match fault.downcast_ref::<CommitUnknownResult>() {
++                    Some(unknown) => {
++                        in_doubt(own.upload_id, DoubtfulCommit::Release { epoch }, unknown)
++                    }
++                    // A definite failure of the release: the fence stands.
++                    None => stands(why.cause(Stop::Store(fault))),
++                });
++            }
++        }
++    }
++}
++
++/// End a request whose fence another writer moved the session off before this Complete released
++/// it, from the state it moved to (`0016:976`). Only the reaper's rollback (`Open`) and a teardown
++/// fence (`Aborting`) move a `Completing` session (`0016:664-666`); an `Open` session is not fenced
++/// by this Complete any more, so the request ends as `why` says.
++fn moved(
++    own: &OwnFence<'_>,
++    found: Option<Bytes>,
++    why: ReleaseFor,
++    fingerprint: Option<&Digest>,
++) -> Result<FenceOutcome, CompleteError> {
++    let epoch = own.epoch;
++    let Some(bytes) = found else {
++        return Ok(refused(Refusal::NoSuchUpload));
++    };
++    let session = match decode_session_record(&bytes) {
++        Ok(session) => session,
++        Err(torn) => {
++            let cause = why.cause(Stop::Record(torn));
++            return Err(stopped(own.upload_id, FenceState::Gone { epoch }, cause));
++        }
++    };
++    match complete_answer(Some(session.state()), fingerprint) {
++        CompleteAnswer::Fences => why.end(own, FenceState::Gone { epoch }),
++        CompleteAnswer::AlreadyCompleted(publication) => {
++            Ok(answered(CompleteOutcome::AlreadyCompleted(publication)))
++        }
++        CompleteAnswer::Refused(refusal) => Ok(refused(refusal)),
++    }
++}
++
++fn answered(outcome: CompleteOutcome) -> FenceOutcome {
++    FenceOutcome::Answered(outcome)
++}
++
++fn refused(refusal: Refusal) -> FenceOutcome {
++    answered(CompleteOutcome::Refused(refusal))
++}
++
++fn stopped(upload_id: &UploadId, fence: FenceState, cause: Stop) -> CompleteError {
++    CompleteError::Stopped(Box::new(Stopped {
++        upload_id: upload_id.clone(),
++        fence,
++        cause,
++    }))
++}
++
++fn in_doubt(
++    upload_id: &UploadId,
++    commit: DoubtfulCommit,
++    unknown: &CommitUnknownResult,
++) -> CompleteError {
++    CompleteError::InDoubt(Box::new(InDoubt {
++        upload_id: upload_id.clone(),
++        commit,
++        may_still_commit: unknown.may_still_commit,
++        outcome: unknown.clone(),
++    }))
++}
+diff --git a/crates/core/tests/multipart_complete.rs b/crates/core/tests/multipart_complete.rs
+new file mode 100644
+index 0000000..a5ed6d3
+--- /dev/null
++++ b/crates/core/tests/multipart_complete.rs
+@@ -0,0 +1,2160 @@
++//! Issue #1007 — `CompleteMultipartUpload`'s **fence phase**,
++//! `wyrd_core::multipart::complete::fence_complete`, driven over a real store
++//! (`RedbMetadataStore::in_memory()`) on a multi-thread tokio runtime (proposal 0016's
++//! *Complete fence* and *Fence release* rows, `0016:661`, `:664`, and decision 3, `0016:895-1036`).
++//!
++//! Every session here is made by Create (`create_session`, #894). Parts are planted as canonical
++//! `part:` / `psum:` records through the key and record helpers, with no staging. A
++//! `Completing`, `Completed` or `Aborting` session is that session's record overwritten with
++//! canonical bytes the decoder accepts.
++//!
++//! * **(E)** Answers by state (`0016:976`): a `Completed` tombstone answers an identical request
++//!   with the recorded publication and a different list `NoSuchUpload`; another publisher's
++//!   `Completing` fence answers `OperationAborted` and is left byte-for-byte as it was, `seg:`
++//!   range included; `Aborting`, absent and another target answer `NoSuchUpload`. None of them
++//!   commits.
++//! * **(D1)** Typos — an absent part, a digest mismatch, part numbers out of order — answer
++//!   `InvalidPart` and leave the session `Open` with `attempts` as it was.
++//! * **(D2)** A part replaced between the first read and the fence: the request fences, fails
++//!   against the frozen set, releases, and answers `InvalidPart`, with `attempts` given back.
++//!   After D1 and D2 a valid request still fences. After a rejected request an Abort fences
++//!   (`0016:1033`).
++//! * **(D4)** A fence the Complete owns and cannot release stops with the error that says the
++//!   fence still stands, never with an answer.
++//! * **(H)** A bucket deleted while the session is open answers `NoSuchBucket`, and the session is
++//!   `Open` again with `attempts` given back (`0016:1035`).
++//! * **(G0-fence)** An unknown outcome on the fence or the release returns the in-doubt error at
++//!   once; a failed first read returns an error, never an answer.
++//! * **The budget, away from zero.** D2, H and a held fence from `Open@E` with attempts already
++//!   spent: the fence charges one more, a release restores that exact count.
++//! * **Paging.** A frozen set larger than one page is read whole, and a page breaking the paging
++//!   contract is a store fault.
++//! * **A store fault behind the fence** tries one release; the error says what became of the
++//!   fence, for each thing that release can do.
++//! * Beside those: the budget at its cap, a foreign clock, a fence that loses its CAS, a release
++//!   that finds the session moved, a definite fence failure and a torn session record.
++//!
++//! The wrapper keeps its state in struct fields, never in a `static` (ADR-0035).
++
++#![forbid(unsafe_code)]
++
++use std::collections::{BTreeMap, VecDeque};
++use std::future::Future;
++use std::sync::Mutex;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentGroup, SegmentNonce};
++use wyrd_core::multipart::abort::abort_session;
++use wyrd_core::multipart::complete::{
++    fence_complete, CompleteError, CompleteRequest, DoubtfulCommit, FenceOutcome, FenceState,
++    HeldFence, InDoubt, NamedParts, Stop, Stopped, FENCE_ROUNDS, RELEASE_ROUNDS,
++};
++use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
++use wyrd_core::multipart::{
++    complete_fingerprint, decode_part_record, decode_part_summary, decode_session_record, mpu_key,
++    multipart_etag, part_key, psum_key, psum_range, AbortOutcome, Budget, CompleteOutcome,
++    CreateOutcome, Digest, InvalidPart, PartNumber, PartSummary, Publication, RecordError, Refusal,
++    SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS, MPU_PREFIX,
++};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_traits::{
++    classify, BoxError, CommitOutcome, CommitUnknownResult, ErrorClass, MetadataStore,
++    Result as StoreResult, ScanPage, TransientFault, WriteBatch,
++};
++
++// ─────────────────────────────── fixtures ───────────────────────────────
++
++const BUCKET: &str = "photos";
++/// The root inode every Alpha object dirent lives under, as `<bucket>/<key>` (ADR-0046).
++const ROOT: InodeId = 0;
++const CLOCK: &str = "wall";
++const CREATED_AT: u64 = 1_000;
++const COMMITTED_AT: u64 = 1_500;
++const FENCED_AT: u64 = 2_000;
++const MARKER: &[u8] = br#"{"name":"photos","created_at_millis":1}"#;
++/// No leg may hang the suite: a schedule that never settles fails here instead.
++const LEG_TIMEOUT: Duration = Duration::from_secs(120);
++/// More commits than any Complete may make. A Complete past it never stops committing.
++const RUNAWAY_COMMITS: usize = 100;
++/// What a scripted plain fault says.
++const FAULT: &str = "the test wrapper's store failed";
++
++async fn within<T>(leg: impl Future<Output = T>) -> T {
++    tokio::time::timeout(LEG_TIMEOUT, leg)
++        .await
++        .expect("the leg settled in time")
++}
++
++/// A profile admitting `n` sessions: every per-session cap at 1, so `U_ref` is 2.
++fn profile_of(n: u64) -> Budget {
++    let json = format!(
++        "{{\"w_ref\":{},\"max_part_chunks\":1,\"max_parts_per_session\":1,\
++         \"max_inflight_parts\":1,\"max_staged_chunks\":1}}",
++        2 * n
++    );
++    let profile: Budget = metadata::decode(json.as_bytes()).expect("a legal profile");
++    assert_eq!(profile.max_sessions(), n);
++    profile
++}
++
++/// Identity number `n`: upload id `n` and a nonce derived from it, both 32 lowercase hex.
++fn identity(n: u128) -> (UploadId, SegmentNonce) {
++    (
++        UploadId::new(format!("{n:032x}")).unwrap(),
++        SegmentNonce::new(format!("{:032x}", n ^ 0x5a5a_5a5a)).unwrap(),
++    )
++}
++
++/// The runtime Create needs: one fixed identity, no jitter, no wait.
++struct Fixed(Option<(UploadId, SegmentNonce)>);
++
++impl CreateRuntime for Fixed {
++    fn mint(&mut self) -> (UploadId, SegmentNonce) {
++        self.0.take().expect("one identity per create")
++    }
++
++    fn jitter(&mut self) -> u64 {
++        0
++    }
++
++    fn wait(&mut self, _millis: u64) -> impl Future<Output = ()> + Send {
++        std::future::ready(())
++    }
++}
++
++fn part(n: u32) -> PartNumber {
++    PartNumber::new(n).unwrap()
++}
++
++/// The digest whose 32 bytes are all `byte`.
++fn digest(byte: u8) -> Digest {
++    Digest::from_bytes([byte; 32])
++}
++
++/// The named list `(part number, digest byte)`, in the order given.
++fn named(list: &[(u32, u8)]) -> NamedParts {
++    NamedParts::new(list.iter().map(|&(n, d)| (part(n), digest(d))).collect()).unwrap()
++}
++
++/// The summary a one-chunk part `n` with `digest` carries.
++fn summary(n: u32, digest: Digest) -> PartSummary {
++    PartSummary {
++        chunks: 1,
++        len: u64::from(n) * 10,
++        digest,
++        committed_at_millis: COMMITTED_AT,
++    }
++}
++
++/// The blind batch that plants part `n` with `digest`: its `part:` record and its `psum:`
++/// summary, together, as the part commit writes them (`0016:660`), each in the codec's own
++/// canonical spelling — checked by decoding it and re-encoding it.
++fn plant_part(id: &UploadId, n: u32, digest: Digest) -> WriteBatch {
++    let summary = summary(n, digest);
++    let record = format!(
++        "{{\"chunks\":[{{\"id\":{},\"scheme\":\"None\",\"len\":{},\"placement\":[]}}],\
++         \"len\":{},\"digest\":\"{digest}\",\"committed_at_millis\":{COMMITTED_AT},\
++         \"session_epoch\":0}}",
++        1_000 + n,
++        summary.len,
++        summary.len,
++    );
++    let decoded = decode_part_record(record.as_bytes()).expect("a canonical part");
++    assert_eq!(metadata::encode(&decoded), record.as_bytes());
++    assert_eq!(decoded.digest(), &digest);
++    let psum = metadata::encode(&summary);
++    assert_eq!(decode_part_summary(&psum).unwrap(), summary);
++    WriteBatch::new()
++        .put(part_key(id, part(n)), Bytes::from(record))
++        .put(psum_key(id, part(n)), psum)
++}
++
++/// The JSON spelling of a string, escapes included — the encoder's own.
++fn json_string(text: &str) -> String {
++    String::from_utf8(metadata::encode(&text).to_vec()).unwrap()
++}
++
++/// `open`'s session at `epoch` and `attempts` in `state` (a JSON state object), in the codec's
++/// canonical spelling — checked by decoding it and re-encoding it.
++fn session_bytes(open: &Bytes, epoch: u64, attempts: u32, state: &str) -> Bytes {
++    let record = decode_session_record(open).unwrap();
++    let bytes = format!(
++        "{{\"parent\":{},\"object\":{},\"created_at_millis\":{},\"clock_source\":{},\
++         \"segment_nonce\":\"{}\",\"epoch\":{epoch},\"attempts\":{attempts},\"state\":{state}}}",
++        record.parent(),
++        json_string(record.object()),
++        record.created_at_millis(),
++        json_string(record.clock_source()),
++        record.segment_nonce(),
++    );
++    let decoded = decode_session_record(bytes.as_bytes()).expect("a canonical session");
++    assert_eq!(metadata::encode(&decoded), bytes.as_bytes());
++    Bytes::from(bytes)
++}
++
++const OPEN: &str = r#"{"kind":"Open"}"#;
++const ABORTING: &str = r#"{"kind":"Aborting"}"#;
++
++/// `open`'s session fenced by **another** publisher at epoch 1: `Completing@1`, one attempt
++/// spent, two segments written.
++fn completing(open: &Bytes) -> Bytes {
++    let record = decode_session_record(open).unwrap();
++    let state = format!(
++        "{{\"kind\":\"Completing\",\"fenced_at_millis\":1900,\"segments_written\":2,\
++         \"publish_target\":{{\"parent\":{},\"name\":{},\"epoch\":1}}}}",
++        record.parent(),
++        json_string(record.object()),
++    );
++    session_bytes(open, 1, 1, &state)
++}
++
++/// What the `Completed` tombstone below records.
++fn recorded(list: &NamedParts) -> Publication {
++    Publication {
++        inode: 7,
++        version: 3,
++        etag: multipart_etag(list.as_slice()).unwrap(),
++        completed_at_millis: 3_000,
++    }
++}
++
++/// `open`'s session published by a Complete naming `list`: a `Completed` tombstone at epoch 2
++/// recording [`recorded`] and `list`'s fingerprint.
++fn completed(open: &Bytes, list: &NamedParts) -> Bytes {
++    let publication = recorded(list);
++    let state = format!(
++        "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":{},\"version\":{},\"etag\":\"{}\",\
++         \"completed_at_millis\":{},\"complete_fingerprint\":\"{}\"}}}}",
++        publication.inode,
++        publication.version,
++        publication.etag,
++        publication.completed_at_millis,
++        complete_fingerprint(list.as_slice()).unwrap(),
++    );
++    session_bytes(open, 2, 1, &state)
++}
++
++fn unknown(may_still_commit: bool) -> BoxError {
++    BoxError::from(CommitUnknownResult {
++        backend: "test wrapper",
++        code: None,
++        detail: "the wrapper withheld the outcome".to_owned(),
++        may_still_commit,
++    })
++}
++
++fn fault(transient: bool) -> BoxError {
++    if transient {
++        BoxError::from(TransientFault::new(FAULT))
++    } else {
++        BoxError::from(FAULT)
++    }
++}
++
++// ──────────────────────────── the logging wrapper ────────────────────────────
++
++/// What [`Logged`] does with one commit of the Complete under test. Later slices add steps here
++/// (a hold step that keeps a batch back until the test releases it, say).
++#[derive(Debug, Clone)]
++enum OnCommit {
++    /// Delegate unchanged.
++    Pass,
++    /// Answer `Ok(Conflict)` without applying the batch or changing any record, as TiKV does when
++    /// its locking read meets another writer's lock (`abort.rs:247-249`).
++    ConflictUnmoved,
++    /// Answer a definite store error (not an unknown outcome), unapplied.
++    Fail { transient: bool },
++    /// Apply the batch or not, then answer `CommitUnknownResult { may_still_commit }`.
++    Unknown {
++        applied: bool,
++        may_still_commit: bool,
++    },
++    /// Apply this blind batch to the inner store first — re-plant a part, remove the bucket,
++    /// move the session — then do the step it carries.
++    WriteFirst(WriteBatch, Box<OnCommit>),
++    /// Arm this for the reads after it — a read that fails only behind the fence — then do the
++    /// step it carries.
++    Arm(Arm, Box<OnCommit>),
++}
++
++/// Something [`Logged`] does to reads from the moment it is armed.
++#[derive(Debug, Clone)]
++enum Arm {
++    /// Every `get` of a key under this prefix fails with a plain fault.
++    FailGets(Vec<u8>),
++    /// Every `scan_page` under this prefix fails with a plain fault.
++    FailScans(Vec<u8>),
++    /// The next `scan_page` calls answer these pages, one each, instead of asking the store: what
++    /// a backend breaking the paging contract would answer.
++    NextPages(Vec<ScanPage>),
++}
++
++impl OnCommit {
++    fn write_first(write: WriteBatch, then: Self) -> Self {
++        Self::WriteFirst(write, Box::new(then))
++    }
++
++    fn arm(arm: Arm, then: Self) -> Self {
++        Self::Arm(arm, Box::new(then))
++    }
++}
++
++#[derive(Default)]
++struct Script {
++    plan: VecDeque<OnCommit>,
++    /// What every commit past `plan` does (`Pass` when unset).
++    then: Option<OnCommit>,
++    /// Every `get` of a key under this prefix fails with a plain fault.
++    fail_gets_under: Option<Vec<u8>>,
++    /// Every `scan_page` under this prefix fails with a plain fault.
++    fail_scans_under: Option<Vec<u8>>,
++    /// What the next `scan_page` calls answer.
++    next_pages: VecDeque<ScanPage>,
++    /// Every `scan_page` asked of this wrapper: `(after, limit)`, in order.
++    scans: Vec<(Option<Vec<u8>>, usize)>,
++    /// Every batch the Complete under test committed through this wrapper, in order.
++    commits: Vec<WriteBatch>,
++}
++
++/// A store wrapper that logs every batch of the Complete under test and acts on each as scripted.
++/// Fixture writes go to `inner` directly, so they are neither logged nor scripted.
++struct Logged {
++    inner: RedbMetadataStore,
++    script: Mutex<Script>,
++}
++
++impl Logged {
++    fn script(&self, plan: Vec<OnCommit>, then: Option<OnCommit>) {
++        let mut script = self.state();
++        script.plan = plan.into();
++        script.then = then;
++    }
++
++    fn arm(&self, arm: Arm) {
++        let mut script = self.state();
++        match arm {
++            Arm::FailGets(prefix) => script.fail_gets_under = Some(prefix),
++            Arm::FailScans(prefix) => script.fail_scans_under = Some(prefix),
++            Arm::NextPages(pages) => script.next_pages = pages.into(),
++        }
++    }
++
++    /// Every armed read fault gone, for a request after the faulty one.
++    fn clear_read_faults(&self) {
++        let mut script = self.state();
++        script.fail_gets_under = None;
++        script.fail_scans_under = None;
++    }
++
++    /// Every `scan_page` asked so far, and the log emptied.
++    fn take_scans(&self) -> Vec<(Option<Vec<u8>>, usize)> {
++        std::mem::take(&mut self.state().scans)
++    }
++
++    fn state(&self) -> std::sync::MutexGuard<'_, Script> {
++        self.script.lock().unwrap()
++    }
++
++    /// Every batch committed so far, and the log emptied.
++    fn take_commits(&self) -> Vec<WriteBatch> {
++        std::mem::take(&mut self.state().commits)
++    }
++
++    async fn step(&self, act: OnCommit, batch: WriteBatch) -> StoreResult<CommitOutcome> {
++        match act {
++            OnCommit::Pass => self.inner.commit(batch).await,
++            OnCommit::ConflictUnmoved => {
++                // A real store yields here; so must this one, or no timeout could fire.
++                tokio::task::yield_now().await;
++                Ok(CommitOutcome::Conflict)
++            }
++            OnCommit::Fail { transient } => Err(fault(transient)),
++            OnCommit::Unknown {
++                applied,
++                may_still_commit,
++            } => {
++                if applied {
++                    assert_eq!(self.inner.commit(batch).await?, CommitOutcome::Committed);
++                }
++                Err(unknown(may_still_commit))
++            }
++            OnCommit::WriteFirst(write, then) => {
++                assert_eq!(self.inner.commit(write).await?, CommitOutcome::Committed);
++                Box::pin(self.step(*then, batch)).await
++            }
++            OnCommit::Arm(arm, then) => {
++                self.arm(arm);
++                Box::pin(self.step(*then, batch)).await
++            }
++        }
++    }
++}
++
++#[async_trait]
++impl MetadataStore for Logged {
++    async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
++        let fails = self
++            .state()
++            .fail_gets_under
++            .as_ref()
++            .is_some_and(|prefix| key.starts_with(prefix));
++        if fails {
++            return Err(fault(false));
++        }
++        self.inner.get(key).await
++    }
++
++    async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
++        self.inner.scan(prefix).await
++    }
++
++    async fn scan_page(
++        &self,
++        prefix: &[u8],
++        after: Option<&[u8]>,
++        limit: usize,
++    ) -> StoreResult<ScanPage> {
++        {
++            let mut script = self.state();
++            script.scans.push((after.map(<[u8]>::to_vec), limit));
++            let fails = script
++                .fail_scans_under
++                .as_ref()
++                .is_some_and(|under| prefix.starts_with(under));
++            if fails {
++                return Err(fault(false));
++            }
++            if let Some(page) = script.next_pages.pop_front() {
++                return Ok(page);
++            }
++        }
++        self.inner.scan_page(prefix, after, limit).await
++    }
++
++    async fn commit(&self, batch: WriteBatch) -> StoreResult<CommitOutcome> {
++        let (act, made) = {
++            let mut script = self.state();
++            script.commits.push(batch.clone());
++            let act = script.plan.pop_front().or_else(|| script.then.clone());
++            (act.unwrap_or(OnCommit::Pass), script.commits.len())
++        };
++        assert!(
++            made <= RUNAWAY_COMMITS,
++            "the complete never stopped committing ({made} commits)"
++        );
++        self.step(act, batch).await
++    }
++}
++
++// ─────────────────────────────── the upload ───────────────────────────────
++
++/// One session made by Create on a store with its bucket, with parts planted.
++struct Upload {
++    store: Logged,
++    id: UploadId,
++    object: String,
++    /// The exact bytes Create stored: `Open@0`, no attempt spent.
++    open: Bytes,
++}
++
++/// A store holding the bucket and session 1, made by Create, with each `(n, digest byte)` of
++/// `parts` planted as a committed part.
++async fn upload(parts: &[(u32, u8)]) -> Upload {
++    let inner = RedbMetadataStore::in_memory().unwrap();
++    let bucket = WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER);
++    assert_eq!(
++        inner.commit(bucket).await.unwrap(),
++        CommitOutcome::Committed
++    );
++    let object = format!("{BUCKET}/object-1");
++    let request = CreateRequest {
++        bucket: BUCKET,
++        parent: ROOT,
++        object: &object,
++        content_type: None,
++        created_at_millis: CREATED_AT,
++        clock_source: CLOCK,
++    };
++    let outcome = create_session(
++        &inner,
++        &profile_of(8),
++        &request,
++        &mut Fixed(Some(identity(1))),
++    )
++    .await
++    .expect("the create ran");
++    let CreateOutcome::Created { upload_id: id } = outcome else {
++        panic!("expected Created, got {outcome:?}");
++    };
++    for &(n, d) in parts {
++        let plant = plant_part(&id, n, digest(d));
++        assert_eq!(inner.commit(plant).await.unwrap(), CommitOutcome::Committed);
++    }
++    let open = inner.get(&mpu_key(&id)).await.unwrap().unwrap();
++    let record = decode_session_record(&open).unwrap();
++    assert!(matches!(record.state(), SessionState::Open {}));
++    assert_eq!((record.epoch(), record.attempts()), (0, 0));
++    Upload {
++        store: Logged {
++            inner,
++            script: Mutex::new(Script::default()),
++        },
++        id,
++        object,
++        open,
++    }
++}
++
++/// [`upload`], with the session moved to `Open@epoch` and `attempts` already spent. Its bytes are
++/// what an earlier fence and rollback leave.
++async fn upload_at(parts: &[(u32, u8)], epoch: u64, attempts: u32) -> Upload {
++    let up = upload(parts).await;
++    up.plant(session_bytes(&up.open, epoch, attempts, OPEN))
++        .await;
++    up
++}
++
++impl Upload {
++    /// A request for this upload's own target naming `parts`, on the session's own clock.
++    fn request<'a>(&'a self, parts: &'a NamedParts) -> CompleteRequest<'a> {
++        CompleteRequest {
++            bucket: BUCKET,
++            parent: ROOT,
++            object: &self.object,
++            parts,
++            fenced_at_millis: FENCED_AT,
++            clock_source: CLOCK,
++        }
++    }
++
++    async fn complete(&self, parts: &NamedParts) -> Result<FenceOutcome, CompleteError> {
++        fence_complete(&self.store, &self.id, &self.request(parts)).await
++    }
++
++    /// The session's stored bytes and record.
++    async fn session(&self) -> (Bytes, SessionRecord) {
++        let bytes = self.store.inner.get(&mpu_key(&self.id)).await.unwrap();
++        let bytes = bytes.expect("the session");
++        let record = decode_session_record(&bytes).expect("a valid session");
++        (bytes, record)
++    }
++
++    /// Overwrite the session record with `bytes`.
++    async fn plant(&self, bytes: Bytes) {
++        let put = WriteBatch::new().put(mpu_key(&self.id), bytes);
++        assert_eq!(
++            self.store.inner.commit(put).await.unwrap(),
++            CommitOutcome::Committed
++        );
++    }
++
++    /// Every record in the store, in key order.
++    async fn snapshot(&self) -> Vec<(Vec<u8>, Bytes)> {
++        let mut all = self.store.inner.scan(b"").await.unwrap();
++        all.sort();
++        all
++    }
++}
++
++// ─────────────────────────────── assertions ───────────────────────────────
++
++/// The refusal an answered request was refused with.
++fn refused(outcome: Result<FenceOutcome, CompleteError>) -> Refusal {
++    match outcome {
++        Ok(FenceOutcome::Answered(CompleteOutcome::Refused(refusal))) => refusal,
++        other => panic!("expected a refusal, got {other:?}"),
++    }
++}
++
++fn held(outcome: Result<FenceOutcome, CompleteError>) -> Box<HeldFence> {
++    match outcome {
++        Ok(FenceOutcome::Held(fence)) => fence,
++        other => panic!("expected the held fence, got {other:?}"),
++    }
++}
++
++/// The stopped error for `id`, which never classifies as indeterminate and carries no
++/// `CommitUnknownResult` anywhere on its source chain.
++fn stopped_error(
++    outcome: Result<FenceOutcome, CompleteError>,
++    id: &UploadId,
++) -> (String, Box<Stopped>) {
++    let err = match outcome {
++        Err(err @ CompleteError::Stopped(_)) => err,
++        other => panic!("expected the stopped error, got {other:?}"),
++    };
++    assert_ne!(
++        classify(&err),
++        ErrorClass::Indeterminate,
++        "nothing is in doubt: {err}"
++    );
++    let mut source = std::error::Error::source(&err);
++    while let Some(cause) = source {
++        assert!(
++            !cause.is::<CommitUnknownResult>(),
++            "no unknown outcome: {err}"
++        );
++        source = cause.source();
++    }
++    let text = err.to_string();
++    assert!(text.contains(id.as_str()), "it names the upload id: {text}");
++    let has_source = std::error::Error::source(&err).is_some();
++    let CompleteError::Stopped(stopped) = err else {
++        unreachable!()
++    };
++    assert_eq!(&stopped.upload_id, id);
++    assert_says_only(&text, &stopped.fence);
++    assert!(
++        text.contains(&stopped.cause.to_string()),
++        "it says the cause: {text}"
++    );
++    assert_eq!(
++        has_source,
++        matches!(stopped.cause, Stop::Store(_) | Stop::Record(_)),
++        "the source is the cause's own error: {text}"
++    );
++    (text, stopped)
++}
++
++/// The error's text says what `fence` says and none of what the other states say: a caller reading
++/// it is never told a fence that stands has gone, or the other way round.
++fn assert_says_only(text: &str, fence: &FenceState) {
++    let said = match fence {
++        FenceState::NotPlaced => "no fence of this complete landed".to_owned(),
++        FenceState::Stands { epoch } => format!("fence at Completing@{epoch} still stands"),
++        FenceState::Released { epoch } => format!("fence at Completing@{epoch} was taken down"),
++        FenceState::Gone { epoch } => format!("fence at Completing@{epoch} no longer stands"),
++        FenceState::Unknown { epoch } => {
++            format!("fence at Completing@{epoch} may or may not stand")
++        }
++    };
++    assert!(text.contains(&said), "expected {said:?} in: {text}");
++    for other in [
++        "no fence of this complete landed",
++        "still stands",
++        "was taken down",
++        "no longer stands",
++        "may or may not stand",
++    ] {
++        assert_eq!(
++            text.contains(other),
++            said.contains(other),
++            "{other:?} in: {text}"
++        );
++    }
++}
++
++/// `cause` is the plain fault the wrapper's armed reads fail with, not a commit's fault.
++fn assert_read_fault(cause: &Stop) {
++    assert!(
++        matches!(cause, Stop::Store(fault) if fault.to_string() == FAULT && !fault.is::<TransientFault>()),
++        "{cause:?}"
++    );
++}
++
++/// The in-doubt error for `id` about `commit`: it classifies as indeterminate, its source is the
++/// store's own unknown outcome, and it carries `may_still_commit` as the store said it.
++fn in_doubt_error(
++    outcome: Result<FenceOutcome, CompleteError>,
++    id: &UploadId,
++    commit: DoubtfulCommit,
++    may_still_commit: bool,
++) -> Box<InDoubt> {
++    let err = match outcome {
++        Err(err @ CompleteError::InDoubt(_)) => err,
++        other => panic!("expected the in-doubt error, never an answer: got {other:?}"),
++    };
++    assert_eq!(classify(&err), ErrorClass::Indeterminate, "{err}");
++    let source = std::error::Error::source(&err)
++        .and_then(|source| source.downcast_ref::<CommitUnknownResult>())
++        .expect("the source is the store's unknown outcome");
++    assert_eq!(source.may_still_commit, may_still_commit);
++    let text = err.to_string();
++    assert!(
++        text.contains(id.as_str()) && text.contains("in doubt"),
++        "{text}"
++    );
++    let about = match commit {
++        DoubtfulCommit::Fence { epoch } => format!("its fence at Completing@{epoch}"),
++        DoubtfulCommit::Release { epoch } => {
++            format!("the release of its fence at Completing@{epoch}")
++        }
++    };
++    assert!(text.contains(&about), "expected {about:?} in: {text}");
++    let may = if may_still_commit {
++        "may still be applied"
++    } else {
++        "may have been applied"
++    };
++    assert!(text.contains(may), "expected {may:?} in: {text}");
++    let CompleteError::InDoubt(doubt) = err else {
++        unreachable!()
++    };
++    assert_eq!(&doubt.upload_id, id);
++    assert_eq!(doubt.commit, commit);
++    assert_eq!(doubt.may_still_commit, may_still_commit);
++    assert_eq!(doubt.outcome.may_still_commit, may_still_commit);
++    doubt
++}
++
++/// A fence or release batch for `id`: one `require` on `mpu:<id>` and one put there, nothing
++/// else. Returns the bytes it requires and the bytes it puts.
++fn session_cas(batch: &WriteBatch, id: &UploadId) -> (Bytes, Bytes) {
++    assert_eq!(batch.preconditions.len(), 1, "{batch:?}");
++    assert_eq!(batch.preconditions[0].key, mpu_key(id));
++    assert_eq!(batch.puts.len(), 1, "{batch:?}");
++    assert_eq!(batch.puts[0].0, mpu_key(id));
++    assert!(batch.deletes.is_empty(), "{batch:?}");
++    let required = batch.preconditions[0].expected.clone();
++    (
++        required.expect("an exact-value require"),
++        batch.puts[0].1.clone(),
++    )
++}
++
++/// `before`'s session fenced by this Complete: `Completing@E+1`, stamped `FENCED_AT`, no segment
++/// written, its own target at the new epoch, one more attempt spent.
++fn assert_fenced(fenced: &SessionRecord, before: &SessionRecord) {
++    let epoch = before.epoch() + 1;
++    assert_eq!(fenced.epoch(), epoch);
++    assert_eq!(
++        fenced.attempts(),
++        before.attempts() + 1,
++        "the fence spends one attempt"
++    );
++    let SessionState::Completing {
++        fenced_at_millis,
++        segments_written,
++        publish_target,
++    } = fenced.state()
++    else {
++        panic!("expected Completing, got {:?}", fenced.state());
++    };
++    assert_eq!((*fenced_at_millis, *segments_written), (FENCED_AT, 0));
++    assert_eq!(publish_target.parent, before.parent());
++    assert_eq!(publish_target.name, before.object());
++    assert_eq!(publish_target.epoch, epoch);
++}
++
++/// A rejected request that fenced and released: exactly two commits, the fence (requiring the
++/// bytes read, putting `Completing@E+1`) and the release (requiring the fence's bytes, putting
++/// `Open@E+2` with `attempts` as before), and the store holds what the release put.
++async fn assert_fenced_and_released(up: &Upload, before: (&Bytes, &SessionRecord)) {
++    let (before_bytes, before) = before;
++    let commits = up.store.take_commits();
++    assert_eq!(commits.len(), 2, "a fence and its release: {commits:?}");
++    let (required, fence) = session_cas(&commits[0], &up.id);
++    assert_eq!(&required, before_bytes, "the fence requires the bytes read");
++    assert_fenced(&decode_session_record(&fence).unwrap(), before);
++    let (required, release) = session_cas(&commits[1], &up.id);
++    assert_eq!(
++        required, fence,
++        "the release requires the fence's own bytes"
++    );
++    let (stored, after) = up.session().await;
++    assert_eq!(stored, release, "the release landed");
++    assert!(matches!(after.state(), SessionState::Open {}), "Open again");
++    assert_eq!(after.epoch(), before.epoch() + 2, "Open@E+2");
++    assert_eq!(
++        after.attempts(),
++        before.attempts(),
++        "the attempt is given back"
++    );
++    let expected = session_bytes(&up.open, before.epoch() + 2, before.attempts(), OPEN);
++    assert_eq!(
++        release, expected,
++        "Create's session, at Open@E+2, nothing else changed"
++    );
++}
++
++/// The parts every D leg plants, and the valid list over them.
++const PARTS: [(u32, u8); 3] = [(1, 0x11), (2, 0x22), (3, 0x33)];
++
++/// `attempts` already spent when a request arrives, away from zero: a release that restores a
++/// constant, a fence that charges one, and a report of the count that is always zero all fail here.
++const SPENT: [u32; 2] = [1, MAX_COMPLETE_ATTEMPTS - 1];
++/// The epoch a session with attempts already spent is planted at. Its fence is at `E+1`.
++const LATE_EPOCH: u64 = 4;
++
++/// The fence commit goes through, with `arm` armed for the reads behind it.
++fn fence_then(arm: Arm) -> OnCommit {
++    OnCommit::arm(arm, OnCommit::Pass)
++}
++
++/// The fence commit goes through, with part 2 replaced just before it lands: D2's fixture.
++fn fence_with_part_2_replaced(id: &UploadId) -> OnCommit {
++    OnCommit::write_first(plant_part(id, 2, digest(0x23)), OnCommit::Pass)
++}
++
++/// The refusal D2's fixture answers.
++fn part_2_replaced() -> Refusal {
++    Refusal::InvalidPart {
++        part_number: part(2),
++        reason: InvalidPart::DigestMismatch,
++    }
++}
++
++// ───────────────────────────── (E) answers by state ─────────────────────────────
++
++/// **(E)** A `Completed` tombstone planted with a publication answers an identical request with
++/// the **recorded** publication — same ETag, inode and version — and a different list
++/// `NoSuchUpload`. Neither commits, and the store is unchanged.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn e_a_completed_tombstone_answers_an_identical_retry_with_the_recorded_publication() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let list = named(&PARTS);
++        up.plant(completed(&up.open, &list)).await;
++        let before = up.snapshot().await;
++
++        let outcome = up.complete(&list).await;
++        let Ok(FenceOutcome::Answered(CompleteOutcome::AlreadyCompleted(publication))) = outcome
++        else {
++            panic!("expected AlreadyCompleted, got {outcome:?}");
++        };
++        assert_eq!(publication, recorded(&list), "the recorded publication");
++
++        for other in [
++            named(&PARTS[..2]),
++            named(&[(1, 0x11), (2, 0x22), (3, 0x34)]),
++        ] {
++            assert_eq!(refused(up.complete(&other).await), Refusal::NoSuchUpload);
++        }
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++        assert_eq!(up.snapshot().await, before, "nothing written");
++    })
++    .await;
++}
++
++/// **(E)** Against another publisher's `Completing` fence the request answers
++/// `OperationAborted`, sends no commit, and leaves that session record and its `seg:` range
++/// byte-for-byte as they were (`0016:953-958`).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn e_another_publishers_completing_fence_is_refused_and_left_untouched() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let theirs = completing(&up.open);
++        up.plant(theirs.clone()).await;
++        let group = SegmentGroup::from_nonce(up.session().await.1.segment_nonce().clone(), 1);
++        let mut segments = WriteBatch::new();
++        for index in 0..2u32 {
++            let chunk = ChunkRef {
++                id: 900 + u128::from(index),
++                scheme: EcScheme::None,
++                len: 10,
++                placement: Vec::new(),
++            };
++            let record = metadata::SegmentRecord::new(vec![chunk], u64::from(index) * 10).unwrap();
++            segments = segments.put(
++                metadata::seg_key(&group, index).unwrap(),
++                metadata::encode(&record),
++            );
++        }
++        assert_eq!(
++            up.store.inner.commit(segments).await.unwrap(),
++            CommitOutcome::Committed
++        );
++        let seg_range = metadata::seg_range_prefix(&group);
++        let segs_before = up.store.inner.scan(&seg_range).await.unwrap();
++        assert_eq!(segs_before.len(), 2);
++        let before = up.snapshot().await;
++
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::OperationAborted
++        );
++
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++        assert_eq!(
++            up.session().await.0,
++            theirs,
++            "their fence is byte-for-byte unchanged"
++        );
++        let mut segs_after = up.store.inner.scan(&seg_range).await.unwrap();
++        let mut segs_before = segs_before;
++        segs_after.sort();
++        segs_before.sort();
++        assert_eq!(segs_after, segs_before, "their seg: range is unchanged");
++        assert_eq!(up.snapshot().await, before, "nothing written");
++    })
++    .await;
++}
++
++/// **(E)** `Aborting`, an absent record, and a request naming another target than the session's
++/// own all answer `NoSuchUpload`, with no commit.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn e_aborting_absent_or_another_target_answers_no_such_upload() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let list = named(&PARTS);
++
++        let other = format!("{BUCKET}/another-object");
++        let request = CompleteRequest {
++            object: &other,
++            ..up.request(&list)
++        };
++        let outcome = fence_complete(&up.store, &up.id, &request).await;
++        assert_eq!(refused(outcome), Refusal::NoSuchUpload, "another target");
++        assert_eq!(up.session().await.0, up.open);
++
++        let (absent, _) = identity(2);
++        let outcome = fence_complete(&up.store, &absent, &up.request(&list)).await;
++        assert_eq!(refused(outcome), Refusal::NoSuchUpload, "no record");
++
++        up.plant(session_bytes(&up.open, 1, 0, ABORTING)).await;
++        assert_eq!(
++            refused(up.complete(&list).await),
++            Refusal::NoSuchUpload,
++            "Aborting"
++        );
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++    })
++    .await;
++}
++
++// ─────────────────── (D1, D2) the budget a client's mistakes never spend ───────────────────
++
++/// **(D1, D2)** On one session:
++///
++/// * **D1** — `MAX_COMPLETE_ATTEMPTS` requests in a row with invalid lists (an absent part, a
++///   digest mismatch, part numbers out of order) each answer `InvalidPart`, and after each the
++///   session is `Open` with `attempts` as it was before that request.
++/// * **D2** — `MAX_COMPLETE_ATTEMPTS` requests in a row, each naming a list valid against the
++///   part set when first read, while the wrapper re-plants part 2 with a new digest just before
++///   the fence commits. Each fences, fails against the frozen set, releases, and answers
++///   `InvalidPart`, with the session `Open` again and `attempts` given back.
++///
++/// Then a request with a valid list **fences** — the held fence at `Completing@E'+1` with
++/// `attempts` one higher — rather than answering `CompleteAttemptsExhausted`: the #636 wedge.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_typos_and_a_part_replaced_before_the_fence_never_spend_the_budget() {
++    within(async {
++        let up = upload(&PARTS).await;
++
++        // D1.
++        let typos = [
++            (named(&[(1, 0x11), (4, 0x44)]), 4, InvalidPart::Absent),
++            (
++                named(&[(1, 0x11), (2, 0x99)]),
++                2,
++                InvalidPart::DigestMismatch,
++            ),
++            (named(&[(2, 0x22), (1, 0x11)]), 1, InvalidPart::OutOfOrder),
++            // A part named twice is out of order, at the second naming.
++            (
++                named(&[(1, 0x11), (2, 0x22), (2, 0x22)]),
++                2,
++                InvalidPart::OutOfOrder,
++            ),
++            // The first part out of place is the one reported, not the lowest or the last.
++            (
++                named(&[(1, 0x11), (3, 0x33), (2, 0x22), (1, 0x11)]),
++                2,
++                InvalidPart::OutOfOrder,
++            ),
++        ];
++        assert!(typos.len() >= MAX_COMPLETE_ATTEMPTS as usize);
++        for (k, (list, part_number, reason)) in typos.iter().enumerate() {
++            let (before_bytes, before) = up.session().await;
++            let refusal = refused(up.complete(list).await);
++            assert_eq!(
++                refusal,
++                Refusal::InvalidPart {
++                    part_number: part(*part_number),
++                    reason: *reason,
++                },
++                "typo {k}"
++            );
++            let (after_bytes, after) = up.session().await;
++            assert!(
++                matches!(after.state(), SessionState::Open {}),
++                "typo {k}: Open"
++            );
++            assert_eq!(
++                after.attempts(),
++                before.attempts(),
++                "typo {k}: no attempt spent"
++            );
++            // A typo does not fence: a fence would stop every in-flight `UploadPart`.
++            assert!(up.store.take_commits().is_empty(), "typo {k}: zero commits");
++            assert_eq!(after_bytes, before_bytes, "typo {k}: the session's bytes");
++        }
++
++        // D2.
++        let mut current = 0x22u8;
++        for k in 0..MAX_COMPLETE_ATTEMPTS {
++            let list = named(&[(1, 0x11), (2, current), (3, 0x33)]);
++            let replaced = current + 1;
++            up.store.script(
++                vec![OnCommit::write_first(
++                    plant_part(&up.id, 2, digest(replaced)),
++                    OnCommit::Pass,
++                )],
++                None,
++            );
++            let (before_bytes, before) = up.session().await;
++            let refusal = refused(up.complete(&list).await);
++            assert_eq!(
++                refusal,
++                Refusal::InvalidPart {
++                    part_number: part(2),
++                    reason: InvalidPart::DigestMismatch,
++                },
++                "replacement {k}"
++            );
++            assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++            current = replaced;
++        }
++
++        // A valid request fences.
++        let (before_bytes, before) = up.session().await;
++        assert_eq!(before.attempts(), 0, "no request spent the budget");
++        let list = named(&[(1, 0x11), (2, current), (3, 0x33)]);
++        let fence = held(up.complete(&list).await);
++        assert_fenced(fence.session(), &before);
++        assert_eq!(fence.epoch(), before.epoch() + 1, "Completing@E'+1");
++        assert_eq!(fence.session().attempts(), 1, "one attempt higher");
++        assert_eq!(fence.attempts_before(), 0);
++        assert_eq!(fence.upload_id(), &up.id);
++        let (stored, _) = up.session().await;
++        assert_eq!(&stored, fence.session_bytes(), "the store holds the fence");
++        assert_eq!(fence.named_parts(), list.as_slice());
++        let frozen: BTreeMap<PartNumber, PartSummary> = [(1, 0x11), (2, current), (3, 0x33)]
++            .into_iter()
++            .map(|(n, d)| (part(n), summary(n, digest(d))))
++            .collect();
++        assert_eq!(fence.frozen_parts(), &frozen, "the frozen set");
++        assert_eq!(
++            fence.bucket_marker().as_ref(),
++            MARKER,
++            "the marker bytes read"
++        );
++        let commits = up.store.take_commits();
++        assert_eq!(commits.len(), 1, "one fence commit and nothing after it");
++        let (required, put) = session_cas(&commits[0], &up.id);
++        assert_eq!((required, &put), (before_bytes, fence.session_bytes()));
++    })
++    .await;
++}
++
++/// **(D)** After a rejected request, an Abort answers `Fenced` (`0016:1033`): the request left the
++/// session `Open`, never in `Completing`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d_after_a_rejected_request_an_abort_fences() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![OnCommit::write_first(
++                plant_part(&up.id, 2, digest(0x23)),
++                OnCommit::Pass,
++            )],
++            None,
++        );
++        let refusal = refused(up.complete(&named(&PARTS)).await);
++        assert!(
++            matches!(refusal, Refusal::InvalidPart { .. }),
++            "{refusal:?}"
++        );
++
++        let outcome = abort_session(&up.store.inner, &up.id).await;
++        assert!(matches!(outcome, Ok(AbortOutcome::Fenced)), "{outcome:?}");
++    })
++    .await;
++}
++
++// ──────────────────── (D4) a fence it owns and cannot release ────────────────────
++
++/// **(D4)** Set up as D2: the fence lands with a definite success and the frozen list is
++/// invalid. The wrapper answers every release `Conflict` without applying it or changing the
++/// session (the TiKV lock case). The request returns the **stopped** error: it names the upload
++/// and the epoch of the fence it still holds (1), says the fence still stands, its cause says the
++/// release rounds ran out, and it carries no `CommitUnknownResult`. The session is `Completing@1`,
++/// byte-identical to the fence's bytes, after exactly `RELEASE_ROUNDS` release commits.
++///
++/// A second run answers the release with a definite store error: the same stopped error, with
++/// that store error as its cause.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn d4_a_fence_it_owns_and_cannot_release_stops_with_the_fence_standing() {
++    within(async {
++        // Release rounds run out.
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![fence_with_part_2_replaced(&up.id)],
++            Some(OnCommit::ConflictUnmoved),
++        );
++        let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Stands { epoch: 1 });
++        assert!(
++            matches!(stopped.cause, Stop::ReleaseRoundsSpent { rounds } if rounds == RELEASE_ROUNDS),
++            "{:?}",
++            stopped.cause
++        );
++        assert!(text.contains("Completing@1") && text.contains("still stands"), "{text}");
++        assert!(text.contains("release rounds"), "{text}");
++        let commits = up.store.take_commits();
++        let (_, fence) = session_cas(&commits[0], &up.id);
++        let releases = &commits[1..];
++        assert_eq!(releases.len() as u32, RELEASE_ROUNDS, "at most the stated bound");
++        for release in releases {
++            assert_eq!(session_cas(release, &up.id).0, fence, "each release requires the fence");
++        }
++        let (stored, record) = up.session().await;
++        assert_eq!(stored, fence, "Completing@1, byte-identical to the fence's bytes");
++        assert!(matches!(record.state(), SessionState::Completing { .. }));
++        assert_eq!(record.epoch(), 1);
++
++        // The release fails for good.
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![
++                OnCommit::write_first(plant_part(&up.id, 2, digest(0x23)), OnCommit::Pass),
++                OnCommit::Fail { transient: true },
++            ],
++            None,
++        );
++        let outcome = up.complete(&named(&PARTS)).await;
++        let err = outcome.as_ref().err();
++        assert_eq!(err.map(|err| classify(err)), Some(ErrorClass::Transient));
++        let source = err
++            .and_then(std::error::Error::source)
++            .and_then(|source| source.downcast_ref::<TransientFault>())
++            .map(ToString::to_string);
++        assert!(
++            source.as_ref().is_some_and(|text| text.contains(FAULT)),
++            "the store error is the cause: {source:?}"
++        );
++        let (text, stopped) = stopped_error(outcome, &up.id);
++        assert_eq!(stopped.fence, FenceState::Stands { epoch: 1 });
++        assert!(
++            matches!(&stopped.cause, Stop::Store(fault) if fault.is::<TransientFault>()),
++            "{:?}",
++            stopped.cause
++        );
++        assert!(text.contains("Completing@1") && text.contains("still stands"), "{text}");
++        let commits = up.store.take_commits();
++        assert_eq!(commits.len(), 2, "the fence and one release");
++        assert_eq!(up.session().await.0, session_cas(&commits[0], &up.id).1);
++    })
++    .await;
++}
++
++// ───────────────────────────── (H) bucket deleted ─────────────────────────────
++
++/// **(H)** With the bucket record removed while the session is open, the request answers
++/// `NoSuchBucket` (`0016:1035`). Removed before the request, nothing is fenced; removed by the
++/// wrapper just before the fence commits, the request fences, finds the bucket gone behind its
++/// fence, and releases it. Either way the session is `Open` with `attempts` as it was.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn h_a_bucket_deleted_while_the_session_is_open_answers_no_such_bucket() {
++    within(async {
++        let remove = || WriteBatch::new().delete(metadata::bucket_key(BUCKET));
++
++        let up = upload(&PARTS).await;
++        assert_eq!(
++            up.store.inner.commit(remove()).await.unwrap(),
++            CommitOutcome::Committed
++        );
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::NoSuchBucket
++        );
++        assert!(up.store.take_commits().is_empty(), "nothing is fenced");
++        assert_eq!(up.session().await.0, up.open, "the session's bytes");
++
++        let up = upload(&PARTS).await;
++        up.store
++            .script(vec![OnCommit::write_first(remove(), OnCommit::Pass)], None);
++        let (before_bytes, before) = up.session().await;
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::NoSuchBucket
++        );
++        assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++    })
++    .await;
++}
++
++// ──────────────────── (G0-fence) unknown outcomes stop in doubt ────────────────────
++
++/// **(G0-fence)** The wrapper answers `CommitUnknownResult` on the initial fence, applied or not,
++/// with either `may_still_commit`. Each time the request returns the in-doubt error carrying that
++/// outcome, never a `CompleteOutcome` (the list is valid, so a fence taken as won would be held),
++/// and sends no further commit.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn g0_an_unknown_fence_outcome_returns_the_in_doubt_error_and_nothing_more() {
++    within(async {
++        for (applied, may_still_commit) in
++            [(true, false), (false, true), (true, true), (false, false)]
++        {
++            let up = upload(&PARTS).await;
++            up.store.script(
++                vec![OnCommit::Unknown {
++                    applied,
++                    may_still_commit,
++                }],
++                None,
++            );
++            let outcome = up.complete(&named(&PARTS)).await;
++            in_doubt_error(
++                outcome,
++                &up.id,
++                DoubtfulCommit::Fence { epoch: 1 },
++                may_still_commit,
++            );
++            let commits = up.store.take_commits();
++            assert_eq!(commits.len(), 1, "no commit after the unknown fence");
++            let (stored, _) = up.session().await;
++            let expected = if applied {
++                session_cas(&commits[0], &up.id).1
++            } else {
++                up.open.clone()
++            };
++            assert_eq!(stored, expected, "applied={applied}");
++        }
++    })
++    .await;
++}
++
++/// **(G0-fence)** The wrapper answers `CommitUnknownResult` on the release of a fence the request
++/// owns (set up as D2). The request returns the in-doubt error about the release, carrying that
++/// outcome, and sends no further commit.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn g0_an_unknown_release_outcome_returns_the_in_doubt_error_and_nothing_more() {
++    within(async {
++        for (applied, may_still_commit) in [(false, true), (true, false)] {
++            let up = upload(&PARTS).await;
++            up.store.script(
++                vec![
++                    OnCommit::write_first(plant_part(&up.id, 2, digest(0x23)), OnCommit::Pass),
++                    OnCommit::Unknown {
++                        applied,
++                        may_still_commit,
++                    },
++                ],
++                None,
++            );
++            let outcome = up.complete(&named(&PARTS)).await;
++            in_doubt_error(
++                outcome,
++                &up.id,
++                DoubtfulCommit::Release { epoch: 1 },
++                may_still_commit,
++            );
++            let commits = up.store.take_commits();
++            assert_eq!(
++                commits.len(),
++                2,
++                "the fence, the release, and nothing after"
++            );
++            let (_, record) = up.session().await;
++            let expect_open = applied;
++            assert_eq!(
++                matches!(record.state(), SessionState::Open {}),
++                expect_open,
++                "applied={applied}: {:?}",
++                record.state()
++            );
++        }
++    })
++    .await;
++}
++
++/// **(G0-fence)** The first read of `mpu:<id>` fails with a store error: the request returns an
++/// error, never an answer, and sends no commit.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn g0_a_failed_first_read_of_the_session_is_an_error_never_an_answer() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store.arm(Arm::FailGets(MPU_PREFIX.to_vec()));
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert!(
++            matches!(&stopped.cause, Stop::Store(fault) if fault.to_string() == FAULT),
++            "{:?}",
++            stopped.cause
++        );
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++    })
++    .await;
++}
++
++// ──────────────────────────────── beside those ────────────────────────────────
++
++/// A session that has spent `MAX_COMPLETE_ATTEMPTS` fences answers `CompleteAttemptsExhausted`
++/// with no commit (`0016:661`), and stays abortable.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn the_budget_at_its_cap_refuses_without_a_commit() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let spent = session_bytes(&up.open, 6, MAX_COMPLETE_ATTEMPTS, OPEN);
++        up.plant(spent.clone()).await;
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::CompleteAttemptsExhausted
++        );
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++        assert_eq!(up.session().await.0, spent);
++        let outcome = abort_session(&up.store.inner, &up.id).await;
++        assert!(matches!(outcome, Ok(AbortOutcome::Fenced)), "{outcome:?}");
++    })
++    .await;
++}
++
++/// A request whose clock is not the session's is stopped before anything is written: its fence
++/// stamp would mix clocks in one session's lifecycle (`0016:1966-1976`).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_request_on_a_foreign_clock_is_stopped_before_anything_is_written() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let list = named(&PARTS);
++        let request = CompleteRequest {
++            clock_source: "logical",
++            ..up.request(&list)
++        };
++        let outcome = fence_complete(&up.store, &up.id, &request).await;
++        let (_, stopped) = stopped_error(outcome, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert!(
++            matches!(&stopped.cause, Stop::ForeignClock { session, request }
++                if session == CLOCK && request == "logical"),
++            "{:?}",
++            stopped.cause
++        );
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++        assert_eq!(up.session().await.0, up.open);
++    })
++    .await;
++}
++
++/// A fence commit that answers `Conflict` is answered from what the store then holds: a rival
++/// publisher's fence that landed first answers `OperationAborted` and is left as it is; a
++/// conflict with the session unchanged spends a round and the request fences on the next; and a
++/// session that stays unchanged through every round stops with no fence placed.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fence_that_loses_its_cas_is_answered_from_what_the_store_holds() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let theirs = completing(&up.open);
++        let rival = WriteBatch::new().put(mpu_key(&up.id), theirs.clone());
++        up.store
++            .script(vec![OnCommit::write_first(rival, OnCommit::Pass)], None);
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::OperationAborted
++        );
++        assert_eq!(up.store.take_commits().len(), 1, "one fence, lost");
++        assert_eq!(up.session().await.0, theirs, "their fence is untouched");
++
++        let up = upload(&PARTS).await;
++        up.store.script(vec![OnCommit::ConflictUnmoved], None);
++        let fence = held(up.complete(&named(&PARTS)).await);
++        assert_eq!(fence.epoch(), 1);
++        assert_eq!(
++            up.store.take_commits().len(),
++            2,
++            "one round spent, then the fence"
++        );
++
++        let up = upload(&PARTS).await;
++        up.store.script(Vec::new(), Some(OnCommit::ConflictUnmoved));
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert!(
++            matches!(stopped.cause, Stop::FenceRoundsSpent { rounds } if rounds == FENCE_ROUNDS),
++            "{:?}",
++            stopped.cause
++        );
++        assert_eq!(up.store.take_commits().len() as u32, FENCE_ROUNDS);
++        assert_eq!(up.session().await.0, up.open, "no fence placed");
++    })
++    .await;
++}
++
++/// A release that finds the session moved off its fence is answered from the new state, and what
++/// it finds is never overwritten: a teardown fence (`Aborting`) answers `NoSuchUpload`, a reaper
++/// rollback (`Open` again) leaves the rejection as the answer, and a rival's `Completing` answers
++/// `OperationAborted`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_release_that_finds_the_session_moved_answers_from_its_new_state() {
++    within(async {
++        type MovedTo = fn(&Bytes) -> Bytes;
++        let cases: [(&str, MovedTo, Refusal); 3] = [
++            (
++                "Aborting",
++                |open| session_bytes(open, 2, 1, ABORTING),
++                Refusal::NoSuchUpload,
++            ),
++            (
++                "Open",
++                |open| session_bytes(open, 2, 1, OPEN),
++                part_2_replaced(),
++            ),
++            (
++                "a rival's Completing",
++                completing,
++                Refusal::OperationAborted,
++            ),
++        ];
++        for (label, moved_to, expected) in cases {
++            let up = upload(&PARTS).await;
++            let moved = moved_to(&up.open);
++            up.store.script(
++                vec![
++                    fence_with_part_2_replaced(&up.id),
++                    OnCommit::write_first(
++                        WriteBatch::new().put(mpu_key(&up.id), moved.clone()),
++                        OnCommit::Pass,
++                    ),
++                ],
++                None,
++            );
++            assert_eq!(
++                refused(up.complete(&named(&PARTS)).await),
++                expected,
++                "{label}"
++            );
++            assert_eq!(
++                up.store.take_commits().len(),
++                2,
++                "{label}: the fence, one release"
++            );
++            assert_eq!(up.session().await.0, moved, "{label}: left as it moved");
++        }
++    })
++    .await;
++}
++
++/// A release that finds a `Completed` tombstone answers by the request's fingerprint, one that
++/// finds no record answers `NoSuchUpload`, and one that finds a torn record stops with the fence
++/// gone: this Complete did not take it down, and the read says it is no longer there.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_release_that_finds_a_tombstone_no_record_or_a_torn_record() {
++    within(async {
++        let list = named(&PARTS);
++        let moved_and_replaced = |up: &Upload, write: WriteBatch| {
++            up.store.script(
++                vec![
++                    fence_with_part_2_replaced(&up.id),
++                    OnCommit::write_first(write, OnCommit::Pass),
++                ],
++                None,
++            );
++        };
++
++        // Its own list: the recorded publication.
++        let up = upload(&PARTS).await;
++        let tombstone = completed(&up.open, &list);
++        moved_and_replaced(&up, WriteBatch::new().put(mpu_key(&up.id), tombstone));
++        let outcome = up.complete(&list).await;
++        let Ok(FenceOutcome::Answered(CompleteOutcome::AlreadyCompleted(publication))) = outcome
++        else {
++            panic!("expected AlreadyCompleted, got {outcome:?}");
++        };
++        assert_eq!(publication, recorded(&list));
++
++        // Another list: the upload id is consumed.
++        let up = upload(&PARTS).await;
++        let tombstone = completed(&up.open, &named(&PARTS[..1]));
++        moved_and_replaced(
++            &up,
++            WriteBatch::new().put(mpu_key(&up.id), tombstone.clone()),
++        );
++        assert_eq!(refused(up.complete(&list).await), Refusal::NoSuchUpload);
++        assert_eq!(up.session().await.0, tombstone);
++
++        // No record.
++        let up = upload(&PARTS).await;
++        moved_and_replaced(&up, WriteBatch::new().delete(mpu_key(&up.id)));
++        assert_eq!(refused(up.complete(&list).await), Refusal::NoSuchUpload);
++
++        // A torn record: an error, with the torn record as its cause.
++        let up = upload(&PARTS).await;
++        let torn = Bytes::from_static(br#"{"parent":0}"#);
++        moved_and_replaced(&up, WriteBatch::new().put(mpu_key(&up.id), torn.clone()));
++        let (_, stopped) = stopped_error(up.complete(&list).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Gone { epoch: 1 });
++        assert!(
++            matches!(
++                stopped.cause,
++                Stop::Record(RecordError::MalformedRecordValue { .. })
++            ),
++            "{:?}",
++            stopped.cause
++        );
++        assert_eq!(
++            up.store.inner.get(&mpu_key(&up.id)).await.unwrap(),
++            Some(torn)
++        );
++    })
++    .await;
++}
++
++/// A release that answers `Conflict` and whose re-read then fails cannot say whether the fence
++/// stands, and does not claim it: a `Conflict` on an exact-bytes check usually means another writer
++/// moved the session.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_release_conflict_whose_re_read_fails_does_not_claim_the_fence_stands() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![
++                fence_with_part_2_replaced(&up.id),
++                OnCommit::arm(
++                    Arm::FailGets(MPU_PREFIX.to_vec()),
++                    OnCommit::ConflictUnmoved,
++                ),
++            ],
++            None,
++        );
++        let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Unknown { epoch: 1 });
++        assert!(!text.contains("still stands"), "{text}");
++        assert_read_fault(&stopped.cause);
++        assert_eq!(up.store.take_commits().len(), 2, "the fence, one release");
++    })
++    .await;
++}
++
++// ──────────────────────── the budget, away from zero ────────────────────────
++
++/// **(D2, away from zero)** A session with attempts already spent: the fence charges one more,
++/// and the release restores exactly the count it read, not zero and not a constant.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_rejected_request_restores_the_attempts_it_read() {
++    within(async {
++        for spent in SPENT {
++            let up = upload_at(&PARTS, LATE_EPOCH, spent).await;
++            up.store
++                .script(vec![fence_with_part_2_replaced(&up.id)], None);
++            let (before_bytes, before) = up.session().await;
++            assert_eq!(before.attempts(), spent);
++            assert_eq!(
++                refused(up.complete(&named(&PARTS)).await),
++                part_2_replaced(),
++                "spent {spent}"
++            );
++            assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++            assert_eq!(up.session().await.1.attempts(), spent, "spent {spent}");
++        }
++    })
++    .await;
++}
++
++/// **(H, away from zero)** The bucket removed just before the fence commits: `NoSuchBucket`, and
++/// the session is `Open` again with exactly the attempts it had.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_bucket_deleted_behind_the_fence_restores_the_attempts_it_read() {
++    within(async {
++        for spent in SPENT {
++            let up = upload_at(&PARTS, LATE_EPOCH, spent).await;
++            let remove = WriteBatch::new().delete(metadata::bucket_key(BUCKET));
++            up.store
++                .script(vec![OnCommit::write_first(remove, OnCommit::Pass)], None);
++            let (before_bytes, before) = up.session().await;
++            assert_eq!(
++                refused(up.complete(&named(&PARTS)).await),
++                Refusal::NoSuchBucket,
++                "spent {spent}"
++            );
++            assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++            assert_eq!(up.session().await.1.attempts(), spent, "spent {spent}");
++        }
++    })
++    .await;
++}
++
++/// **(A held fence, away from zero)** It charges one more than the session had, and it reports the
++/// count it read: the value the next slice's release puts back.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_held_fence_charges_one_more_and_reports_the_attempts_it_read() {
++    within(async {
++        for spent in SPENT {
++            let up = upload_at(&PARTS, LATE_EPOCH, spent).await;
++            let (_, before) = up.session().await;
++            let fence = held(up.complete(&named(&PARTS)).await);
++            assert_fenced(fence.session(), &before);
++            assert_eq!(fence.epoch(), LATE_EPOCH + 1);
++            assert_eq!(fence.session().attempts(), spent + 1, "spent {spent}");
++            assert_eq!(fence.attempts_before(), spent, "spent {spent}");
++            assert_eq!(up.session().await.1.attempts(), spent + 1, "spent {spent}");
++        }
++    })
++    .await;
++}
++
++// ──────────────────────────── a frozen set past one page ────────────────────────────
++
++/// Two more parts than a page holds, so the second page is short and the walk ends on it.
++const PAGED_PARTS: u32 = metadata::SEGMENT_PAGE_LIMIT as u32 + 2;
++
++fn paged_parts() -> Vec<(u32, u8)> {
++    (1..=PAGED_PARTS)
++        .map(|n| (n, u8::try_from(n % 251).unwrap()))
++        .collect()
++}
++
++/// The frozen set is read whole across pages: a part on the second page validates, and the held
++/// fence carries every part. Each of the two validations walks two pages, the second continuing
++/// from the last key of the first.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_part_on_the_second_page_is_found_and_the_whole_set_is_frozen() {
++    within(async {
++        let parts = paged_parts();
++        let up = upload(&parts).await;
++        let tail = parts[parts.len() - 1];
++        let list = named(&[(1, parts[0].1), tail]);
++
++        let fence = held(up.complete(&list).await);
++
++        let frozen = fence.frozen_parts();
++        assert_eq!(frozen.len(), parts.len(), "named or not");
++        for &(n, d) in &parts {
++            assert_eq!(
++                frozen.get(&part(n)),
++                Some(&summary(n, digest(d))),
++                "part {n}"
++            );
++        }
++        let limit = metadata::SEGMENT_PAGE_LIMIT;
++        let cursor = psum_key(&up.id, part(PAGED_PARTS - 2));
++        let walk = [(None, limit), (Some(cursor), limit)];
++        let expected: Vec<_> = walk.iter().chain(walk.iter()).cloned().collect();
++        assert_eq!(up.store.take_scans(), expected, "two walks of two pages");
++    })
++    .await;
++}
++
++/// A part on the second page, changed before the fence commits: the check behind the fence reads
++/// that page too, so the request is rejected and the fence released. A wrong digest for a part
++/// on that page is refused before any fence.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_change_on_the_second_page_is_seen_behind_the_fence() {
++    within(async {
++        let parts = paged_parts();
++        let tail = parts[parts.len() - 1];
++        let list = named(&[tail]);
++
++        let up = upload(&parts).await;
++        up.store.script(
++            vec![OnCommit::write_first(
++                plant_part(&up.id, tail.0, digest(tail.1.wrapping_add(1))),
++                OnCommit::Pass,
++            )],
++            None,
++        );
++        let (before_bytes, before) = up.session().await;
++        assert_eq!(
++            refused(up.complete(&list).await),
++            Refusal::InvalidPart {
++                part_number: part(tail.0),
++                reason: InvalidPart::DigestMismatch,
++            }
++        );
++        assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++
++        let up = upload(&parts).await;
++        let wrong = named(&[(tail.0, tail.1.wrapping_add(1))]);
++        assert_eq!(
++            refused(up.complete(&wrong).await),
++            Refusal::InvalidPart {
++                part_number: part(tail.0),
++                reason: InvalidPart::DigestMismatch,
++            }
++        );
++        assert!(up.store.take_commits().is_empty(), "refused before a fence");
++    })
++    .await;
++}
++
++/// The `psum:` page of part `n` under `id`, as a backend would answer it.
++fn psum_entry(id: &UploadId, n: u32) -> (Vec<u8>, Bytes) {
++    (
++        psum_key(id, part(n)),
++        metadata::encode(&summary(n, digest(0x11))),
++    )
++}
++
++/// A page that breaks the paging contract is a store fault, never a part set: a key repeated in a
++/// page or across pages, a key below the last one read, or a key of another upload. Before the
++/// fence, that stops with no fence placed; behind it, the fence is taken down.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_page_that_breaks_the_paging_contract_is_a_store_fault() {
++    within(async {
++        let (other_upload, _) = identity(2);
++        let up = upload(&PARTS).await;
++        let id = up.id.clone();
++        let cases: Vec<(&str, Vec<ScanPage>)> = vec![
++            (
++                "a key repeated in a page",
++                vec![(vec![psum_entry(&id, 1), psum_entry(&id, 1)], None)],
++            ),
++            (
++                "a key repeated across pages",
++                vec![
++                    (vec![psum_entry(&id, 1)], Some(psum_key(&id, part(1)))),
++                    (vec![psum_entry(&id, 1)], None),
++                ],
++            ),
++            (
++                "a key below the last one read",
++                vec![(vec![psum_entry(&id, 2), psum_entry(&id, 1)], None)],
++            ),
++            (
++                "a key of another upload, ascending",
++                vec![(vec![psum_entry(&id, 1), psum_entry(&other_upload, 2)], None)],
++            ),
++        ];
++        let list = named(&[(1, 0x11)]);
++        let says_broken = |stopped: &Stopped, label: &str| {
++            assert!(
++                matches!(&stopped.cause, Stop::Store(fault)
++                    if fault.to_string().contains("out of order or outside the range")),
++                "{label}: {:?}",
++                stopped.cause
++            );
++        };
++        for (label, pages) in cases {
++            // Before the fence.
++            up.store.arm(Arm::NextPages(pages.clone()));
++            let (_, stopped) = stopped_error(up.complete(&list).await, &up.id);
++            assert_eq!(stopped.fence, FenceState::NotPlaced, "{label}");
++            says_broken(&stopped, label);
++            assert!(up.store.take_commits().is_empty(), "{label}: zero commits");
++            assert_eq!(up.session().await.0, up.open, "{label}: no fence");
++
++            // Behind it, on a session of its own (every upload here is identity 1, so the
++            // same page answers there too).
++            let behind = upload(&PARTS).await;
++            behind
++                .store
++                .script(vec![fence_then(Arm::NextPages(pages))], None);
++            let (_, stopped) = stopped_error(behind.complete(&list).await, &behind.id);
++            assert_eq!(stopped.fence, FenceState::Released { epoch: 1 }, "{label}");
++            says_broken(&stopped, label);
++        }
++    })
++    .await;
++}
++
++/// A key under the session's `psum:` range that does not parse, and a summary that does not decode,
++/// are typed errors, never parts (ADR-0045).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_torn_part_set_is_a_typed_error() {
++    within(async {
++        let list = named(&PARTS);
++        let mut bad_key = psum_range(&identity(1).0);
++        bad_key.extend_from_slice(b"not-a-number");
++        let torn: [(&str, Vec<u8>, Bytes); 2] = [
++            (
++                "a key that does not parse",
++                bad_key,
++                metadata::encode(&1u32),
++            ),
++            (
++                "a summary that does not decode",
++                psum_key(&identity(1).0, part(2)),
++                Bytes::from_static(b"{}"),
++            ),
++        ];
++        for (label, key, value) in torn {
++            // Already torn before the fence: no fence is placed.
++            let up = upload(&PARTS).await;
++            let plant = WriteBatch::new().put(key.clone(), value.clone());
++            up.store.inner.commit(plant.clone()).await.unwrap();
++            let (_, stopped) = stopped_error(up.complete(&list).await, &up.id);
++            assert_eq!(stopped.fence, FenceState::NotPlaced, "{label}");
++            assert!(
++                matches!(stopped.cause, Stop::Record(_)),
++                "{label}: {:?}",
++                stopped.cause
++            );
++            assert!(up.store.take_commits().is_empty(), "{label}: zero commits");
++
++            // Torn behind the fence: the fence is taken down, and the cause is the torn record.
++            let up = upload(&PARTS).await;
++            up.store
++                .script(vec![OnCommit::write_first(plant, OnCommit::Pass)], None);
++            let (before_bytes, before) = up.session().await;
++            let (_, stopped) = stopped_error(up.complete(&list).await, &up.id);
++            assert_eq!(stopped.fence, FenceState::Released { epoch: 1 }, "{label}");
++            assert!(
++                matches!(stopped.cause, Stop::Record(_)),
++                "{label}: {:?}",
++                stopped.cause
++            );
++            assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++        }
++    })
++    .await;
++}
++
++// ──────────────────────── a store fault behind the fence ────────────────────────
++
++/// The reads a validation behind the fence can fail on, as an arm for the fence commit: the
++/// session's `psum:` range, and the bucket marker.
++fn faults_behind_the_fence(up: &Upload) -> [(&'static str, Arm); 2] {
++    [
++        ("a psum: page", Arm::FailScans(psum_range(&up.id))),
++        (
++            "the bucket marker",
++            Arm::FailGets(metadata::bucket_key(BUCKET)),
++        ),
++    ]
++}
++
++/// **A store fault behind the fence, the release lands.** One best-effort release takes the fence
++/// down: the error says so, its cause is the fault, and the session is `Open@E+2` with `attempts`
++/// exactly as read — at zero and away from it.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_takes_the_fence_down_when_the_release_lands() {
++    within(async {
++        for spent in [0, SPENT[0], SPENT[1]] {
++            for which in 0..2 {
++                let up = upload_at(&PARTS, LATE_EPOCH, spent).await;
++                let [first, second] = faults_behind_the_fence(&up);
++                let (label, arm) = if which == 0 { first } else { second };
++                up.store.script(vec![fence_then(arm)], None);
++                let (before_bytes, before) = up.session().await;
++
++                let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++
++                let epoch = LATE_EPOCH + 1;
++                assert_eq!(stopped.fence, FenceState::Released { epoch }, "{label}");
++                assert_read_fault(&stopped.cause);
++                assert!(text.contains("was taken down"), "{text}");
++                assert_fenced_and_released(&up, (&before_bytes, &before)).await;
++                assert_eq!(up.session().await.1.attempts(), spent, "{label}");
++            }
++        }
++    })
++    .await;
++}
++
++/// **Store faults never wedge a session.** More faults in a row than the budget allows fences,
++/// and then a request that meets no fault still fences: the #636 wedge, reached through the store.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn store_faults_behind_the_fence_never_spend_the_budget() {
++    within(async {
++        let up = upload(&PARTS).await;
++        for _ in 0..=MAX_COMPLETE_ATTEMPTS {
++            up.store
++                .script(vec![fence_then(Arm::FailScans(psum_range(&up.id)))], None);
++            let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++            assert!(matches!(stopped.fence, FenceState::Released { .. }));
++            up.store.clear_read_faults();
++        }
++        assert_eq!(up.session().await.1.attempts(), 0);
++        let fence = held(up.complete(&named(&PARTS)).await);
++        assert_eq!(fence.attempts_before(), 0);
++    })
++    .await;
++}
++
++/// **A store fault behind the fence, the release fails for good.** The fence stands and the error
++/// says so — never `NotPlaced`, which would tell the caller no fence landed. The cause is the fault
++/// that stopped validation, and only one release was tried.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_says_the_fence_stands_when_the_release_fails() {
++    within(async {
++        for which in 0..2 {
++            let up = upload(&PARTS).await;
++            let [first, second] = faults_behind_the_fence(&up);
++            let (label, arm) = if which == 0 { first } else { second };
++            up.store.script(
++                vec![fence_then(arm), OnCommit::Fail { transient: true }],
++                None,
++            );
++
++            let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++
++            assert_eq!(stopped.fence, FenceState::Stands { epoch: 1 }, "{label}");
++            assert_read_fault(&stopped.cause);
++            assert!(
++                text.contains("Completing@1") && text.contains("still stands"),
++                "{text}"
++            );
++            let commits = up.store.take_commits();
++            assert_eq!(commits.len(), 2, "{label}: the fence, one release");
++            let (stored, record) = up.session().await;
++            assert_eq!(
++                stored,
++                session_cas(&commits[0], &up.id).1,
++                "{label}: the fence's bytes"
++            );
++            assert!(matches!(record.state(), SessionState::Completing { .. }));
++        }
++    })
++    .await;
++}
++
++/// **A store fault behind the fence, the release answers `Conflict` with the session unchanged**
++/// (the TiKV lock). One release is all a best-effort release gets: the fence stands, and the cause
++/// is still the fault, not spent rounds.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_tries_one_release_only() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![fence_then(Arm::FailScans(psum_range(&up.id)))],
++            Some(OnCommit::ConflictUnmoved),
++        );
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Stands { epoch: 1 });
++        assert_read_fault(&stopped.cause);
++        let commits = up.store.take_commits();
++        assert_eq!(commits.len(), 2, "the fence, one release");
++        assert_eq!(up.session().await.0, session_cas(&commits[0], &up.id).1);
++    })
++    .await;
++}
++
++/// **A store fault behind the fence, the release's outcome is unknown.** The in-doubt error about
++/// the release, carrying that outcome, and nothing sent after it.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_with_an_unknown_release_is_in_doubt() {
++    within(async {
++        for (applied, may_still_commit) in [(false, true), (true, false)] {
++            let up = upload(&PARTS).await;
++            up.store.script(
++                vec![
++                    fence_then(Arm::FailScans(psum_range(&up.id))),
++                    OnCommit::Unknown {
++                        applied,
++                        may_still_commit,
++                    },
++                ],
++                None,
++            );
++            in_doubt_error(
++                up.complete(&named(&PARTS)).await,
++                &up.id,
++                DoubtfulCommit::Release { epoch: 1 },
++                may_still_commit,
++            );
++            assert_eq!(up.store.take_commits().len(), 2, "the fence, the release");
++        }
++    })
++    .await;
++}
++
++/// **A store fault behind the fence, the release finds the session moved.** Answered from the new
++/// state, as a rejection's release is. An `Open` session has no rejection to answer, so that is the
++/// error, saying the fence is gone and it was not this Complete that took it down.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_whose_release_finds_the_session_moved() {
++    within(async {
++        let moved_by = |up: &Upload, write: WriteBatch| {
++            up.store.script(
++                vec![
++                    fence_then(Arm::FailScans(psum_range(&up.id))),
++                    OnCommit::write_first(write, OnCommit::Pass),
++                ],
++                None,
++            );
++        };
++
++        let up = upload(&PARTS).await;
++        let aborting = session_bytes(&up.open, 2, 1, ABORTING);
++        moved_by(
++            &up,
++            WriteBatch::new().put(mpu_key(&up.id), aborting.clone()),
++        );
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::NoSuchUpload
++        );
++        assert_eq!(up.session().await.0, aborting, "left as it moved");
++
++        let up = upload(&PARTS).await;
++        moved_by(&up, WriteBatch::new().delete(mpu_key(&up.id)));
++        assert_eq!(
++            refused(up.complete(&named(&PARTS)).await),
++            Refusal::NoSuchUpload
++        );
++
++        let up = upload(&PARTS).await;
++        let rolled_back = session_bytes(&up.open, 2, 1, OPEN);
++        moved_by(
++            &up,
++            WriteBatch::new().put(mpu_key(&up.id), rolled_back.clone()),
++        );
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Gone { epoch: 1 });
++        assert_read_fault(&stopped.cause);
++        assert_eq!(up.session().await.0, rolled_back, "left as it moved");
++
++        let up = upload(&PARTS).await;
++        let torn = Bytes::from_static(br#"{"parent":0}"#);
++        moved_by(&up, WriteBatch::new().put(mpu_key(&up.id), torn));
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Gone { epoch: 1 });
++        assert_read_fault(&stopped.cause);
++    })
++    .await;
++}
++
++/// **A store fault behind the fence, the release answers `Conflict` and the re-read fails.** It
++/// does not claim the fence stands, and the cause stays the fault that stopped validation.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_behind_the_fence_whose_re_read_fails_does_not_claim_the_fence_stands() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store.script(
++            vec![
++                fence_then(Arm::FailScans(psum_range(&up.id))),
++                OnCommit::arm(
++                    Arm::FailGets(MPU_PREFIX.to_vec()),
++                    OnCommit::ConflictUnmoved,
++                ),
++            ],
++            None,
++        );
++        let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::Unknown { epoch: 1 });
++        assert!(!text.contains("still stands"), "{text}");
++        assert_read_fault(&stopped.cause);
++        assert_eq!(up.store.take_commits().len(), 2, "the fence, one release");
++    })
++    .await;
++}
++
++/// A read that fails **before** the fence, on the part set or the bucket, or after a fence commit
++/// that answered `Conflict`, stops with no fence placed: that is the one error that may say so.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_fault_before_the_fence_lands_is_stopped_with_no_fence_placed() {
++    within(async {
++        let up = upload(&PARTS).await;
++        let [(_, psum), (_, bucket)] = faults_behind_the_fence(&up);
++        for arm in [psum, bucket] {
++            up.store.arm(arm);
++            let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++            assert_eq!(stopped.fence, FenceState::NotPlaced);
++            assert_read_fault(&stopped.cause);
++            assert!(up.store.take_commits().is_empty(), "zero commits");
++            up.store.clear_read_faults();
++        }
++
++        up.store.script(
++            vec![OnCommit::arm(
++                Arm::FailGets(MPU_PREFIX.to_vec()),
++                OnCommit::ConflictUnmoved,
++            )],
++            None,
++        );
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert_read_fault(&stopped.cause);
++        assert_eq!(up.store.take_commits().len(), 1, "one fence, not applied");
++        assert_eq!(up.session().await.0, up.open);
++    })
++    .await;
++}
++
++/// The state answers before the list: a list out of order or naming a part twice is refused for its
++/// order only by an `Open` session (`0016:976`). Against the other states it gets what any list
++/// not matching the tombstone gets, with no commit.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn the_state_answers_before_the_order_of_the_list() {
++    within(async {
++        let lists = [
++            named(&[(2, 0x22), (1, 0x11)]),
++            named(&[(1, 0x11), (1, 0x11)]),
++        ];
++        let up = upload(&PARTS).await;
++        let tombstone = named(&PARTS);
++        let states = [
++            (completing(&up.open), Refusal::OperationAborted),
++            (completed(&up.open, &tombstone), Refusal::NoSuchUpload),
++            (
++                session_bytes(&up.open, 1, 0, ABORTING),
++                Refusal::NoSuchUpload,
++            ),
++        ];
++        for (state, expected) in states {
++            up.plant(state.clone()).await;
++            for list in &lists {
++                assert_eq!(refused(up.complete(list).await), expected);
++            }
++            assert!(up.store.take_commits().is_empty(), "zero commits");
++            assert_eq!(up.session().await.0, state, "left as it was");
++        }
++    })
++    .await;
++}
++
++/// A session too near the epoch ceiling for a fence **and** its release is stopped before anything
++/// is written: a fence that could not be taken down again would wedge the session on a client's
++/// mistake.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_session_at_the_epoch_ceiling_is_stopped_before_anything_is_written() {
++    within(async {
++        for epoch in [u64::MAX - 1, u64::MAX] {
++            let up = upload_at(&PARTS, epoch, 0).await;
++            let (before, _) = up.session().await;
++            let (text, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++            assert_eq!(stopped.fence, FenceState::NotPlaced);
++            assert!(
++                matches!(stopped.cause, Stop::EpochExhausted),
++                "{:?}",
++                stopped.cause
++            );
++            assert!(text.contains("epoch too high"), "{text}");
++            assert!(up.store.take_commits().is_empty(), "zero commits");
++            assert_eq!(up.session().await.0, before);
++        }
++    })
++    .await;
++}
++
++/// A fence commit the store refuses for good stops the request with no fence placed, and a
++/// stored session record that does not decode is a typed error writing nothing (ADR-0045).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_definite_fence_failure_or_a_torn_session_is_stopped_with_no_fence_placed() {
++    within(async {
++        let up = upload(&PARTS).await;
++        up.store
++            .script(vec![OnCommit::Fail { transient: true }], None);
++        let outcome = up.complete(&named(&PARTS)).await;
++        assert_eq!(
++            outcome.as_ref().err().map(|err| classify(err)),
++            Some(ErrorClass::Transient)
++        );
++        let (_, stopped) = stopped_error(outcome, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert!(
++            matches!(stopped.cause, Stop::Store(_)),
++            "{:?}",
++            stopped.cause
++        );
++        assert_eq!(up.store.take_commits().len(), 1);
++        assert_eq!(up.session().await.0, up.open);
++
++        let up = upload(&PARTS).await;
++        let torn = Bytes::from_static(br#"{"parent":0}"#);
++        let put = WriteBatch::new().put(mpu_key(&up.id), torn.clone());
++        assert_eq!(
++            up.store.inner.commit(put).await.unwrap(),
++            CommitOutcome::Committed
++        );
++        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
++        assert_eq!(stopped.fence, FenceState::NotPlaced);
++        assert!(
++            matches!(
++                stopped.cause,
++                Stop::Record(RecordError::MalformedRecordValue { .. })
++            ),
++            "{:?}",
++            stopped.cause
++        );
++        assert!(up.store.take_commits().is_empty(), "zero commits");
++    })
++    .await;
++}
++
++/// An empty list is not a request: `NamedParts` refuses it, so no Complete can be asked for one.
++#[test]
++fn an_empty_list_is_not_a_request() {
++    assert_eq!(NamedParts::new(Vec::new()), Err(RecordError::NoPartsNamed));
++}
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 2ef4f70..7a6a3ca 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -245,6 +245,8 @@ The record **types** of the multipart commit protocol (proposal 0016, still a dr
+ 
+ `UploadPart`'s staging half gives `slot:` and `sidx:` their first writer: `wyrd_core::multipart::stage::stage_part` (#932). It reserves one in-flight slot, a free index of the session's fixed slot range, under `require_absent` on that key with the session required `Open` on its exact bytes, so the cap is the key space and a slot a crashed or refused attempt leaves counts toward it until the session is reclaimed. It then streams the body into chunks and registers each chunk's owned `sidx:` entry, with the placement its fragments will go to, before any of those fragments is written. That intent batch requires the session `Open` on the bytes the attempt was fenced on, and the absence of a drain record for every server it names (`desired:dserver:<id>`, a key that now lives in core and that the custodian shares), so it fails once the session has left `Open` or a selected server's drain is recorded; a chunk is planned around draining servers and re-planned when a drain lands first, never refused for it. Each intent checks every lease of the attempt at its own clock reading before it is sent, and refuses a lapsed one rather than reviving it. For as long as the request runs, including while a body read or a fragment write is pending (on a timer the caller supplies), one batch moves the slot's lease and every owned lease forward together, half a lease TTL after the last such batch (#933). It rewrites the slot in the same batch as every owned lease it renews, under the session fence, so a reaper fence that pinned the slot bytes it judged cannot land over a request that has since renewed. That renewal never holds staging past a pending write's deadline or the body-idle bound: work that answers while it commits is taken, and the renewal is then awaited to its end; one still committing when such a deadline passes is reported as an unknown outcome. Every round of a renewal checks every lease at its own clock reading, so a lapsed lease is refused, never revived. A renewal that fails, or finds the session gone from `Open`, stops staging at once; if a fragment write is then still pending, or the chunk store could not verify one, the error that stops staging is classed indeterminate, carries the renewal's cause and any doubt about its own commit, and is never a plain refusal. No renewal batch can exceed the per-batch operation budget `B_ops`: a knob set whose largest part would need one fails the knob clamps, and staging refuses a request whose chunk bound would. The staged attempt gives the part commit one last renewal of the same kind, which succeeds only when its leases still cover a span the caller names, judged at a clock reading taken after its last commit returned. Every fragment write carries an authorization deadline measured from the clock reading taken before its chunk's intent was committed, and staging waits for the writes no longer than that deadline: a write still pending then, or one the chunk store could not verify, is counted neither written nor not written, the error that stops staging is classed indeterminate in either case, and whatever such a write leaves sits at a position the chunk's owned entry already names. Every body read is bounded too: a read the client leaves without a non-empty piece for the caller's idle bound stops staging, and a piece or end of body that staging only sees once the bound has passed counts as none. An outcome the store could not report is settled by re-reading the batch's own record, never guessed, and an ambiguous reserve retries only the index it may already hold, so no attempt ever holds two slots. Staging writes no `part:` or `psum:` record and releases nothing: it hands its attempt, with one complete chunk reference per chunk, to the part commit (#927), and nothing calls it in production until the S3 `UploadPart` verb is wired (#669).
+ 
++`CompleteMultipartUpload`'s fence phase writes `mpu:` too: `wyrd_core::multipart::complete::fence_complete` (#1007). It answers every state but `Open` from the decision-3 table and writes nothing: another publisher's `Completing` fence is refused `OperationAborted` and left untouched, and a `Completed` tombstone answers only an identical part list, with the publication it recorded. A request for another target than the session's own answers `NoSuchUpload`, and one whose clock source is not the session's is stopped before anything is written, so every stamp in a session comes from one clock. On `Open@E` it first checks the named list: part numbers strictly ascending, every part present in the session's `psum:` range with the named digest, and the bucket marker present. A list that is already invalid is answered without a fence, and a session that has spent `MAX_COMPLETE_ATTEMPTS` fences is refused with nothing written. Otherwise one batch, conditioned on the exact bytes read, moves the session to `Completing@E+1` with the fence time, no segment written, a publish target of the session's own parent, name and new epoch, and one more attempt spent. Behind the fence the list is checked again, against the part set the fence froze, and that check is the one that decides: a part replaced between the two checks, or a bucket deleted, is a rejection. A rejected request releases its fence in one batch conditioned on the fence's own bytes, back to `Open@E+2` with the attempt given back, and then answers the rejection; so a client's mistake never spends the budget, and an `Open` session can always be fenced again. A valid request hands its caller the held fence (the frozen part summaries, the fence epoch and the bucket marker bytes read) and publishes nothing yet: publication is #1008–#1011. A lost commit is judged from what the store holds, within a bounded number of rounds for the fence and for the release. A commit whose outcome the store could not report ends the request at once in an error that names the upload and classifies as indeterminate. A release that runs out of rounds or that the store refuses for good ends in an error that says the fence still stands, which the reaper's rollback (#625) then clears; neither is ever an answer. A store fault while checking behind the fence is an error too, not a rejection, but it still tries one release, so a fault of the store's does not cost the client an attempt or a wait: the error says the fence was taken down, or that it still stands if that release did not land. A release that conflicts and whose re-read fails says the fence's state is unknown, since nothing can tell. It has no production caller until the S3 verb is wired (#670).
++
+ The post-restore reconciliation keeps one more singleton beside them, `mpufence`: the **restore-fence generation** that proposal 0016 requires to complete before any gateway serves multipart verbs on a restored image (0016 names the generation but gives it no key). Its value is `{"generation":N,"complete":B}`, closed and canonical like `mpuctl`'s. `generation` numbers that pass's runs from 1, so the record is absent until the first run, and absent is the only spelling of "no run has happened". `complete` says whether that run finished its session fence. Each run first writes the next generation as not complete, and marks or fences nothing until that write is acknowledged. After its last write it records the generation complete, but only if every write it made was acknowledged and no upload session is left for a human: one it could not read or fence, or a fenced one whose segment records need a human. Every run judges those sessions afresh from their records, so a session an earlier run fenced but could not clear holds back every later run until someone repairs it. Findings that are not about a session, such as a lost or misplaced chunk or an unreadable object or staged record, do not hold the generation back. Both writes are conditioned on the bytes last read there, so a completion that lands late never overwrites a newer run's generation. What the record cannot tell: a restore rewinds it with everything else, so an image captured after an earlier run completed comes back reading complete until the next run starts. No gateway reads it yet. The gateway gate (#508) needs a restore-scoped signal beside it, and until then what keeps multipart off a restored image is the runbook's order: the reconciliation runs with writers stopped, before any gateway is re-enabled.
+ 
+ The protocol's client-visible answers, and the two digests a completed upload is identified by, are landed the same way: as pure functions that no production path calls yet. A multipart object's ETag is composed on ADR-0047's SHA-256 basis, never MD5: the lowercase-hex SHA-256 of the named parts' raw 32-byte digests concatenated in part-number order, then `-` and the number of parts named (`<hex>-<N>`, with `N` from 1 to 999,999, the most parts the `part:` key grammar can address). A `Completed` session record's `etag` holds that ETag whole, suffix included, and decode refuses any other spelling (a bare digest, a count out of range, a noncanonical number), because by the time the session's tombstone answers a retry, the part records the ETag was composed from may already be retired. Beside it, `complete_fingerprint` is a SHA-256 over each named part's number (4 bytes, big-endian) followed by its digest, so the tombstone answers an identical retry with the recorded ETag and a different part list under the consumed upload id with `NoSuchUpload`. Both digests are computed only over a non-empty list in strictly ascending part-number order; any other list is refused, never sorted. Proposal 0016's decision-3 table answers its five verbs (`UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`, `ListMultipartUploads`) in each session state and for an absent record, in a typed outcome vocabulary that names no HTTP status; the S3 status and XML mapping arrives with #508.

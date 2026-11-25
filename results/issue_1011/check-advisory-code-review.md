@@ -1,0 +1,6 @@
+- No introduced correctness defects found. Both validation passes check the stored obligation values, and publication uses the obligations validated against the frozen set (`crates/core/src/multipart/complete.rs:961`, `crates/core/src/multipart/complete.rs:1011`, `crates/core/src/multipart/complete.rs:1192`, `crates/core/src/multipart/complete.rs:1848`).
+- No actionable reuse, simplification, or efficiency findings. Part-set construction is centralized in `PartRetirement`, and measurement and writing share the obligation encoder (`crates/core/src/multipart/complete.rs:1165`, `crates/core/src/multipart.rs:4382`).
+
+Validation reviewed from frozen gate evidence; tests were not rerun. All nine new tests passed; reverting production code produced four behavioral failures. Mutation testing reported nine caught and seven unviable mutants, with none surviving. The tests cover the exact ceiling, both zero-commit refusal paths, and the concurrent-addition release (`crates/core/tests/multipart_complete_value_ceiling.rs:562`, `crates/core/tests/multipart_complete_value_ceiling.rs:580`, `crates/core/tests/multipart_complete_value_ceiling.rs:630`, `crates/core/tests/multipart_complete_value_ceiling.rs:676`). Diff coverage was not measured because the gate could not apply the patch to `origin/main`.
+
+<!-- pdca:leaf-complete -->

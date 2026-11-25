@@ -1,0 +1,1091 @@
+diff --git a/crates/server/src/cli.rs b/crates/server/src/cli.rs
+index f7aec20..b00b103 100644
+--- a/crates/server/src/cli.rs
++++ b/crates/server/src/cli.rs
+@@ -512,8 +512,13 @@ fn usage() {
+     eprintln!("  each list one entry per endpoint (matching each D-server's own --id /");
+     eprintln!("  --failure-domain); the role never fabricates identity or topology from endpoint");
+     eprintln!(
+-        "  order. Omit all three to run the leader-elected role with no reconstruction plane."
++        "  order. Omit all three to run the leader-elected role with no reconstruction plane:"
+     );
++    eprintln!("  it then runs the multipart reaper alone, every --interval-secs, until Ctrl-C.");
++    eprintln!(
++        "  If none of the --endpoints is reachable at startup, the role runs one reaper pass"
++    );
++    eprintln!("  and then fails (non-zero exit), as it always has.");
+     eprintln!();
+     eprintln!(
+         "  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: {} to {}",
+@@ -900,6 +905,13 @@ const DEFAULT_CUSTODIAN_INTERVAL_SECS: u64 = 30;
+ /// paused / partitioned peer must fail a fetch (transient `DEADLINE_EXCEEDED`) rather
+ /// than hang the reconcile loop forever.
+ const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
++/// The longest the one multipart reaper pass the role runs before failing on an empty fleet may
++/// take, the metadata store's open included (#625). Past it the pass is abandoned and the role
++/// fails as it always has: a hung backend must not turn a loud, restartable failure into a role
++/// that never exits. A pass is bounded by the reaper's and the drain's per-pass budgets — a few
++/// thousand store reads and a few dozen commits — so a minute is far past what a live backend
++/// needs, and short enough that a supervisor's restart is not held up for long.
++const EMPTY_FLEET_REAPER_PASS_BOUND: Duration = Duration::from_secs(60);
+ 
+ /// `wyrd custodian`: the **deployable custodian role** (observability floor, proposal
+ /// 0010 §"Scope boundary" item 2; the `wyrd custodian --otlp-endpoint …` bring-up command
+@@ -951,6 +963,12 @@ const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
+ /// ([`REAPER_ONE_SHOT_EXCLUDES`]), and on a redb `--data-dir` that holds no store
+ /// ([`open_existing_local_meta_redb`]); its outcome line names the store it ran on.
+ ///
++/// The multipart reaper runs on **every** shape of the ordinary role (#625): with a fleet it
++/// rides each interval's reconstruction pass, on whatever part of the fleet is reachable; with no
++/// `--endpoints` the role runs it alone every interval ([`run_reaper_over_backend`]) rather than
++/// exiting; and when no configured D server is reachable at startup the role runs one reaper pass
++/// before it panics, as it did before.
++///
+ /// `pub` so the deployable role's own binary entry — arg parse → [`resolve_backend`] →
+ /// backend open → [`connect_fleet`] (with [`require_aligned_topology`] and the concrete
+ /// [`GrpcDServerConnector`] dial) → run loop — is driven **end to end** by a test, not only
+@@ -1155,10 +1173,20 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
+                         .into(),
+                 );
+             }
++            // No fleet, but not no work: the multipart reaper reads and writes metadata alone, so
++            // the role runs it every interval instead of exiting (#625; 0016 `:234-268`, the
++            // reaper runs wherever the custodian role runs). The same interval step the fleet loop
++            // runs, record-only.
+             eprintln!(
+-                "wyrd custodian: no --endpoints; nothing to reconstruct. Wire --endpoints to \
+-                 the D-server fleet to run the reconstruction plane."
++                "wyrd custodian: no --endpoints; nothing to reconstruct. Running the multipart \
++                 reaper alone every {}s; wire --endpoints to the D-server fleet to run the \
++                 reconstruction plane.",
++                interval.as_secs()
+             );
++            run_reaper_over_backend(
++                backend, data_dir, &service, &zone, &custodian, interval, clock, shutdown,
++            )
++            .await?;
+             return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
+         };
+ 
+@@ -1228,6 +1256,44 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
+             // it and the operator would see a clean vanish on a total fleet outage / a bad
+             // `--endpoints`. Panic instead: a non-zero exit + diagnostic is a loud, restartable
+             // failure the supervisor and operator both act on.
++            //
++            // Before failing, exactly ONE multipart reaper pass, record-only, under the
++            // leadership elected above (#625): it needs no fleet, and a deployment whose fleet is
++            // down at every restart would otherwise never reap an abandoned upload. A ready
++            // shutdown makes the interval loop stop after its first pass. The role is not kept up
++            // for more: `connect_fleet` never re-dials, so it would sit on an empty fleet and
++            // vanish from the supervisor's view. Whatever the pass answers, the role then fails
++            // exactly as before; a pass fault is logged, not returned, so it cannot turn this
++            // panic into an ordinary error exit. The pass, the store open included, is bounded by
++            // [`EMPTY_FLEET_REAPER_PASS_BOUND`]: a metadata backend that hangs must not keep the
++            // role from failing.
++            match tokio::time::timeout(
++                EMPTY_FLEET_REAPER_PASS_BOUND,
++                run_reaper_over_backend(
++                    backend,
++                    data_dir,
++                    &service,
++                    &zone,
++                    &custodian,
++                    interval,
++                    clock,
++                    std::future::ready(()),
++                ),
++            )
++            .await
++            {
++                Ok(Ok(())) => {}
++                Ok(Err(e)) => {
++                    eprintln!(
++                        "wyrd custodian: multipart reaper pass on the empty fleet failed: {e}"
++                    );
++                }
++                Err(_) => eprintln!(
++                    "wyrd custodian: multipart reaper pass on the empty fleet did not finish \
++                     within {}s; abandoned",
++                    EMPTY_FLEET_REAPER_PASS_BOUND.as_secs()
++                ),
++            }
+             panic!(
+                 "wyrd custodian: NO configured D server was reachable at startup ({} endpoint(s) \
+                  all unreachable) — refusing to run a reconstruction plane over an empty fleet. \
+@@ -1806,6 +1872,52 @@ where
+     Ok(outcome)
+ }
+ 
++/// Open the metadata store the cluster wrote to and run the custodian's **no-fleet loop** over it
++/// (#625, [`CustodianService::run_reaper_until`]): the multipart reaper every `interval` until
++/// `shutdown`. The backend dispatch of the two deployed shapes that have no fleet — no
++/// `--endpoints`, and the one pass before the empty-fleet startup failure — mirroring
++/// [`run_reconstruction_over_backend`], whose store open it shares: the role's own store, opened
++/// (and on redb created) as the fleet role opens it.
++#[allow(clippy::too_many_arguments)]
++pub async fn run_reaper_over_backend<Fut, Clock>(
++    backend: MetadataBackend,
++    data_dir: &str,
++    service: &CustodianService,
++    zone: &FencedZone,
++    custodian: &Custodian,
++    interval: Duration,
++    clock: Clock,
++    shutdown: Fut,
++) -> Result<(), BoxError>
++where
++    Fut: Future<Output = ()>,
++    Clock: FnMut() -> u64 + Send,
++{
++    match backend {
++        MetadataBackend::Redb => {
++            let meta = open_local_meta_redb(data_dir)?;
++            service
++                .run_reaper_until(zone, custodian, &meta, interval, clock, shutdown)
++                .await?;
++        }
++        #[cfg(feature = "tikv")]
++        MetadataBackend::Tikv => {
++            let meta = open_tikv_meta().await?;
++            service
++                .run_reaper_until(zone, custodian, &meta, interval, clock, shutdown)
++                .await?;
++        }
++        #[cfg(feature = "fdb")]
++        MetadataBackend::Fdb => {
++            let meta = open_fdb_meta().await?;
++            service
++                .run_reaper_until(zone, custodian, &meta, interval, clock, shutdown)
++                .await?;
++        }
++    }
++    Ok(())
++}
++
+ /// Open the metadata store the cluster wrote to for the configured `backend` and run the
+ /// custodian's leader-elected reconstruction loop over it — the **exact production
+ /// backend-open path** `wyrd custodian` drives (redb dev / TiKV prod, ADR-0014), factored
+diff --git a/crates/server/src/custodian.rs b/crates/server/src/custodian.rs
+index e71924a..0c28c25 100644
+--- a/crates/server/src/custodian.rs
++++ b/crates/server/src/custodian.rs
+@@ -472,18 +472,50 @@ impl CustodianService {
+     {
+         let clock = LoopClock::new(clock);
+         let policy = ReaperPolicy::default();
++        self.reaper_pass(zone, custodian, meta, &clock, &policy, None)
++            .await
++    }
++
++    /// **The reaper's interval step** — the one dispatch of the multipart reaper every custodian
++    /// shape runs (#625; 0016 `:234-268`: the actor that drives an abandoned session out exists
++    /// wherever the custodian role runs). One fenced [`Self::reconcile_pass`] carrying the reaper
++    /// and, when the caller has a fleet, its `reconstruction` input:
++    ///
++    /// * the fleet loop ([`Self::run_reconstruction_until`]) hands its reconstruction context, so
++    ///   the retirement leg after the reaper sees the live fleet and the operator's fleet size
++    ///   (its by-chunk-id retirement keeps its own whole-fleet gate). It runs whatever part of the
++    ///   fleet is reachable, never behind GC's whole-fleet gate;
++    /// * a role with no fleet — no `--endpoints` ([`Self::run_reaper_until`]), none reachable at
++    ///   startup, or the operator one-shot ([`Self::reap_abandoned_uploads_once`]) — hands `None`,
++    ///   so `reconcile_step` runs the retirement leg **record-only**.
++    ///
++    /// `clock` is the caller's one `LoopClock`: the reaper's judgment, the drain's marks and the
++    /// pass's `now_millis` all read it (ADR-0009). It is the deployment wall clock the gateway
++    /// stamps sessions from, so the reaper's `clock_source` is `wall`.
++    async fn reaper_pass<F>(
++        &self,
++        zone: &FencedZone,
++        custodian: &Custodian,
++        meta: &dyn MetadataStore,
++        clock: &LoopClock<F>,
++        policy: &ReaperPolicy,
++        reconstruction: Option<&ReconstructionContext<'_>>,
++    ) -> Result<Reconciled, ReconcileError>
++    where
++        F: FnMut() -> u64 + Send,
++    {
+         let reaper = ReaperContext {
+             meta,
+-            clock: &clock,
++            clock,
+             clock_source: WALL_CLOCK_SOURCE,
+-            policy: &policy,
++            policy,
+         };
+         self.reconcile_pass(
+             zone,
+             custodian,
+             None,
+             None,
+-            None,
++            reconstruction,
+             None,
+             Some(&reaper),
+             clock.now_millis(),
+@@ -491,6 +523,62 @@ impl CustodianService {
+         .await
+     }
+ 
++    /// The **no-fleet run loop** (#625): the custodian role with no D-server fleet to maintain
++    /// runs the multipart reaper every `interval` until `shutdown` — one [`Self::reaper_pass`]
++    /// per interval, record-only. The reaper reads and writes metadata alone, so a role with no
++    /// fleet still has this work, and before this loop it exited with an abandoned upload holding
++    /// its records and its admission slot for good.
++    ///
++    /// It runs on two shapes of `wyrd custodian` (`cli::cmd_custodian`): without `--endpoints`,
++    /// until Ctrl-C; and when `--endpoints` were given but none was reachable at startup, with a
++    /// `shutdown` that is already ready, which makes it exactly **one** pass before the role fails
++    /// as it always has (the shutdown is polled first, after each pass). Each pass is bounded by
++    /// the reaper's and the drain's per-pass budgets.
++    ///
++    /// A store fault degrades the pass, not the process: it is logged and retried next interval.
++    /// A [`ReconcileError::Fenced`] (a newer term holds the zone) stops the loop, as in the fleet
++    /// loop. `clock` feeds one `LoopClock` for every read of the loop (ADR-0009).
++    pub async fn run_reaper_until<Fut, Clock>(
++        &self,
++        zone: &FencedZone,
++        custodian: &Custodian,
++        meta: &dyn MetadataStore,
++        interval: Duration,
++        clock: Clock,
++        shutdown: Fut,
++    ) -> Result<(), ReconcileError>
++    where
++        Fut: Future<Output = ()>,
++        Clock: FnMut() -> u64 + Send,
++    {
++        tokio::pin!(shutdown);
++        let clock = LoopClock::new(clock);
++        let policy = ReaperPolicy::default();
++        loop {
++            match self
++                .reaper_pass(zone, custodian, meta, &clock, &policy, None)
++                .await
++            {
++                // A hold or a refused profile check is named on the audit seam by the pass itself.
++                Ok(_) => {}
++                Err(e @ ReconcileError::Fenced(_)) => return Err(e),
++                Err(ReconcileError::Store(e)) => {
++                    eprintln!(
++                        "wyrd custodian: multipart reaper pass failed (retrying next interval): \
++                         {e}"
++                    );
++                }
++            }
++            tokio::select! {
++                // Polled first: a shutdown that is already ready ends the loop after one pass,
++                // whatever the interval.
++                biased;
++                _ = &mut shutdown => return Ok(()),
++                _ = tokio::time::sleep(interval) => {}
++            }
++        }
++    }
++
+     /// The deployable **reconstruction run loop** — the spine the `wyrd custodian` binary
+     /// drives over a configured D-server fleet. Each pass:
+     ///
+@@ -627,16 +715,6 @@ impl CustodianService {
+                 // slot.
+                 tombstone: policy.tombstone(),
+             };
+-            // The multipart reaper rides the reconstruction pass below, through the same fenced
+-            // control point: it fences abandoned and over-age `Open` sessions, and the same
+-            // step's retirement leg drains them. Its judgment reads the loop's one clock, the
+-            // source `ctx.clock` and every pass's `now_millis` read (ADR-0009), stamped `wall`.
+-            let reaper = ReaperContext {
+-                meta,
+-                clock: &clock,
+-                clock_source: WALL_CLOCK_SOURCE,
+-                policy: &policy,
+-            };
+             // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
+             // circuits on the first loop's error (scrub's `?`), so a combined pass would let a
+             // transient scrub fault — a reachable node erroring on a single `get_fragment` —
+@@ -668,18 +746,13 @@ impl CustodianService {
+             }
+             // Reconstruction pass — drains the shared repair queue (what scrub just enqueued
+             // plus any prior backlog), independent of a scrub blip — then the reaper and the
+-            // retirement leg.
++            // retirement leg: the reaper's interval step ([`Self::reaper_pass`]), the one the
++            // no-fleet loop runs, here handed this pass's reconstruction context. It runs on
++            // whatever part of the fleet is reachable, never behind the GC gate below. Its
++            // judgment reads the loop's one clock, the source `ctx.clock` and every pass's
++            // `now_millis` read (ADR-0009), stamped `wall`.
+             match self
+-                .reconcile_pass(
+-                    zone,
+-                    custodian,
+-                    None,
+-                    None,
+-                    Some(&ctx),
+-                    None,
+-                    Some(&reaper),
+-                    clock.now_millis(),
+-                )
++                .reaper_pass(zone, custodian, meta, &clock, &policy, Some(&ctx))
+                 .await
+             {
+                 Ok(_) => {}
+diff --git a/crates/server/tests/custodian_gc.rs b/crates/server/tests/custodian_gc.rs
+index c21b9e7..823a476 100644
+--- a/crates/server/tests/custodian_gc.rs
++++ b/crates/server/tests/custodian_gc.rs
+@@ -1661,3 +1661,176 @@ async fn deployed_loop_reaps_an_idle_open_upload_and_tears_it_down() {
+         "its admission slot is released"
+     );
+ }
++
++// ---- the multipart reaper runs on a DEGRADED fleet, outside GC's whole-fleet gate ----
++
++/// Leg A's fixture from `multipart_reaper.rs`, seeded raw at the loop clock `now` (#625, slice
++/// 625.2): an idle `Open` session created 14 days before `now`, its progress stamped 10 days
++/// before, every lease lapsed 9 days before; one committed `part:`/`psum:` pair over `committed`;
++/// the slot and owned `sidx:` entry of a crashed part over `in_flight`; `mpuctl.count = 1`. The
++/// record spellings are copied from that file, not shared.
++fn leg_a_records(
++    id: &UploadId,
++    now: u64,
++    committed: &ChunkRef,
++    in_flight: &ChunkRef,
++) -> Vec<(Vec<u8>, Bytes)> {
++    use wyrd_core::multipart as mp;
++    const DAY: u64 = 24 * 60 * 60 * 1_000;
++    fn canonical<T: serde::Serialize + serde::de::DeserializeOwned>(json: &str) -> Bytes {
++        let value: T = metadata::decode(json.as_bytes()).expect("a legal record");
++        metadata::encode(&value)
++    }
++    let profile = format!(
++        "{{\"w_ref\":{},\"max_part_chunks\":{},\"max_parts_per_session\":{},\
++         \"max_inflight_parts\":{},\"max_staged_chunks\":{}}}",
++        mp::W_REF,
++        mp::MAX_PART_CHUNKS,
++        mp::MAX_PARTS_PER_SESSION,
++        mp::MAX_INFLIGHT_PARTS,
++        mp::MAX_STAGED_CHUNKS
++    );
++    let budget: Budget = metadata::decode(profile.as_bytes()).expect("a legal profile");
++    let ledger = format!(
++        "{{\"count\":1,\"max_sessions\":{},\"profile\":{profile}}}",
++        budget.max_sessions()
++    );
++    let session = format!(
++        "{{\"parent\":42,\"object\":\"bucket/object-{id}\",\"created_at_millis\":{},\
++         \"clock_source\":\"wall\",\"segment_nonce\":\"{}\",\"epoch\":0,\"attempts\":0,\
++         \"state\":{{\"kind\":\"Open\"}}}}",
++        now - 14 * DAY,
++        id.as_str()
++    );
++    let slot = format!(
++        "{{\"part_number\":2,\"attempt_id\":\"{}\",\"reserved_at_millis\":{},\
++         \"lease_expiry_millis\":{}}}",
++        "ab".repeat(16),
++        now - 10 * DAY,
++        now - 9 * DAY
++    );
++    let staged = StagedPlacement::new(in_flight.scheme, in_flight.placement.clone()).unwrap();
++    let owned = OwnedEntry::new(id.clone(), now - 9 * DAY, staged).to_pending();
++    let digest = format!("{:064x}", 1);
++    let chunks_json =
++        String::from_utf8(metadata::encode(&std::slice::from_ref(committed)).to_vec()).unwrap();
++    let at = now - 10 * DAY;
++    let part = format!(
++        "{{\"chunks\":{chunks_json},\"len\":{},\"digest\":\"{digest}\",\
++         \"committed_at_millis\":{at},\"session_epoch\":0}}",
++        committed.len
++    );
++    let summary = format!(
++        "{{\"chunks\":1,\"len\":{},\"digest\":\"{digest}\",\"committed_at_millis\":{at}}}",
++        committed.len
++    );
++    let one = PartNumber::new(1).unwrap();
++    vec![
++        (
++            MPUCTL_KEY.to_vec(),
++            canonical::<mp::AdmissionRecord>(&ledger),
++        ),
++        (mpu_key(id), canonical::<mp::SessionRecord>(&session)),
++        (
++            mp::slot_key(id, mp::SlotIndex::new(0).unwrap()),
++            canonical::<mp::SlotRecord>(&slot),
++        ),
++        (
++            sidx_key(id, PartNumber::new(2).unwrap(), in_flight.id),
++            metadata::encode(&owned),
++        ),
++        (part_key(id, one), canonical::<mp::PartRecord>(&part)),
++        (psum_key(id, one), canonical::<PartSummary>(&summary)),
++    ]
++}
++
++#[tokio::test]
++async fn deployed_loop_reaps_an_idle_upload_on_a_degraded_fleet_while_gc_is_deferred() {
++    // The operator wired four D servers; one was down at startup, so `connect_fleet` handed the
++    // loop three. GC's whole-fleet gate (`fleet.len() == operator_fleet_size`) defers GC on every
++    // pass — and the multipart reaper must not wait with it: it runs on whatever part of the fleet
++    // is reachable (#625, 0016 `:234-268`). Leg A's idle upload is fenced and torn down with every
++    // byte evidenced.
++    enable_log_callsites();
++    const DAY: u64 = 24 * 60 * 60 * 1_000;
++    const NOW: u64 = 40 * DAY;
++    const OPERATOR_FLEET_SIZE: usize = 4;
++    let meta = MemMeta::default();
++    let d: Vec<Arc<MemDServer>> = (0..3).map(|_| Arc::new(MemDServer::default())).collect();
++    let servers: Vec<ConfiguredDServer> = (0..3u16)
++        .map(|i| ConfiguredDServer {
++            id: DServerId::from(i),
++            failure_domain: format!("domain-{i}"),
++            store: dyn_store(&d[usize::from(i)]),
++        })
++        .collect();
++    assert!(
++        servers.len() < OPERATOR_FLEET_SIZE,
++        "a degraded fleet: GC is deferred on every pass"
++    );
++
++    let id = UploadId::new("a1".repeat(16)).unwrap();
++    let committed = ChunkRef {
++        id: 0xa1_0001,
++        scheme: RS21,
++        len: 4_096,
++        placement: vec![1, 2, 3],
++    };
++    let in_flight = ChunkRef {
++        id: 0xa1_0002,
++        scheme: RS21,
++        len: 4_096,
++        placement: vec![4, 5, 6],
++    };
++    let mut batch = WriteBatch::new();
++    batch
++        .puts
++        .extend(leg_a_records(&id, NOW, &committed, &in_flight));
++    meta.commit(batch).await.unwrap();
++    assert_eq!(sessions_counted(&meta).await, 1);
++
++    let capture = Capture::default();
++    drive_passes_at(
++        &meta,
++        &servers,
++        OPERATOR_FLEET_SIZE,
++        &d[0],
++        6,
++        &capture,
++        NOW,
++    )
++    .await;
++
++    assert_eq!(
++        meta.get(&mpu_key(&id)).await.unwrap(),
++        None,
++        "the idle upload is fenced and its teardown finished on the degraded fleet (RED if the \
++         reaper is dispatched only inside GC's whole-fleet branch)"
++    );
++    for prefix in [
++        wyrd_core::multipart::part_range(&id),
++        wyrd_core::multipart::psum_range(&id),
++        wyrd_core::multipart::sidx_range(&id),
++        wyrd_core::multipart::slot_range(&id),
++        wyrd_core::multipart::retire_session_range(wyrd_core::multipart::RetireMode::Bytes, &id),
++        wyrd_core::multipart::retire_session_range(wyrd_core::multipart::RetireMode::Records, &id),
++    ] {
++        let left = meta.scan(&prefix).await.unwrap();
++        assert!(left.is_empty(), "drained: {left:?}");
++    }
++    assert_eq!(
++        sessions_counted(&meta).await,
++        0,
++        "its admission slot is released"
++    );
++    for chunk in [&committed, &in_flight] {
++        for (index, &dserver) in chunk.placement.iter().enumerate() {
++            assert!(
++                orphan_record_present(&meta, dserver, chunk.id, index as u16).await,
++                "fragment {index} of {:#x} on server {dserver} is marked",
++                chunk.id
++            );
++        }
++        assert_eq!(marks_of(&meta, chunk.id).await, 3);
++    }
++}
+diff --git a/crates/server/tests/multipart_reaper_deployed.rs b/crates/server/tests/multipart_reaper_deployed.rs
+new file mode 100644
+index 0000000..480e8a7
+--- /dev/null
++++ b/crates/server/tests/multipart_reaper_deployed.rs
+@@ -0,0 +1,562 @@
++//! The multipart **reaper runs on every deployed startup shape** of the ordinary `wyrd custodian`
++//! role (#625, slice 625.2; proposal 0016 decision 6, `0016:1794-2277`, and the requirement that
++//! the reaper run wherever the verbs are exposed, `0016:234-268`).
++//!
++//! Each leg seeds a real redb store **exactly as `multipart_reaper.rs` leg A does** — an idle
++//! `Open` session created 14 days ago, its progress stamped 10 days ago, every lease lapsed 9 days
++//! ago, one committed `part:`/`psum:` pair, the `sidx:` residue of a crashed in-flight part and
++//! `mpuctl.count = 1` — drops it (redb holds an exclusive lock), runs the built binary as a
++//! subprocess with **no one-shot flag anywhere in argv**, bounds it, reopens the store and asserts
++//! leg A's transition: every `mpu:`, `part:`, `psum:`, `sidx:` and `slot:` record of the session
++//! gone, the count back to zero, an `orphan:` mark on every position of both byte sets, and both of
++//! the session's `retire:` ranges empty.
++//!
++//! * **G2a — no `--endpoints`.** The role runs the reaper alone, every `--interval-secs`, instead
++//!   of exiting. Each run is given a bounded window of a few intervals and then terminated.
++//! * **G2c — `--endpoints` given, none reachable.** The role runs one reaper pass and then fails
++//!   as it always has: a non-zero exit and the existing "NO configured D server was reachable at
++//!   startup" diagnostic. A supervisor restarts it; each restart is one more pass.
++//!
++//! The seeding helpers are copied from `multipart_reaper.rs`, not shared: a shared
++//! `tests/support/mod.rs` would be classified as a test target of its own. The command is stringly
++//! typed, so this file names no symbol the slice adds and compiles the same on a tree without it.
++//!
++//! Plain `#[test]`s with short-lived runtimes of their own: the role `block_on`s its own.
++
++#![forbid(unsafe_code)]
++
++use std::io::Read;
++use std::path::Path;
++use std::process::{Child, Command, ExitStatus, Stdio};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++
++use bytes::Bytes;
++use wyrd_core::metadata::{self, decode_orphan_mark, orphan_key, ChunkRef, EcScheme};
++use wyrd_core::multipart::{
++    decode_admission_record, mpu_key, part_key, part_range, psum_key, psum_range, retire_key,
++    retire_session_range, sidx_key, sidx_range, slot_key, slot_range, AdmissionRecord, OwnedEntry,
++    PartNumber, PartRecord, PartSummary, RetireMode, SessionRecord, SlotIndex, SlotRecord,
++    StagedPlacement, UploadId, MAX_INFLIGHT_PARTS, MAX_PARTS_PER_SESSION, MAX_PART_CHUNKS,
++    MAX_STAGED_CHUNKS, MPUCTL_KEY, W_REF,
++};
++use wyrd_metadata_redb::RedbMetadataStore;
++use wyrd_traits::{ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, WriteBatch};
++
++const WYRD: &str = env!("CARGO_BIN_EXE_wyrd");
++
++/// The one-shot's flag. Asserted absent from every argv this file runs: the legs prove the
++/// ordinary role reaps, not the operator one-shot.
++const ONE_SHOT_FLAG: &str = "--reap-abandoned-uploads";
++
++/// The role's interval in these legs, in seconds: the shortest the flag spells.
++const INTERVAL_SECS: &str = "1";
++
++/// How long G2a lets one run of the no-endpoints role go before terminating it: three intervals
++/// after the first pass, which starts at once.
++const RUN_WINDOW: Duration = Duration::from_secs(3);
++
++/// The longest a role that should exit by itself may take (G2c), and the hard stop for G2a's
++/// window. A hang past it fails the leg rather than the suite.
++const EXIT_BOUND: Duration = Duration::from_secs(120);
++
++/// How many runs a leg allows the store to converge in. A fence and the drain's marks land in the
++/// first pass; the terminal delete waits for the `retire:` obligation to drain, so it lands in the
++/// second or third. G2c runs one pass per start; G2a several per run. Six leaves room without
++/// hiding a role that never converges.
++const CONVERGE_RUNS: usize = 6;
++
++/// The diagnostic the empty-fleet startup has always panicked with (`cli.rs`, `cmd_custodian`).
++const EMPTY_FLEET_DIAGNOSTIC: &str = "NO configured D server was reachable at startup";
++
++const DAY: u64 = 24 * 60 * 60 * 1_000;
++
++/// The deployment wall clock, read once per leg at seeding. The reaper judges every session
++/// against the same source (`clock_source: "wall"`), so the fixture's stamps are written relative
++/// to it.
++// wall-clock exempt: the reaper under test reads the deployment wall clock, so its fixture's
++// stamps must come from that same clock (#619).
++#[allow(clippy::disallowed_methods)]
++fn wall_now() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .expect("after the epoch")
++        .as_millis() as u64
++}
++
++// ───────────────────────────── the store, outside the process ─────────────────────────────
++
++/// A redb store under a temp dir the role is pointed at.
++struct Store {
++    dir: tempfile::TempDir,
++}
++
++impl Store {
++    fn new() -> Self {
++        Self {
++            dir: tempfile::tempdir().expect("temp dir"),
++        }
++    }
++
++    fn data_dir(&self) -> &Path {
++        self.dir.path()
++    }
++
++    /// Run `f` over the store, opened for the call and closed before it returns, in a runtime of
++    /// its own.
++    fn with<T>(&self, f: impl AsyncFnOnce(&RedbMetadataStore) -> T) -> T {
++        let runtime = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("runtime");
++        runtime.block_on(async {
++            let meta = RedbMetadataStore::open(self.data_dir().join("meta.redb")).expect("redb");
++            f(&meta).await
++        })
++    }
++
++    /// Put every record, in one batch.
++    fn seed(&self, records: Vec<(Vec<u8>, Bytes)>) {
++        self.with(async |meta| {
++            let batch = records
++                .into_iter()
++                .fold(WriteBatch::new(), |batch, (key, value)| {
++                    batch.put(key, value)
++                });
++            let outcome = meta.commit(batch).await.expect("seeded");
++            assert_eq!(outcome, CommitOutcome::Committed);
++        });
++    }
++
++    fn value(&self, key: &[u8]) -> Option<Bytes> {
++        let key = key.to_vec();
++        self.with(async move |meta| meta.get(&key).await.expect("get"))
++    }
++
++    fn range(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Bytes)> {
++        let prefix = prefix.to_vec();
++        self.with(async move |meta| meta.scan(&prefix).await.expect("scan"))
++    }
++
++    /// The `mpuctl` count.
++    fn counted(&self) -> u64 {
++        let ledger = self.value(MPUCTL_KEY).expect("the admission ledger");
++        decode_admission_record(&ledger)
++            .expect("the ledger decodes")
++            .count()
++    }
++}
++
++// ─────────────────────────────── the role, as a subprocess ───────────────────────────────
++
++/// The ordinary role's command over `data_dir`, with `extra` after it — never the one-shot.
++fn role(data_dir: &Path, extra: &[&str]) -> Command {
++    let mut command = Command::new(WYRD);
++    command
++        .arg("custodian")
++        .arg("--data-dir")
++        .arg(data_dir)
++        .args(["--interval-secs", INTERVAL_SECS])
++        .args(extra);
++    let argv: Vec<String> = command
++        .get_args()
++        .map(|arg| arg.to_string_lossy().into_owned())
++        .collect();
++    assert!(
++        !argv.iter().any(|arg| arg == ONE_SHOT_FLAG),
++        "the ordinary role, not the one-shot: {argv:?}"
++    );
++    command
++}
++
++/// What one run of the role did: its exit status if it exited by itself, and its stderr.
++struct Run {
++    exited: Option<ExitStatus>,
++    stderr: String,
++}
++
++/// Run `command` until it exits by itself or `window` passes, whichever is first, then terminate
++/// it if it is still up.
++fn run_for(mut command: Command, window: Duration) -> Run {
++    let mut child = Reaped(
++        command
++            .stdout(Stdio::null())
++            .stderr(Stdio::piped())
++            .spawn()
++            .expect("spawn wyrd"),
++    );
++    // Read while the child runs: a child whose stderr fills the pipe must never block on it.
++    let mut pipe = child.0.stderr.take().expect("stderr");
++    let drained = std::thread::spawn(move || {
++        let mut stderr = String::new();
++        pipe.read_to_string(&mut stderr).map(|_| stderr)
++    });
++    let started = Instant::now();
++    let exited = loop {
++        if let Some(status) = child.0.try_wait().expect("wait") {
++            break Some(status);
++        }
++        if started.elapsed() >= window {
++            break None;
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    };
++    // Terminated here when it is still up; the pipe then closes and the reader ends.
++    drop(child);
++    let stderr = drained
++        .join()
++        .expect("the stderr reader")
++        .expect("stderr is utf-8");
++    Run { exited, stderr }
++}
++
++/// The child process, killed on every exit path so a hang never outlives the test.
++struct Reaped(Child);
++
++impl Drop for Reaped {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++
++/// Run the role over `store` until `done` holds, at most [`CONVERGE_RUNS`] times, checking each
++/// run with `check`. The store's convergence is asserted first, then every run's check: a leg
++/// fails on what the store holds before it fails on how the role ran.
++fn run_until(
++    store: &Store,
++    command: impl Fn() -> Command,
++    window: Duration,
++    done: impl Fn(&Store) -> bool,
++    check: impl Fn(&Run) -> Option<String>,
++) {
++    let mut failed = Vec::new();
++    let mut runs = Vec::new();
++    for run in 0..CONVERGE_RUNS {
++        if done(store) {
++            break;
++        }
++        let outcome = run_for(command(), window);
++        if let Some(fault) = check(&outcome) {
++            failed.push(format!("run {run}: {fault}\n{}", outcome.stderr));
++        }
++        runs.push(format!(
++            "run {run} ({}):\n{}",
++            match outcome.exited {
++                Some(status) => format!("exited by itself, {status}"),
++                None => "terminated at the end of its window".to_owned(),
++            },
++            outcome.stderr
++        ));
++    }
++    assert!(
++        done(store),
++        "the store did not converge within {CONVERGE_RUNS} runs of the ordinary role\n{}",
++        runs.join("\n")
++    );
++    assert!(failed.is_empty(), "{}", failed.join("\n"));
++}
++
++// ─────────────────────────────── the records (copied from leg A) ───────────────────────────────
++
++/// Decode `json` as `T` and re-encode it: the canonical bytes the store's decoders require.
++fn canonical<T: serde::Serialize + serde::de::DeserializeOwned>(json: &str) -> Bytes {
++    let value: T = metadata::decode(json.as_bytes()).expect("a legal record");
++    metadata::encode(&value)
++}
++
++fn upload(n: u8) -> UploadId {
++    UploadId::new(format!("{n:02x}").repeat(16)).expect("an upload id")
++}
++
++fn part(n: u32) -> PartNumber {
++    PartNumber::new(n).expect("a part number")
++}
++
++const RS21: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
++
++/// One RS(2,1) chunk placed on `servers`.
++fn chunk(id: ChunkId, servers: [DServerId; 3]) -> ChunkRef {
++    ChunkRef {
++        id,
++        scheme: RS21,
++        len: 4_096,
++        placement: servers.to_vec(),
++    }
++}
++
++/// Every fragment position of `chunk`: fragment `i` on `placement[i]`.
++fn positions(chunk: &ChunkRef) -> Vec<(DServerId, FragmentId)> {
++    chunk
++        .placement
++        .iter()
++        .enumerate()
++        .map(|(i, &dserver)| {
++            (
++                dserver,
++                FragmentId {
++                    chunk: chunk.id,
++                    index: i as u16,
++                },
++            )
++        })
++        .collect()
++}
++
++/// The shipped budget profile, spelled from its public constants: the one the custodian under
++/// test holds as its own.
++fn shipped_profile_json(w_ref: u64) -> String {
++    format!(
++        "{{\"w_ref\":{w_ref},\"max_part_chunks\":{MAX_PART_CHUNKS},\
++         \"max_parts_per_session\":{MAX_PARTS_PER_SESSION},\
++         \"max_inflight_parts\":{MAX_INFLIGHT_PARTS},\"max_staged_chunks\":{MAX_STAGED_CHUNKS}}}"
++    )
++}
++
++/// `mpuctl` counting `count` sessions under the profile with `W_ref = w_ref` (and every other
++/// number shipped), its `max_sessions` the profile's own derivation.
++fn ledger(count: u64, w_ref: u64) -> (Vec<u8>, Bytes) {
++    let profile = shipped_profile_json(w_ref);
++    let profile_budget: wyrd_core::multipart::Budget =
++        metadata::decode(profile.as_bytes()).expect("a legal profile");
++    let json = format!(
++        "{{\"count\":{count},\"max_sessions\":{},\"profile\":{profile}}}",
++        profile_budget.max_sessions()
++    );
++    (MPUCTL_KEY.to_vec(), canonical::<AdmissionRecord>(&json))
++}
++
++/// The session record of `id` in `state` (its JSON), created at `created`, stamped under `clock`.
++fn session_json(id: &UploadId, created: u64, clock: &str, epoch: u64, state: &str) -> String {
++    format!(
++        "{{\"parent\":42,\"object\":\"bucket/object-{id}\",\"created_at_millis\":{created},\
++         \"clock_source\":\"{clock}\",\"segment_nonce\":\"{}\",\"epoch\":{epoch},\"attempts\":0,\
++         \"state\":{{\"kind\":\"{state}\"}}}}",
++        id.as_str()
++    )
++}
++
++/// An `Open@0` session record.
++fn open_session(id: &UploadId, created: u64, clock: &str) -> (Vec<u8>, Bytes) {
++    let json = session_json(id, created, clock, 0, "Open");
++    (mpu_key(id), canonical::<SessionRecord>(&json))
++}
++
++/// A committed part `n` of `id` over `chunks`, committed at `at`: its `part:` and `psum:` records.
++fn committed_part(id: &UploadId, n: u32, chunks: &[ChunkRef], at: u64) -> Vec<(Vec<u8>, Bytes)> {
++    let digest = format!("{:064x}", n);
++    let len: u64 = chunks.iter().map(|c| c.len).sum();
++    let chunks_json = String::from_utf8(metadata::encode(&chunks).to_vec()).unwrap();
++    let part_json = format!(
++        "{{\"chunks\":{chunks_json},\"len\":{len},\"digest\":\"{digest}\",\
++         \"committed_at_millis\":{at},\"session_epoch\":0}}"
++    );
++    let summary_json = format!(
++        "{{\"chunks\":{},\"len\":{len},\"digest\":\"{digest}\",\"committed_at_millis\":{at}}}",
++        chunks.len()
++    );
++    vec![
++        (part_key(id, part(n)), canonical::<PartRecord>(&part_json)),
++        (
++            psum_key(id, part(n)),
++            canonical::<PartSummary>(&summary_json),
++        ),
++    ]
++}
++
++/// Slot `index` of `id`, reserved for part `n` at `reserved`, leased to `lease`.
++fn slot(id: &UploadId, index: u32, n: u32, reserved: u64, lease: u64) -> (Vec<u8>, Bytes) {
++    let json = format!(
++        "{{\"part_number\":{n},\"attempt_id\":\"{}\",\"reserved_at_millis\":{reserved},\
++         \"lease_expiry_millis\":{lease}}}",
++        "ab".repeat(16)
++    );
++    (
++        slot_key(id, SlotIndex::new(index).expect("a slot index")),
++        canonical::<SlotRecord>(&json),
++    )
++}
++
++/// The owned staging entry of `chunk` for part `n` of `id`, leased to `lease`.
++fn owned(id: &UploadId, n: u32, chunk: &ChunkRef, lease: u64) -> (Vec<u8>, Bytes) {
++    let staged = StagedPlacement::new(chunk.scheme, chunk.placement.clone()).expect("staged");
++    let entry = OwnedEntry::new(id.clone(), lease, staged).to_pending();
++    (sidx_key(id, part(n), chunk.id), metadata::encode(&entry))
++}
++
++/// Whether every staged and session record of `id` is gone.
++fn session_gone(store: &Store, id: &UploadId) -> bool {
++    store.value(&mpu_key(id)).is_none()
++        && [
++            part_range(id),
++            psum_range(id),
++            sidx_range(id),
++            slot_range(id),
++        ]
++        .iter()
++        .all(|prefix| store.range(prefix).is_empty())
++}
++
++/// Assert the whole teardown of `id`: every record gone, both of its `retire:` ranges empty.
++fn assert_torn_down(store: &Store, id: &UploadId) {
++    assert!(store.value(&mpu_key(id)).is_none(), "mpu:{id} deleted");
++    for (name, prefix) in [
++        ("part:", part_range(id)),
++        ("psum:", psum_range(id)),
++        ("sidx:", sidx_range(id)),
++        ("slot:", slot_range(id)),
++        ("retire:bytes:", retire_session_range(RetireMode::Bytes, id)),
++        (
++            "retire:records:",
++            retire_session_range(RetireMode::Records, id),
++        ),
++    ] {
++        assert!(store.range(&prefix).is_empty(), "{name}{id} is empty");
++    }
++}
++
++/// Assert GC's licence for every position of `expected`: an `orphan:` mark stands there, it
++/// decodes stamped (not `reclaiming`), the `retire:bytes:` obligation its event names (if any) is
++/// gone, and no `part:` or `sidx:` record in the store still names the position.
++fn assert_licensed(store: &Store, expected: &[(DServerId, FragmentId)]) {
++    let naming: Vec<(DServerId, FragmentId)> = store
++        .range(b"part:")
++        .iter()
++        .flat_map(|(_, value)| {
++            let part: PartRecord = metadata::decode(value).expect("a part");
++            part.chunks().iter().flat_map(positions).collect::<Vec<_>>()
++        })
++        .chain(store.range(b"sidx:").iter().flat_map(|(key, value)| {
++            let (_, chunk_id, entry) =
++                wyrd_core::multipart::decode_owned_entry(key, value).expect("an owned entry");
++            let staged = entry.staged();
++            positions(&ChunkRef {
++                id: chunk_id,
++                scheme: staged.scheme(),
++                len: 0,
++                placement: staged.placement().to_vec(),
++            })
++        }))
++        .collect();
++    for &(dserver, frag) in expected {
++        let key = orphan_key(dserver, frag);
++        let value = store
++            .value(&key)
++            .unwrap_or_else(|| panic!("an orphan: mark on server {dserver}, {frag:?}"));
++        let mark = decode_orphan_mark(&value).expect("the mark decodes");
++        assert!(!mark.is_reclaiming(), "{frag:?} is stamped, not reclaiming");
++        if let Some(token) = mark.retire_token() {
++            assert!(
++                store
++                    .value(&retire_key(RetireMode::Bytes, &token))
++                    .is_none(),
++                "the obligation {token} the mark names has drained"
++            );
++        }
++        assert!(
++            !naming.contains(&(dserver, frag)),
++            "no record still names {dserver}/{frag:?}"
++        );
++    }
++}
++
++/// Leg A's fixture: the idle session, its committed part and its crashed in-flight residue, and
++/// `mpuctl.count = 1`. Returns the session and both byte sets.
++fn seed_leg_a(store: &Store) -> (UploadId, ChunkRef, ChunkRef) {
++    let now = wall_now();
++    let id = upload(0xa1);
++    let committed = chunk(0xa1_0001, [1, 2, 3]);
++    let in_flight = chunk(0xa1_0002, [4, 5, 6]);
++    let mut records = vec![
++        ledger(1, W_REF),
++        open_session(&id, now - 14 * DAY, "wall"),
++        slot(&id, 0, 2, now - 10 * DAY, now - 9 * DAY),
++        owned(&id, 2, &in_flight, now - 9 * DAY),
++    ];
++    records.extend(committed_part(
++        &id,
++        1,
++        std::slice::from_ref(&committed),
++        now - 10 * DAY,
++    ));
++    store.seed(records);
++    assert_eq!(store.counted(), 1);
++    (id, committed, in_flight)
++}
++
++/// Assert leg A's transition over `store`.
++fn assert_leg_a_transition(
++    store: &Store,
++    id: &UploadId,
++    committed: &ChunkRef,
++    in_flight: &ChunkRef,
++) {
++    assert_torn_down(store, id);
++    assert_eq!(store.counted(), 0, "the admission slot is released");
++    assert_licensed(store, &positions(committed));
++    assert_licensed(store, &positions(in_flight));
++}
++
++// ─────────────────────────────── the legs ───────────────────────────────
++
++/// **G2a — the no-endpoints role reaps.** With no `--endpoints` the ordinary role has no fleet to
++/// reconstruct over, but the reaper reads and writes metadata alone: the role runs it every
++/// interval instead of exiting. Each run is left up for a bounded window and then terminated; the
++/// role never exits by itself, and a run that does is a fault.
++#[test]
++fn the_no_endpoints_role_reaps_an_idle_upload_every_interval() {
++    let store = Store::new();
++    let (id, committed, in_flight) = seed_leg_a(&store);
++
++    run_until(
++        &store,
++        || role(store.data_dir(), &[]),
++        RUN_WINDOW,
++        |store| session_gone(store, &id),
++        |run| {
++            run.exited.map(|status| {
++                format!("the no-endpoints role exited by itself ({status}) instead of running")
++            })
++        },
++    );
++
++    assert_leg_a_transition(&store, &id, &committed, &in_flight);
++}
++
++/// **G2c — the empty-fleet startup reaps once, then fails as before.** `--endpoints` names one
++/// address nothing listens on, so no configured D server is reachable at startup. The role runs
++/// one reaper pass and then fails with the existing diagnostic and a non-zero exit; a supervisor
++/// restarts it, and each restart is one more pass.
++#[test]
++fn the_empty_fleet_startup_reaps_once_and_still_fails_loudly() {
++    let store = Store::new();
++    let (id, committed, in_flight) = seed_leg_a(&store);
++    let unreachable = [
++        "--endpoints",
++        "http://127.0.0.1:1",
++        "--ids",
++        "1",
++        "--failure-domains",
++        "domain-1",
++        "--connect-timeout-secs",
++        "1",
++    ];
++
++    run_until(
++        &store,
++        || role(store.data_dir(), &unreachable),
++        EXIT_BOUND,
++        |store| session_gone(store, &id),
++        |run| match run.exited {
++            None => Some(format!("the role did not exit within {EXIT_BOUND:?}")),
++            Some(status) if status.success() => Some(format!(
++                "the empty-fleet startup exited successfully ({status})"
++            )),
++            Some(_) if !run.stderr.contains(EMPTY_FLEET_DIAGNOSTIC) => Some(format!(
++                "stderr lacks the diagnostic `{EMPTY_FLEET_DIAGNOSTIC}`"
++            )),
++            Some(_) => None,
++        },
++    );
++
++    assert_leg_a_transition(&store, &id, &committed, &in_flight);
++}
+diff --git a/docs/design/architecture/06-runtime-view.md b/docs/design/architecture/06-runtime-view.md
+index 6341bc5..3114752 100644
+--- a/docs/design/architecture/06-runtime-view.md
++++ b/docs/design/architecture/06-runtime-view.md
+@@ -91,6 +91,6 @@ Delete is a commit-point operation too, and its cost is paid lazily, off the cri
+ 
+    A multipart upload that has ended — aborted, or completed — **leaves the store at a terminal delete**, in the same repair-loop pass, before the obligations are walked. The custodian walks the upload's own staging entries — the residue of a part whose write stopped before it committed — writing the grace record of every position an entry names, under the upload's own identity, and deleting the entry in a later commit; nothing refills that range once the upload has ended, so the entries left are the progress. An entry can name more positions than one batch reads (a wide erasure scheme, or a damaged placement), so the walk keeps how far it has got inside one entry in one small record of the custodian's own per upload, written in the batch whose grace records it counts under a condition on its exact value — and put only while the upload's record is unchanged, so a batch that lands after another drainer has ended the upload leaves none behind — and removed with that entry or, at the latest, with the upload. It names the first entry the last batch left that the walk can still work on — whatever it covered of it — and the next batch walks that entry first, so an entry held for the operator ahead of it never stalls it. A batch that writes no grace record and deletes no entry can only move that record: it is outside the pass's batch budget and ends the upload's turn for the pass, so uploads whose held entries keep moving it cannot starve the rest. Entries held for the operator stay in the range, so a second small record per upload says where the walk's next read starts: a batch that marks and deletes nothing and holds something moves it past the held entries at the head of what it read — leaving the first record on a held entry rather than moving it to the entry it has only read again, which the next batch reads first — and once nothing is left after it the walk is back at the start of the range and the record is deleted. Every entry is therefore read once a lap however many are held ahead of it, and each held entry is named to the operator again every lap. That record is a position, never evidence — what an entry's deletion needs does not change with it, and one that names nothing of the upload's range is named to the operator and read as the start. It is written in a commit of its own, outside the pass's batch budget so that uploads with held entries cannot starve the rest, at most twice per upload a pass, put only while the upload's record is unchanged, and removed at the latest with the upload. Once a pass finds the range empty and no obligation of the upload left, one batch, conditioned on the upload's record exactly as read, deletes the record and the slots its parts reserved, deletes the reservation of its segment group unless a published object adopted the group, and lowers the admission count by one: of two drainers that race to it, one commits and the other's batch is refused, so the count goes down exactly once and an admission slot is released once. A **completed** upload's record is the tombstone that answers a retried completion with the published result, so it is kept, and its admission slot with it, until its tombstone window has passed; nothing measures that window yet, so the deployed custodian keeps every completed upload's record for now. For an **aborted** upload only, a record whose placement cannot be trusted — a part or a staging entry whose placement is not one server per fragment, or a staging entry that will not decode under a key that still names its chunk — is retired **by chunk id**: every fragment of that chunk that the D servers' own listings show gets a grace record, and for a staging entry that decodes so does every position it names, before the record goes. This runs only on a pass that sees every server the operator configured, the condition GC already runs under, since a listing that misses a server would leave that server's fragments with neither record nor grace record; on any other pass the record is held and named to the operator, and nothing is lost while it waits. The positions a record names itself are a fixed order, so the drain resumes inside them from its cursor across as many batches as they need. A listing is no such order — a fragment that drops out of it moves every later one — so a batch that reaches a chunk's listed fragments reads all of them, and progress is counted a whole chunk at a time; a chunk listed with more fragments than one batch reads is held and named to the operator as needing a human. A batch lists the fleet at most once, so a pass lists it at most once per batch it commits, plus once per aborted upload whose damaged record is held after its listing. One gap is stated rather than hidden: a write the aborted upload had authorized that lands after the listing, at a position the damaged record does not name, has neither record nor grace record, and GC keeps it — kept for good, never lost, never reclaimed without an operator. A part record that will not decode names no chunk in its key, so it is held for a human, and the upload stays until one acts. A grace record the walk wrote over a position whose write never landed stays as well, since that write may still land there.
+ 
+-   A multipart upload whose client went silent — never aborted, never completed — is ended by the **multipart reaper** (proposal 0016 decision 6), which runs in the same repair-loop pass, after reconstruction and before the terminal deletes and the obligation walk, so an upload it ends is drained in the same pass. A reconstruction failure does not skip them: the pass still reports it, but only after the reaper and the drain have had their turn, so a fault reading the repair queue cannot keep abandoned uploads holding their admission slots. It first compares the budget profile the admission record stores with its own and, if they differ or the record will not decode, stops before reading any upload and names the mismatch for an operator — and the terminal deletes and the obligation walk do not run in that pass either, since they build the staged references that profile sizes, so no upload's records change in that pass. It reads the admission record once more as the last thing it does, just before those legs run, so a record installed or replaced under another profile while it worked — a first upload created by a differently sized gateway — stops them the same way. With no admission record at all nothing was ever admitted, so it judges no upload. If the record is still missing at its last read while an upload is listed — or the listing cannot be read — the record is lost and the profile those uploads were admitted under is unknown, so the pass is refused as for a mismatch, and the terminal deletes and the obligation walk do not run either. A record that was there at the first read and is gone at the last is lost in the same way — nothing deletes it — and refuses the pass the same way, whatever the pass did before that read. A refusal at the first read says that the reaper refused before acting; one at the last read of a pass that had judged says how many uploads it had already ended — they stay ended, under the profile the first read matched — and the pass's counts are reported either way, as they are when that last read fails. A first upload created under its own profile while the pass works is left for the next pass, and that pass reports that it did not finish rather than that nothing is left. It lists the uploads in key order, at most a fixed number per pass, and keeps where it stopped in a position of its own, `custodian:reaper-cursor`, so the next pass goes on from there and every upload is judged once a lap (a stored position that is not an upload key a backend accepts is named and replaced by the head, never handed to the store). When that number runs out it reads one entry further, judging none, so a listing that ends exactly there is known to have ended. A read of the listing the store cannot answer — a page of it, or that one entry — holds the rest of the listing for that pass, named for an operator, and sends the next pass back to the head rather than to the read that failed, so a fault that lasts never keeps the uploads listed before it from being judged again. The position also records whether the lap so far is clean — nothing ended, contended or held since its head — so the pass that finishes a clean lap reports that nothing is left, and one that finishes any other lap reports that it did not finish, and a longer listing still reaches the first report once a whole lap finds nothing to do; the admission count does not bound the listing, since a lowered limit or uploads created and deleted between two pages can list more uploads than the count, and neither is damage. It judges only an **open** one stamped under the clock it reads. An upload stamped under another clock is named for an operator and never judged; while it is open only an operator can end it, so it is held, and once it has ended its teardown runs as any other's, since none of it reads a timestamp. An upload whose creation or newest progress is stamped later than the reaper's own clock by more than the clock-skew budget is held too, rather than kept for as long as the stamp stays ahead. An open upload is ended when it is **idle** — its newest progress (its creation, its newest committed part, its newest in-flight slot reservation) is older than the idle window and no slot or staging lease of it is still live — or when it is **over age**, older than the residency ceiling however live it is. It reads the slot range before the part summaries, so a part committing between the two reads is seen in one or both, never neither. An upload whose records it cannot read or decode — a part summary under a key that names no part included — is held and named for an operator, and the pass goes on to the next and to the terminal deletes and the obligation walk. Ending an upload is the one commit a client abort also makes — the upload moved to aborting under a condition on its exact record, with the obligation owing everything it staged — and the idle commit also pins every slot of the upload as read, present or absent, so a renewal or release of a slot it read, or a reservation still standing when the commit lands, makes the commit fail and the upload is judged again next pass; the over-age commit pins nothing. A commit that fails because the upload's teardown obligation already exists beside its unchanged record is damage rather than contention, since no writer leaves that state: the upload is held and named. A commit whose outcome the store could not report is neither a success nor a failure: the upload may already have been ended, and the drain of that same pass then tears it down, so it is never reported as left in place and never counted as ended. It is named for an operator and counted on its own, the pass reports that it could not account for everything, the commit is not sent again, and the next pass reads which way it went. One gap is stated rather than hidden: a request that reserves a slot the reaper read free and commits its part, both between the reads and the idle commit, leaves every slot as the reaper read it, so the commit lands and that upload is ended together with the part it has just committed. Closing that needs a change to the upload protocol (proposal 0016) that this release does not make; it is a known gap, and the follow-up that closes it must land before uploads are created in production. Each commit is measured against the batch budgets before it is sent and never split. An operator can run exactly one such pass and exit with `wyrd custodian --reap-abandoned-uploads`: it needs no `--endpoints`, reads and writes metadata only, and drains what it ended record by record, holding for a whole-fleet pass anything that could only be retired by listing the fleet; it exits non-zero when anything was held, a commit's outcome is unknown or the profile check refused, so an open upload under another clock keeps it failing until an operator ends that upload. It is refused before it opens the store when given a flag that selects work it does not run — `--endpoints`, `--ids`, `--failure-domains` or `--gc-expired-pending` — rather than ignoring the flag, and when its `--data-dir` holds no local metadata store — no file there, or an empty one — which it never creates: a store made on the spot would be reported as holding nothing to reap. Its last line names the store it ran on: the local file, or the TiKV PD endpoints or the FoundationDB cluster file it connected with.
++   A multipart upload whose client went silent — never aborted, never completed — is ended by the **multipart reaper** (proposal 0016 decision 6), which runs in the same repair-loop pass, after reconstruction and before the terminal deletes and the obligation walk, so an upload it ends is drained in the same pass. A reconstruction failure does not skip them: the pass still reports it, but only after the reaper and the drain have had their turn, so a fault reading the repair queue cannot keep abandoned uploads holding their admission slots. It first compares the budget profile the admission record stores with its own and, if they differ or the record will not decode, stops before reading any upload and names the mismatch for an operator — and the terminal deletes and the obligation walk do not run in that pass either, since they build the staged references that profile sizes, so no upload's records change in that pass. It reads the admission record once more as the last thing it does, just before those legs run, so a record installed or replaced under another profile while it worked — a first upload created by a differently sized gateway — stops them the same way. With no admission record at all nothing was ever admitted, so it judges no upload. If the record is still missing at its last read while an upload is listed — or the listing cannot be read — the record is lost and the profile those uploads were admitted under is unknown, so the pass is refused as for a mismatch, and the terminal deletes and the obligation walk do not run either. A record that was there at the first read and is gone at the last is lost in the same way — nothing deletes it — and refuses the pass the same way, whatever the pass did before that read. A refusal at the first read says that the reaper refused before acting; one at the last read of a pass that had judged says how many uploads it had already ended — they stay ended, under the profile the first read matched — and the pass's counts are reported either way, as they are when that last read fails. A first upload created under its own profile while the pass works is left for the next pass, and that pass reports that it did not finish rather than that nothing is left. It lists the uploads in key order, at most a fixed number per pass, and keeps where it stopped in a position of its own, `custodian:reaper-cursor`, so the next pass goes on from there and every upload is judged once a lap (a stored position that is not an upload key a backend accepts is named and replaced by the head, never handed to the store). When that number runs out it reads one entry further, judging none, so a listing that ends exactly there is known to have ended. A read of the listing the store cannot answer — a page of it, or that one entry — holds the rest of the listing for that pass, named for an operator, and sends the next pass back to the head rather than to the read that failed, so a fault that lasts never keeps the uploads listed before it from being judged again. The position also records whether the lap so far is clean — nothing ended, contended or held since its head — so the pass that finishes a clean lap reports that nothing is left, and one that finishes any other lap reports that it did not finish, and a longer listing still reaches the first report once a whole lap finds nothing to do; the admission count does not bound the listing, since a lowered limit or uploads created and deleted between two pages can list more uploads than the count, and neither is damage. It judges only an **open** one stamped under the clock it reads. An upload stamped under another clock is named for an operator and never judged; while it is open only an operator can end it, so it is held, and once it has ended its teardown runs as any other's, since none of it reads a timestamp. An upload whose creation or newest progress is stamped later than the reaper's own clock by more than the clock-skew budget is held too, rather than kept for as long as the stamp stays ahead. An open upload is ended when it is **idle** — its newest progress (its creation, its newest committed part, its newest in-flight slot reservation) is older than the idle window and no slot or staging lease of it is still live — or when it is **over age**, older than the residency ceiling however live it is. It reads the slot range before the part summaries, so a part committing between the two reads is seen in one or both, never neither. An upload whose records it cannot read or decode — a part summary under a key that names no part included — is held and named for an operator, and the pass goes on to the next and to the terminal deletes and the obligation walk. Ending an upload is the one commit a client abort also makes — the upload moved to aborting under a condition on its exact record, with the obligation owing everything it staged — and the idle commit also pins every slot of the upload as read, present or absent, so a renewal or release of a slot it read, or a reservation still standing when the commit lands, makes the commit fail and the upload is judged again next pass; the over-age commit pins nothing. A commit that fails because the upload's teardown obligation already exists beside its unchanged record is damage rather than contention, since no writer leaves that state: the upload is held and named. A commit whose outcome the store could not report is neither a success nor a failure: the upload may already have been ended, and the drain of that same pass then tears it down, so it is never reported as left in place and never counted as ended. It is named for an operator and counted on its own, the pass reports that it could not account for everything, the commit is not sent again, and the next pass reads which way it went. One gap is stated rather than hidden: a request that reserves a slot the reaper read free and commits its part, both between the reads and the idle commit, leaves every slot as the reaper read it, so the commit lands and that upload is ended together with the part it has just committed. Closing that needs a change to the upload protocol (proposal 0016) that this release does not make; it is a known gap, and the follow-up that closes it must land before uploads are created in production. Each commit is measured against the batch budgets before it is sent and never split. An operator can run exactly one such pass and exit with `wyrd custodian --reap-abandoned-uploads`: it needs no `--endpoints`, reads and writes metadata only, and drains what it ended record by record, holding for a whole-fleet pass anything that could only be retired by listing the fleet; it exits non-zero when anything was held, a commit's outcome is unknown or the profile check refused, so an open upload under another clock keeps it failing until an operator ends that upload. It is refused before it opens the store when given a flag that selects work it does not run — `--endpoints`, `--ids`, `--failure-domains` or `--gc-expired-pending` — rather than ignoring the flag, and when its `--data-dir` holds no local metadata store — no file there, or an empty one — which it never creates: a store made on the spot would be reported as holding nothing to reap. Its last line names the store it ran on: the local file, or the TiKV PD endpoints or the FoundationDB cluster file it connected with. The reaper runs on every startup shape of the ordinary role, not only on a healthy fleet. With a fleet it rides each interval's repair-loop pass over whatever part of the fleet is reachable, so a server down at startup or unreachable this pass defers garbage collection but not the reaper; the drain after it still waits for a pass that sees the whole fleet before it retires anything by listing the fleet. With no `--endpoints` the role has nothing to reconstruct but does not exit: it runs the reaper alone every interval, record by record, until it is stopped. When `--endpoints` are given and none of them is reachable at startup, the role runs exactly one reaper pass under the leadership it already holds and then fails as before, with a non-zero exit and the same diagnostic, so a supervisor restarts it; it is not kept up on the empty fleet, because the role never dials a server again after startup.
+ 3. **Propagate across zones (L3).** If the object had replicas, the deletion propagates through the replica catalog: each holding zone drops its catalog record and its GC reclaims the local fragments. Until propagation completes, a *stale-tolerant* read in a lagging zone may still see the old object, bounded by replication lag (section 8.1); consistency-sensitive reads route to the home zone and never do.
+ 4. **Prove it (audit + crypto-erase).** The deletion is recorded in the append-only audit/event log — the operator's compliance and GDPR-deletion story (section 8.3). Where per-tenant envelope encryption is enabled, dropping the object/tenant key crypto-shreds the data immediately, making it unrecoverable independent of when GC runs (section 8.5).
