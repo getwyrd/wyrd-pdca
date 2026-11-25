@@ -2756,3 +2756,113 @@ owner. The work this review produced is evidence on those owners and 12 code fol
   `cargo deny all-features advisories` in every affected bundle.
 - **Sweep retired:** if a later review finds a §10 item that only lived in an archived
   iteration, restart the sweep and add the case to harness#608.
+
+# Act review — 2026-11-10 — cycles considered: 658, 659, 667, 927, 937, 955, 956, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1027, 1028, 1029, 1030, 1061, 1062, 1084 (decided by Eduard Ralph in session)
+
+> These are the 28 frozen cycles the 2026-10-19 review did not cover. The index holds 182;
+> the other 154 were reviewed before. No disposition is re-decided.
+
+## What the records exposed
+
+**No system-process delta is warranted.** The finding that looked like one is a deliberate
+choice. The rest is either already owned or was routed below as work items.
+
+- **The process checkout is pinned, on purpose.** Local `main` split from `origin/main` at
+  `4fe47c2` (2026-10-29): 21 local `chore(records)` commits ahead, 8 merged commits behind.
+  Eduard Ralph keeps it that way so the mainline does not shift during a long development
+  cycle. So these are merged but **not live**: getwyrd/wyrd-pdca#288 (T4 model/effort pin
+  and per-pass evidence, which closed #276), #287 (security reviewer leaf, #274), and
+  #291–#296 (secret guard). Consequences for reading the records:
+  - **#276 is closed but not live.** `review-batch.md` is still the 563-byte header in 1006,
+    1009, 1010, 1013, 1029, 1030 and 1062, all built after #276 closed. That is the pin's
+    expected cost, not a regression. The 2026-10-19 effect check moves to "first bundle built
+    after the next sync".
+  - **§10 requests for merged work are noise.** 927, 956, 1027 and 1030 each asked again for
+    what #288 does. Act reads these as "merged, waiting for sync" and does not file them again.
+  - A doctor check for "checkout behind origin" was proposed and dropped, because it would
+    fire on every run by design.
+- **Already owned, nothing new:**
+  - Prior art cannot be checked on the reviewer's one-commit target (1007, 1008, 1018, 1062)
+    → eduralph/pdca-harness#575.
+  - Stacked diff coverage is measured against `origin/main` (1013) → #277.
+  - Size backstop on oversized slices (1007, 1008, 1013, 1061, 1062, 1084; 1084 at 451 KB)
+    → #275 / harness#719.
+  - Plan findings come back in §6 after the brief settled them (658, 659, 937, 956)
+    → harness#692.
+  - New-API "no isolable red" (955, 1007, 1013, 1027, 1061): a cost kept on purpose since
+    2026-09-20.
+  - Split closes (658, 659, 927, 937, 1012, 1014, 1017) work as designed. Fitness-to-purpose
+    is always the human's call.
+- **C4-verify's record overstates what it showed.** Both issues are in this repo's
+  `engine/scripts/run-verify.sh`. A green-only run (`:494-503`, exit 0) is recorded as `pass`
+  under the "red pre-fix, green post-fix" label (`pdca.toml:1501`), and it counts toward
+  `promote_after = 3`. 11 of 68 bundles with a C4-verify log were green-only (774, 776, 843,
+  933, 956, 1008, 1009, 1010, 1028, 1029, 1030). Separately, the PASS line prints tests
+  *run* as tests *red* (`:194-197`, `:550`; 1006: "42 ran red" where 39 failed).
+- **`plan-cap` counts a close bundle waiting for Check.** 1014: 508, 625 and 633 carry
+  `close-disposition = split` with no `check-gates.json`, so they read BUILT
+  (`src/pdca_harness/state.py:342-368`, correct) and `scripts/plan-cap:44` counts them. Their
+  children spend budget slots too, so the same work is charged twice. This is this repo's rule
+  P1, not a harness bug.
+- **Carry-forward items were lost between slices.** #1007's four "must carry to #1008" items
+  and #1027's two "add to #1028" tests appear in neither next brief. They were filed below.
+  Watch for this (see "How effectiveness will be judged").
+
+## Process deltas
+
+- **No delta warranted.** The candidate delta (a doctor check that the checkout is current) was
+  withdrawn once the pin turned out to be deliberate. The C4-verify and `plan-cap` items are
+  filed as issues against this repo's code, to be fixed with their issues, as was decided on
+  2026-10-19.
+
+## Follow-ups routed
+
+- **getwyrd/wyrd-pdca** (this repo):
+  - #297 (https://github.com/getwyrd/wyrd-pdca/issues/297): run-verify.sh records a
+    green-only pass as red→green, and it counts toward `promote_after`.
+  - #298 (https://github.com/getwyrd/wyrd-pdca/issues/298): run-verify.sh's PASS line reports
+    tests that ran as tests that ran red (1006).
+  - #299 (https://github.com/getwyrd/wyrd-pdca/issues/299): plan-cap counts a close bundle
+    waiting for Check (1014).
+- **getwyrd/wyrd** (§10 code follow-ups, checked against main `e839e76`, none previously
+  filed):
+  - #1105 (https://github.com/getwyrd/wyrd/issues/1105): 955, a reply the HTTP parser refuses
+    reads as `NoResponse`.
+  - #1106: 955/956, S3 client test gaps (partial/conditional GET deadlines, bad `Expires`,
+    empty list token, `~` in a bucket name).
+  - #1107: 1007, four Complete-fence follow-ups #1008 did not carry.
+  - #1108: 1009, the segmented "wrote nothing, not charged" leg.
+  - #1109: 1010, `InDoubt` returned before `doubt.settle`, so `may_still_commit` over-reports.
+  - #1110: 1011, **design issue**: the ~79 GiB per-object ceiling of the two-level chunk map
+    (third level?). Needs a design phase outside the PDCA cycle; for Eduard Ralph to schedule.
+    No brief authored.
+  - #1111: 1011, `SessionTooLarge` wording, S3 terms and S3's 10,000-part cap in core.
+  - #1112: 1015, the fdb-single-node cluster file lives under `target/` and is lost on a clean.
+  - #1113: 1016, `RUST_LOG` leaks into the usage test; no test for a pass cut short by Ctrl-C.
+  - #1114: 1018, operator-abort FDB label, empty env var, whole-fleet hint.
+  - #1115: 1027/1028, four untested UploadPart commit branches.
+  - #1116: 1061, a timing regression test for the O(N²) part-set lookup.
+  - #1117: 1062, the drain waits forever, unaudited, on a departed D server.
+  - #1118: 1062, two surviving `marks.rs:886` mutants.
+  - #1119: 1084, the fallback picks a server absent from the fleet and reports `Satisfied`.
+  - #1120: 1084, committed moves lack the drain fence and filter (predates #1084).
+  - #1121: 1084, pin the vacated mark's stamp.
+  - #1122: 927, proposal 0016's lease wording, and slots left held after a Complete rollback.
+  - Comments: #511 (comment 7162734725, 1008's bucket pin), #670 (7162735298, three inputs
+    for Complete), #625 (7162735918, fence stamp timing and held slots), #1026 (7162736512,
+    the rise-then-fall epoch case).
+  - Not filed: 927's brief notes for #1027 and #1030 (both since built).
+- **Upstream (eduralph/pdca-harness):** nothing new. The 1014 item was first marked for
+  upstream, then found to be this repo's rule (#299).
+
+## How effectiveness will be judged
+
+- **After the next sync:** the first bundle built after it has a `review-batch.md` with 3
+  passes, times, bytes, the model pin and the patch sha256 (#276's original check), and a
+  security-review advisory artifact (#287). Until then, T4 §6 items on bundles over ~100 KB
+  are the pin's expected cost.
+- **#297:** once fixed, green-only bundles show a distinct C4-verify result, and
+  `pdca gates --promotions` no longer counts them.
+- **Carry-forward:** at the next review, check each "#NNNN must carry" §10 item against the
+  named next brief. A second lost carry is evidence for a Plan-side rule (the planner reads the
+  predecessor's §10), which is not proposed yet.
