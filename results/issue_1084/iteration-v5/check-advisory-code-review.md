@@ -1,0 +1,5 @@
+- NEEDS-HUMAN [impl] — **Evacuation fixtures still ignore the new write deadline.** The contexts updated at `crates/custodian/tests/rebalance.rs:863`, `crates/custodian/tests/segmented_map_evacuate.rs:284`, and `crates/custodian/tests/segmented_map_rebalance.rs:206` now drive deadline-bearing copies, but their `MemDServer::put_fragment` implementations discard that deadline (`rebalance.rs:132`, `segmented_map_evacuate.rs:181`, `segmented_map_rebalance.rs:105`, all under `crates/custodian/tests/`). Consequently, even a zero write window permits successful evacuation in these fixtures, whereas the production store rejects the write at its deadline. Share each context's `ManualClock` with its destination stores and enforce the pre-write and post-publication deadline checks, as the updated reconstruction double does. This is a test-fidelity gap in the newly exercised contract; the separate D7 tests do enforce deadlines.
+
+No additional introduced production-correctness bugs or worthwhile reuse/simplification findings identified within the stated scope. Reviewed target source and frozen gate evidence; no tests were rerun.
+
+<!-- pdca:leaf-complete -->
